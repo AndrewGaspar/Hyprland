@@ -114,6 +114,8 @@ namespace Desktop::Rule {
         DEFINE_PROP(bool, persistentSize, false, WINDOW_RULE_EFFECT_PERSISTENT_SIZE)
         DEFINE_PROP(bool, stayFocused, false, WINDOW_RULE_EFFECT_STAY_FOCUSED)
 
+        DEFINE_PROP(double, aspectRatio, 0.0, WINDOW_RULE_EFFECT_ASPECT_RATIO)
+
         DEFINE_PROP(int, idleInhibitMode, false, WINDOW_RULE_EFFECT_IDLE_INHIBIT)
 
         DEFINE_PROP(Hyprlang::INT, borderSize, {std::string("general:border_size") COMMA sc<Hyprlang::INT>(0) COMMA std::nullopt}, WINDOW_RULE_EFFECT_BORDER_SIZE)
