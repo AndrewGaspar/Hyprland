@@ -46,11 +46,26 @@ void CWindowTarget::updatePos() {
         return;
 
     if (floating() && fullscreenMode() != FSMODE_MAXIMIZED) {
+        const double arTarget = m_window->m_ruleApplicator->aspectRatio().valueOrDefault();
+        Vector2D     pos      = m_box.logicalBox.pos();
+        Vector2D     size     = m_box.logicalBox.size();
+
+        if (arTarget > 0) {
+            const double arCur           = size.x / size.y;
+            Vector2D     constrainedSize = size;
+            if (arTarget > arCur)
+                constrainedSize.y = size.x / arTarget;
+            else
+                constrainedSize.x = size.y * arTarget;
+            pos  = pos + (size - constrainedSize) / 2.0;
+            size = constrainedSize;
+        }
+
         m_window->m_position = m_box.logicalBox.pos();
         m_window->m_size     = m_box.logicalBox.size();
 
-        *m_window->m_realPosition = m_box.logicalBox.pos();
-        *m_window->m_realSize     = m_box.logicalBox.size();
+        *m_window->m_realPosition = pos;
+        *m_window->m_realSize     = size;
 
         m_window->sendWindowSize();
         m_window->updateWindowDecos();
@@ -163,6 +178,19 @@ void CWindowTarget::updatePos() {
             calcPos    = calcPos + DELTA / 2.f; // center
             calcSize   = m_pseudoSize;
         }
+    }
+
+    // Apply target aspect ratio constraint (letterbox / pillarbox)
+    const double arTarget = m_window->m_ruleApplicator->aspectRatio().valueOrDefault();
+    if (arTarget > 0 && fullscreenMode() == FSMODE_NONE) {
+        const double arAvail         = calcSize.x / calcSize.y;
+        Vector2D     constrainedSize = calcSize;
+        if (arTarget > arAvail)
+            constrainedSize.y = calcSize.x / arTarget;
+        else
+            constrainedSize.x = calcSize.y * arTarget;
+        calcPos  = calcPos + (calcSize - constrainedSize) / 2.0;
+        calcSize = constrainedSize;
     }
 
     const auto RESERVED = m_window->getFullWindowReservedArea();

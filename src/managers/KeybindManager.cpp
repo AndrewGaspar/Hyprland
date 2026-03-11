@@ -3104,7 +3104,25 @@ SDispatchResult CKeybindManager::setProp(std::string args) {
             parsePropTrivial(PWINDOW->m_ruleApplicator->persistentSize(), VAL);
         else if (PROP == "stay_focused")
             parsePropTrivial(PWINDOW->m_ruleApplicator->stayFocused(), VAL);
-        else if (PROP == "idle_inhibit")
+        else if (PROP == "aspect_ratio") {
+            if (VAL == "unset") {
+                PWINDOW->m_ruleApplicator->aspectRatio().unset(Desktop::Types::PRIORITY_SET_PROP);
+            } else {
+                double     ratio    = 0.0;
+                const auto colonPos = VAL.find(':');
+                if (colonPos != std::string::npos) {
+                    double w = std::stod(VAL.substr(0, colonPos));
+                    double h = std::stod(VAL.substr(colonPos + 1));
+                    if (h > 0)
+                        ratio = w / h;
+                } else {
+                    ratio = std::stod(VAL);
+                }
+                if (ratio < 0)
+                    ratio = 0;
+                PWINDOW->m_ruleApplicator->aspectRatio() = Desktop::Types::COverridableVar<double>(ratio, Desktop::Types::PRIORITY_SET_PROP);
+            }
+        } else if (PROP == "idle_inhibit")
             parsePropTrivial(PWINDOW->m_ruleApplicator->idleInhibitMode(), VAL);
         else if (PROP == "border_size")
             parsePropTrivial(PWINDOW->m_ruleApplicator->borderSize(), VAL);
@@ -3139,6 +3157,10 @@ SDispatchResult CKeybindManager::setProp(std::string args) {
         if (m->m_activeWorkspace)
             m->m_activeWorkspace->m_space->recalculate();
     }
+
+    // recalculate() doesn't update floating windows — do it explicitly
+    if (PWINDOW->m_isFloating && PWINDOW->layoutTarget())
+        PWINDOW->layoutTarget()->recalc();
 
     return {};
 }

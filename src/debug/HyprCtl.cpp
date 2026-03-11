@@ -1327,7 +1327,7 @@ static std::string dispatchKeyword(eHyprCtlOutputFormat format, std::string in) 
         }
     }
 
-    if (COMMAND.contains("windowrule ") || COMMAND.contains("windowrule["))
+    if (COMMAND == "windowrule" || COMMAND.contains("windowrule["))
         g_pConfigManager->reloadRules();
 
     if (COMMAND.contains("layerrule") || COMMAND.contains("layerrule[")) {
@@ -1721,6 +1721,8 @@ static std::string dispatchGetProp(eHyprCtlOutputFormat format, std::string requ
         return windowPropToString(PWINDOW->m_ruleApplicator->scrollMouse());
     else if (PROP == "scroll_touchpad")
         return windowPropToString(PWINDOW->m_ruleApplicator->scrollTouchpad());
+    else if (PROP == "aspect_ratio")
+        return windowPropToString(PWINDOW->m_ruleApplicator->aspectRatio());
 
     return "prop not found";
 }

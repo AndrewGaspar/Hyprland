@@ -5,6 +5,7 @@
 #include "../../view/Window.hpp"
 #include "../../types/OverridableVar.hpp"
 #include "../../../event/EventBus.hpp"
+#include "../../../layout/space/Space.hpp"
 
 #include <hyprutils/string/String.hpp>
 
@@ -58,6 +59,7 @@ std::unordered_set<CWindowRuleEffectContainer::storageType> CWindowRuleApplicato
     UNSET(noVRR)
     UNSET(persistentSize)
     UNSET(stayFocused)
+    UNSET(aspectRatio)
     UNSET(idleInhibitMode)
     UNSET(borderSize)
     UNSET(rounding)
@@ -434,6 +436,26 @@ CWindowRuleApplicator::SRuleResult CWindowRuleApplicator::applyDynamicRule(const
                 m_stayFocused.second |= rule->getPropertiesMask();
                 break;
             }
+            case WINDOW_RULE_EFFECT_ASPECT_RATIO: {
+                try {
+                    double     ratio    = 0.0;
+                    const auto colonPos = effect.find(':');
+                    if (colonPos != std::string::npos) {
+                        double w = std::stod(effect.substr(0, colonPos));
+                        double h = std::stod(effect.substr(colonPos + 1));
+                        if (h > 0)
+                            ratio = w / h;
+                    } else {
+                        ratio = std::stod(effect);
+                    }
+                    if (ratio < 0)
+                        ratio = 0;
+                    m_aspectRatio.first.set(ratio, Types::PRIORITY_WINDOW_RULE);
+                    m_aspectRatio.second |= rule->getPropertiesMask();
+                    result.needsRelayout = true;
+                } catch (...) { Log::logger->log(Log::ERR, "CWindowRuleApplicator::applyDynamicRule: aspect_ratio rule \"{}\" failed to parse", effect); }
+                break;
+            }
             case WINDOW_RULE_EFFECT_SCROLL_MOUSE: {
                 try {
                     m_scrollMouse.first.set(std::clamp(std::stof(effect), 0.01F, 10.F), Types::PRIORITY_WINDOW_RULE);
@@ -634,8 +656,15 @@ void CWindowRuleApplicator::propertiesChanged(std::underlying_type_t<eRuleProper
     m_window->updateWindowDecos();
     m_window->updateDecorationValues();
 
-    if (needsRelayout)
+    if (needsRelayout) {
         g_pDecorationPositioner->forceRecalcFor(m_window.lock());
+        if (m_window->m_workspace && m_window->m_workspace->m_space)
+            m_window->m_workspace->m_space->recalculate();
+
+        // recalculate() doesn't update floating windows — do it explicitly
+        if (m_window->m_isFloating && m_window->layoutTarget())
+            m_window->layoutTarget()->recalc();
+    }
 
     // for plugins
     Event::bus()->m_events.window.updateRules.emit(m_window.lock());
