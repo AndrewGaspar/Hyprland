@@ -39,6 +39,7 @@ namespace Render {
         SH_FRAG_SURFACE,
         SH_FRAG_BORDER1,
         SH_FRAG_GLITCH,
+        SH_FRAG_AMBIENT,
 
         SH_FRAG_LAST,
     };

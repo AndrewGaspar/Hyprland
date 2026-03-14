@@ -2160,6 +2160,12 @@ void CCompositor::setWindowFullscreenState(const PHLWINDOW PWINDOW, Desktop::Vie
         return;
     }
 
+    // If leaving constrained fullscreen (aspect_ratio bars), damage the full
+    // monitor so the bar areas are cleared on the next frame.
+    if (CURRENT_EFFECTIVE_MODE == FSMODE_FULLSCREEN && EFFECTIVE_MODE != FSMODE_FULLSCREEN && PMONITOR &&
+        PWINDOW->m_ruleApplicator->aspectRatio().valueOrDefault() > 0)
+        g_pHyprRenderer->damageMonitor(PMONITOR);
+
     PWORKSPACE->m_fullscreenMode      = EFFECTIVE_MODE;
     PWORKSPACE->m_hasFullscreenWindow = EFFECTIVE_MODE != FSMODE_NONE;
 

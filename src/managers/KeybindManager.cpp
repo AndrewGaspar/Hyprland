@@ -3117,6 +3117,19 @@ SDispatchResult CKeybindManager::setProp(std::string args) {
                     ratio = 0;
                 PWINDOW->m_ruleApplicator->aspectRatio() = Desktop::Types::COverridableVar<double>(ratio, Desktop::Types::PRIORITY_SET_PROP);
             }
+        } else if (PROP == "aspect_ratio_fill") {
+            if (VAL == "unset") {
+                PWINDOW->m_ruleApplicator->aspectRatioFill().unset(Desktop::Types::PRIORITY_SET_PROP);
+            } else {
+                int fill = Desktop::Rule::ASPECT_RATIO_FILL_BLACK;
+                if (VAL == "wallpaper")
+                    fill = Desktop::Rule::ASPECT_RATIO_FILL_WALLPAPER;
+                else if (VAL == "blur")
+                    fill = Desktop::Rule::ASPECT_RATIO_FILL_BLUR;
+                else if (VAL == "ambient")
+                    fill = Desktop::Rule::ASPECT_RATIO_FILL_AMBIENT;
+                PWINDOW->m_ruleApplicator->aspectRatioFill() = Desktop::Types::COverridableVar<int>(fill, Desktop::Types::PRIORITY_SET_PROP);
+            }
         } else if (PROP == "idle_inhibit")
             parsePropTrivial(PWINDOW->m_ruleApplicator->idleInhibitMode(), VAL);
         else if (PROP == "border_size")

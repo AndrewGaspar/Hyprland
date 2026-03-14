@@ -66,8 +66,16 @@ namespace Desktop::Rule {
         WINDOW_RULE_EFFECT_SCROLL_TOUCHPAD,
         WINDOW_RULE_EFFECT_STAY_FOCUSED,
         WINDOW_RULE_EFFECT_ASPECT_RATIO,
+        WINDOW_RULE_EFFECT_ASPECT_RATIO_FILL,
 
         WINDOW_RULE_EFFECT_LAST_STATIC,
+    };
+
+    enum eAspectRatioFill : uint8_t {
+        ASPECT_RATIO_FILL_BLACK = 0,
+        ASPECT_RATIO_FILL_WALLPAPER,
+        ASPECT_RATIO_FILL_BLUR,
+        ASPECT_RATIO_FILL_AMBIENT,
     };
 
     class CWindowRuleEffectContainer : public IEffectContainer<eWindowRuleEffect> {

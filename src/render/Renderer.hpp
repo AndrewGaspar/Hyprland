@@ -26,6 +26,7 @@
 #include "render/pass/SurfacePassElement.hpp"
 #include "render/pass/TexPassElement.hpp"
 #include "render/pass/TextureMatteElement.hpp"
+#include "render/pass/AmbientPassElement.hpp"
 
 struct SMonitorRule;
 class CWorkspace;
@@ -370,6 +371,10 @@ class IHyprRenderer {
     void preDrawSurface(CSurfacePassElement* element, const CRegion& damage);
     void drawTex(CTexPassElement* element, const CRegion& damage);
     void drawTexMatte(CTextureMatteElement* element, const CRegion& damage);
+    void drawAmbient(CAmbientPassElement* element, const CRegion& damage);
+
+    SP<IFramebuffer> m_ambientFB[2];  // ping-pong framebuffers for diffusion
+    int              m_ambientFBIdx = 0; // current write target
 };
 
 inline UP<IHyprRenderer> g_pHyprRenderer;

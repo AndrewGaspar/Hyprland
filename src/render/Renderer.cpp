@@ -592,6 +592,47 @@ void IHyprRenderer::renderWindow(PHLWINDOW pWindow, PHLMONITOR pMonitor, const T
         m_renderPass.add(makeUnique<CRectPassElement>(data));
     }
 
+    if (pWindow->isEffectiveInternalFSMode(FSMODE_FULLSCREEN) && pWindow->m_ruleApplicator->aspectRatio().valueOrDefault() > 0 && !m_bRenderingSnapshot &&
+        mode != RENDER_PASS_POPUP) {
+        using namespace Desktop::Rule;
+        const int fillMode = pWindow->m_ruleApplicator->aspectRatioFill().valueOrDefault();
+
+        if (fillMode == ASPECT_RATIO_FILL_BLACK) {
+            CBox                        monbox = {0, 0, m_renderData.pMonitor->m_transformedSize.x, m_renderData.pMonitor->m_transformedSize.y};
+            CRectPassElement::SRectData data;
+            data.color = CHyprColor(0, 0, 0, fullAlpha);
+            data.box   = monbox;
+            m_renderPass.add(makeUnique<CRectPassElement>(data));
+        } else if (fillMode == ASPECT_RATIO_FILL_BLUR) {
+            CBox                        monbox = {0, 0, m_renderData.pMonitor->m_transformedSize.x, m_renderData.pMonitor->m_transformedSize.y};
+            CRectPassElement::SRectData data;
+            data.color = CHyprColor(0, 0, 0, 0);
+            data.box   = monbox;
+            data.blur  = true;
+            data.blurA = fullAlpha;
+            data.xray  = shouldUseNewBlurOptimizations(nullptr, pWindow);
+            m_renderPass.add(makeUnique<CRectPassElement>(data));
+        } else if (fillMode == ASPECT_RATIO_FILL_AMBIENT) {
+            // Ambient mode: downscale window content to a tiny framebuffer (destroys detail),
+            // upscale back to full monitor size (creates smooth color gradients), then apply
+            // vignette fade to black at edges. YouTube Ambient Mode style effect.
+            auto* surface = pWindow->wlSurface() ? pWindow->wlSurface()->resource().get() : nullptr;
+            if (surface && surface->m_current.texture) {
+                const auto monSize = m_renderData.pMonitor->m_transformedSize;
+                const auto winPos  = (pWindow->m_realPosition->value() - pMonitor->m_position) * pMonitor->m_scale;
+                const auto winSize = pWindow->m_realSize->value() * pMonitor->m_scale;
+
+                CAmbientPassElement::SAmbientData ambientData;
+                ambientData.tex        = surface->m_current.texture;
+                ambientData.windowBox  = CBox(winPos.x, winPos.y, winSize.x, winSize.y);
+                ambientData.monitorBox = CBox(0, 0, monSize.x, monSize.y);
+                ambientData.a          = fullAlpha;
+                m_renderPass.add(makeUnique<CAmbientPassElement>(ambientData));
+            }
+        }
+        // ASPECT_RATIO_FILL_WALLPAPER: wallpaper shows through naturally — no extra rendering
+    }
+
     renderdata.pos.x += pWindow->m_floatingOffset.x;
     renderdata.pos.y += pWindow->m_floatingOffset.y;
 
@@ -1093,6 +1134,88 @@ void IHyprRenderer::drawTexMatte(CTextureMatteElement* element, const CRegion& d
         draw(element, damage);
 }
 
+void IHyprRenderer::drawAmbient(CAmbientPassElement* element, const CRegion& damage) {
+    if (m_renderData.damage.empty())
+        return;
+
+    const auto& data    = element->m_data;
+    const auto  monSize = m_renderData.pMonitor->m_transformedSize;
+    const int   monW    = static_cast<int>(monSize.x);
+    const int   monH    = static_cast<int>(monSize.y);
+
+    // Allocate two full-resolution ping-pong framebuffers for temporal diffusion
+    for (int i = 0; i < 2; ++i) {
+        if (!m_ambientFB[i] || m_ambientFB[i]->m_size != Vector2D(monW, monH)) {
+            m_ambientFB[i] = createFB(i == 0 ? "ambient-A" : "ambient-B");
+            m_ambientFB[i]->alloc(monW, monH, DRM_FORMAT_ARGB8888);
+        }
+    }
+
+    const int writeIdx = m_ambientFBIdx;
+    const int readIdx  = 1 - writeIdx;
+
+    // --- Run diffusion shader: reads window tex + previous frame, writes new frame ---
+    // Bypass the normal pipeline (projection is for monitor, but we render to our own FB)
+    m_ambientFB[writeIdx]->bind();
+    setViewport(0, 0, monW, monH);
+    disableScissor();
+
+    const Mat3x3 proj     = Mat3x3::outputProjection(Vector2D(monW, monH), HYPRUTILS_TRANSFORM_NORMAL);
+    const Mat3x3 glMatrix = proj.projectBox(CBox(0, 0, monW, monH), HYPRUTILS_TRANSFORM_NORMAL, 0);
+
+    // Bind window texture on unit 0
+    glActiveTexture(GL_TEXTURE0);
+    data.tex->bind();
+    data.tex->setTexParameter(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    data.tex->setTexParameter(GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    // Bind previous ambient frame on unit 1
+    auto prevTex = m_ambientFB[readIdx]->getTexture();
+    glActiveTexture(GL_TEXTURE1);
+    prevTex->bind();
+    prevTex->setTexParameter(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    prevTex->setTexParameter(GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    // Use the ambient diffusion shader
+    auto shader = g_pHyprOpenGL->useShader(g_pHyprOpenGL->getShaderVariant(Render::SH_FRAG_AMBIENT));
+    shader->setUniformMatrix3fv(SHADER_PROJ, 1, GL_TRUE, glMatrix.getMatrix());
+    shader->setUniformInt(SHADER_TEX, 0);
+    shader->setUniformInt(SHADER_BLURRED_BG, 1);
+
+    // Window rectangle in UV coords (0-1 range)
+    shader->setUniformFloat2(SHADER_TOP_LEFT, data.windowBox.x / monSize.x, data.windowBox.y / monSize.y);
+    shader->setUniformFloat2(SHADER_BOTTOM_RIGHT, (data.windowBox.x + data.windowBox.w) / monSize.x,
+                             (data.windowBox.y + data.windowBox.h) / monSize.y);
+    shader->setUniformFloat2(SHADER_FULL_SIZE, monSize.x, monSize.y);
+    shader->setUniformFloat(SHADER_ALPHA, data.a);
+
+    glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glBindVertexArray(0);
+
+    data.tex->unbind();
+    glActiveTexture(GL_TEXTURE1);
+    prevTex->unbind();
+    glActiveTexture(GL_TEXTURE0);
+
+    // Swap ping-pong index for next frame
+    m_ambientFBIdx = readIdx;
+
+    // --- Composite the ambient FB onto the main framebuffer ---
+    m_renderData.currentFB->bind();
+    setViewport(0, 0, monW, monH);
+
+    // Black background so wallpaper doesn't bleed through
+    CBox monbox(0, 0, monSize.x, monSize.y);
+    g_pHyprOpenGL->renderRect(monbox, CHyprColor(0, 0, 0, data.a), {});
+
+    // Render the diffused ambient result on top
+    auto ambientTex = m_ambientFB[writeIdx]->getTexture();
+    ambientTex->setTexParameter(GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    ambientTex->setTexParameter(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    g_pHyprOpenGL->renderTexture(ambientTex, monbox, CHyprOpenGLImpl::STextureRenderData{.a = data.a});
+}
+
 void IHyprRenderer::draw(WP<IPassElement> element, const CRegion& damage) {
     if (!element)
         return;
@@ -1108,6 +1231,7 @@ void IHyprRenderer::draw(WP<IPassElement> element, const CRegion& damage) {
         case EK_SURFACE: preDrawSurface(dc<CSurfacePassElement*>(element.get()), damage); break;
         case EK_TEXTURE: drawTex(dc<CTexPassElement*>(element.get()), damage); break;
         case EK_TEXTURE_MATTE: drawTexMatte(dc<CTextureMatteElement*>(element.get()), damage); break;
+        case EK_AMBIENT: drawAmbient(dc<CAmbientPassElement*>(element.get()), damage); break;
         default: Log::logger->log(Log::WARN, "Unimplimented draw for {}", element->passName());
     }
 }
@@ -2984,6 +3108,17 @@ void IHyprRenderer::damageSurface(SP<CWLSurfaceResource> pSurface, double x, dou
 void IHyprRenderer::damageWindow(PHLWINDOW pWindow, bool forceFull) {
     if (g_pCompositor->m_unsafeState)
         return;
+
+    // If the window is fullscreen with an aspect-ratio fill that extends
+    // beyond the window bounds (ambient, blur, black), damage the entire
+    // monitor so the fill area is redrawn whenever the window redraws.
+    if (pWindow->isEffectiveInternalFSMode(FSMODE_FULLSCREEN) && pWindow->m_ruleApplicator->aspectRatio().valueOrDefault() > 0 &&
+        pWindow->m_ruleApplicator->aspectRatioFill().valueOrDefault() != Desktop::Rule::ASPECT_RATIO_FILL_WALLPAPER) {
+        if (const auto MON = pWindow->m_monitor.lock()) {
+            damageMonitor(MON);
+            return;
+        }
+    }
 
     CBox       windowBox        = pWindow->getFullWindowBoundingBox();
     const auto PWINDOWWORKSPACE = pWindow->m_workspace;

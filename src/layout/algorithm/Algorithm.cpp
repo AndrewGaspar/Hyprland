@@ -113,8 +113,27 @@ void CAlgorithm::recalculate() {
 
         if (PFULLWINDOW) {
             if (PWORKSPACE->m_fullscreenMode == FSMODE_FULLSCREEN) {
-                *PFULLWINDOW->m_realPosition = PMONITOR->m_position;
-                *PFULLWINDOW->m_realSize     = PMONITOR->m_size;
+                Vector2D pos  = PMONITOR->m_position;
+                Vector2D size = PMONITOR->m_size;
+
+                const double arTarget = PFULLWINDOW->m_ruleApplicator->aspectRatio().valueOrDefault();
+                if (arTarget > 0) {
+                    const double arMonitor = size.x / size.y;
+                    Vector2D     constrainedSize = size;
+                    if (arTarget > arMonitor)
+                        constrainedSize.y = size.x / arTarget;
+                    else
+                        constrainedSize.x = size.y * arTarget;
+                    pos  = pos + (size - constrainedSize) / 2.0;
+                    size = constrainedSize;
+
+                    // Damage the full monitor so the fill bars in the
+                    // letterbox/pillarbox areas are rendered correctly.
+                    g_pHyprRenderer->damageMonitor(PMONITOR.lock());
+                }
+
+                *PFULLWINDOW->m_realPosition = pos;
+                *PFULLWINDOW->m_realSize     = size;
             } else if (PWORKSPACE->m_fullscreenMode == FSMODE_MAXIMIZED)
                 PFULLWINDOW->layoutTarget()->setPositionGlobal(m_space->workArea());
         }

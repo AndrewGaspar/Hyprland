@@ -2315,7 +2315,13 @@ void CWindow::commitWindow() {
 
     const auto PMONITOR = m_monitor.lock();
 
-    g_pHyprRenderer->damageSurface(wlSurface()->resource(), m_realPosition->goal().x, m_realPosition->goal().y, m_isX11 ? 1.0 / m_X11SurfaceScaledBy : 1.0);
+    // Ambient aspect-ratio fill mirrors window content in the bar areas,
+    // so when the window surface changes, damage the entire monitor.
+    if (isEffectiveInternalFSMode(FSMODE_FULLSCREEN) && m_ruleApplicator->aspectRatio().valueOrDefault() > 0 &&
+        m_ruleApplicator->aspectRatioFill().valueOrDefault() == Desktop::Rule::ASPECT_RATIO_FILL_AMBIENT && PMONITOR)
+        g_pHyprRenderer->damageMonitor(PMONITOR);
+    else
+        g_pHyprRenderer->damageSurface(wlSurface()->resource(), m_realPosition->goal().x, m_realPosition->goal().y, m_isX11 ? 1.0 / m_X11SurfaceScaledBy : 1.0);
 
     if (!m_isX11) {
         m_subsurfaceHead->recheckDamageForSubsurfaces();

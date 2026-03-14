@@ -258,10 +258,10 @@ static void testFloating() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Test 6: fullscreen – constraint must NOT apply
+// Test 6: fullscreen – constraint DOES apply (pillarboxed/letterboxed)
 // ──────────────────────────────────────────────────────────────────────────────
-static void testNoFullscreen() {
-    NLog::log("{}aspectratio: fullscreen – constraint must be bypassed", Colors::GREEN);
+static void testFullscreen() {
+    NLog::log("{}aspectratio: fullscreen – constraint applies", Colors::GREEN);
 
     OK(getFromSocket("/keyword windowrule match:class kitty, aspect_ratio 1:1"));
 
@@ -276,18 +276,21 @@ static void testNoFullscreen() {
         EXPECT_MAX_DELTA(sz.h, 1036, 2);
     }
 
-    // Go fullscreen — constraint must not apply
+    // Go fullscreen — constraint must apply (1:1 in 1920x1080 → 1080x1080)
     OK(getFromSocket("/dispatch fullscreen 0 set"));
 
     {
         auto win = getFromSocket("/activewindow");
         auto sz  = parseSize(win);
-        NLog::log("{}Fullscreen with 1:1 rule: size {},{}", Colors::YELLOW, sz.w, sz.h);
-        EXPECT_MAX_DELTA(sz.w, 1920, 2);
+        auto p   = parsePos(win);
+        NLog::log("{}Fullscreen 1:1: at {},{} size {},{}", Colors::YELLOW, p.x, p.y, sz.w, sz.h);
+        EXPECT_MAX_DELTA(sz.w, 1080, 2);
         EXPECT_MAX_DELTA(sz.h, 1080, 2);
+        EXPECT_MAX_DELTA(p.x, 420, 2);
+        EXPECT_MAX_DELTA(p.y, 0, 2);
     }
 
-    // Exit fullscreen — constraint must be restored
+    // Exit fullscreen — constraint must be restored to tiled
     OK(getFromSocket("/dispatch fullscreenstate 0 0"));
 
     {
@@ -299,6 +302,81 @@ static void testNoFullscreen() {
 
     Tests::killAllWindows();
     OK(getFromSocket("/reload"));
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 6b: fullscreen 4:3 on 1920x1080 → 1440x1080 at 240,0
+// ──────────────────────────────────────────────────────────────────────────────
+static void testFullscreen4x3() {
+    NLog::log("{}aspectratio: fullscreen 4:3 sizing", Colors::GREEN);
+
+    OK(getFromSocket("/keyword windowrule match:class kitty, aspect_ratio 4:3"));
+
+    if (!spawnKitty())
+        return;
+
+    OK(getFromSocket("/dispatch fullscreen 0 set"));
+
+    {
+        auto win = getFromSocket("/activewindow");
+        auto sz  = parseSize(win);
+        auto p   = parsePos(win);
+        NLog::log("{}Fullscreen 4:3: at {},{} size {},{}", Colors::YELLOW, p.x, p.y, sz.w, sz.h);
+        EXPECT_MAX_DELTA(sz.w, 1440, 2);
+        EXPECT_MAX_DELTA(sz.h, 1080, 2);
+        EXPECT_MAX_DELTA(p.x, 240, 2);
+        EXPECT_MAX_DELTA(p.y, 0, 2);
+    }
+
+    Tests::killAllWindows();
+    OK(getFromSocket("/reload"));
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 6c: aspect_ratio_fill modes via getprop round-trip
+// ──────────────────────────────────────────────────────────────────────────────
+static void testFillModes() {
+    NLog::log("{}aspectratio: fill mode getprop/setprop", Colors::GREEN);
+
+    if (!spawnKitty())
+        return;
+
+    // Default should be black
+    {
+        auto prop = getFromSocket("/getprop active aspect_ratio_fill");
+        NLog::log("{}Default fill: {}", Colors::YELLOW, prop);
+        EXPECT_CONTAINS(prop, "black");
+    }
+
+    OK(getFromSocket("/dispatch setprop active aspect_ratio_fill wallpaper"));
+    {
+        auto prop = getFromSocket("/getprop active aspect_ratio_fill");
+        NLog::log("{}After wallpaper: {}", Colors::YELLOW, prop);
+        EXPECT_CONTAINS(prop, "wallpaper");
+    }
+
+    OK(getFromSocket("/dispatch setprop active aspect_ratio_fill blur"));
+    {
+        auto prop = getFromSocket("/getprop active aspect_ratio_fill");
+        NLog::log("{}After blur: {}", Colors::YELLOW, prop);
+        EXPECT_CONTAINS(prop, "blur");
+    }
+
+    OK(getFromSocket("/dispatch setprop active aspect_ratio_fill ambient"));
+    {
+        auto prop = getFromSocket("/getprop active aspect_ratio_fill");
+        NLog::log("{}After ambient: {}", Colors::YELLOW, prop);
+        EXPECT_CONTAINS(prop, "ambient");
+    }
+
+    OK(getFromSocket("/dispatch setprop active aspect_ratio_fill black"));
+    {
+        auto prop = getFromSocket("/getprop active aspect_ratio_fill");
+        NLog::log("{}After black: {}", Colors::YELLOW, prop);
+        EXPECT_CONTAINS(prop, "black");
+    }
+
+    Tests::killAllWindows();
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -363,7 +441,9 @@ static bool test() {
     testTiled4x3();
     testSetpropAndUnset();
     testFloating();
-    testNoFullscreen();
+    testFullscreen();
+    testFullscreen4x3();
+    testFillModes();
     testGetSetPropRoundTrip();
 
     NLog::log("{}Cleaning up aspect_ratio tests", Colors::YELLOW);

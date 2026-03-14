@@ -1723,6 +1723,16 @@ static std::string dispatchGetProp(eHyprCtlOutputFormat format, std::string requ
         return windowPropToString(PWINDOW->m_ruleApplicator->scrollTouchpad());
     else if (PROP == "aspect_ratio")
         return windowPropToString(PWINDOW->m_ruleApplicator->aspectRatio());
+    else if (PROP == "aspect_ratio_fill") {
+        const int fill = PWINDOW->m_ruleApplicator->aspectRatioFill().valueOrDefault();
+        if (fill == Desktop::Rule::ASPECT_RATIO_FILL_WALLPAPER)
+            return "wallpaper";
+        else if (fill == Desktop::Rule::ASPECT_RATIO_FILL_BLUR)
+            return "blur";
+        else if (fill == Desktop::Rule::ASPECT_RATIO_FILL_AMBIENT)
+            return "ambient";
+        return "black";
+    }
 
     return "prop not found";
 }

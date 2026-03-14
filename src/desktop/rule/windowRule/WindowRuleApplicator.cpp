@@ -60,6 +60,7 @@ std::unordered_set<CWindowRuleEffectContainer::storageType> CWindowRuleApplicato
     UNSET(persistentSize)
     UNSET(stayFocused)
     UNSET(aspectRatio)
+    UNSET(aspectRatioFill)
     UNSET(idleInhibitMode)
     UNSET(borderSize)
     UNSET(rounding)
@@ -454,6 +455,18 @@ CWindowRuleApplicator::SRuleResult CWindowRuleApplicator::applyDynamicRule(const
                     m_aspectRatio.second |= rule->getPropertiesMask();
                     result.needsRelayout = true;
                 } catch (...) { Log::logger->log(Log::ERR, "CWindowRuleApplicator::applyDynamicRule: aspect_ratio rule \"{}\" failed to parse", effect); }
+                break;
+            }
+            case WINDOW_RULE_EFFECT_ASPECT_RATIO_FILL: {
+                int fill = ASPECT_RATIO_FILL_BLACK;
+                if (effect == "wallpaper")
+                    fill = ASPECT_RATIO_FILL_WALLPAPER;
+                else if (effect == "blur")
+                    fill = ASPECT_RATIO_FILL_BLUR;
+                else if (effect == "ambient")
+                    fill = ASPECT_RATIO_FILL_AMBIENT;
+                m_aspectRatioFill.first.set(fill, Types::PRIORITY_WINDOW_RULE);
+                m_aspectRatioFill.second |= rule->getPropertiesMask();
                 break;
             }
             case WINDOW_RULE_EFFECT_SCROLL_MOUSE: {

@@ -847,8 +847,9 @@ static const std::vector<std::string> SHADER_INCLUDES = {
 
 // order matters, see ePreparedFragmentShader
 const std::array<std::string, SH_FRAG_LAST> FRAG_SHADERS = {
-    "quad.frag",        "passthru.frag",   "rgbamatte.frag", "ext.frag",     "blur1.frag",  "blur2.frag",
-    "blurprepare.frag", "blurfinish.frag", "shadow.frag",    "surface.frag", "border.frag", "glitch.frag",
+    "quad.frag",        "passthru.frag",   "rgbamatte.frag", "ext.frag",      "blur1.frag",    "blur2.frag",
+    "blurprepare.frag", "blurfinish.frag", "shadow.frag",    "surface.frag",  "border.frag",   "glitch.frag",
+    "ambient.frag",
 };
 
 bool CHyprOpenGLImpl::initShaders(const std::string& path) {
