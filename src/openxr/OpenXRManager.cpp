@@ -406,7 +406,10 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
             finalizeLayerRemoval(e.str);
             break;
         case eXRStateEventType::GRAB:
-            // WP8 fills this: post the xrmonitorgrab socket2 event here.
+            // The frame thread already resolved the monitor name at grab-begin/end time (it
+            // carries a race with the layer-removed ack otherwise — doc 05 §5). Post verbatim.
+            if (!e.str.empty() && g_pEventManager)
+                g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitorgrab", e.str + (e.a ? ",1" : ",0")});
             break;
         case eXRStateEventType::TRACKING: Log::logger->log(Log::DEBUG, "[OPENXR] device-lock tracking {} (monitor {})", e.a ? "gained" : "lost", e.str); break;
     }
@@ -435,8 +438,8 @@ void COpenXRManager::dispatchInputEvent(const SXRInputEvent& e) {
         }
         case eXRInputEventType::BUTTON:
             if (m_pointerDevice)
-                m_pointerDevice->m_pointerEvents.button.emit(
-                    IPointer::SButtonEvent{.timeMs = e.timeMs, .button = e.button, .state = e.pressed ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED, .mouse = true});
+                m_pointerDevice->m_pointerEvents.button.emit(IPointer::SButtonEvent{
+                    .timeMs = e.timeMs, .button = e.button, .state = e.pressed ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED, .mouse = true});
             break;
         case eXRInputEventType::AXIS:
             if (m_pointerDevice)
@@ -813,21 +816,41 @@ void COpenXRManager::frameThread() {
             // Ray-pointer target: hit-test against the world-composed pose (device/grip-locked
             // quads included), expressed in the aim poses' reference frame (undo the LOCAL
             // fallback floor shift, exactly as the reference-frame submission path above does).
+            // `anchor` hands the grab machine (WP8) the live CXRAnchor for this layer, valid only
+            // for the rest of this frame (backed by `active`, a local SP<CXRMonitorLayer> vector).
             if (auto mon = l->m_monitor.lock()) {
                 OpenXR::SXRPose worldRef = res.worldPose;
                 if (!m_session->m_usingLocalFloor)
                     worldRef.pos.y -= floorOffset;
-                pointerTargets.push_back(SXRPointerTarget{mon->m_id, worldRef, res.widthMeters, res.heightMeters});
+                SXRPointerTarget pt;
+                pt.id        = mon->m_id;
+                pt.worldPose = worldRef;
+                pt.w         = res.widthMeters;
+                pt.h         = res.heightMeters;
+                pt.name      = l->m_monitorName;
+                pt.anchor    = &l->m_anchor;
+                pointerTargets.push_back(std::move(pt));
             }
         }
         for (auto& q : quads)
             layerPtrs.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&q));
 
-        // Ray pointer (doc 04 §3-§5): cast every hand's aim ray against the visible quads and emit
-        // motion/button/axis/frame across the frame->main queue. Runs after the solve so hit tests
-        // use this frame's poses; only produces events while FOCUSED (aim poses are valid then).
-        if (m_input)
-            m_input->processPointer(pointerTargets, (uint32_t)Time::millis(Time::steadyNow()));
+        // Ray pointer (doc 04 §3-§5) + grab machine (doc 04 §6, WP8): cast every hand's aim ray
+        // against the visible quads and emit motion/button/axis/frame/grab across the frame->main
+        // queue. Runs after the solve so hit tests use this frame's poses; only produces events
+        // while FOCUSED (aim poses are valid then). The grab machine mutates layer anchor state
+        // (beginGrab/grabPushPull/grabResize/endGrab), so it runs under m_layersMu — the same
+        // discipline as the solve loop above, guarding against a concurrent main-thread verb
+        // (move/anchor/scale/...) touching the same CXRAnchor.
+        if (m_input) {
+            OpenXR::SXRSolveInput pointerSolveIn;
+            pointerSolveIn.view      = viewPose;
+            pointerSolveIn.dt        = dt;
+            pointerSolveIn.gripLeft  = gripLeft;
+            pointerSolveIn.gripRight = gripRight;
+            std::scoped_lock lock(m_layersMu);
+            m_input->processPointer(pointerTargets, (uint32_t)Time::millis(Time::steadyNow()), pointerSolveIn, tune);
+        }
 
         // xrEndFrame with zero layers is valid (nothing composited yet) — doc 01.
         XrFrameEndInfo endInfo       = {XR_TYPE_FRAME_END_INFO};
@@ -1463,16 +1486,24 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
         info.sizeMeters = st.widthMeters;
         info.anchorMode = OpenXR::anchorModeToString(st);
         // doc 05 §4.3: for local the pose is in LOCAL_FLOOR; for leashed/device modes it is the
-        // configured offset (pos) + relative rotation (quat) in the leash/device frame.
-        info.posX    = st.anchorPose.pos.x;
-        info.posY    = st.anchorPose.pos.y;
-        info.posZ    = st.anchorPose.pos.z;
-        info.quatX   = st.anchorPose.rot.x;
-        info.quatY   = st.anchorPose.rot.y;
-        info.quatZ   = st.anchorPose.rot.z;
-        info.quatW   = st.anchorPose.rot.w;
-        info.grabbed = l->m_anchor.grabbed(); // WP8 drives the grab machine
-        info.hovered = l->m_hovered;          // WP7
+        // configured offset (pos) + relative rotation (quat) in the leash/device frame. WP8
+        // DEVIATION: while grabbed, `m_state.anchorPose` is a frozen snapshot of the
+        // pre-grab pose (the grab override lives in a separate m_grabOffset, doc 03 §4.2, and
+        // is only folded back into anchorPose on release) — report the live world-composed pose
+        // instead so `hyprctl openxr status` tracks the controller during a grab, not a stale
+        // value. Not explicitly specified by doc 05 (written before grab existed); this is the
+        // more useful behavior for any status-polling consumer, noted for WP13 to fold into the
+        // doc.
+        const OpenXR::SXRPose reportPose = l->m_anchor.grabbed() && l->m_anchor.hasLastWorld() ? l->m_anchor.lastWorld() : st.anchorPose;
+        info.posX                        = reportPose.pos.x;
+        info.posY                        = reportPose.pos.y;
+        info.posZ                        = reportPose.pos.z;
+        info.quatX                       = reportPose.rot.x;
+        info.quatY                       = reportPose.rot.y;
+        info.quatZ                       = reportPose.rot.z;
+        info.quatW                       = reportPose.rot.w;
+        info.grabbed                     = l->m_anchor.grabbed(); // WP8 drives the grab machine
+        info.hovered                     = l->m_hovered;          // WP7
         if (l->m_reqResolution) {
             info.w = (int)l->m_reqResolution->x;
             info.h = (int)l->m_reqResolution->y;
