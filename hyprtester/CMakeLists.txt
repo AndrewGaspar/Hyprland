@@ -22,6 +22,14 @@ add_custom_command(
 
 target_link_libraries(hyprtester PUBLIC PkgConfig::hyprtester_deps)
 
+# OpenXR integration suite (docs/openxr/06-testing.md). Gated by compile
+# definition, not file exclusion — hyprtester GLOBs all of src/*.cpp and every
+# file under src/xr/ + src/tests/xr/ wraps its contents in #ifdef WITH_XR_TESTS.
+if(WITH_XR_TESTS)
+  target_compile_definitions(hyprtester PRIVATE WITH_XR_TESTS)
+  message(STATUS "hyprtester: OpenXR integration suite enabled (WITH_XR_TESTS)")
+endif()
+
 install(TARGETS hyprtester)
 
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/test.lua
