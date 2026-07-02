@@ -156,6 +156,16 @@ pkg_check_modules(hyprcursor_dep REQUIRED IMPORTED_TARGET hyprcursor>=${HYPRCURS
 pkg_check_modules(hyprutils_dep REQUIRED IMPORTED_TARGET hyprutils>=${HYPRUTILS_MINIMUM_VERSION})
 pkg_check_modules(hyprgraphics_dep REQUIRED IMPORTED_TARGET hyprgraphics>=${HYPRGRAPHICS_MINIMUM_VERSION})
 
+option(WITH_OPENXR "Build with OpenXR support" ON)
+if(WITH_OPENXR)
+  pkg_check_modules(openxr_dep IMPORTED_TARGET openxr)
+  if(openxr_dep_FOUND)
+    message(STATUS "OpenXR support enabled (${openxr_dep_VERSION})")
+  else()
+    message(STATUS "OpenXR not found, disabling OpenXR support")
+  endif()
+endif()
+
 string(REPLACE "." ";" AQ_VERSION_LIST ${aquamarine_dep_VERSION})
 list(GET AQ_VERSION_LIST 0 AQ_VERSION_MAJOR)
 list(GET AQ_VERSION_LIST 1 AQ_VERSION_MINOR)
@@ -527,6 +537,11 @@ if(TARGET OpenGL::GL)
   target_link_libraries(hyprland_lib PUBLIC OpenGL::EGL OpenGL::GL glslang::glslang glslang::glslang-default-resource-limits glslang::SPIRV Threads::Threads)
 else()
   target_link_libraries(hyprland_lib PUBLIC OpenGL::EGL OpenGL::GLES3 glslang::glslang glslang::glslang-default-resource-limits glslang::SPIRV Threads::Threads)
+endif()
+
+if(WITH_OPENXR AND openxr_dep_FOUND)
+  target_compile_definitions(hyprland_lib PRIVATE HAVE_OPENXR=1)
+  target_link_libraries(hyprland_lib PUBLIC PkgConfig::openxr_dep)
 endif()
 
 pkg_check_modules(hyprland_protocols_dep hyprland-protocols>=0.7.0)
