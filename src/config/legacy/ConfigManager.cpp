@@ -34,6 +34,9 @@
 #include "../../errorOverlay/Overlay.hpp"
 #include "../../managers/input/InputManager.hpp"
 #include "../../managers/eventLoop/EventLoopManager.hpp"
+#ifdef HAVE_OPENXR
+#include "../../openxr/OpenXRManager.hpp"
+#endif
 #include "../../managers/EventManager.hpp"
 #include "../../managers/permissions/DynamicPermissionManager.hpp"
 #include "../../notification/NotificationOverlay.hpp"
@@ -277,6 +280,18 @@ static Hyprlang::CParseResult handleMonitor(const char* c, const char* v) {
     const std::string      COMMAND = c;
 
     const auto             RESULT = Config::Legacy::mgr()->handleMonitor(COMMAND, VALUE);
+
+    Hyprlang::CParseResult result;
+    if (RESULT.has_value())
+        result.setError(RESULT.value().c_str());
+    return result;
+}
+
+static Hyprlang::CParseResult handleXRMonitor(const char* c, const char* v) {
+    const std::string      VALUE   = v;
+    const std::string      COMMAND = c;
+
+    const auto             RESULT = Config::Legacy::mgr()->handleXRMonitor(COMMAND, VALUE);
 
     Hyprlang::CParseResult result;
     if (RESULT.has_value())
@@ -604,6 +619,7 @@ CConfigManager::CConfigManager() {
     m_config->registerHandler(&::handleExecRawOnce, "execr-once", {false});
     m_config->registerHandler(&::handleExecShutdown, "exec-shutdown", {false});
     m_config->registerHandler(&::handleMonitor, "monitor", {false});
+    m_config->registerHandler(&::handleXRMonitor, "xrmonitor", {false});
     m_config->registerHandler(&::handleBind, "bind", {true});
     m_config->registerHandler(&::handleUnbind, "unbind", {false});
     m_config->registerHandler(&::handleWorkspaceRules, "workspace", {false});
@@ -771,6 +787,7 @@ std::optional<std::string> CConfigManager::resetHLConfig() {
     m_declaredPlugins.clear();
     m_failedPluginConfigValues.clear();
     m_keywordRules.clear();
+    m_declaredXRMonitors.clear();
 
     // paths
     m_configPaths.clear();
@@ -1384,6 +1401,32 @@ std::optional<std::string> CConfigManager::handleMonitor(const std::string& comm
     Config::monitorRuleMgr()->add(std::move(parser.rule()));
 
     return parser.getError();
+}
+
+std::optional<std::string> CConfigManager::handleXRMonitor(const std::string& command, const std::string& args) {
+    // Does no XR work itself (doc 05 §2.1): parse via the pure parser and, on success, append to
+    // the declared list. COpenXRManager reconciles the live set against it after the reload
+    // (guarded — a build without OpenXR just accumulates a harmless list). Compiles either way.
+    auto parsed = OpenXR::parseXRMonitorLine(args);
+    if (!parsed.has_value())
+        return parsed.error();
+
+    // Later declarations of the same name override earlier ones within a single parse.
+    std::erase_if(m_declaredXRMonitors, [&](const SXRMonitorParams& p) { return p.m_name == parsed->m_name; });
+    m_declaredXRMonitors.emplace_back(std::move(parsed.value()));
+
+#ifdef HAVE_OPENXR
+    // A dynamic `hyprctl keyword xrmonitor` does not fire config.reloaded / props_refreshed, so
+    // it never reaches COpenXRManager::onConfigReload(). Reconcile explicitly in that case,
+    // deferred so all keyword state is settled first. A full config reload reconciles once from
+    // onConfigReload() after parsing completes, so we must NOT reconcile per-line there.
+    if (g_pHyprCtl && g_pHyprCtl->m_currentRequestParams.isDynamicKeyword && g_pEventLoopManager)
+        g_pEventLoopManager->doLater([] {
+            if (g_pOpenXRManager)
+                g_pOpenXRManager->reconcileDeclaredMonitors();
+        });
+#endif
+    return {};
 }
 
 std::optional<std::string> CConfigManager::handleBezier(const std::string& command, const std::string& args) {
