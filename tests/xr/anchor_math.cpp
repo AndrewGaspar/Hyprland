@@ -302,6 +302,39 @@ TEST(XRAnchorMath, GrabOffsetFollows) {
     EXPECT_NEAR(qAngleBetween(w.rot, expected.rot), 0.f, 1e-4f);
 }
 
+// 9b ------------------------------------------------------------------------------------------
+// §4.2 amendment: head/body-anchored quads re-evaluate orientation continuously while carried
+// (position rigid to the grip; orientation faces the viewer regardless of wrist rotation).
+TEST(XRAnchorMath, GrabContinuousFacing) {
+    const auto    tune = defaultTuning();
+    const SXRPose view{{0, 1.6f, 0}, Quat{}};
+
+    for (const auto mode : {XR_ANCHOR_HEAD, XR_ANCHOR_BODY}) {
+        CXRAnchor      a;
+        SXRAnchorState st;
+        st.mode           = mode;
+        st.anchorPose.pos = Vec3{0, 0, -1.2f};
+        a.initFromState(st);
+
+        SXRSolveInput in = viewInput(view);
+        in.dt            = 0.016f;
+        const SXRPose grip0{{0.1f, 1.2f, -0.5f}, qFromYaw(0.f)};
+        in.gripLeft = grip0;
+        a.solve(in, tune); // one settled frame so lastWorld exists
+        a.beginGrab(XR_HAND_LEFT, grip0);
+
+        // carry the quad off to the left with an arbitrary wrist yaw+pitch
+        const SXRPose grip1{{-0.9f, 1.3f, -0.6f}, qMul(qFromYaw(80.f * PI / 180.f), qFromPitch(-30.f * PI / 180.f))};
+        in.gripLeft     = grip1;
+        const SXRPose w = a.solve(in, tune).worldPose;
+
+        Quat expectFace = lookAtNoRoll(w.pos, view.pos, Quat{});
+        if (mode == XR_ANCHOR_BODY)
+            expectFace = qFromYaw(qYawOf(expectFace, 0.f)); // body stays upright: yaw-only facing
+        EXPECT_NEAR(qAngleBetween(w.rot, expectFace), 0.f, 1e-3f);
+    }
+}
+
 // 10 -------------------------------------------------------------------------------------------
 TEST(XRAnchorMath, VerbMath) {
     const auto tune = defaultTuning();

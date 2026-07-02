@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <numeric>
 #include <cstdint>
 #include <chrono>
 #include <cmath>
@@ -692,14 +693,6 @@ void COpenXRManager::frameThread() {
             xrReleaseSwapchainImage(l->m_swapchain, &relInfo);
         }
 
-        // Build the quad layer array (sorted back->front by z-order then creation seq),
-        // truncated to maxLayerCount. Storage must outlive xrEndFrame, so reserve up front.
-        std::sort(active.begin(), active.end(), [](const SP<CXRMonitorLayer>& a, const SP<CXRMonitorLayer>& b) {
-            if (a->m_zOrder != b->m_zOrder)
-                return a->m_zOrder < b->m_zOrder;
-            return a->m_seq < b->m_seq;
-        });
-
         // --- anchor solve (WP5) ---
         // Locate the head (VIEW) pose in our reference space at the predicted display time. In the
         // LOCAL fallback (no LOCAL_FLOOR) shift +floor_offset so the solver works in floor-relative
@@ -778,13 +771,32 @@ void COpenXRManager::frameThread() {
         quads.reserve(active.size());
         layerPtrs.reserve(active.size());
 
+        // Composition order: OpenXR composites the layer array in SUBMISSION order (later
+        // entries draw on top) — a quad's 3D position plays no part, so ordering must be
+        // computed per frame from the solved poses: farthest-from-viewer first, so nearer
+        // quads occlude farther ones. m_zOrder remains an explicit override tier; creation
+        // seq breaks remaining ties.
+        std::vector<size_t> order(active.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            if (active[a]->m_zOrder != active[b]->m_zOrder)
+                return active[a]->m_zOrder < active[b]->m_zOrder;
+            if (viewValid && solved[a] && solved[b]) {
+                const float da = (results[a].worldPose.pos - viewPose.pos).length();
+                const float db = (results[b].worldPose.pos - viewPose.pos).length();
+                if (std::fabs(da - db) > 1e-4F)
+                    return da > db; // farther composites first (ends up behind)
+            }
+            return active[a]->m_seq < active[b]->m_seq;
+        });
+
         // Ray-pointer targets: the same visible quads, with their solved world pose expressed in
         // the reference frame the aim poses were sampled in (doc 04 §3). Built alongside the quad
         // array below so the two sets stay in lockstep.
         std::vector<SXRPointerTarget> pointerTargets;
         pointerTargets.reserve(active.size());
 
-        for (size_t i = 0; i < active.size(); ++i) {
+        for (size_t i : order) {
             auto& l = active[i];
             if (quads.size() >= m_session->m_maxLayerCount)
                 break;
