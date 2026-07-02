@@ -4,12 +4,22 @@
 #include <openxr/openxr.h>
 
 #include <cstring>
+#include <cstdint>
+#include <chrono>
+
+#include <sys/eventfd.h>
+#include <unistd.h>
+#include <wayland-server-core.h>
 
 #include "XRIpc.hpp"
+#include "XRSession.hpp"
+#include "XRGraphics.hpp"
+#include "../Compositor.hpp"
 #include "../debug/log/Logger.hpp"
 #include "../config/ConfigValue.hpp"
 #include "../event/EventBus.hpp"
 #include "../managers/EventManager.hpp"
+#include "../managers/eventLoop/EventLoopManager.hpp"
 #include "../managers/input/InputManager.hpp"
 
 COpenXRManager::COpenXRManager() = default;
@@ -92,34 +102,88 @@ void COpenXRManager::start() {
 
     m_runtimeName.clear();
     m_systemName.clear();
+    m_frameRequestedTeardown = false;
 
-    // WP1: availability probe only. Full instance/system/session creation over EGL/GBM and
-    // the frame thread land in WP2 (docs/openxr/01-session-graphics.md). A successful probe
-    // still ends in UNAVAILABLE here because there is no session code to bring RUNNING up yet.
-    XrInstanceCreateInfo ci{};
-    ci.type = XR_TYPE_INSTANCE_CREATE_INFO;
-    std::strncpy(ci.applicationInfo.applicationName, "Hyprland", XR_MAX_APPLICATION_NAME_SIZE - 1);
-    ci.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
+    m_session  = makeUnique<CXRSession>();
+    m_graphics = makeUnique<CXRGraphics>();
 
-    XrInstance     instance = XR_NULL_HANDLE;
-    const XrResult result   = xrCreateInstance(&ci, &instance);
-
-    if (XR_FAILED(result)) {
-        Log::logger->log(Log::WARN, "[OPENXR] no runtime available (xrCreateInstance -> {}), state -> unavailable", static_cast<int>(result));
-        setState(XR_STATE_UNAVAILABLE);
+    // 1. Instance (extension checks; missing runtime / required extensions -> UNAVAILABLE).
+    if (!m_session->createInstance()) {
+        Log::logger->log(Log::WARN, "[OPENXR] no runtime / required extensions unavailable, state -> unavailable");
+        abortStart();
         return;
     }
 
-    XrInstanceProperties props{};
-    props.type = XR_TYPE_INSTANCE_PROPERTIES;
-    if (XR_SUCCEEDED(xrGetInstanceProperties(instance, &props)))
-        Log::logger->log(Log::DEBUG, "[OPENXR] runtime available: {}; session support lands in WP2, state -> unavailable", props.runtimeName);
-    else
-        Log::logger->log(Log::DEBUG, "[OPENXR] runtime available; session support lands in WP2, state -> unavailable");
+    // 2. System.
+    if (!m_session->getSystem()) {
+        Log::logger->log(Log::WARN, "[OPENXR] system lookup failed, state -> unavailable");
+        abortStart();
+        return;
+    }
 
-    xrDestroyInstance(instance);
+    // Publish runtime/system names for `hyprctl openxr status` as soon as we have them.
+    m_runtimeName = m_session->runtimeName();
+    m_systemName  = m_session->systemName();
 
-    // No session support yet — do not advertise a runtime name while UNAVAILABLE.
+    // 3. EGL/GBM display + context on the right GPU.
+    static auto       PGPU = CConfigValue<std::string>("openxr:gpu");
+    const std::string gpu  = *PGPU;
+    if (!m_graphics->initEGL(gpu)) {
+        Log::logger->log(Log::ERR, "[OPENXR] EGL/GBM init failed, state -> unavailable");
+        abortStart();
+        return;
+    }
+
+    // 4. Session (XrGraphicsBindingEGLMNDX).
+    if (!m_session->createSession(*m_graphics)) {
+        abortStart();
+        return;
+    }
+
+    // 5. Reference + view spaces.
+    if (!m_session->createSpaces(*m_graphics)) {
+        abortStart();
+        return;
+    }
+
+    // 6. Blit GL resources (still on the main thread, before the frame thread exists).
+    if (!m_graphics->initBlitGL()) {
+        abortStart();
+        return;
+    }
+
+    // 7. Choose the swapchain format once (per-layer swapchains are created lazily in WP3).
+    m_session->chooseSwapchainFormat();
+
+    // 8. Frame->main channel, then spawn the frame thread and go RUNNING{idle}.
+    if (!setupFrameChannel()) {
+        abortStart();
+        return;
+    }
+
+    m_running = true;
+    m_frameThread = std::thread([this] { frameThread(); });
+
+    setState(XR_STATE_RUNNING_IDLE);
+    Log::logger->log(Log::DEBUG, "[OPENXR] session up (runtime: {}, system: {}), frame thread started", m_runtimeName, m_systemName);
+}
+
+void COpenXRManager::abortStart() {
+    // No frame thread has been started at any abortStart() call site, so there is nothing
+    // to join. Tear down in the doc-01 order: GL -> XR handles -> EGL.
+    teardownFrameChannel();
+    if (m_graphics)
+        m_graphics->destroyGL();
+    if (m_session)
+        m_session->destroy();
+    if (m_graphics)
+        m_graphics->destroyEGL();
+    m_graphics.reset();
+    m_session.reset();
+
+    m_runtimeName.clear();
+    m_systemName.clear();
+
     setState(XR_STATE_UNAVAILABLE);
 }
 
@@ -127,14 +191,169 @@ void COpenXRManager::stop() {
     if (m_state == XR_STATE_DISABLED)
         return;
 
+    // Whether stop was ultimately triggered by instance loss decides the final state.
+    const bool lost = m_session && m_session->m_instanceLost;
+
     setState(XR_STATE_STOPPING);
 
-    // WP1: nothing to tear down yet (no frame thread / session / monitors). The teardown
-    // ordering invariant and openxr:destroy_monitors_on_stop handling land in WP2+.
+    // Teardown ordering (doc 01): join the frame thread BEFORE touching any EGL/XR object.
+    m_running = false;
+    if (m_frameThread.joinable())
+        m_frameThread.join();
+
+    teardownFrameChannel();
+
+    // GL cleanup with the context current, then XR handles (context not current), then EGL.
+    if (m_graphics)
+        m_graphics->destroyGL();
+    if (m_session)
+        m_session->destroy();
+    if (m_graphics)
+        m_graphics->destroyEGL();
+
+    m_graphics.reset();
+    m_session.reset();
+
     m_runtimeName.clear();
     m_systemName.clear();
 
-    setState(XR_STATE_DISABLED);
+    setState(lost ? XR_STATE_UNAVAILABLE : XR_STATE_DISABLED);
+}
+
+eXRManagerState COpenXRManager::mapSessionState(int xrSessionState) {
+    switch (xrSessionState) {
+        case XR_SESSION_STATE_VISIBLE: return XR_STATE_RUNNING_VISIBLE;
+        case XR_SESSION_STATE_FOCUSED: return XR_STATE_RUNNING_FOCUSED;
+        // IDLE / READY / SYNCHRONIZED / STOPPING all map to RUNNING_IDLE (doc 01).
+        default: return XR_STATE_RUNNING_IDLE;
+    }
+}
+
+bool COpenXRManager::setupFrameChannel() {
+    m_eventFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (m_eventFd < 0) {
+        Log::logger->log(Log::ERR, "[OPENXR] eventfd() failed for the frame->main channel");
+        return false;
+    }
+
+    m_eventSource = wl_event_loop_add_fd(
+        g_pCompositor->m_wlEventLoop, m_eventFd, WL_EVENT_READABLE,
+        [](int /*fd*/, uint32_t /*mask*/, void* data) -> int {
+            static_cast<COpenXRManager*>(data)->onFrameChannelReadable();
+            return 0;
+        },
+        this);
+
+    if (!m_eventSource) {
+        Log::logger->log(Log::ERR, "[OPENXR] wl_event_loop_add_fd failed for the frame->main channel");
+        close(m_eventFd);
+        m_eventFd = -1;
+        return false;
+    }
+
+    return true;
+}
+
+void COpenXRManager::teardownFrameChannel() {
+    if (m_eventSource) {
+        wl_event_source_remove(m_eventSource);
+        m_eventSource = nullptr;
+    }
+    if (m_eventFd >= 0) {
+        close(m_eventFd);
+        m_eventFd = -1;
+    }
+    std::scoped_lock lock(m_pendingMu);
+    m_pendingStates.clear();
+}
+
+void COpenXRManager::reportState(eXRManagerState s) {
+    // Frame thread: enqueue the transition and wake the main thread.
+    {
+        std::scoped_lock lock(m_pendingMu);
+        m_pendingStates.push_back(s);
+    }
+    if (m_eventFd >= 0) {
+        const uint64_t one = 1;
+        [[maybe_unused]] auto _ = write(m_eventFd, &one, sizeof(one));
+    }
+}
+
+void COpenXRManager::onFrameChannelReadable() {
+    // Main thread: consume the eventfd and drain the queued transitions.
+    uint64_t v = 0;
+    [[maybe_unused]] auto _ = read(m_eventFd, &v, sizeof(v));
+
+    std::vector<eXRManagerState> pending;
+    {
+        std::scoped_lock lock(m_pendingMu);
+        pending.swap(m_pendingStates);
+    }
+    for (auto s : pending)
+        setState(s);
+
+    // EXITING / LOSS_PENDING: the frame loop has already exited. Defer stop() out of this
+    // fd callback (doLater is main-thread-safe) so we don't remove the event source from
+    // within its own dispatch. stop() decides DISABLED vs UNAVAILABLE from m_instanceLost.
+    if (m_frameRequestedTeardown.exchange(false) && g_pEventLoopManager)
+        g_pEventLoopManager->doLater([this] { stop(); });
+}
+
+void COpenXRManager::frameThread() {
+    // The frame thread exclusively owns the EGL context while running. For WP2 we submit
+    // ZERO composition layers (quad layers land in WP3) — the frame lifecycle still runs so
+    // the runtime advances the session state machine, and transitions are reported to main.
+    eXRManagerState lastReported = XR_STATE_RUNNING_IDLE;
+
+    while (m_running.load()) {
+        m_session->pollEvents();
+
+        if (m_session->m_exitRequested) {
+            // Signal the main thread to run teardown; the loop exits so the join is instant.
+            m_frameRequestedTeardown.store(true);
+            if (m_eventFd >= 0) {
+                const uint64_t one = 1;
+                [[maybe_unused]] auto _ = write(m_eventFd, &one, sizeof(one));
+            }
+            break;
+        }
+
+        const eXRManagerState mapped = mapSessionState((int)m_session->m_xrState);
+        if (mapped != lastReported) {
+            reportState(mapped);
+            lastReported = mapped;
+        }
+
+        // DEVIATION from doc 01's frame-loop pseudocode (which gates the pump on the state
+        // already being SYNCHRONIZED/VISIBLE/FOCUSED): the runtime only advances
+        // READY -> SYNCHRONIZED -> VISIBLE once the app STARTS submitting frames, so gating
+        // the pump on those states deadlocks the session at READY (confirmed against
+        // Monado's null compositor). We therefore pump the frame lifecycle as soon as the
+        // session is running (m_sessionBegan). xrWaitFrame blocks until the next frame time,
+        // so this needs no throttle. Pacing (scheduleFrame) stays VISIBLE/FOCUSED-gated once
+        // monitors exist (WP3). Reported to WP13 for a doc-01 amendment.
+        if (!m_session->m_sessionBegan) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50)); // WIP idle throttle
+            continue;
+        }
+
+        XrFrameWaitInfo waitInfo = {XR_TYPE_FRAME_WAIT_INFO};
+        XrFrameState    fs       = {XR_TYPE_FRAME_STATE};
+        if (XR_FAILED(xrWaitFrame(m_session->m_session, &waitInfo, &fs)))
+            continue;
+
+        XrFrameBeginInfo beginInfo = {XR_TYPE_FRAME_BEGIN_INFO};
+        if (XR_FAILED(xrBeginFrame(m_session->m_session, &beginInfo)))
+            continue;
+
+        // xrEndFrame with zero layers is valid (nothing composited yet) — doc 01.
+        XrFrameEndInfo endInfo       = {XR_TYPE_FRAME_END_INFO};
+        endInfo.displayTime          = fs.predictedDisplayTime;
+        endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        endInfo.layerCount           = 0;
+        endInfo.layers               = nullptr;
+        xrEndFrame(m_session->m_session, &endInfo);
+    }
 }
 
 void COpenXRManager::onConfigReload() {
