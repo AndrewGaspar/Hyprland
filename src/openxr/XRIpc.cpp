@@ -18,6 +18,14 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     const std::string RUNTIME = g_pOpenXRManager->runtimeName();
     const std::string SYSTEM  = g_pOpenXRManager->systemName();
     const auto        MONS    = g_pOpenXRManager->monitorInfos();
+    // Read-only observability for the idle-inhibit predicate (doc 05 §6.1). There is otherwise
+    // no queryable surface for "is the compositor's idle-inhibit bit currently raised because of
+    // XR" — CIdleNotifyProtocol::isInhibited is private with no getter, and it's a fold of every
+    // inhibitor source, not XR-specific anyway. This mirrors shouldInhibitIdle()'s own predicate
+    // (openxr:inhibit_idle && FOCUSED) rather than adding a new getter to IdleNotify.hpp, keeping
+    // the touched surface to this one file (WP12 test infra needs it to assert idle-inhibit
+    // end-to-end without polling wall-clock idle timers).
+    const bool         INHIBITING_IDLE = g_pOpenXRManager->shouldInhibitIdle();
 
     if (format == FORMAT_JSON) {
         std::string mons;
@@ -49,13 +57,14 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "state": "{}",
     "runtimeName": "{}",
     "systemName": "{}",
+    "inhibitingIdle": {},
     "monitors": [{}{}]
 }}
 )#",
-                           STATE, RUNTIME, SYSTEM, MONS.empty() ? "" : "\n", mons);
+                           STATE, RUNTIME, SYSTEM, INHIBITING_IDLE ? "true" : "false", MONS.empty() ? "" : "\n", mons);
     }
 
-    std::string out = std::format("state: {}\nruntime: {}\nsystem: {}\n", STATE, RUNTIME, SYSTEM);
+    std::string out = std::format("state: {}\nruntime: {}\nsystem: {}\nidle inhibited: {}\n", STATE, RUNTIME, SYSTEM, INHIBITING_IDLE ? "yes" : "no");
     for (const auto& m : MONS) {
         out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} hovered: {}\n", m.name, m.id, m.w, m.h, m.refresh,
                            m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.grabbed ? "yes" : "no", m.hovered ? "yes" : "no");

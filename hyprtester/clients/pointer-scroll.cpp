@@ -51,6 +51,17 @@ struct SWlState {
     // last delta
     float lastScrollDelta = -1.F;
     bool  writeDelta      = false;
+
+    // WP12 (openxr integration tests) additions: a running scroll-magnitude accumulator and
+    // last-button-event tracking, independent of the legacy writeDelta/lastScrollDelta handshake
+    // above (which is tuned for the single-synthetic-event `hl.plugin.test.scroll()` flow of the
+    // disabled `pointerScroll` test). Continuous XR thumbstick scrolling produces many axis
+    // events per query, which that handshake isn't designed for — these fields are purely
+    // additive and never touched by the legacy code path.
+    double scrollAccum     = 0.0;
+    int    lastButton      = -1;
+    bool   lastButtonPressed = false;
+    bool   hasButtonEvent   = false;
 };
 
 static std::ofstream logfile;
@@ -226,6 +237,9 @@ static bool setupSeat(SWlState& state) {
     state.pointer->setAxis([&](CCWlPointer* p, uint32_t time, wl_pointer_axis axis, wl_fixed_t delta) {
         debugLog("axis: ax {} delta {}", (int)axis, wl_fixed_to_double(delta));
 
+        // WP12 addition: silent running accumulator, queried via the "scrollsum" command.
+        state.scrollAccum += wl_fixed_to_double(delta);
+
         if (state.writeDelta) {
             clientLog("{:.2f}", wl_fixed_to_double(delta));
             state.writeDelta      = false;
@@ -237,6 +251,14 @@ static bool setupSeat(SWlState& state) {
         state.writeDelta      = true;
     });
 
+    state.pointer->setButton([&](CCWlPointer* p, uint32_t serial, uint32_t time, uint32_t button, wl_pointer_button_state st) {
+        debugLog("button: {} state {}", button, (int)st);
+        // WP12 addition: silent last-event tracking, queried via the "btn" command.
+        state.lastButton        = (int)button;
+        state.lastButtonPressed = st == WL_POINTER_BUTTON_STATE_PRESSED;
+        state.hasButtonEvent    = true;
+    });
+
     state.pointer->setLeave([&](CCWlPointer* p, uint32_t serial, wl_proxy* surf) { debugLog("Got pointer leave event, serial {}", serial); });
 
     state.pointer->setMotion([&](CCWlPointer* p, uint32_t serial, wl_fixed_t x, wl_fixed_t y) { debugLog("Got pointer motion event, serial {}, x {}, y {}", serial, x, y); });
@@ -244,8 +266,36 @@ static bool setupSeat(SWlState& state) {
     return true;
 }
 
+// WP12 (openxr integration tests) commands, checked before the legacy default handling below so
+// the pre-existing (disabled) pointerScroll test's protocol is byte-for-byte unchanged for any
+// other input:
+//   "btn"       -> "<button>:<0|1>" (pressed/released) once since the last "btn" query, or "none"
+//   "scrollsum" -> the accumulated wl_fixed scroll delta since the last "scrollsum" query
+static bool parseXrCommand(SWlState& state, const std::string& req) {
+    if (req == "btn") {
+        if (!state.hasButtonEvent)
+            clientLog("none");
+        else {
+            clientLog("{}:{}", state.lastButton, state.lastButtonPressed ? 1 : 0);
+            state.hasButtonEvent = false;
+        }
+        return true;
+    }
+    if (req == "scrollsum") {
+        clientLog("{:.3f}", state.scrollAccum);
+        state.scrollAccum = 0.0;
+        return true;
+    }
+    return false;
+}
+
 // return last delta after axis
 static void parseRequest(SWlState& state, std::string req) {
+    while (!req.empty() && (req.back() == '\n' || req.back() == '\r'))
+        req.pop_back();
+    if (parseXrCommand(state, req))
+        return;
+
     if (!state.writeDelta) {
         state.writeDelta = true;
         return;
