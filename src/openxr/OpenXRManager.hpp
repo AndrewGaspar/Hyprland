@@ -12,6 +12,7 @@
 #include "../helpers/memory/Memory.hpp"
 #include "../helpers/signal/Signal.hpp"
 #include "XRMonitorConfig.hpp"
+#include "XRInput.hpp" // SXRInputEvent / SXRStateEvent / XRQueueItem / CXRQueue / CXRInput
 
 struct wl_event_source;
 
@@ -135,13 +136,17 @@ class COpenXRManager {
     // maxLayerCount quads active, older suspended; posts xrmonitorquad on flips. Under m_layersMu.
     void recomputeQuadActive();
 
-    // --- minimal frame->main session-state channel (WP6 replaces this with the general
-    // SPSC + eventfd queue; the interface — reportState()/onFrameChannelReadable() — is
-    // shaped so the internals can be swapped without touching callers). ---
+    // --- frame->main channel: the general SPSC ring + eventfd on the wayland loop (doc 04 §7).
+    // All frame->main crossings (session-state transitions, layer-removed acks, and — from WP7
+    // on — pointer input events) travel through m_queue. ---
     bool                   setupFrameChannel();
     void                   teardownFrameChannel();
-    void                   reportState(eXRManagerState s); // frame thread: enqueue + wake main
-    void                   onFrameChannelReadable();       // main thread: drain + apply
+    void                   enqueue(XRQueueItem item);                  // frame thread: push + wake main
+    void                   wakeMain();                                 // frame thread: write the eventfd
+    void                   reportState(eXRManagerState s);             // frame thread: SESSION_STATE event
+    void                   onFrameChannelReadable();                   // main thread: drain + dispatch
+    void                   dispatchStateEvent(const SXRStateEvent& e); // main thread
+    void                   dispatchInputEvent(const SXRInputEvent& e); // main thread (WP7 sink)
 
     static eXRManagerState mapSessionState(int xrSessionState);
 
@@ -162,6 +167,7 @@ class COpenXRManager {
     UP<CXRIpc>        m_ipc;
     UP<CXRSession>    m_session;
     UP<CXRGraphics>   m_graphics;
+    UP<CXRInput>      m_input; // OpenXR action system (frame-thread sampling), created in start()
 
     std::thread       m_frameThread;
     std::atomic<bool> m_running{false};
@@ -180,16 +186,16 @@ class COpenXRManager {
     // WP7 hook: the ray pointer will set this to the last-hovered XR monitor name.
     std::string m_lastHoveredMonitor;
 
-    // Frame->main channel state.
-    int                          m_eventFd     = -1;
-    wl_event_source*             m_eventSource = nullptr;
-    std::mutex                   m_pendingMu;
-    std::vector<eXRManagerState> m_pendingStates;
-    std::vector<std::string>     m_removedLayerNames; // frame->main layer-removed acks
-    std::atomic<bool>            m_frameRequestedTeardown{false};
+    // Frame->main channel state (doc 04 §7.2): lock-free SPSC ring drained by an eventfd on the
+    // wayland event loop. Single producer = frame thread, single consumer = main thread.
+    int                 m_eventFd     = -1;
+    wl_event_source*    m_eventSource = nullptr;
+    CXRQueue            m_queue;
+    std::atomic<bool>   m_queueOverflowed{false}; // logged-once guard for a lost non-droppable item
+    std::atomic<bool>   m_frameRequestedTeardown{false};
 
-    CHyprSignalListener          m_configReloadListener;
-    CHyprSignalListener          m_propsRefreshedListener;
+    CHyprSignalListener m_configReloadListener;
+    CHyprSignalListener m_propsRefreshedListener;
 };
 
 inline UP<COpenXRManager> g_pOpenXRManager;
