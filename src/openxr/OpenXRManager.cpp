@@ -412,6 +412,18 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
                 g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitorgrab", e.str + (e.a ? ",1" : ",0")});
             break;
         case eXRStateEventType::TRACKING: Log::logger->log(Log::DEBUG, "[OPENXR] device-lock tracking {} (monitor {})", e.a ? "gained" : "lost", e.str); break;
+        case eXRStateEventType::SCHEDULE_FRAMES: {
+            // Pacing on behalf of the frame thread (see the frame loop): scheduleFrame() is
+            // main-thread-only (aquamarine idle-callback list has no lock).
+            std::scoped_lock lock(m_layersMu);
+            for (auto& l : m_layers) {
+                if (l->m_pendingRemoval.load(std::memory_order_acquire))
+                    continue;
+                if (auto mon = l->m_monitor.lock())
+                    mon->scheduleFrame();
+            }
+            break;
+        }
     }
 }
 
@@ -595,14 +607,12 @@ void COpenXRManager::frameThread() {
         const bool visible = m_session->m_xrState == XR_SESSION_STATE_VISIBLE || m_session->m_xrState == XR_SESSION_STATE_FOCUSED;
 
         // Pacing (doc 02): drive compositor renders of each visible XR monitor at the XR
-        // cadence. This is the single sanctioned cross-thread monitor call, VISIBLE/FOCUSED
-        // only — no scheduleFrame churn while idle.
-        if (visible) {
-            for (auto& l : active) {
-                if (auto mon = l->m_monitor.lock())
-                    mon->scheduleFrame();
-            }
-        }
+        // cadence, VISIBLE/FOCUSED only — no scheduleFrame churn while idle. Routed through
+        // the frame->main queue: CMonitor::scheduleFrame() lands in aquamarine's idle-callback
+        // vector, which the main thread concurrently drains in CBackend::dispatchIdle with no
+        // lock — calling it from this thread corrupts the heap.
+        if (visible && !active.empty())
+            enqueue(SXRStateEvent{.type = eXRStateEventType::SCHEDULE_FRAMES});
 
         XrFrameWaitInfo waitInfo = {XR_TYPE_FRAME_WAIT_INFO};
         XrFrameState    fs       = {XR_TYPE_FRAME_STATE};
@@ -653,6 +663,14 @@ void COpenXRManager::frameThread() {
 
             XrSwapchainImageAcquireInfo acqInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
             uint32_t                    imgIdx  = 0;
+
+            // The XR context must stay current from acquire through release (KHR_opengl_es_enable
+            // contract): Monado's GL client inserts a native fence into OUR command stream inside
+            // xrReleaseSwapchainImage — eglCreateSyncKHR requires a current context, and without
+            // one the fence fails every frame and Monado falls back to an unsynchronized path
+            // that corrupts the heap in-process.
+            CXRGraphics::CScopedGLContext ctx(*m_graphics);
+
             if (XR_FAILED(xrAcquireSwapchainImage(l->m_swapchain, &acqInfo, &imgIdx)))
                 continue;
             XrSwapchainImageWaitInfo waitImg = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
@@ -660,7 +678,6 @@ void COpenXRManager::frameThread() {
             xrWaitSwapchainImage(l->m_swapchain, &waitImg);
 
             if (imgIdx < l->m_swapchainImages.size()) {
-                CXRGraphics::CScopedGLContext ctx(*m_graphics); // bind ONLY around GL work
                 if (buf) {
                     m_graphics->blitBuffer(buf, *l, l->m_swapchainImages[imgIdx]);
                     if (!l->m_hasContent)
@@ -858,7 +875,13 @@ void COpenXRManager::frameThread() {
         endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
         endInfo.layerCount           = (uint32_t)layerPtrs.size();
         endInfo.layers               = layerPtrs.empty() ? nullptr : layerPtrs.data();
-        xrEndFrame(m_session->m_session, &endInfo);
+        {
+            // Monado's layer_commit inserts a fence via context_begin(SYNCHRONIZE), which
+            // assumes the app's GL context is current (it never binds for that reason) — same
+            // contract as xrReleaseSwapchainImage above.
+            CXRGraphics::CScopedGLContext ctx(*m_graphics);
+            xrEndFrame(m_session->m_session, &endInfo);
+        }
     }
 }
 
