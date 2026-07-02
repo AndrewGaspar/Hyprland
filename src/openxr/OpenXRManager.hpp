@@ -3,9 +3,15 @@
 
 #include <cstdint>
 #include <string>
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 #include "../helpers/memory/Memory.hpp"
 #include "../helpers/signal/Signal.hpp"
+
+struct wl_event_source;
 
 // Top-level lifecycle state of the OpenXR integration. Kept verbatim from
 // docs/openxr/00-overview.md — do not reorder or renumber.
@@ -21,6 +27,8 @@ enum eXRManagerState : uint8_t {
 };
 
 class CXRIpc;
+class CXRSession;
+class CXRGraphics;
 
 // The single main-thread entry point the rest of Hyprland touches for OpenXR.
 // Owns the lifecycle state machine and funnels the three enable/disable entry points
@@ -49,14 +57,43 @@ class COpenXRManager {
     void                setState(eXRManagerState newState);
     void                onConfigReload();
 
+    // Aborts an in-progress start(), tearing down whatever was created, and lands in
+    // UNAVAILABLE. Safe to call at any failure point in start().
+    void                abortStart();
+
+    // The XR frame thread body (owns the EGL context + XR frame loop while running).
+    void                frameThread();
+
+    // --- minimal frame->main session-state channel (WP6 replaces this with the general
+    // SPSC + eventfd queue; the interface — reportState()/onFrameChannelReadable() — is
+    // shaped so the internals can be swapped without touching callers). ---
+    bool                setupFrameChannel();
+    void                teardownFrameChannel();
+    void                reportState(eXRManagerState s);  // frame thread: enqueue + wake main
+    void                onFrameChannelReadable();        // main thread: drain + apply
+
+    static eXRManagerState mapSessionState(int xrSessionState);
+
     eXRManagerState     m_state = XR_STATE_DISABLED;
     bool                m_active = false; // derived: state ∈ {visible, focused}
 
-    // Populated from xrInstanceProperties/xrSystemProperties once a session exists (WP2).
+    // Populated from xrInstanceProperties/xrSystemProperties once a session exists.
     std::string         m_runtimeName;
     std::string         m_systemName;
 
     UP<CXRIpc>          m_ipc;
+    UP<CXRSession>      m_session;
+    UP<CXRGraphics>     m_graphics;
+
+    std::thread         m_frameThread;
+    std::atomic<bool>   m_running{false};
+
+    // Frame->main channel state.
+    int                          m_eventFd     = -1;
+    wl_event_source*             m_eventSource = nullptr;
+    std::mutex                   m_pendingMu;
+    std::vector<eXRManagerState> m_pendingStates;
+    std::atomic<bool>            m_frameRequestedTeardown{false};
 
     CHyprSignalListener m_configReloadListener;
     CHyprSignalListener m_propsRefreshedListener;
