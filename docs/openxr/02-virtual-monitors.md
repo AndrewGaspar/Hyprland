@@ -67,7 +67,7 @@ class CXRMonitorLayer {
     //      frame thread copies into its per-frame snapshot ----
     SP<CXRAnchor>           m_anchor;                  // anchor mode + pose; interface in doc 03
     float                   m_sizeMeters = 1.6f;       // quad width (m); height = width * pxH/pxW
-    int                     m_zOrder     = 0;          // xrEndFrame submission order (back→front)
+    int                     m_zOrder     = 0;          // explicit composition tier override (see below)
     uint64_t                m_seq        = 0;          // creation sequence, monotonic (cap policy)
 
     // ---- frame thread only (touched only between xrBeginFrame/xrEndFrame or teardown) ----
@@ -275,6 +275,13 @@ Frame-thread enforcement is the sort/truncate step in the doc 01 loop pseudocode
 the manager recomputes `m_quadActive` flags on the main thread whenever the layer
 set changes (under `m_layersMu`), so IPC state (`hyprctl openxr status`) matches
 what is rendered.
+
+AS-BUILT AMENDMENT — composition order is depth-sorted per frame: OpenXR composites
+the `xrEndFrame` layer array in submission order (later entries on top) with no
+regard for 3D position, so the frame thread orders quads by their freshly solved
+distance from the viewer, farthest first — nearer quads therefore occlude farther
+ones, as expected in a 3D scene. `m_zOrder` remains an explicit override tier
+(compared first); creation `m_seq` breaks remaining ties.
 
 ## Mirroring an XR monitor onto a physical one — pure recipe, zero new code
 
