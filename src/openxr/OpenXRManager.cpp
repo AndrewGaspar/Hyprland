@@ -22,6 +22,7 @@
 #include <format>
 #include <optional>
 #include <ranges>
+#include <variant>
 
 #include <sys/eventfd.h>
 #include <unistd.h>
@@ -31,6 +32,7 @@
 #include "XRSession.hpp"
 #include "XRGraphics.hpp"
 #include "XRMonitorLayer.hpp"
+#include "XRInput.hpp"
 #include "../Compositor.hpp"
 #include "../debug/log/Logger.hpp"
 #include "../config/ConfigValue.hpp"
@@ -187,7 +189,17 @@ void COpenXRManager::start() {
     // 7. Choose the swapchain format once (per-layer swapchains are created lazily in WP3).
     m_session->chooseSwapchainFormat();
 
-    // 8. Bind any layers whose monitor still exists (created while disabled — doc 02), then
+    // 8. Action system (WP6): build the action set + bindings + action spaces and attach them to
+    //    the session (attach is legal only once, and must happen before the frame loop begins).
+    //    A missing interaction profile is not fatal; a genuine failure leaves input disabled but
+    //    the session running (quads still composite, device anchors just take the loss path).
+    m_input = makeUnique<CXRInput>();
+    if (!m_input->init(*m_session, m_session->m_hasHandInteraction)) {
+        Log::logger->log(Log::WARN, "[OPENXR] input action system unavailable; continuing without XR input");
+        m_input.reset();
+    }
+
+    // 9. Bind any layers whose monitor still exists (created while disabled — doc 02), then
     //    set up the frame->main channel and spawn the frame thread.
     bindExistingLayers();
 
@@ -195,6 +207,11 @@ void COpenXRManager::start() {
         abortStart();
         return;
     }
+
+    // The frame thread is the single producer for the frame->main queue; give CXRInput the
+    // producer sink now that the eventfd exists and before the thread spawns.
+    if (m_input)
+        m_input->setEmitter([this](XRQueueItem item) { enqueue(std::move(item)); });
 
     m_running     = true;
     m_frameThread = std::thread([this] { frameThread(); });
@@ -215,6 +232,10 @@ void COpenXRManager::abortStart() {
     teardownFrameChannel();
     if (m_graphics)
         m_graphics->destroyGL();
+    if (m_input) {
+        m_input->destroy(); // action spaces are session children — destroy before the session
+        m_input.reset();
+    }
     if (m_session)
         m_session->destroy();
     if (m_graphics)
@@ -255,9 +276,13 @@ void COpenXRManager::stop() {
     if (m_graphics)
         m_graphics->destroyGL();
 
-    // 3. Per-layer swapchains (context NOT current), then XR handles.
+    // 3. Per-layer swapchains (context NOT current), then the action system, then XR handles.
     for (auto& l : m_layers)
         l->destroySwapchain();
+    if (m_input) {
+        m_input->destroy(); // action spaces are session children — destroy before the session
+        m_input.reset();
+    }
     if (m_session)
         m_session->destroy();
 
@@ -287,6 +312,9 @@ eXRManagerState COpenXRManager::mapSessionState(int xrSessionState) {
 }
 
 bool COpenXRManager::setupFrameChannel() {
+    m_queue.reset(); // no producer/consumer yet — safe to clear any stale items from a prior run
+    m_queueOverflowed.store(false);
+
     m_eventFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (m_eventFd < 0) {
         Log::logger->log(Log::ERR, "[OPENXR] eventfd() failed for the frame->main channel");
@@ -320,41 +348,82 @@ void COpenXRManager::teardownFrameChannel() {
         close(m_eventFd);
         m_eventFd = -1;
     }
-    std::scoped_lock lock(m_pendingMu);
-    m_pendingStates.clear();
-    m_removedLayerNames.clear();
+    // The frame thread is joined before teardownFrameChannel runs, so this is single-threaded.
+    m_queue.reset();
+}
+
+void COpenXRManager::wakeMain() {
+    if (m_eventFd < 0)
+        return;
+    const uint64_t        one = 1;
+    [[maybe_unused]] auto _   = write(m_eventFd, &one, sizeof(one));
+}
+
+void COpenXRManager::enqueue(XRQueueItem item) {
+    // Frame thread (single producer). Full-queue policy (doc 04 §7.2): MOTION_ABS/AXIS may be
+    // dropped (regenerated next frame); BUTTON/FRAME and every SXRStateEvent must not be — log
+    // once if that ever happens (1024-deep with per-dispatch drain cannot realistically fill).
+    bool droppable = false;
+    if (auto* ie = std::get_if<SXRInputEvent>(&item))
+        droppable = ie->type == eXRInputEventType::MOTION_ABS || ie->type == eXRInputEventType::AXIS;
+
+    if (!m_queue.push(std::move(item))) {
+        if (!droppable && !m_queueOverflowed.exchange(true))
+            Log::logger->log(Log::ERR, "[OPENXR] frame->main event queue overflow; a non-droppable event was lost");
+        return;
+    }
+    wakeMain();
 }
 
 void COpenXRManager::reportState(eXRManagerState s) {
-    // Frame thread: enqueue the transition and wake the main thread.
-    {
-        std::scoped_lock lock(m_pendingMu);
-        m_pendingStates.push_back(s);
+    // Frame thread: SESSION_STATE event carrying the already-mapped manager state.
+    SXRStateEvent ev;
+    ev.type = eXRStateEventType::SESSION_STATE;
+    ev.a    = (int32_t)s;
+    enqueue(ev);
+}
+
+void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
+    switch (e.type) {
+        case eXRStateEventType::SESSION_STATE: setState((eXRManagerState)e.a); break;
+        case eXRStateEventType::LAYER_REMOVED:
+            // Removal barrier step 3: the frame thread released a layer's resources and acked.
+            finalizeLayerRemoval(e.str);
+            break;
+        case eXRStateEventType::GRAB:
+            // WP8 fills this: post the xrmonitorgrab socket2 event here.
+            break;
+        case eXRStateEventType::TRACKING: Log::logger->log(Log::DEBUG, "[OPENXR] device-lock tracking {} (monitor {})", e.a ? "gained" : "lost", e.str); break;
     }
-    if (m_eventFd >= 0) {
-        const uint64_t        one = 1;
-        [[maybe_unused]] auto _   = write(m_eventFd, &one, sizeof(one));
+}
+
+void COpenXRManager::dispatchInputEvent(const SXRInputEvent& e) {
+    // WP6 handoff point (WP7 replaces this with CXRPointerDevice signal emission). For now just
+    // prove that action state crossed the queue onto the main thread.
+    switch (e.type) {
+        case eXRInputEventType::BUTTON:
+            Log::logger->log(Log::DEBUG, "[OPENXR] input event crossed queue: BUTTON 0x{:x} {} (monitor {})", e.button, e.pressed ? "press" : "release", (long long)e.monitorID);
+            break;
+        case eXRInputEventType::MOTION_ABS:
+        case eXRInputEventType::AXIS:
+        case eXRInputEventType::FRAME:
+            // Coalesced/positional events: no logging (would be noisy). Sink until WP7.
+            break;
     }
 }
 
 void COpenXRManager::onFrameChannelReadable() {
-    // Main thread: consume the eventfd and drain the queued transitions.
-    uint64_t                     v = 0;
-    [[maybe_unused]] auto        _ = read(m_eventFd, &v, sizeof(v));
+    // Main thread (single consumer): consume the eventfd counter, then drain the ring to empty.
+    uint64_t              v = 0;
+    [[maybe_unused]] auto _ = read(m_eventFd, &v, sizeof(v));
 
-    std::vector<eXRManagerState> pending;
-    std::vector<std::string>     removed;
-    {
-        std::scoped_lock lock(m_pendingMu);
-        pending.swap(m_pendingStates);
-        removed.swap(m_removedLayerNames);
+    XRQueueItem           item;
+    while (m_queue.pop(item)) {
+        if (auto* se = std::get_if<SXRStateEvent>(&item))
+            dispatchStateEvent(*se);
+        else if (auto* ie = std::get_if<SXRInputEvent>(&item))
+            dispatchInputEvent(*ie);
     }
-    for (auto s : pending)
-        setState(s);
-
-    // Removal barrier step 3: the frame thread has released a layer's resources and acked.
-    for (auto& name : removed)
-        finalizeLayerRemoval(name);
 
     // EXITING / LOSS_PENDING: the frame loop has already exited. Defer stop() out of this
     // fd callback (doLater is main-thread-safe) so we don't remove the event source from
@@ -388,10 +457,7 @@ void COpenXRManager::frameThread() {
         if (m_session->m_exitRequested) {
             // Signal the main thread to run teardown; the loop exits so the join is instant.
             m_frameRequestedTeardown.store(true);
-            if (m_eventFd >= 0) {
-                const uint64_t        one = 1;
-                [[maybe_unused]] auto _   = write(m_eventFd, &one, sizeof(one));
-            }
+            wakeMain();
             break;
         }
 
@@ -462,6 +528,12 @@ void COpenXRManager::frameThread() {
         XrFrameBeginInfo beginInfo = {XR_TYPE_FRAME_BEGIN_INFO};
         if (XR_FAILED(xrBeginFrame(m_session->m_session, &beginInfo)))
             continue;
+
+        // Sample controller/hand actions once per frame (doc 04 §2): xrSyncActions + per-hand
+        // aim/grip pose + analog reads at the predicted display time, located in the reference
+        // space. Only delivers real input while the session is FOCUSED (a success code otherwise).
+        if (m_input)
+            m_input->sample(fs.predictedDisplayTime, m_session->m_refSpace);
 
         // Per-layer: ensure a swapchain, then blit the latest presented buffer into it.
         for (auto& l : active) {
@@ -552,14 +624,26 @@ void COpenXRManager::frameThread() {
 
         const OpenXR::SXRAnchorTuning tune = readAnchorTuning();
 
-        // WP6 hook: grip action spaces don't exist yet, so grips are always invalid here. Device-
-        // locked quads take the §3.4 tracking-loss path (parked in LOCAL_FLOOR at their last pose).
-        // When WP6 lands, feed real grip poses into SXRSolveInput and map the grip space selectors.
-        const std::optional<OpenXR::SXRPose> gripLeft  = std::nullopt;
-        const std::optional<OpenXR::SXRPose> gripRight = std::nullopt;
+        // Feed the sampled grip poses (in the reference space) into the anchor solve. In the LOCAL
+        // fallback the solver works in floor-relative coordinates, so shift grips +floor_offset the
+        // same way as the view; the device-lock late-latch path (below) composes that shift back
+        // out algebraically, so the grip ActionSpace is still submitted unshifted.
+        std::optional<OpenXR::SXRPose> gripLeft, gripRight;
+        if (m_input) {
+            if (auto g = m_input->grip(OpenXR::XR_HAND_LEFT)) {
+                if (!m_session->m_usingLocalFloor)
+                    g->pos.y += floorOffset;
+                gripLeft = g;
+            }
+            if (auto g = m_input->grip(OpenXR::XR_HAND_RIGHT)) {
+                if (!m_session->m_usingLocalFloor)
+                    g->pos.y += floorOffset;
+                gripRight = g;
+            }
+        }
 
-        std::vector<OpenXR::SXRSolveResult>  results(active.size());
-        std::vector<bool>                    solved(active.size(), false);
+        std::vector<OpenXR::SXRSolveResult> results(active.size());
+        std::vector<bool>                   solved(active.size(), false);
         {
             std::scoped_lock lock(m_layersMu);
             m_lastVerbCtx = OpenXR::SXRVerbContext{viewPose, viewValid, gripLeft, gripRight};
@@ -607,21 +691,35 @@ void COpenXRManager::frameThread() {
 
             const OpenXR::SXRSolveResult& res = results[i];
 
-            // Map the space selector to a real XrSpace. Only LOCAL_FLOOR is possible in WP5 (grips
-            // are invalid); GRIP_* falls back to the world pose in LOCAL_FLOOR until WP6 provides
-            // the grip action spaces.
-            OpenXR::SXRPose poseLF = res.space == OpenXR::XR_SPACE_LOCAL_FLOOR ? res.pose : res.worldPose;
-            if (!m_session->m_usingLocalFloor)
-                poseLF.pos.y -= floorOffset; // back to the LOCAL reference frame
+            // Map the solver's space selector to a real XrSpace. A device-locked / grabbed quad
+            // whose selector is a grip space is submitted against CXRInput's grip ActionSpace with
+            // the stored grip-space offset verbatim — the runtime late-latches the controller pose
+            // at display time (doc 03 §3.4), so the quad tracks 1:1 with zero added latency. Any
+            // other selector (incl. a grip selector with no valid grip space) submits the world
+            // pose in the reference space, with the LOCAL-fallback floor shift removed.
+            XrSpace gripSpace = XR_NULL_HANDLE;
+            if (m_input && (res.space == OpenXR::XR_SPACE_GRIP_LEFT || res.space == OpenXR::XR_SPACE_GRIP_RIGHT))
+                gripSpace = m_input->gripSpace(res.space == OpenXR::XR_SPACE_GRIP_LEFT ? OpenXR::XR_HAND_LEFT : OpenXR::XR_HAND_RIGHT);
+
+            XrSpace         quadSpace = m_session->m_refSpace;
+            OpenXR::SXRPose quadPose;
+            if (gripSpace != XR_NULL_HANDLE) {
+                quadSpace = gripSpace;
+                quadPose  = res.pose; // grip-space offset; the grip ActionSpace is unshifted
+            } else {
+                quadPose = res.space == OpenXR::XR_SPACE_LOCAL_FLOOR ? res.pose : res.worldPose;
+                if (!m_session->m_usingLocalFloor)
+                    quadPose.pos.y -= floorOffset; // back to the LOCAL reference frame
+            }
 
             XrCompositionLayerQuad quad   = {XR_TYPE_COMPOSITION_LAYER_QUAD};
             quad.layerFlags               = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-            quad.space                    = m_session->m_refSpace;
+            quad.space                    = quadSpace;
             quad.eyeVisibility            = XR_EYE_VISIBILITY_BOTH;
             quad.subImage.swapchain       = l->m_swapchain;
             quad.subImage.imageRect       = {{0, 0}, {w, h}};
             quad.subImage.imageArrayIndex = 0;
-            quad.pose                     = xrFromPose(poseLF);
+            quad.pose                     = xrFromPose(quadPose);
             quad.size                     = {res.widthMeters, res.heightMeters};
             quads.push_back(quad);
         }
@@ -958,14 +1056,10 @@ void COpenXRManager::teardownLayers() {
 
 void COpenXRManager::reportLayerRemoved(const std::string& name) {
     // Frame thread: enqueue the ack and wake the main thread (removal barrier step 2->3).
-    {
-        std::scoped_lock lock(m_pendingMu);
-        m_removedLayerNames.push_back(name);
-    }
-    if (m_eventFd >= 0) {
-        const uint64_t        one = 1;
-        [[maybe_unused]] auto _   = write(m_eventFd, &one, sizeof(one));
-    }
+    SXRStateEvent ev;
+    ev.type = eXRStateEventType::LAYER_REMOVED;
+    ev.str  = name;
+    enqueue(ev);
 }
 
 void COpenXRManager::onConfigReload() {
