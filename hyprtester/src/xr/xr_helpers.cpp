@@ -7,6 +7,7 @@
 #include "../shared.hpp" // HIS
 
 #include <unistd.h>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <thread>
@@ -97,6 +98,74 @@ namespace XR {
         }
 
         NLog::red("Artifacts written to {}/", std::filesystem::absolute(outDir, ec).string());
+    }
+
+    size_t findAfter(const std::string& hay, const std::string& marker, size_t from) {
+        return hay.find(marker, from);
+    }
+
+    std::string fieldAfter(const std::string& json, size_t from, const std::string& key) {
+        if (from == std::string::npos)
+            return "";
+        const std::string needle = "\"" + key + "\":";
+        const auto        kpos   = json.find(needle, from);
+        if (kpos == std::string::npos)
+            return "";
+
+        size_t i = kpos + needle.size();
+        while (i < json.size() && (json[i] == ' ' || json[i] == '\t'))
+            ++i;
+        if (i >= json.size())
+            return "";
+
+        if (json[i] == '"') {
+            const auto end = json.find('"', i + 1);
+            if (end == std::string::npos)
+                return "";
+            return json.substr(i + 1, end - i - 1);
+        }
+
+        if (json[i] == '[') {
+            const auto end = json.find(']', i);
+            if (end == std::string::npos)
+                return "";
+            return json.substr(i, end - i + 1);
+        }
+
+        size_t end = i;
+        while (end < json.size() && json[end] != ',' && json[end] != '}' && json[end] != ']' && json[end] != '\n')
+            ++end;
+        while (end > i && std::isspace(static_cast<unsigned char>(json[end - 1])))
+            --end;
+        return json.substr(i, end - i);
+    }
+
+    std::vector<float> parseFloatArray(const std::string& arr) {
+        std::vector<float> out;
+        std::string        cur;
+        for (char c : arr) {
+            if (c == '[' || c == ']')
+                continue;
+            if (c == ',') {
+                if (!cur.empty()) {
+                    out.push_back(toFloatOr(cur, 0.f));
+                    cur.clear();
+                }
+                continue;
+            }
+            cur += c;
+        }
+        if (!cur.empty())
+            out.push_back(toFloatOr(cur, 0.f));
+        return out;
+    }
+
+    float toFloatOr(const std::string& s, float fallback) {
+        try {
+            size_t idx = 0;
+            float  v   = std::stof(s, &idx);
+            return v;
+        } catch (...) { return fallback; }
     }
 
 } // namespace XR
