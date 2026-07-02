@@ -105,6 +105,13 @@ const std::string& COpenXRManager::systemName() const {
     return m_systemName;
 }
 
+bool COpenXRManager::shouldInhibitIdle() {
+    // doc 05 §6.1. FOCUSED (and only FOCUSED) inhibits: the headset is on and this session has
+    // input focus. VISIBLE (e.g. runtime dashboard in front) intentionally does not inhibit.
+    static auto PINHIBIT = CConfigValue<Hyprlang::INT>("openxr:inhibit_idle");
+    return *PINHIBIT && m_state == XR_STATE_RUNNING_FOCUSED;
+}
+
 void COpenXRManager::setState(eXRManagerState newState) {
     if (m_state == newState)
         return;
