@@ -16,6 +16,11 @@
 
 #include <hyprutils/string/String.hpp>
 #include <hyprutils/string/VarList2.hpp>
+
+#ifdef HAVE_OPENXR
+#include "../../openxr/OpenXRManager.hpp"
+#endif
+
 using namespace Hyprutils::String;
 
 using namespace Config;
@@ -789,6 +794,45 @@ static SDispatchResult forceidle(const std::string& args) {
     return wrap(Actions::forceIdle(duration.value()));
 }
 
+// xrmonitor dispatcher (doc 05 §3). A thin shim: every verb funnels into a COpenXRManager
+// method — the exact same methods the hyprctl openxr subcommands call (one implementation, two
+// transports). Registered unconditionally; without HAVE_OPENXR it returns a clean error.
+static SDispatchResult xrmonitorDispatch(const std::string& args) {
+#ifndef HAVE_OPENXR
+    return {.success = false, .error = "Hyprland was built without OpenXR support"};
+#else
+    if (!g_pOpenXRManager)
+        return {.success = false, .error = "OpenXR manager not initialized"};
+
+    // verb + unsplit rest (rest keeps its spaces, e.g. "XR-test 1280x720 anchor:local ...").
+    const auto        sp   = args.find(' ');
+    const std::string verb = sp == std::string::npos ? args : args.substr(0, sp);
+    const std::string rest = sp == std::string::npos ? std::string{} : args.substr(sp + 1);
+
+    if (verb.empty())
+        return {.success = false, .error = "xrmonitor: expected a verb (create|destroy|select|...)"};
+
+    auto wrapExp = [](std::expected<void, std::string>&& r) -> SDispatchResult {
+        if (r)
+            return {};
+        return {.success = false, .error = r.error()};
+    };
+
+    if (verb == "create")
+        return wrapExp(g_pOpenXRManager->cmdCreate(rest));
+    if (verb == "destroy")
+        return wrapExp(g_pOpenXRManager->cmdDestroy(rest));
+    if (verb == "select")
+        return wrapExp(g_pOpenXRManager->cmdSelect(rest));
+
+    // Pose-mutation verbs land in WP5 (anchoring engine).
+    if (verb == "anchor" || verb == "move" || verb == "rotate" || verb == "scale" || verb == "distance" || verb == "center")
+        return {.success = false, .error = "xrmonitor " + verb + ": not implemented until WP5"};
+
+    return {.success = false, .error = "unknown xrmonitor verb '" + verb + "'"};
+#endif
+}
+
 CDispatcherTranslator::CDispatcherTranslator() {
     m_dispMap["exec"]                           = ::exec;
     m_dispMap["execr"]                          = ::execr;
@@ -860,4 +904,5 @@ CDispatcherTranslator::CDispatcherTranslator() {
     m_dispMap["global"]                         = ::globalDispatcher;
     m_dispMap["setprop"]                        = ::setprop;
     m_dispMap["forceidle"]                      = ::forceidle;
+    m_dispMap["xrmonitor"]                      = ::xrmonitorDispatch;
 }

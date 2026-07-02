@@ -107,7 +107,8 @@ CKeybindManager::CKeybindManager() {
                              "event",
                              "global",
                              "setprop",
-                             "forceidle"}) {
+                             "forceidle",
+                             "xrmonitor"}) {
         m_dispatchers[name] = [n = std::string(name)](std::string args) -> SDispatchResult { return Config::Legacy::translator()->run(n, args); };
     }
 
