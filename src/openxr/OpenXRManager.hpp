@@ -4,12 +4,14 @@
 #include <cstdint>
 #include <string>
 #include <atomic>
+#include <expected>
 #include <mutex>
 #include <thread>
 #include <vector>
 
 #include "../helpers/memory/Memory.hpp"
 #include "../helpers/signal/Signal.hpp"
+#include "XRMonitorConfig.hpp"
 
 struct wl_event_source;
 
@@ -29,6 +31,7 @@ enum eXRManagerState : uint8_t {
 class CXRIpc;
 class CXRSession;
 class CXRGraphics;
+class CXRMonitorLayer;
 
 // The single main-thread entry point the rest of Hyprland touches for OpenXR.
 // Owns the lifecycle state machine and funnels the three enable/disable entry points
@@ -50,6 +53,13 @@ class COpenXRManager {
     const std::string&  runtimeName() const;
     const std::string&  systemName() const;
 
+    // Monitor create/destroy funnel (main thread). createXRMonitor works in EVERY manager
+    // state (including DISABLED) so monitors created without a session become plain headless
+    // outputs whose quads bind lazily on start() (doc 02). WP3 exercises this with a single
+    // hard-coded test monitor; the config keyword/dispatcher/hyprctl surfaces are WP4.
+    std::expected<SP<CXRMonitorLayer>, std::string> createXRMonitor(const SXRMonitorParams& params);
+    void                                            destroyXRMonitor(const std::string& name);
+
     // "disabled" | "unavailable" | "starting" | "idle" | "visible" | "focused" | "stopping"
     static const char*  stateToString(eXRManagerState state);
 
@@ -63,6 +73,21 @@ class COpenXRManager {
 
     // The XR frame thread body (owns the EGL context + XR frame loop while running).
     void                frameThread();
+
+    // --- layer management ---
+    // Frame thread: (re)create a layer's swapchain at the given pixel size. Returns false on
+    // failure (leaves m_swapchain == XR_NULL_HANDLE).
+    bool                createLayerSwapchain(CXRMonitorLayer& layer, const Vector2D& size);
+    // Main thread: bind still-existing layers on start() and drop those whose monitor
+    // disappeared while disabled (doc 02 lazy binding).
+    void                bindExistingLayers();
+    // Main thread: destroy all layer frame-side + monitor resources during stop() (path C —
+    // no frame thread; barrier not needed). Honors openxr:destroy_monitors_on_stop.
+    void                teardownLayers();
+    // Frame thread: enqueue a "layer removed" ack + wake main (removal barrier step 2).
+    void                reportLayerRemoved(const std::string& name);
+    // Main thread: erase the acked layer + destroy its output (removal barrier step 3).
+    void                finalizeLayerRemoval(const std::string& name);
 
     // --- minimal frame->main session-state channel (WP6 replaces this with the general
     // SPSC + eventfd queue; the interface — reportState()/onFrameChannelReadable() — is
@@ -88,11 +113,18 @@ class COpenXRManager {
     std::thread         m_frameThread;
     std::atomic<bool>   m_running{false};
 
+    // XR monitor layers. m_layers is written on the main thread and snapshotted per frame by
+    // the frame thread, both under m_layersMu (doc 00 handoff table).
+    std::vector<SP<CXRMonitorLayer>> m_layers;
+    std::mutex                       m_layersMu;
+    uint64_t                         m_seqCounter = 0;
+
     // Frame->main channel state.
     int                          m_eventFd     = -1;
     wl_event_source*             m_eventSource = nullptr;
     std::mutex                   m_pendingMu;
     std::vector<eXRManagerState> m_pendingStates;
+    std::vector<std::string>     m_removedLayerNames; // frame->main layer-removed acks
     std::atomic<bool>            m_frameRequestedTeardown{false};
 
     CHyprSignalListener m_configReloadListener;

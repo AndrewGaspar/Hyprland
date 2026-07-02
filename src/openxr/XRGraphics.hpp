@@ -4,12 +4,20 @@
 #include <EGL/egl.h> // EGLDisplay, EGLContext, EGLConfig, EGL_NO_DISPLAY, EGL_NO_CONTEXT
 #include <string>
 
+#include "../helpers/memory/Memory.hpp"
+#include "../helpers/math/Math.hpp"
+
 // Forward-declare GL/EGL extension types so this header compiles in TUs that do not
 // pull in the GLES headers (the WIP forward-declaration trick — see doc 01).
 using XR_GLuint      = unsigned int; // = GLuint
 using XR_EGLImageKHR = void*;        // = EGLImageKHR
 
 struct gbm_device;
+
+namespace Aquamarine {
+    class IBuffer;
+}
+class CXRMonitorLayer;
 
 // CXRGraphics owns the GBM/EGL display + context and the shared GL blit resources used
 // to push presented monitor buffers into XR swapchains. Ported from the WIP prototype
@@ -37,8 +45,18 @@ class CXRGraphics {
     // Teardown is split so COpenXRManager can honor doc 01's ordering: GL objects are
     // deleted with the context current (destroyGL), then the XR handles are destroyed
     // (CXRSession::destroy), then the context/display/GBM are torn down (destroyEGL).
-    void destroyGL();  // context current -> delete GL objects -> unbind
+    void destroyGL();  // context current -> delete shared GL objects -> unbind
     void destroyEGL(); // eglDestroyContext, eglTerminate, gbm_device_destroy, close(fd)
+
+    // Frame thread, inside a CScopedGLContext. Blit a presented monitor buffer into the
+    // layer's acquired swapchain image (dstTex). Tries DMA-BUF import, then the CPU
+    // data-pointer fallback, then a black clear. Uses/updates the per-layer m_lastEGLImg +
+    // m_cpuTex (sized to the source mode). See doc 01 "Blit pipeline".
+    void blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer& layer, XR_GLuint dstTex);
+    // Frame thread, inside a CScopedGLContext. Clear an image to a solid color.
+    void clearTex(XR_GLuint dstTex, const Vector2D& size, float r, float g, float b);
+    // Delete a layer's per-layer GL objects (EGLImage + staging tex). Context must be current.
+    void destroyLayerGL(XR_EGLImageKHR img, XR_GLuint cpuTex);
 
     // RAII guard: ctor eglMakeCurrent(m_xrContext), dtor eglMakeCurrent(EGL_NO_CONTEXT).
     // The ONLY sanctioned way GL work is issued — see doc 01 "EGL context ownership".
