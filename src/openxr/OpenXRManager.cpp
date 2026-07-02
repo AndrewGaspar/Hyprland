@@ -14,11 +14,13 @@
 #include <openxr/openxr_platform.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <cstdint>
 #include <chrono>
 #include <cmath>
 #include <format>
+#include <optional>
 #include <ranges>
 
 #include <sys/eventfd.h>
@@ -365,10 +367,23 @@ void COpenXRManager::frameThread() {
     // The frame thread exclusively owns the EGL context while running. It snapshots the
     // layer set once per frame, blits each layer's latest presented buffer into its
     // swapchain, and submits one XrCompositionLayerQuad per layer (doc 01 loop / doc 02).
-    eXRManagerState lastReported = XR_STATE_RUNNING_IDLE;
+    eXRManagerState lastReported  = XR_STATE_RUNNING_IDLE;
+    int64_t         lastPredicted = 0; // XrTime (ns) of the previous frame, for the solve dt
 
     while (m_running.load()) {
         m_session->pollEvents();
+
+        // Recenter (doc 03 §6): re-express every anchor across a reference-space change.
+        if (m_session->m_recenterPending) {
+            const OpenXR::SXRPose M      = m_session->m_recenterPose;
+            const bool            valid  = m_session->m_recenterPoseValid;
+            m_session->m_recenterPending = false;
+            if (valid) {
+                std::scoped_lock lock(m_layersMu);
+                for (auto& l : m_layers)
+                    l->m_anchor.onReferenceSpaceChanged(M);
+            }
+        }
 
         if (m_session->m_exitRequested) {
             // Signal the main thread to run teardown; the loop exits so the join is instant.
@@ -512,30 +527,92 @@ void COpenXRManager::frameThread() {
             return a->m_seq < b->m_seq;
         });
 
-        // Static pose for WP3 (anchoring is WP5): centered ~1.5m in front, ~1.4m high. In the
-        // LOCAL fallback (no LOCAL_FLOOR) subtract the assumed eye height so it stays roughly
-        // eye-level relative to the head origin.
-        static auto                                      PDIST  = CConfigValue<Hyprlang::FLOAT>("openxr:default_distance");
-        static auto                                      PFLOOR = CConfigValue<Hyprlang::FLOAT>("openxr:floor_offset");
-        const float                                      dist   = (float)*PDIST;
-        const float                                      yFloor = 1.4f;
-        const float                                      y      = m_session->m_usingLocalFloor ? yFloor : (yFloor - (float)*PFLOOR);
+        // --- anchor solve (WP5) ---
+        // Locate the head (VIEW) pose in our reference space at the predicted display time. In the
+        // LOCAL fallback (no LOCAL_FLOOR) shift +floor_offset so the solver works in floor-relative
+        // coordinates; the final quad pose is shifted back before submission.
+        static auto     PFLOOR      = CConfigValue<Hyprlang::FLOAT>("openxr:floor_offset");
+        const float     floorOffset = (float)*PFLOOR;
+        OpenXR::SXRPose viewPose;
+        bool            viewValid = false;
+        XrSpaceLocation loc       = {XR_TYPE_SPACE_LOCATION};
+        if (XR_SUCCEEDED(xrLocateSpace(m_session->m_viewSpace, m_session->m_refSpace, fs.predictedDisplayTime, &loc)) &&
+            (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) && (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+            viewPose  = xrToPose(loc.pose);
+            viewValid = true;
+            if (!m_session->m_usingLocalFloor)
+                viewPose.pos.y += floorOffset;
+        }
+
+        // dt from predicted display time deltas (monotone, no wall clock); clamped in solve().
+        float dt = 0.f;
+        if (lastPredicted != 0 && fs.predictedDisplayTime > lastPredicted)
+            dt = (float)(fs.predictedDisplayTime - lastPredicted) / 1e9f;
+        lastPredicted = fs.predictedDisplayTime;
+
+        const OpenXR::SXRAnchorTuning tune = readAnchorTuning();
+
+        // WP6 hook: grip action spaces don't exist yet, so grips are always invalid here. Device-
+        // locked quads take the §3.4 tracking-loss path (parked in LOCAL_FLOOR at their last pose).
+        // When WP6 lands, feed real grip poses into SXRSolveInput and map the grip space selectors.
+        const std::optional<OpenXR::SXRPose> gripLeft  = std::nullopt;
+        const std::optional<OpenXR::SXRPose> gripRight = std::nullopt;
+
+        std::vector<OpenXR::SXRSolveResult>  results(active.size());
+        std::vector<bool>                    solved(active.size(), false);
+        {
+            std::scoped_lock lock(m_layersMu);
+            m_lastVerbCtx = OpenXR::SXRVerbContext{viewPose, viewValid, gripLeft, gripRight};
+            for (size_t i = 0; i < active.size(); ++i) {
+                auto&      l         = active[i];
+                const bool needsView = l->m_anchor.state().mode != OpenXR::XR_ANCHOR_LOCAL;
+                if (viewValid || !needsView) {
+                    OpenXR::SXRSolveInput in;
+                    in.view      = viewPose;
+                    in.dt        = dt;
+                    in.gripLeft  = gripLeft;
+                    in.gripRight = gripRight;
+                    in.pxW       = (uint32_t)std::max(1.0, l->m_swapchainSize.x);
+                    in.pxH       = (uint32_t)std::max(1.0, l->m_swapchainSize.y);
+                    results[i]   = l->m_anchor.solve(in, tune);
+                    solved[i]    = true;
+                } else if (l->m_anchor.hasLastWorld()) {
+                    // No head pose this frame: hold the quad at its last composed world pose.
+                    results[i].space        = OpenXR::XR_SPACE_LOCAL_FLOOR;
+                    results[i].pose         = l->m_anchor.lastWorld();
+                    results[i].worldPose    = results[i].pose;
+                    results[i].widthMeters  = l->m_anchor.state().widthMeters;
+                    results[i].heightMeters = results[i].widthMeters * (float)l->m_swapchainSize.y / (float)std::max(1.0, l->m_swapchainSize.x);
+                    solved[i]               = true;
+                }
+            }
+        }
 
         std::vector<XrCompositionLayerQuad>              quads;
         std::vector<const XrCompositionLayerBaseHeader*> layerPtrs;
         quads.reserve(active.size());
         layerPtrs.reserve(active.size());
 
-        for (auto& l : active) {
+        for (size_t i = 0; i < active.size(); ++i) {
+            auto& l = active[i];
             if (quads.size() >= m_session->m_maxLayerCount)
                 break;
-            if (!l->m_quadActive || !l->m_hasContent)
+            if (!l->m_quadActive || !l->m_hasContent || !solved[i])
                 continue;
 
             const int w = (int)l->m_swapchainSize.x;
             const int h = (int)l->m_swapchainSize.y;
             if (w <= 0 || h <= 0)
                 continue;
+
+            const OpenXR::SXRSolveResult& res = results[i];
+
+            // Map the space selector to a real XrSpace. Only LOCAL_FLOOR is possible in WP5 (grips
+            // are invalid); GRIP_* falls back to the world pose in LOCAL_FLOOR until WP6 provides
+            // the grip action spaces.
+            OpenXR::SXRPose poseLF = res.space == OpenXR::XR_SPACE_LOCAL_FLOOR ? res.pose : res.worldPose;
+            if (!m_session->m_usingLocalFloor)
+                poseLF.pos.y -= floorOffset; // back to the LOCAL reference frame
 
             XrCompositionLayerQuad quad   = {XR_TYPE_COMPOSITION_LAYER_QUAD};
             quad.layerFlags               = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
@@ -544,9 +621,8 @@ void COpenXRManager::frameThread() {
             quad.subImage.swapchain       = l->m_swapchain;
             quad.subImage.imageRect       = {{0, 0}, {w, h}};
             quad.subImage.imageArrayIndex = 0;
-            quad.pose.orientation         = {0, 0, 0, 1};
-            quad.pose.position            = {0.0f, y, -dist};
-            quad.size                     = {l->m_sizeMeters, l->m_sizeMeters * (float)h / (float)w};
+            quad.pose                     = xrFromPose(poseLF);
+            quad.size                     = {res.widthMeters, res.heightMeters};
             quads.push_back(quad);
         }
         for (auto& q : quads)
@@ -635,9 +711,28 @@ std::expected<SP<CXRMonitorLayer>, std::string> COpenXRManager::createXRMonitor(
     static auto PSIZE      = CConfigValue<Hyprlang::FLOAT>("openxr:default_size");
     const float sizeMeters = params.m_sizeMeters.value_or((float)*PSIZE);
     auto        layer      = makeShared<CXRMonitorLayer>(params.m_name, ++m_seqCounter, sizeMeters);
-    layer->m_anchorSpec    = params.m_anchor; // parsed anchor (WP5 makes it live; WP4 static pose)
-    layer->m_reqResolution = params.m_resolution;
-    layer->m_reqRefresh    = params.m_refreshRate;
+
+    // Seed the anchoring engine (WP5). widthMeters is the live quad width; height derives from
+    // the pixel mode each frame.
+    OpenXR::SXRAnchorState st = params.m_anchor;
+    st.widthMeters            = sizeMeters;
+    // Create verb with no explicit anchor: place along the current gaze at default distance
+    // (doc 05 §3.1). Falls back to a sensible default pose when there is no tracking yet.
+    if (!params.m_anchorProvided) {
+        static auto       PDEFDIST = CConfigValue<Hyprlang::FLOAT>("openxr:default_distance");
+        const float       dist     = (float)*PDEFDIST;
+        OpenXR::CXRAnchor tmp;
+        st.mode = OpenXR::XR_ANCHOR_LOCAL;
+        tmp.initFromState(st);
+        if (tmp.applyCenter(currentVerbContext(), dist))
+            st = tmp.m_state;
+        else
+            st.anchorPose = OpenXR::SXRPose{OpenXR::Vec3{0.f, 1.4f, -dist}, OpenXR::Quat{}}; // no tracking yet
+    }
+    layer->m_anchor.initFromState(st);
+    layer->m_declaredAnchor = st;
+    layer->m_reqResolution  = params.m_resolution;
+    layer->m_reqRefresh     = params.m_refreshRate;
     {
         std::scoped_lock lock(m_layersMu);
         m_layers.push_back(layer);
@@ -894,20 +989,56 @@ void COpenXRManager::onConfigReload() {
 // ---------------------------------------------------------------------------------------------
 
 namespace {
-    // yaw (about +Y) then pitch (about +X): rot = qFromYaw ∘ qFromPitch (doc 03 §7). Local
-    // helper so this file needs no anchoring engine (that arrives in WP5). x,y,z,w out.
-    void yawPitchToQuat(float yawDeg, float pitchDeg, float& x, float& y, float& z, float& w) {
-        const float yr = yawDeg * (float)M_PI / 180.f;
-        const float pr = pitchDeg * (float)M_PI / 180.f;
-        // qFromYaw
-        const float ys = std::sin(yr * 0.5f), yc = std::cos(yr * 0.5f); // {0, ys, 0, yc}
-        const float ps = std::sin(pr * 0.5f), pc = std::cos(pr * 0.5f); // {ps, 0, 0, pc}
-        // Hamilton product a*b with a = yaw quat, b = pitch quat.
-        w = yc * pc; // aw*bw
-        x = yc * ps; // aw*bx
-        y = ys * pc; // ay*bw
-        z = ys * ps; // ay*bx (a.y*b.x term of z)
+    // Derive yaw/pitch degrees from a stored quat for serialization (doc 03 §7).
+    void quatToYawPitchDeg(const OpenXR::Quat& q, float& yawDeg, float& pitchDeg) {
+        const OpenXR::Vec3 f       = OpenXR::qRotate(q, OpenXR::Vec3{0.f, 0.f, -1.f});
+        const float        pitch   = std::asin(std::clamp(f.y, -1.f, 1.f));
+        const float        yaw     = (f.x * f.x + f.z * f.z < 1e-8f) ? 0.f : std::atan2(-f.x, -f.z);
+        constexpr float    RAD2DEG = 180.f / (float)M_PI;
+        yawDeg                     = yaw * RAD2DEG;
+        pitchDeg                   = pitch * RAD2DEG;
     }
+
+    OpenXR::eXRAnchorMode parseAnchorModeSpec(const std::string& tok, OpenXR::eXRHand& hand, bool& ok) {
+        ok = true;
+        if (tok == "local")
+            return OpenXR::XR_ANCHOR_LOCAL;
+        if (tok == "head")
+            return OpenXR::XR_ANCHOR_HEAD;
+        if (tok == "body")
+            return OpenXR::XR_ANCHOR_BODY;
+        if (tok == "device:left") {
+            hand = OpenXR::XR_HAND_LEFT;
+            return OpenXR::XR_ANCHOR_DEVICE;
+        }
+        if (tok == "device:right") {
+            hand = OpenXR::XR_HAND_RIGHT;
+            return OpenXR::XR_ANCHOR_DEVICE;
+        }
+        ok = false;
+        return OpenXR::XR_ANCHOR_LOCAL;
+    }
+}
+
+OpenXR::SXRAnchorTuning COpenXRManager::readAnchorTuning() const {
+    static auto             PRESP    = CConfigValue<Hyprlang::FLOAT>("openxr:leash_response");
+    static auto             PANG     = CConfigValue<Hyprlang::FLOAT>("openxr:leash_deadzone_angle");
+    static auto             PDIST    = CConfigValue<Hyprlang::FLOAT>("openxr:leash_deadzone_distance");
+    static auto             PFOLLOW  = CConfigValue<Hyprlang::INT>("openxr:body_leash_follow_height");
+    static auto             PDEFDIST = CConfigValue<Hyprlang::FLOAT>("openxr:default_distance");
+
+    OpenXR::SXRAnchorTuning t;
+    t.leashResponse    = (float)*PRESP;
+    t.deadzoneAngleRad = (float)*PANG * (float)M_PI / 180.f;
+    t.deadzoneDistance = (float)*PDIST;
+    t.bodyFollowHeight = *PFOLLOW;
+    t.defaultDistance  = (float)*PDEFDIST;
+    return t;
+}
+
+OpenXR::SXRVerbContext COpenXRManager::currentVerbContext() {
+    std::scoped_lock lock(m_layersMu);
+    return m_lastVerbCtx;
 }
 
 SP<CXRMonitorLayer> COpenXRManager::layerByName(const std::string& name) {
@@ -971,19 +1102,21 @@ void COpenXRManager::reconcileDeclaredMonitors() {
                 existing->m_reqResolution = d.m_resolution;
                 existing->m_reqRefresh    = d.m_refreshRate;
             }
-            // Anchor / size change -> re-anchor in place (WP5 makes the pose live; WP4 stores it).
-            const bool anchorChanged = !(existing->m_anchorSpec == d.m_anchor);
-            if (anchorChanged) {
-                std::scoped_lock lock(m_layersMu);
-                existing->m_anchorSpec = d.m_anchor;
-                if (g_pEventManager)
+            // Anchor / size change -> re-anchor to the new declared state (doc 05 §2.5 / doc 03).
+            static auto PSIZE             = CConfigValue<Hyprlang::FLOAT>("openxr:default_size");
+            const float wantSize          = d.m_sizeMeters.value_or((float)*PSIZE);
+            const bool  anchorChanged     = !(existing->m_declaredAnchor == d.m_anchor);
+            const bool  sizeChanged       = existing->m_anchor.state().widthMeters != wantSize;
+            const bool  anchorModeChanged = existing->m_declaredAnchor.mode != d.m_anchor.mode || existing->m_declaredAnchor.device != d.m_anchor.device;
+            if (anchorChanged || sizeChanged) {
+                std::scoped_lock       lock(m_layersMu);
+                OpenXR::SXRAnchorState st = d.m_anchor;
+                st.widthMeters            = wantSize;
+                existing->m_anchor.initFromState(st);
+                existing->m_declaredAnchor = st;
+                existing->m_sizeMeters     = wantSize;
+                if (anchorChanged && g_pEventManager && anchorModeChanged)
                     g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitoranchor", d.m_name + "," + OpenXR::anchorModeToString(d.m_anchor)});
-            }
-            static auto PSIZE    = CConfigValue<Hyprlang::FLOAT>("openxr:default_size");
-            const float wantSize = d.m_sizeMeters.value_or((float)*PSIZE);
-            if (existing->m_sizeMeters != wantSize) {
-                std::scoped_lock lock(m_layersMu);
-                existing->m_sizeMeters = wantSize;
             }
             continue;
         }
@@ -1118,17 +1251,22 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
     for (auto& l : m_layers) {
         if (l->m_pendingRemoval.load(std::memory_order_acquire))
             continue;
+        const auto&    st = l->m_anchor.state();
         SXRMonitorInfo info;
         info.name       = l->m_monitorName;
-        info.sizeMeters = l->m_sizeMeters;
-        info.anchorMode = OpenXR::anchorModeToString(l->m_anchorSpec);
-        info.posX       = l->m_anchorSpec.posX;
-        info.posY       = l->m_anchorSpec.posY;
-        info.posZ       = l->m_anchorSpec.posZ;
-        // WP4: pose is the parsed-but-static anchor (WP5 reports the live solved pose).
-        yawPitchToQuat(l->m_anchorSpec.yawDeg, l->m_anchorSpec.pitchDeg, info.quatX, info.quatY, info.quatZ, info.quatW);
-        info.grabbed = false;        // WP8
-        info.hovered = l->m_hovered; // WP7
+        info.sizeMeters = st.widthMeters;
+        info.anchorMode = OpenXR::anchorModeToString(st);
+        // doc 05 §4.3: for local the pose is in LOCAL_FLOOR; for leashed/device modes it is the
+        // configured offset (pos) + relative rotation (quat) in the leash/device frame.
+        info.posX    = st.anchorPose.pos.x;
+        info.posY    = st.anchorPose.pos.y;
+        info.posZ    = st.anchorPose.pos.z;
+        info.quatX   = st.anchorPose.rot.x;
+        info.quatY   = st.anchorPose.rot.y;
+        info.quatZ   = st.anchorPose.rot.z;
+        info.quatW   = st.anchorPose.rot.w;
+        info.grabbed = l->m_anchor.grabbed(); // WP8 drives the grab machine
+        info.hovered = l->m_hovered;          // WP7
         if (l->m_reqResolution) {
             info.w = (int)l->m_reqResolution->x;
             info.h = (int)l->m_reqResolution->y;
@@ -1176,29 +1314,243 @@ std::string COpenXRManager::layoutDump() {
             if (hz > 0.f)
                 mode += std::format("@{:.0f}", hz);
 
-            const auto& a = l->m_anchorSpec;
+            const auto& st = l->m_anchor.state();
+            const auto& p  = st.anchorPose.pos;
             std::string anchor;
-            switch (a.mode) {
-                case OpenXR::XR_ANCHOR_LOCAL: anchor = std::format("anchor:local pos:{:.3f},{:.3f},{:.3f}", a.posX, a.posY, a.posZ); break;
-                case OpenXR::XR_ANCHOR_HEAD: anchor = std::format("anchor:head offset:{:.3f},{:.3f},{:.3f}", a.posX, a.posY, a.posZ); break;
-                case OpenXR::XR_ANCHOR_BODY: anchor = std::format("anchor:body offset:{:.3f},{:.3f},{:.3f}", a.posX, a.posY, a.posZ); break;
+            switch (st.mode) {
+                case OpenXR::XR_ANCHOR_LOCAL: anchor = std::format("anchor:local pos:{:.3f},{:.3f},{:.3f}", p.x, p.y, p.z); break;
+                case OpenXR::XR_ANCHOR_HEAD: anchor = std::format("anchor:head offset:{:.3f},{:.3f},{:.3f}", p.x, p.y, p.z); break;
+                case OpenXR::XR_ANCHOR_BODY: anchor = std::format("anchor:body offset:{:.3f},{:.3f},{:.3f}", p.x, p.y, p.z); break;
                 case OpenXR::XR_ANCHOR_DEVICE:
-                    anchor = std::format("anchor:device:{} offset:{:.3f},{:.3f},{:.3f}", a.device == OpenXR::XR_HAND_RIGHT ? "right" : "left", a.posX, a.posY, a.posZ);
+                    anchor = std::format("anchor:device:{} offset:{:.3f},{:.3f},{:.3f}", st.device == OpenXR::XR_HAND_RIGHT ? "right" : "left", p.x, p.y, p.z);
                     break;
             }
-            // Rotation serialization (doc 03 §7): head prints no rotation; body only yaw;
-            // local/device print yaw and (optional) pitch.
-            if (a.mode != OpenXR::XR_ANCHOR_HEAD && a.hasYaw)
-                anchor += std::format(" yaw:{:.1f}", a.yawDeg);
-            if ((a.mode == OpenXR::XR_ANCHOR_LOCAL || a.mode == OpenXR::XR_ANCHOR_DEVICE) && a.hasPitch)
-                anchor += std::format(" pitch:{:.1f}", a.pitchDeg);
+            // Rotation serialization (doc 03 §7): derive yaw/pitch from the stored quat. head
+            // prints no rotation (lookAt-driven); body prints yaw only (pitch/roll forced to 0);
+            // local/device print yaw and pitch (pitch omitted when |pitch| < 0.05°). Roll is not
+            // representable and is intentionally dropped (documented v1 limitation).
+            float yawDeg = 0.f, pitchDeg = 0.f;
+            quatToYawPitchDeg(st.anchorPose.rot, yawDeg, pitchDeg);
+            if (st.mode != OpenXR::XR_ANCHOR_HEAD)
+                anchor += std::format(" yaw:{:.1f}", yawDeg);
+            if ((st.mode == OpenXR::XR_ANCHOR_LOCAL || st.mode == OpenXR::XR_ANCHOR_DEVICE) && std::fabs(pitchDeg) >= 0.05f)
+                anchor += std::format(" pitch:{:.1f}", pitchDeg);
 
-            lines.push_back(std::format("xrmonitor = {}, {}, {}, size:{:.2f}", l->m_monitorName, mode, anchor, l->m_sizeMeters));
+            lines.push_back(std::format("xrmonitor = {}, {}, {}, size:{:.2f}", l->m_monitorName, mode, anchor, st.widthMeters));
         }
     }
     for (auto& ln : lines)
         out += ln + "\n";
     return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// WP5: pose-mutation verbs. One implementation, two transports (dispatcher + hyprctl). Each runs
+// on the main thread, captures the frame-thread solve context, then mutates the layer's anchor
+// under m_layersMu (doc 03 §5 / doc 05 §3.1).
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+    std::vector<std::string> splitWs(const std::string& s) {
+        std::vector<std::string> out;
+        size_t                   i = 0;
+        while (i < s.size()) {
+            while (i < s.size() && std::isspace((unsigned char)s[i]))
+                ++i;
+            size_t b = i;
+            while (i < s.size() && !std::isspace((unsigned char)s[i]))
+                ++i;
+            if (i > b)
+                out.push_back(s.substr(b, i - b));
+        }
+        return out;
+    }
+
+    std::optional<float> parseFloatArg(const std::string& s) {
+        try {
+            size_t idx = 0;
+            float  v   = std::stof(s, &idx);
+            if (idx != s.size())
+                return std::nullopt;
+            return v;
+        } catch (...) { return std::nullopt; }
+    }
+
+    std::optional<OpenXR::Vec3> parseVec3Arg(const std::string& s) {
+        std::vector<std::string> parts;
+        size_t                   start = 0;
+        for (size_t i = 0; i <= s.size(); ++i) {
+            if (i == s.size() || s[i] == ',') {
+                parts.push_back(s.substr(start, i - start));
+                start = i + 1;
+            }
+        }
+        if (parts.size() != 3)
+            return std::nullopt;
+        auto x = parseFloatArg(parts[0]);
+        auto y = parseFloatArg(parts[1]);
+        auto z = parseFloatArg(parts[2]);
+        if (!x || !y || !z)
+            return std::nullopt;
+        return OpenXR::Vec3{*x, *y, *z};
+    }
+}
+
+std::expected<void, std::string> COpenXRManager::cmdAnchor(const std::string& args) {
+    const auto tokens = splitWs(args);
+    if (tokens.size() < 2)
+        return std::unexpected<std::string>("anchor: expected <name|active> <local|head|body|device:left|right> [offset:x,y,z]");
+
+    const std::string   target = tokens[0];
+    SP<CXRMonitorLayer> layer  = target == "active" ? resolveSelected() : layerByName(target);
+    if (!layer)
+        return std::unexpected<std::string>(target == "active" ? "no XR monitor selected" : "no XR monitor named '" + target + "'");
+
+    bool                  modeOk  = false;
+    OpenXR::eXRHand       hand    = OpenXR::XR_HAND_LEFT;
+    OpenXR::eXRAnchorMode newMode = parseAnchorModeSpec(tokens[1], hand, modeOk);
+    if (!modeOk)
+        return std::unexpected<std::string>("anchor: unknown mode '" + tokens[1] + "' (expected local|head|body|device:left|right)");
+
+    bool         hasOffset = false;
+    OpenXR::Vec3 offset;
+    for (size_t i = 2; i < tokens.size(); ++i) {
+        if (tokens[i].starts_with("offset:")) {
+            auto v = parseVec3Arg(tokens[i].substr(7));
+            if (!v)
+                return std::unexpected<std::string>("anchor: bad offset '" + tokens[i] + "' (expected offset:x,y,z)");
+            offset    = *v;
+            hasOffset = true;
+        } else
+            return std::unexpected<std::string>("anchor: unexpected token '" + tokens[i] + "'");
+    }
+
+    const auto ctx  = currentVerbContext();
+    const auto tune = readAnchorTuning();
+
+    bool       modeChanged = false;
+    {
+        std::scoped_lock lock(m_layersMu);
+        const auto&      before = layer->m_anchor.state();
+        modeChanged             = before.mode != newMode || (newMode == OpenXR::XR_ANCHOR_DEVICE && before.device != hand);
+
+        if (hasOffset) {
+            OpenXR::SXRAnchorState st = layer->m_anchor.state(); // keep width
+            st.mode                   = newMode;
+            if (newMode == OpenXR::XR_ANCHOR_DEVICE)
+                st.device = hand;
+            st.anchorPose.pos = offset;
+            st.anchorPose.rot = OpenXR::Quat{};
+            layer->m_anchor.initFromState(st);
+        } else if (!layer->m_anchor.setMode(newMode, hand, ctx, tune))
+            return std::unexpected<std::string>("anchor: cannot re-anchor to that mode (head/body need head tracking, device needs a tracked controller)");
+    }
+
+    if (modeChanged && g_pEventManager)
+        g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitoranchor", layer->m_monitorName + "," + OpenXR::anchorModeToString(newMode, hand)});
+    return {};
+}
+
+std::expected<void, std::string> COpenXRManager::cmdMove(const std::string& args) {
+    const auto tokens = splitWs(args);
+    if (tokens.size() != 3)
+        return std::unexpected<std::string>("move: expected <dx> <dy> <dz> (meters)");
+    auto dx = parseFloatArg(tokens[0]);
+    auto dy = parseFloatArg(tokens[1]);
+    auto dz = parseFloatArg(tokens[2]);
+    if (!dx || !dy || !dz)
+        return std::unexpected<std::string>("move: arguments must be numbers");
+
+    auto layer = resolveSelected();
+    if (!layer)
+        return std::unexpected<std::string>("no XR monitor selected");
+
+    const auto       ctx = currentVerbContext();
+    std::scoped_lock lock(m_layersMu);
+    if (!layer->m_anchor.applyMove(OpenXR::Vec3{*dx, *dy, *dz}, ctx))
+        return std::unexpected<std::string>("move: head tracking (or controller for device anchors) unavailable");
+    return {};
+}
+
+std::expected<void, std::string> COpenXRManager::cmdRotate(const std::string& args) {
+    const auto tokens = splitWs(args);
+    if (tokens.empty() || tokens.size() > 2)
+        return std::unexpected<std::string>("rotate: expected <dyaw> [dpitch] (degrees)");
+    auto yaw = parseFloatArg(tokens[0]);
+    if (!yaw)
+        return std::unexpected<std::string>("rotate: dyaw must be a number");
+    float pitch = 0.f;
+    if (tokens.size() == 2) {
+        auto p = parseFloatArg(tokens[1]);
+        if (!p)
+            return std::unexpected<std::string>("rotate: dpitch must be a number");
+        pitch = *p;
+    }
+    // Pitch clamped to ±85° (doc 05 §3.1).
+    pitch = std::clamp(pitch, -85.f, 85.f);
+
+    auto layer = resolveSelected();
+    if (!layer)
+        return std::unexpected<std::string>("no XR monitor selected");
+
+    const auto       ctx     = currentVerbContext();
+    constexpr float  DEG2RAD = (float)M_PI / 180.f;
+    std::scoped_lock lock(m_layersMu);
+    layer->m_anchor.applyRotate(*yaw * DEG2RAD, pitch * DEG2RAD, ctx);
+    return {};
+}
+
+std::expected<void, std::string> COpenXRManager::cmdScale(const std::string& args) {
+    const auto tokens = splitWs(args);
+    if (tokens.size() != 1)
+        return std::unexpected<std::string>("scale: expected <f|+d|-d>");
+    const std::string& a = tokens[0];
+    // Explicitly signed => additive delta in meters; bare number => multiplicative factor.
+    const bool isDelta = a.front() == '+' || a.front() == '-';
+    auto       f       = parseFloatArg(a);
+    if (!f)
+        return std::unexpected<std::string>("scale: argument must be a number");
+
+    auto layer = resolveSelected();
+    if (!layer)
+        return std::unexpected<std::string>("no XR monitor selected");
+
+    std::scoped_lock lock(m_layersMu);
+    layer->m_anchor.applyScale(isDelta, *f);
+    layer->m_sizeMeters = layer->m_anchor.state().widthMeters;
+    return {};
+}
+
+std::expected<void, std::string> COpenXRManager::cmdDistance(const std::string& args) {
+    const auto tokens = splitWs(args);
+    if (tokens.size() != 1)
+        return std::unexpected<std::string>("distance: expected <±m>");
+    auto dm = parseFloatArg(tokens[0]);
+    if (!dm)
+        return std::unexpected<std::string>("distance: argument must be a number");
+
+    auto layer = resolveSelected();
+    if (!layer)
+        return std::unexpected<std::string>("no XR monitor selected");
+
+    const auto       ctx = currentVerbContext();
+    std::scoped_lock lock(m_layersMu);
+    if (!layer->m_anchor.applyDistance(*dm, ctx))
+        return std::unexpected<std::string>("distance: head tracking unavailable or no current pose");
+    return {};
+}
+
+std::expected<void, std::string> COpenXRManager::cmdCenter() {
+    auto layer = resolveSelected();
+    if (!layer)
+        return std::unexpected<std::string>("no XR monitor selected");
+
+    static auto      PDEFDIST = CConfigValue<Hyprlang::FLOAT>("openxr:default_distance");
+    const auto       ctx      = currentVerbContext();
+    std::scoped_lock lock(m_layersMu);
+    if (!layer->m_anchor.applyCenter(ctx, (float)*PDEFDIST))
+        return std::unexpected<std::string>("center: head tracking unavailable");
+    return {};
 }
 
 #endif

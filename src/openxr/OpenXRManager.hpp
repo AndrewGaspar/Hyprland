@@ -67,6 +67,14 @@ class COpenXRManager {
     std::expected<void, std::string> cmdDestroy(const std::string& target); // <name>|active
     std::expected<void, std::string> cmdSelect(const std::string& arg);     // <name>|next|prev
 
+    // --- pose-mutation verbs (WP5, doc 03 §5 / doc 05 §3.1). Main thread; take m_layersMu. ---
+    std::expected<void, std::string> cmdAnchor(const std::string& args);   // <name|active> <mode-spec>
+    std::expected<void, std::string> cmdMove(const std::string& args);     // <dx> <dy> <dz>
+    std::expected<void, std::string> cmdRotate(const std::string& args);   // <dyaw> [dpitch]
+    std::expected<void, std::string> cmdScale(const std::string& args);    // <f|+d|-d>
+    std::expected<void, std::string> cmdDistance(const std::string& args); // <±m>
+    std::expected<void, std::string> cmdCenter();                          // (none)
+
     // Snapshot of one XR monitor for `hyprctl openxr status` (doc 05 §4.3). Main thread.
     struct SXRMonitorInfo {
         std::string name;
@@ -137,6 +145,13 @@ class COpenXRManager {
 
     static eXRManagerState mapSessionState(int xrSessionState);
 
+    // --- anchoring (WP5) ---
+    // Read the leash/placement tuning from config (hot-live; called per frame + per verb).
+    OpenXR::SXRAnchorTuning readAnchorTuning() const;
+    // Copy of the most recent frame-thread solve inputs, so verbs (main thread) get a view/grip
+    // context without blocking the frame thread. Written by the frame thread under m_layersMu.
+    OpenXR::SXRVerbContext currentVerbContext();
+
     eXRManagerState        m_state  = XR_STATE_DISABLED;
     bool                   m_active = false; // derived: state ∈ {visible, focused}
 
@@ -156,6 +171,9 @@ class COpenXRManager {
     std::vector<SP<CXRMonitorLayer>> m_layers;
     std::mutex                       m_layersMu;
     uint64_t                         m_seqCounter = 0;
+
+    // Latest solve context captured by the frame thread (under m_layersMu) for main-thread verbs.
+    OpenXR::SXRVerbContext m_lastVerbCtx;
 
     // Selected-monitor state (doc 05 §3.2). Explicit selection wins; cleared when destroyed.
     std::string m_selectedMonitor;

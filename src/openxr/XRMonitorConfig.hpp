@@ -9,46 +9,17 @@
 #include <expected>
 
 #include "../helpers/math/Math.hpp"
+#include "XRAnchor.hpp" // OpenXR::SXRAnchorState + eXRAnchorMode/eXRHand (unconditional pure math)
 
 namespace OpenXR {
-    // Anchor mode as declared by the xrmonitor keyword / create verb (doc 05 §2.2).
-    // NOTE(WP5): doc 03 defines the canonical eXRAnchorMode/eXRHand + SXRAnchorState in
-    // XRAnchor.hpp (which does not exist yet). WP4 only needs a parsed representation, so this
-    // is the minimal parsed anchor spec; WP5 must unify it with SXRAnchorState.
-    enum eXRAnchorMode : uint8_t {
-        XR_ANCHOR_LOCAL = 0, // fixed in LOCAL_FLOOR
-        XR_ANCHOR_HEAD,      // head leash
-        XR_ANCHOR_BODY,      // body leash (yaw-only)
-        XR_ANCHOR_DEVICE,    // locked to a controller grip
-    };
+    // WP5 unification: the parser now produces the canonical doc-03 SXRAnchorState directly
+    // (absorbing WP4's placeholder SXRAnchorSpec). The parser stays pure/unconditional; it just
+    // includes the equally-pure XRAnchor.hpp for the shared enums/state type.
 
-    enum eXRHand : uint8_t {
-        XR_HAND_LEFT = 0,
-        XR_HAND_RIGHT,
-    };
-
-    // Parsed anchor spec. Coordinates are meters in the OpenXR convention (+X right, +Y up,
-    // -Z forward). For local, m_pos is the LOCAL_FLOOR world position; for head/body/device it
-    // is the offset in the respective leash/device frame. yaw/pitch are degrees.
-    struct SXRAnchorSpec {
-        eXRAnchorMode mode     = XR_ANCHOR_LOCAL;
-        eXRHand       device   = XR_HAND_LEFT; // meaningful iff mode == XR_ANCHOR_DEVICE
-        float         posX     = 0.f;
-        float         posY     = 0.f;
-        float         posZ     = 0.f;
-        float         yawDeg   = 0.f;
-        float         pitchDeg = 0.f;
-        bool          hasYaw   = false;
-        bool          hasPitch = false;
-
-        bool          operator==(const SXRAnchorSpec& o) const {
-            return mode == o.mode && device == o.device && posX == o.posX && posY == o.posY && posZ == o.posZ && yawDeg == o.yawDeg && pitchDeg == o.pitchDeg &&
-                hasYaw == o.hasYaw && hasPitch == o.hasPitch;
-        }
-    };
-
-    // Anchor mode -> the string used by doc 05 §4.3 (status/layout): local|head|body|device:left|device:right.
-    std::string anchorModeToString(const SXRAnchorSpec& spec);
+    // Anchor mode -> the string used by doc 05 §4.3 (status/layout):
+    // local|head|body|device:left|device:right.
+    std::string anchorModeToString(eXRAnchorMode mode, eXRHand device);
+    std::string anchorModeToString(const SXRAnchorState& state);
 }
 
 // Parameters describing one XR monitor. Every create path (config keyword, dispatcher,
@@ -60,9 +31,13 @@ struct SXRMonitorParams {
     std::optional<float>    m_refreshRate; // @Hz part; absent => headless default (60)
     std::optional<float>    m_sizeMeters;  // quad width in meters; absent => *openxr:default_size
 
-    // Parsed anchor spec (doc 05 §2.2). WP4 stores it (and the layer keeps WP3's static pose);
-    // WP5 makes it live via the anchoring engine.
-    OpenXR::SXRAnchorSpec m_anchor;
+    // Parsed anchor as the canonical doc-03 state (WP5). anchorPose.rot is built from the
+    // parsed yaw/pitch; widthMeters is left at its default here (seeded from m_sizeMeters /
+    // openxr:default_size when the layer is created).
+    OpenXR::SXRAnchorState m_anchor;
+    // True iff an anchor-spec was explicitly given (config keyword always does; the create verb
+    // may omit it, in which case the caller places the monitor along the current gaze, doc 05 §3.1).
+    bool m_anchorProvided = false;
 };
 
 namespace OpenXR {

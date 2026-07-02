@@ -122,10 +122,12 @@ namespace {
         if (tokens.empty())
             return std::unexpected<std::string>("missing anchor spec (expected anchor:local|head|body|device:left|right)");
 
-        OpenXR::SXRAnchorSpec anchor;
-        bool                  gotPos = false;
+        OpenXR::SXRAnchorState anchor;
+        bool                   gotPos = false;
+        float                  posX = 0.f, posY = 0.f, posZ = 0.f;
+        float                  yawDeg = 0.f, pitchDeg = 0.f;
 
-        const std::string&    modeTok = tokens[0];
+        const std::string&     modeTok = tokens[0];
         if (modeTok == "anchor:local")
             anchor.mode = OpenXR::XR_ANCHOR_LOCAL;
         else if (modeTok == "anchor:head")
@@ -154,27 +156,25 @@ namespace {
             if (key == "pos") {
                 if (anchor.mode != OpenXR::XR_ANCHOR_LOCAL)
                     return std::unexpected<std::string>("'pos:' is only valid for anchor:local (use 'offset:' for head/body/device)");
-                if (auto r = parseVec3(val, "pos", anchor.posX, anchor.posY, anchor.posZ); !r)
+                if (auto r = parseVec3(val, "pos", posX, posY, posZ); !r)
                     return std::unexpected(r.error());
                 gotPos = true;
             } else if (key == "offset") {
                 if (anchor.mode == OpenXR::XR_ANCHOR_LOCAL)
                     return std::unexpected<std::string>("'offset:' is only valid for head/body/device (use 'pos:' for anchor:local)");
-                if (auto r = parseVec3(val, "offset", anchor.posX, anchor.posY, anchor.posZ); !r)
+                if (auto r = parseVec3(val, "offset", posX, posY, posZ); !r)
                     return std::unexpected(r.error());
                 gotPos = true;
             } else if (key == "yaw") {
                 auto r = parseFloat(val, "yaw");
                 if (!r)
                     return std::unexpected(r.error());
-                anchor.yawDeg = *r;
-                anchor.hasYaw = true;
+                yawDeg = *r;
             } else if (key == "pitch") {
                 auto r = parseFloat(val, "pitch");
                 if (!r)
                     return std::unexpected(r.error());
-                anchor.pitchDeg = *r;
-                anchor.hasPitch = true;
+                pitchDeg = *r;
             } else if (key == "size") {
                 auto r = parseFloat(val, "size");
                 if (!r)
@@ -191,7 +191,20 @@ namespace {
         if (anchor.mode != OpenXR::XR_ANCHOR_LOCAL && !gotPos)
             return std::unexpected<std::string>("this anchor mode requires 'offset:x,y,z'");
 
-        out.m_anchor = anchor;
+        anchor.anchorPose.pos = OpenXR::Vec3{posX, posY, posZ};
+
+        // Build the stored rotation (doc 03 §7 deserialization): rot = qFromYaw ∘ qFromPitch.
+        // head display orientation is lookAt-driven (§3.2) so its stored rot is left identity;
+        // body is yaw-only (§3.3); local/device carry yaw+pitch.
+        constexpr float DEG2RAD = 3.14159265358979323846f / 180.f;
+        switch (anchor.mode) {
+            case OpenXR::XR_ANCHOR_HEAD: anchor.anchorPose.rot = OpenXR::Quat{}; break;
+            case OpenXR::XR_ANCHOR_BODY: anchor.anchorPose.rot = OpenXR::qFromYaw(yawDeg * DEG2RAD); break;
+            default: anchor.anchorPose.rot = OpenXR::qMul(OpenXR::qFromYaw(yawDeg * DEG2RAD), OpenXR::qFromPitch(pitchDeg * DEG2RAD)); break;
+        }
+
+        out.m_anchor         = anchor;
+        out.m_anchorProvided = true;
         return {};
     }
 
@@ -209,14 +222,18 @@ namespace {
     }
 }
 
-std::string OpenXR::anchorModeToString(const SXRAnchorSpec& spec) {
-    switch (spec.mode) {
+std::string OpenXR::anchorModeToString(eXRAnchorMode mode, eXRHand device) {
+    switch (mode) {
         case XR_ANCHOR_LOCAL: return "local";
         case XR_ANCHOR_HEAD: return "head";
         case XR_ANCHOR_BODY: return "body";
-        case XR_ANCHOR_DEVICE: return spec.device == XR_HAND_RIGHT ? "device:right" : "device:left";
+        case XR_ANCHOR_DEVICE: return device == XR_HAND_RIGHT ? "device:right" : "device:left";
     }
     return "local";
+}
+
+std::string OpenXR::anchorModeToString(const SXRAnchorState& state) {
+    return anchorModeToString(state.mode, state.device);
 }
 
 std::expected<SXRMonitorParams, std::string> OpenXR::parseXRMonitorLine(const std::string& args) {

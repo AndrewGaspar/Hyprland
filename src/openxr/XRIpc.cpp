@@ -104,11 +104,34 @@ static std::string openxrRequest(eHyprCtlOutputFormat format, std::string reques
     if (SUBCOMMAND == "layout")
         return g_pOpenXRManager->layoutDump();
 
-    // Pose-mutation verbs land in WP5 (anchoring engine + verbs).
-    if (SUBCOMMAND == "anchor" || SUBCOMMAND == "move" || SUBCOMMAND == "rotate" || SUBCOMMAND == "scale" || SUBCOMMAND == "distance" || SUBCOMMAND == "center")
-        return std::format("openxr subcommand '{}' is not implemented until WP5", SUBCOMMAND);
+    // Pose-mutation verbs (WP5). Same manager funnel as the xrmonitor dispatcher (doc 05 §3/§4).
+    if (SUBCOMMAND == "anchor") {
+        auto r = g_pOpenXRManager->cmdAnchor(ARGS);
+        return r ? "ok" : r.error();
+    }
+    if (SUBCOMMAND == "move") {
+        auto r = g_pOpenXRManager->cmdMove(ARGS);
+        return r ? "ok" : r.error();
+    }
+    if (SUBCOMMAND == "rotate") {
+        auto r = g_pOpenXRManager->cmdRotate(ARGS);
+        return r ? "ok" : r.error();
+    }
+    if (SUBCOMMAND == "scale") {
+        auto r = g_pOpenXRManager->cmdScale(ARGS);
+        return r ? "ok" : r.error();
+    }
+    if (SUBCOMMAND == "distance") {
+        auto r = g_pOpenXRManager->cmdDistance(ARGS);
+        return r ? "ok" : r.error();
+    }
+    if (SUBCOMMAND == "center") {
+        auto r = g_pOpenXRManager->cmdCenter();
+        return r ? "ok" : r.error();
+    }
 
-    return std::format("unknown openxr subcommand '{}'. Valid: status, enable, disable, create, destroy, select, layout", SUBCOMMAND);
+    return std::format("unknown openxr subcommand '{}'. Valid: status, enable, disable, create, destroy, select, anchor, move, rotate, scale, distance, center, layout",
+                       SUBCOMMAND);
 }
 
 CXRIpc::CXRIpc() = default;

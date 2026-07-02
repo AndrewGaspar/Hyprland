@@ -21,13 +21,13 @@
 
 // Small XR_CHK helper: logs via Log::logger and returns false on failure (doc 01 asked to
 // drop the WIP's fprintf duplication + XR_LOG macro).
-#define XR_CHK(expr)                                                                                                                                                                 \
-    do {                                                                                                                                                                             \
-        XrResult _r = (expr);                                                                                                                                                        \
-        if (XR_FAILED(_r)) {                                                                                                                                                         \
-            Log::logger->log(Log::ERR, "[OPENXR] " #expr " failed: {}", (int)_r);                                                                                                    \
-            return false;                                                                                                                                                            \
-        }                                                                                                                                                                            \
+#define XR_CHK(expr)                                                                                                                                                               \
+    do {                                                                                                                                                                           \
+        XrResult _r = (expr);                                                                                                                                                      \
+        if (XR_FAILED(_r)) {                                                                                                                                                       \
+            Log::logger->log(Log::ERR, "[OPENXR] " #expr " failed: {}", (int)_r);                                                                                                  \
+            return false;                                                                                                                                                          \
+        }                                                                                                                                                                          \
     } while (0)
 
 CXRSession::~CXRSession() {
@@ -267,8 +267,15 @@ void CXRSession::pollEvents() {
                 break;
             }
             case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING: {
-                // Runtime recenter. Forwarded to the anchor engine in a later WP (doc 03).
-                Log::logger->log(Log::DEBUG, "[OPENXR] reference space change pending (recenter)");
+                // Runtime recenter (doc 03 §6). Forward to the anchor engine via the frame loop.
+                auto*      ev      = reinterpret_cast<XrEventDataReferenceSpaceChangePending*>(&event);
+                const auto ourType = m_usingLocalFloor ? XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR_EXT : XR_REFERENCE_SPACE_TYPE_LOCAL;
+                if (ev->referenceSpaceType == ourType) {
+                    m_recenterPending   = true;
+                    m_recenterPoseValid = ev->poseValid;
+                    m_recenterPose      = xrToPose(ev->poseInPreviousSpace);
+                    Log::logger->log(Log::DEBUG, "[OPENXR] reference space change pending (recenter, poseValid={})", (bool)ev->poseValid);
+                }
                 break;
             }
             default: break;
