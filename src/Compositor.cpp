@@ -757,6 +757,12 @@ void CCompositor::initManagers(eManagersInitStage stage) {
 
             Log::logger->log(Log::DEBUG, "Starting XWayland");
             g_pXWayland = makeUnique<CXWayland>(g_pCompositor->m_wantsXwayland);
+
+#ifdef HAVE_OPENXR
+            Log::logger->log(Log::DEBUG, "Creating the OpenXRManager!");
+            g_pOpenXRManager = makeUnique<COpenXRManager>();
+            g_pOpenXRManager->init();
+#endif
         } break;
         default: UNREACHABLE();
     }
