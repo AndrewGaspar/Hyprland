@@ -54,6 +54,11 @@ class COpenXRManager {
     const std::string& runtimeName() const;
     const std::string& systemName() const;
 
+    // Idle-inhibit predicate (doc 05 §6.1). Main thread only. True iff openxr:inhibit_idle is
+    // set AND the session currently has input focus (FOCUSED). CInputManager::recheckIdleInhibitorStatus()
+    // is the sole writer of the inhibit bit; it consults this before its final setInhibit(false).
+    bool               shouldInhibitIdle();
+
     // Monitor create/destroy funnel (main thread). createXRMonitor works in EVERY manager
     // state (including DISABLED) so monitors created without a session become plain headless
     // outputs whose quads bind lazily on start() (doc 02). WP3 exercises this with a single
