@@ -43,15 +43,15 @@ class COpenXRManager {
 
     // Constructed at STAGE_LATE (after XWayland). init() registers the config-reload
     // listeners + the hyprctl command, then honors openxr:enabled on startup.
-    void                init();
+    void init();
 
     // Idempotent main-thread lifecycle methods — all enable/disable paths funnel here.
-    void                start();
-    void                stop();
+    void               start();
+    void               stop();
 
-    eXRManagerState     state() const;
-    const std::string&  runtimeName() const;
-    const std::string&  systemName() const;
+    eXRManagerState    state() const;
+    const std::string& runtimeName() const;
+    const std::string& systemName() const;
 
     // Monitor create/destroy funnel (main thread). createXRMonitor works in EVERY manager
     // state (including DISABLED) so monitors created without a session become plain headless
@@ -60,64 +60,107 @@ class COpenXRManager {
     std::expected<SP<CXRMonitorLayer>, std::string> createXRMonitor(const SXRMonitorParams& params);
     void                                            destroyXRMonitor(const std::string& name);
 
+    // --- IPC verb funnel (main thread). ONE implementation, two transports: the xrmonitor
+    // dispatcher and the hyprctl openxr subcommands both call these (doc 05 §3/§4). Return
+    // empty-expected on success, an error string otherwise. ---
+    std::expected<void, std::string> cmdCreate(const std::string& args);    // runtime-owned monitor
+    std::expected<void, std::string> cmdDestroy(const std::string& target); // <name>|active
+    std::expected<void, std::string> cmdSelect(const std::string& arg);     // <name>|next|prev
+
+    // Snapshot of one XR monitor for `hyprctl openxr status` (doc 05 §4.3). Main thread.
+    struct SXRMonitorInfo {
+        std::string name;
+        int64_t     id = -1;
+        int         w = 0, h = 0; // current pixel mode (normal-format line only)
+        float       refresh    = 0.f;
+        float       sizeMeters = 1.6f;
+        std::string anchorMode = "local";
+        float       posX = 0.f, posY = 0.f, posZ = 0.f;
+        float       quatX = 0.f, quatY = 0.f, quatZ = 0.f, quatW = 1.f;
+        bool        grabbed = false;
+        bool        hovered = false;
+    };
+    std::vector<SXRMonitorInfo> monitorInfos();
+
+    // `hyprctl openxr layout`: paste-ready `xrmonitor = ...` lines for every live XR monitor.
+    std::string layoutDump();
+
+    // Reconcile the declared (`xrmonitor` keyword) set against live layers (doc 05 §2.5). Runs
+    // from onConfigReload() and from init() so declared monitors materialize even while disabled.
+    void reconcileDeclaredMonitors();
+
     // "disabled" | "unavailable" | "starting" | "idle" | "visible" | "focused" | "stopping"
-    static const char*  stateToString(eXRManagerState state);
+    static const char* stateToString(eXRManagerState state);
 
   private:
-    void                setState(eXRManagerState newState);
-    void                onConfigReload();
+    void setState(eXRManagerState newState);
+    void onConfigReload();
 
     // Aborts an in-progress start(), tearing down whatever was created, and lands in
     // UNAVAILABLE. Safe to call at any failure point in start().
-    void                abortStart();
+    void abortStart();
 
     // The XR frame thread body (owns the EGL context + XR frame loop while running).
-    void                frameThread();
+    void frameThread();
 
     // --- layer management ---
     // Frame thread: (re)create a layer's swapchain at the given pixel size. Returns false on
     // failure (leaves m_swapchain == XR_NULL_HANDLE).
-    bool                createLayerSwapchain(CXRMonitorLayer& layer, const Vector2D& size);
+    bool createLayerSwapchain(CXRMonitorLayer& layer, const Vector2D& size);
     // Main thread: bind still-existing layers on start() and drop those whose monitor
     // disappeared while disabled (doc 02 lazy binding).
-    void                bindExistingLayers();
+    void bindExistingLayers();
     // Main thread: destroy all layer frame-side + monitor resources during stop() (path C —
     // no frame thread; barrier not needed). Honors openxr:destroy_monitors_on_stop.
-    void                teardownLayers();
+    void teardownLayers();
     // Frame thread: enqueue a "layer removed" ack + wake main (removal barrier step 2).
-    void                reportLayerRemoved(const std::string& name);
+    void reportLayerRemoved(const std::string& name);
     // Main thread: erase the acked layer + destroy its output (removal barrier step 3).
-    void                finalizeLayerRemoval(const std::string& name);
+    void finalizeLayerRemoval(const std::string& name);
+
+    // --- selection + layer cap (main thread) ---
+    // Resolve the "the" monitor per doc 05 §3.2: explicit selection > last ray-hovered (WP7) >
+    // focused-if-XR. Returns null if none resolves.
+    SP<CXRMonitorLayer> resolveSelected();
+    SP<CXRMonitorLayer> layerByName(const std::string& name);
+    // Recompute m_quadActive under the runtime layer cap (doc 02 recency policy): newest
+    // maxLayerCount quads active, older suspended; posts xrmonitorquad on flips. Under m_layersMu.
+    void recomputeQuadActive();
 
     // --- minimal frame->main session-state channel (WP6 replaces this with the general
     // SPSC + eventfd queue; the interface — reportState()/onFrameChannelReadable() — is
     // shaped so the internals can be swapped without touching callers). ---
-    bool                setupFrameChannel();
-    void                teardownFrameChannel();
-    void                reportState(eXRManagerState s);  // frame thread: enqueue + wake main
-    void                onFrameChannelReadable();        // main thread: drain + apply
+    bool                   setupFrameChannel();
+    void                   teardownFrameChannel();
+    void                   reportState(eXRManagerState s); // frame thread: enqueue + wake main
+    void                   onFrameChannelReadable();       // main thread: drain + apply
 
     static eXRManagerState mapSessionState(int xrSessionState);
 
-    eXRManagerState     m_state = XR_STATE_DISABLED;
-    bool                m_active = false; // derived: state ∈ {visible, focused}
+    eXRManagerState        m_state  = XR_STATE_DISABLED;
+    bool                   m_active = false; // derived: state ∈ {visible, focused}
 
     // Populated from xrInstanceProperties/xrSystemProperties once a session exists.
-    std::string         m_runtimeName;
-    std::string         m_systemName;
+    std::string       m_runtimeName;
+    std::string       m_systemName;
 
-    UP<CXRIpc>          m_ipc;
-    UP<CXRSession>      m_session;
-    UP<CXRGraphics>     m_graphics;
+    UP<CXRIpc>        m_ipc;
+    UP<CXRSession>    m_session;
+    UP<CXRGraphics>   m_graphics;
 
-    std::thread         m_frameThread;
-    std::atomic<bool>   m_running{false};
+    std::thread       m_frameThread;
+    std::atomic<bool> m_running{false};
 
     // XR monitor layers. m_layers is written on the main thread and snapshotted per frame by
     // the frame thread, both under m_layersMu (doc 00 handoff table).
     std::vector<SP<CXRMonitorLayer>> m_layers;
     std::mutex                       m_layersMu;
     uint64_t                         m_seqCounter = 0;
+
+    // Selected-monitor state (doc 05 §3.2). Explicit selection wins; cleared when destroyed.
+    std::string m_selectedMonitor;
+    // WP7 hook: the ray pointer will set this to the last-hovered XR monitor name.
+    std::string m_lastHoveredMonitor;
 
     // Frame->main channel state.
     int                          m_eventFd     = -1;
@@ -127,8 +170,8 @@ class COpenXRManager {
     std::vector<std::string>     m_removedLayerNames; // frame->main layer-removed acks
     std::atomic<bool>            m_frameRequestedTeardown{false};
 
-    CHyprSignalListener m_configReloadListener;
-    CHyprSignalListener m_propsRefreshedListener;
+    CHyprSignalListener          m_configReloadListener;
+    CHyprSignalListener          m_propsRefreshedListener;
 };
 
 inline UP<COpenXRManager> g_pOpenXRManager;

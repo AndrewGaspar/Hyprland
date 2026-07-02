@@ -13,7 +13,8 @@
 #include <string>
 #include <vector>
 
-#include "XRGraphics.hpp" // XR_GLuint / XR_EGLImageKHR aliases + CXRGraphics
+#include "XRGraphics.hpp"      // XR_GLuint / XR_EGLImageKHR aliases + CXRGraphics
+#include "XRMonitorConfig.hpp" // SXRMonitorParams / OpenXR::SXRAnchorSpec (unguarded)
 #include "../helpers/memory/Memory.hpp"
 #include "../helpers/signal/Signal.hpp"
 #include "../helpers/math/Math.hpp"
@@ -36,18 +37,18 @@ class CXRMonitorLayer {
     // Connect the headless CMonitor: cache the weak ref + wire the presented/modeChanged/
     // destroy listeners. onGone is invoked (main thread) when the monitor is externally
     // destroyed so the manager can run the removal barrier.
-    void                    bindToMonitor(PHLMONITOR mon, std::function<void()> onGone);
+    void bindToMonitor(PHLMONITOR mon, std::function<void()> onGone);
     // Stop queueing new buffers/mode changes (removal barrier step 1).
-    void                    stopMainListeners();
+    void stopMainListeners();
 
     // ---- frame thread ----
     // Grab the latest presented buffer, if any (nulls m_haveNewFrame). Returns null when no
     // new frame is pending.
     SP<Aquamarine::IBuffer> takeLatestBuffer();
     // Delete per-layer GL objects (m_lastEGLImg, m_cpuTex). REQUIRES the EGL context current.
-    void                    destroyFrameResourcesGL(CXRGraphics& gfx);
+    void destroyFrameResourcesGL(CXRGraphics& gfx);
     // Destroy the XrSwapchain. REQUIRES the context NOT current (interop rule, doc 01).
-    void                    destroySwapchain();
+    void destroySwapchain();
 
     // ---- main thread ----
     std::string         m_monitorName;         // key; survives monitor teardown
@@ -57,14 +58,23 @@ class CXRMonitorLayer {
     CHyprSignalListener m_destroyListener;     // mon->m_events.destroy (external destroy)
     bool                m_createdByXR = true;  // false for xrmonitor-adopted pre-existing outputs
 
+    // WP4 lifecycle/state (main thread, under COpenXRManager::m_layersMu):
+    // m_declaredByConfig == true iff this monitor came from an `xrmonitor` keyword. Only these
+    // are touched by reload reconciliation (doc 05 §2.5); runtime-created ones are left alone.
+    bool                    m_declaredByConfig = false;
+    OpenXR::SXRAnchorSpec   m_anchorSpec;      // parsed anchor (WP5 makes it live; WP4 static pose)
+    std::optional<Vector2D> m_reqResolution;   // last requested pixel mode (for reconcile diff)
+    std::optional<float>    m_reqRefresh;      // last requested refresh (for reconcile diff)
+    bool                    m_hovered = false; // last ray-hovered (WP7 sets this; status field)
+
     // ---- main -> frame handoff (doc 00 table) ----
     std::mutex              m_bufMu;
-    SP<Aquamarine::IBuffer> m_latestBuffer;             // written under m_bufMu on presented
-    Vector2D                m_pendingSize;              // written under m_bufMu on mode change
-    std::atomic<bool>       m_haveNewFrame{false};      // release-store after buffer write
-    std::atomic<bool>       m_swapchainDirty{false};    // set on mode change / (re)bind
-    std::atomic<bool>       m_pendingRemoval{false};    // removal barrier flag
-    std::atomic<bool>       m_removalAcked{false};      // frame thread acked removal once
+    SP<Aquamarine::IBuffer> m_latestBuffer;          // written under m_bufMu on presented
+    Vector2D                m_pendingSize;           // written under m_bufMu on mode change
+    std::atomic<bool>       m_haveNewFrame{false};   // release-store after buffer write
+    std::atomic<bool>       m_swapchainDirty{false}; // set on mode change / (re)bind
+    std::atomic<bool>       m_pendingRemoval{false}; // removal barrier flag
+    std::atomic<bool>       m_removalAcked{false};   // frame thread acked removal once
 
     // ---- quad params: main writes under COpenXRManager::m_layersMu, frame copies per frame ----
     float    m_sizeMeters = 1.6f; // quad width (m); height = width * pxH/pxW
@@ -73,10 +83,10 @@ class CXRMonitorLayer {
 
     // ---- frame thread only ----
     XrSwapchain           m_swapchain = XR_NULL_HANDLE;
-    std::vector<uint32_t> m_swapchainImages; // GLuints from XrSwapchainImageOpenGLESKHR
-    Vector2D              m_swapchainSize;    // size the swapchain was created at
-    XR_GLuint             m_cpuTex     = 0;   // CPU-fallback staging tex, sized to mode
-    Vector2D              m_cpuTexSize;       // size m_cpuTex was allocated at
+    std::vector<uint32_t> m_swapchainImages;      // GLuints from XrSwapchainImageOpenGLESKHR
+    Vector2D              m_swapchainSize;        // size the swapchain was created at
+    XR_GLuint             m_cpuTex = 0;           // CPU-fallback staging tex, sized to mode
+    Vector2D              m_cpuTexSize;           // size m_cpuTex was allocated at
     XR_EGLImageKHR        m_lastEGLImg = nullptr; // last dmabuf EGLImage (destroyed on next blit)
     bool                  m_hasContent = false;   // at least one successful blit since (re)create
     bool                  m_quadActive = true;    // false while suspended by the layer cap
