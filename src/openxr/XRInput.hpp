@@ -19,6 +19,7 @@
 #include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 
 #include "XRQueue.hpp"
 #include "XRMath.hpp"               // OpenXR::SXRPose
@@ -66,6 +67,37 @@ using XRQueueItem = std::variant<SXRInputEvent, SXRStateEvent>;
 constexpr size_t XR_QUEUE_CAP = 1024; // doc 04 §7.2 (power of two)
 using CXRQueue                = OpenXR::CXRSPSCRing<XRQueueItem, XR_QUEUE_CAP>;
 
+// ---- constants introduced by doc 04 §12 (the ones WP7 uses) ----
+constexpr float XR_STICK_DEADZONE = 0.1F;  // §5: thumbstick deadzone
+constexpr float XR_SCROLL_NOTCH   = 15.0F; // §5: wl axis units per full stick deflection / frame
+constexpr float XR_UV_EPSILON     = 1e-4F; // §3: motion coalescing threshold
+
+// A visible quad the ray pointer can hit, supplied by the frame loop each frame after the anchor
+// solve (doc 04 §3). worldPose is the SOLVED quad pose expressed in the SAME reference frame as
+// the sampled aim poses (device/grip-locked quads pass their world-composed pose).
+struct SXRPointerTarget {
+    MONITORID       id = -1;
+    OpenXR::SXRPose worldPose;
+    float           w = 0.F; // width in meters
+    float           h = 0.F; // height in meters
+};
+
+// Schmitt trigger for analog buttons (doc 04 §4). update() returns true on an edge.
+struct SXRSchmitt {
+    bool state = false;
+    bool update(float v, float on, float off) {
+        if (!state && v >= on) {
+            state = true;
+            return true;
+        }
+        if (state && v <= off) {
+            state = false;
+            return true;
+        }
+        return false;
+    }
+};
+
 // Per-hand sampled action state, produced each frame by sample() and read by the frame loop
 // (anchor solve grip poses now; ray cast / hysteresis / grab in WP7/WP8).
 struct SXRHandState {
@@ -94,8 +126,15 @@ class CXRInput {
     void destroy();
 
     // Frame thread. xrSyncActions + per-hand pose/analog sampling at predictedDisplayTime,
-    // locating aim/grip in refSpace. Emits WP6 instrumentation input events across the queue.
+    // locating aim/grip in refSpace. Snapshots per-hand state into m_hands; the ray cast +
+    // event emission happens in processPointer() once the frame loop has solved the quad poses.
     void sample(XrTime predictedDisplayTime, XrSpace refSpace);
+
+    // Frame thread. Ray-cast every non-grabbing hand's aim pose against the solved quad targets,
+    // resolve hover + the single-pointer owner (doc 04 §3), run the select/menu hysteresis (§4)
+    // and scroll (§5), and emit MOTION_ABS / BUTTON / AXIS / FRAME across the frame->main queue.
+    // Called once per frame after the anchor solve. `timeMs` is the sample-time stamp.
+    void processPointer(const std::vector<SXRPointerTarget>& targets, uint32_t timeMs);
 
     // Frame-thread reads of the latest sample:
     const SXRHandState& hand(OpenXR::eXRHand h) const {
@@ -120,6 +159,9 @@ class CXRInput {
     bool                             suggestBindings();
     bool                             createActionSpaces();
     void                             logInteractionProfileOnce();
+    // Fire-and-forget haptic tick on a hand (doc 04 §6.3). No-op / ignored if the current
+    // profile has no haptic binding.
+    void                             hapticTick(OpenXR::eXRHand hand);
 
     std::function<void(XRQueueItem)> m_emit;
 
@@ -144,9 +186,22 @@ class CXRInput {
 
     bool                             m_attached      = false;
     bool                             m_profileLogged = false; // interaction profile logged once for debuggability
-    // WP6 instrumentation: a per-hand Schmitt trigger on select, proving action state crosses the
-    // frame->main queue (the real pointer hysteresis + ray cast lands in WP7).
-    std::array<bool, 2> m_selectPressed{false, false};
+
+    // ---- ray pointer state (frame thread, doc 04 §3-§5) ----
+    std::array<SXRSchmitt, 2> m_selectTrig; // per-hand select hysteresis
+    std::array<SXRSchmitt, 2> m_menuTrig;   // per-hand menu press/release (bool via 0.5/0.5)
+    std::array<MONITORID, 2>  m_hoverMon{-1, -1}; // current ray-hit monitor per hand (-1 = none)
+    std::array<Vector2D, 2>   m_hoverUV;          // current ray-hit uv per hand
+    // WP8 hook: while a hand grabs, it casts no ray, drives no pointer, and its stick feeds the
+    // grab machine instead of scroll (doc 04 §2/§6). Always false in WP7 — the grab machine lands
+    // in WP8, which flips these.
+    std::array<bool, 2> m_grabbing{false, false};
+
+    int       m_owner      = -1; // hand that owns the single pointer (-1 = none)
+    MONITORID m_emittedMon = -1; // last MOTION_ABS monitor emitted (coalescing, -1 = hover clear)
+    Vector2D  m_emittedUV;       // last MOTION_ABS uv emitted
+    int       m_leftHolder  = -1; // hand currently holding BTN_LEFT  (single pointer, -1 = none)
+    int       m_rightHolder = -1; // hand currently holding BTN_RIGHT (single pointer, -1 = none)
 };
 
 #endif // HAVE_OPENXR
