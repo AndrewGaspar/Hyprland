@@ -825,9 +825,19 @@ static SDispatchResult xrmonitorDispatch(const std::string& args) {
     if (verb == "select")
         return wrapExp(g_pOpenXRManager->cmdSelect(rest));
 
-    // Pose-mutation verbs land in WP5 (anchoring engine).
-    if (verb == "anchor" || verb == "move" || verb == "rotate" || verb == "scale" || verb == "distance" || verb == "center")
-        return {.success = false, .error = "xrmonitor " + verb + ": not implemented until WP5"};
+    // Pose-mutation verbs (WP5, doc 03 §5 / doc 05 §3.1).
+    if (verb == "anchor")
+        return wrapExp(g_pOpenXRManager->cmdAnchor(rest));
+    if (verb == "move")
+        return wrapExp(g_pOpenXRManager->cmdMove(rest));
+    if (verb == "rotate")
+        return wrapExp(g_pOpenXRManager->cmdRotate(rest));
+    if (verb == "scale")
+        return wrapExp(g_pOpenXRManager->cmdScale(rest));
+    if (verb == "distance")
+        return wrapExp(g_pOpenXRManager->cmdDistance(rest));
+    if (verb == "center")
+        return wrapExp(g_pOpenXRManager->cmdCenter());
 
     return {.success = false, .error = "unknown xrmonitor verb '" + verb + "'"};
 #endif
