@@ -18,6 +18,8 @@
 #include "../Compositor.hpp"
 #include "../render/OpenGL.hpp"
 #include "../debug/log/Logger.hpp"
+#include "XRMonitorLayer.hpp"
+#include <aquamarine/buffer/Buffer.hpp>
 
 // EGL/GL extension procs — loaded once in initEGL. Kept at file scope (the WIP pattern);
 // the per-layer DMA-BUF blit that consumes them lands in WP3.
@@ -310,6 +312,132 @@ bool CXRGraphics::initBlitGL() {
 
     Log::logger->log(Log::DEBUG, "[OPENXR] blit GL resources initialized");
     return true;
+}
+
+void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer& layer, XR_GLuint dstTex) {
+    const int dstW = (int)layer.m_swapchainSize.x;
+    const int dstH = (int)layer.m_swapchainSize.y;
+
+    // --- 1. DMA-BUF path (primary) ---
+    auto dmab = buf->dmabuf();
+    if (dmab.success && s_eglCreateImage && s_eglDestroyImage && s_glImageTarget2D) {
+        // Destroy the layer's previous EGLImage first (per-layer so removal teardown is
+        // self-contained).
+        if (layer.m_lastEGLImg != nullptr) {
+            s_eglDestroyImage(m_eglDisplay, layer.m_lastEGLImg);
+            layer.m_lastEGLImg = nullptr;
+        }
+
+        std::vector<EGLint> attribs = {
+            EGL_WIDTH,
+            (EGLint)buf->size.x,
+            EGL_HEIGHT,
+            (EGLint)buf->size.y,
+            EGL_LINUX_DRM_FOURCC_EXT,
+            (EGLint)dmab.format,
+            EGL_DMA_BUF_PLANE0_FD_EXT,
+            dmab.fds[0],
+            EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+            (EGLint)dmab.offsets[0],
+            EGL_DMA_BUF_PLANE0_PITCH_EXT,
+            (EGLint)dmab.strides[0],
+        };
+        if (dmab.planes > 1) {
+            const EGLenum pfd[]  = {EGL_DMA_BUF_PLANE1_FD_EXT, EGL_DMA_BUF_PLANE2_FD_EXT};
+            const EGLenum poff[] = {EGL_DMA_BUF_PLANE1_OFFSET_EXT, EGL_DMA_BUF_PLANE2_OFFSET_EXT};
+            const EGLenum ppit[] = {EGL_DMA_BUF_PLANE1_PITCH_EXT, EGL_DMA_BUF_PLANE2_PITCH_EXT};
+            for (int p = 1; p < dmab.planes && p < 3; p++) {
+                attribs.push_back(pfd[p - 1]);
+                attribs.push_back(dmab.fds[p]);
+                attribs.push_back(poff[p - 1]);
+                attribs.push_back((EGLint)dmab.offsets[p]);
+                attribs.push_back(ppit[p - 1]);
+                attribs.push_back((EGLint)dmab.strides[p]);
+            }
+        }
+        attribs.push_back(EGL_NONE);
+
+        layer.m_lastEGLImg = s_eglCreateImage(m_eglDisplay, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attribs.data());
+        if (layer.m_lastEGLImg != nullptr) {
+            glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_extTex);
+            s_glImageTarget2D(GL_TEXTURE_EXTERNAL_OES, (GLeglImageOES)layer.m_lastEGLImg);
+
+            GLuint fbo = 0;
+            glGenFramebuffers(1, &fbo);
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
+            glViewport(0, 0, (GLsizei)dstW, (GLsizei)dstH);
+
+            glUseProgram(m_blitProg);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_extTex);
+            glUniform1i(glGetUniformLocation(m_blitProg, "uTex"), 0);
+            glBindVertexArray(m_blitVAO);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            glBindVertexArray(0);
+            glDeleteFramebuffers(1, &fbo);
+            return;
+        }
+        Log::logger->log(Log::WARN, "[OPENXR] eglCreateImageKHR failed (0x{:x}), falling back to CPU path", (unsigned)eglGetError());
+    }
+
+    // --- 2. CPU data-pointer fallback ---
+    if (buf->caps() & Aquamarine::BUFFER_CAPABILITY_DATAPTR) {
+        auto [data, stride, size] = buf->beginDataPtr(0);
+        if (data) {
+            // Allocate/realloc the per-layer staging texture at the ACTUAL source mode (the
+            // WIP hard-coded 1920x1080 here, corrupting any other mode — doc 01 fix).
+            if (layer.m_cpuTex == 0 || layer.m_cpuTexSize != buf->size) {
+                if (layer.m_cpuTex == 0)
+                    glGenTextures(1, &layer.m_cpuTex);
+                glBindTexture(GL_TEXTURE_2D, layer.m_cpuTex);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)buf->size.x, (GLsizei)buf->size.y, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                layer.m_cpuTexSize = buf->size;
+            }
+
+            glBindTexture(GL_TEXTURE_2D, layer.m_cpuTex);
+            // DRM_FORMAT_XRGB8888 is BGRX in memory; GL_BGRA_EXT swaps to RGBA correctly.
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)buf->size.x, (GLsizei)buf->size.y, GL_BGRA_EXT, GL_UNSIGNED_BYTE, data);
+            buf->endDataPtr();
+
+            GLuint srcFBO = 0, dstFBO = 0;
+            glGenFramebuffers(1, &srcFBO);
+            glGenFramebuffers(1, &dstFBO);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, srcFBO);
+            glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, layer.m_cpuTex, 0);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dstFBO);
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
+            glBlitFramebuffer(0, 0, (GLint)buf->size.x, (GLint)buf->size.y, 0, 0, dstW, dstH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+            glDeleteFramebuffers(1, &srcFBO);
+            glDeleteFramebuffers(1, &dstFBO);
+            return;
+        }
+    }
+
+    // --- 3. Clear fallback (black in production; WIP used cyan as a debug sentinel) ---
+    clearTex(dstTex, layer.m_swapchainSize, 0.0f, 0.0f, 0.0f);
+}
+
+void CXRGraphics::clearTex(XR_GLuint dstTex, const Vector2D& size, float r, float g, float b) {
+    GLuint fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
+    glViewport(0, 0, (GLsizei)size.x, (GLsizei)size.y);
+    glClearColor(r, g, b, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDeleteFramebuffers(1, &fbo);
+}
+
+void CXRGraphics::destroyLayerGL(XR_EGLImageKHR img, XR_GLuint cpuTex) {
+    if (img != nullptr && s_eglDestroyImage)
+        s_eglDestroyImage(m_eglDisplay, img);
+    if (cpuTex) {
+        GLuint t = cpuTex;
+        glDeleteTextures(1, &t);
+    }
 }
 
 void CXRGraphics::destroyGL() {
