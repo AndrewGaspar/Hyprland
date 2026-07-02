@@ -59,6 +59,15 @@ void CInputManager::recheckIdleInhibitorStatus() {
         }
     }
 
+#ifdef HAVE_OPENXR
+    // Inhibit while a focused XR session asks for it (doc 05 §6). This is the only writer of the
+    // inhibit bit, so the XR module raises it here rather than calling setInhibit() itself.
+    if (g_pOpenXRManager && g_pOpenXRManager->shouldInhibitIdle()) {
+        PROTO::idle->setInhibit(true);
+        return;
+    }
+#endif
+
     PROTO::idle->setInhibit(false);
 }
 
