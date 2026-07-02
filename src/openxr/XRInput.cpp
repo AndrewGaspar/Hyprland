@@ -334,10 +334,10 @@ void CXRInput::sample(XrTime predictedDisplayTime, XrSpace refSpace) {
 void CXRInput::hapticTick(OpenXR::eXRHand hand) {
     if (m_hapticAction == XR_NULL_HANDLE)
         return;
-    XrHapticVibration vib = {XR_TYPE_HAPTIC_VIBRATION};
-    vib.duration          = 10'000'000; // XR_HAPTIC_TICK_NS = 10 ms (doc 04 §6.3)
-    vib.frequency         = XR_FREQUENCY_UNSPECIFIED;
-    vib.amplitude         = 0.5f;
+    XrHapticVibration vib  = {XR_TYPE_HAPTIC_VIBRATION};
+    vib.duration           = 10'000'000; // XR_HAPTIC_TICK_NS = 10 ms (doc 04 §6.3)
+    vib.frequency          = XR_FREQUENCY_UNSPECIFIED;
+    vib.amplitude          = 0.5f;
     XrHapticActionInfo hai = {XR_TYPE_HAPTIC_ACTION_INFO};
     hai.action             = m_hapticAction;
     hai.subactionPath      = m_handPath[hand];
@@ -345,23 +345,50 @@ void CXRInput::hapticTick(OpenXR::eXRHand hand) {
     xrApplyHapticFeedback(m_session, &hai, reinterpret_cast<const XrHapticBaseHeader*>(&vib));
 }
 
-void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint32_t timeMs) {
+void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint32_t timeMs, const OpenXR::SXRSolveInput& solveIn, const OpenXR::SXRAnchorTuning& tune) {
     if (!m_emit)
         return;
 
     static auto PSELON      = CConfigValue<Hyprlang::FLOAT>("openxr:pointer_trigger_threshold");
     static auto PSELOFF     = CConfigValue<Hyprlang::FLOAT>("openxr:pointer_trigger_threshold_release");
+    static auto PGRABON     = CConfigValue<Hyprlang::FLOAT>("openxr:grab_threshold");
+    static auto PGRABOFF    = CConfigValue<Hyprlang::FLOAT>("openxr:grab_threshold_release");
     static auto PSCROLLSPD  = CConfigValue<Hyprlang::FLOAT>("openxr:scroll_speed");
     const float onT         = (float)*PSELON;
     const float offT        = (float)*PSELOFF;
+    const float grabOnT     = (float)*PGRABON;
+    const float grabOffT    = (float)*PGRABOFF;
     const float scrollSpeed = (float)*PSCROLLSPD;
 
     bool        emittedAny = false;
 
-    auto        emit       = [&](SXRInputEvent ev) {
+    auto        emit = [&](SXRInputEvent ev) {
         ev.timeMs = timeMs;
         m_emit(ev);
         emittedAny = true;
+    };
+
+    auto emitGrabState = [&](MONITORID id, const std::string& name, bool begin) {
+        SXRStateEvent ev;
+        ev.type      = eXRStateEventType::GRAB;
+        ev.monitorID = id;
+        ev.a         = begin ? 1 : 0;
+        ev.str       = name;
+        m_emit(ev);
+    };
+
+    // Ray-plane parameter t only (no bounds test) — used by the §6 cone-forgiveness pass to size
+    // the slack (tan(cone) * t) before re-testing bounds with rayQuadIntersect.
+    auto planeT = [](const OpenXR::SXRPose& Q, const OpenXR::Vec3& o, const OpenXR::Vec3& d) -> std::optional<float> {
+        const OpenXR::Quat qi = OpenXR::qInverse(Q.rot);
+        const OpenXR::Vec3 lo = OpenXR::qRotate(qi, o - Q.pos);
+        const OpenXR::Vec3 ld = OpenXR::qRotate(qi, d);
+        if (std::fabs(ld.z) < 1e-6F)
+            return std::nullopt;
+        const float t = -lo.z / ld.z;
+        if (t <= 0.F)
+            return std::nullopt;
+        return t;
     };
 
     // 1. Ray cast per hand: nearest-t hit across all targets wins (occlusion). A grabbing hand
@@ -374,7 +401,7 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
             const OpenXR::Vec3     origin = aim.pos;
             const OpenXR::Vec3     dir    = OpenXR::qRotate(aim.rot, OpenXR::Vec3{0.f, 0.f, -1.f});
 
-            float bestT = std::numeric_limits<float>::max();
+            float                  bestT = std::numeric_limits<float>::max();
             for (const auto& t : targets) {
                 const OpenXR::SXRQuadHit hit = OpenXR::rayQuadIntersect(t.worldPose, origin, dir, t.w, t.h);
                 if (hit.hit && hit.t < bestT) {
@@ -387,11 +414,104 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
 
         if (newMon != m_hoverMon[hand]) {
             m_owner = hand; // hover change owns the pointer (§3)
-            Log::logger->log(Log::DEBUG, "[OPENXR] hand {} hover {} -> {} (uv {:.3f},{:.3f})", hand == XR_HAND_LEFT ? "L" : "R", (long long)m_hoverMon[hand], (long long)newMon, newUV.x,
-                             newUV.y);
+            Log::logger->log(Log::DEBUG, "[OPENXR] hand {} hover {} -> {} (uv {:.3f},{:.3f})", hand == XR_HAND_LEFT ? "L" : "R", (long long)m_hoverMon[hand], (long long)newMon,
+                             newUV.x, newUV.y);
         }
         m_hoverMon[hand] = newMon;
         m_hoverUV[hand]  = newUV;
+    }
+
+    // 2. Grab state machine (doc 04 §6 / doc 03 §4). Uses this frame's just-updated hover (step
+    //    1) to decide grab entry, and re-resolves the grabbed target by id every frame (a target
+    //    vanishing mid-grab means its monitor was destroyed -> force release, no re-anchor).
+    for (auto hand : {XR_HAND_LEFT, XR_HAND_RIGHT}) {
+        const std::optional<OpenXR::SXRPose>& worldGrip = hand == XR_HAND_LEFT ? solveIn.gripLeft : solveIn.gripRight;
+
+        if (m_grabTrig[hand].update(m_hands[hand].grab, grabOnT, grabOffT)) {
+            if (m_grabTrig[hand].state) {
+                // Rising edge: try to begin a grab on the hovered quad, or (if hovering nothing)
+                // redo the intersection with the 5-degree entry cone (doc 04 §6).
+                const SXRPointerTarget* target = nullptr;
+                if (m_hoverMon[hand] >= 0) {
+                    for (const auto& t : targets)
+                        if (t.id == m_hoverMon[hand]) {
+                            target = &t;
+                            break;
+                        }
+                }
+                if (!target && m_hands[hand].aim) {
+                    const OpenXR::SXRPose&  aim    = *m_hands[hand].aim;
+                    const OpenXR::Vec3      origin = aim.pos;
+                    const OpenXR::Vec3      dir    = OpenXR::qRotate(aim.rot, OpenXR::Vec3{0.f, 0.f, -1.f});
+                    float                   bestT  = std::numeric_limits<float>::max();
+                    const SXRPointerTarget* best   = nullptr;
+                    for (const auto& t : targets) {
+                        const auto pt = planeT(t.worldPose, origin, dir);
+                        if (!pt)
+                            continue;
+                        const float              slack = std::tan(XR_GRAB_CONE_DEG * (float)M_PI / 180.F) * (*pt);
+                        const OpenXR::SXRQuadHit hit   = OpenXR::rayQuadIntersect(t.worldPose, origin, dir, t.w, t.h, slack);
+                        if (hit.hit && hit.t < bestT) {
+                            bestT = hit.t;
+                            best  = &t;
+                        }
+                    }
+                    target = best;
+                }
+
+                if (target && target->anchor && !target->anchor->grabbed() && worldGrip) {
+                    target->anchor->beginGrab(hand, *worldGrip);
+                    m_grabbing[hand]       = true;
+                    m_grabbedMon[hand]     = target->id;
+                    m_grabbedMonName[hand] = target->name;
+                    if (m_owner == (int)hand)
+                        m_owner = -1; // pointer ownership free-for-take by the other hand (§6)
+                    hapticTick(hand);
+                    emitGrabState(target->id, target->name, true);
+                }
+                // else: no target even with cone forgiveness, or it's already grabbed by the
+                // other hand -> the squeeze is ignored, no state change (doc 04 §6).
+            } else if (m_grabbing[hand]) {
+                // Falling edge: end the grab and re-anchor into the persistent mode.
+                const SXRPointerTarget* target = nullptr;
+                for (const auto& t : targets)
+                    if (t.id == m_grabbedMon[hand]) {
+                        target = &t;
+                        break;
+                    }
+                if (target && target->anchor)
+                    target->anchor->endGrab(solveIn, tune);
+                // else: the layer is gone (destroyed mid-grab) -> force release, no re-anchor.
+                hapticTick(hand);
+                emitGrabState(m_grabbedMon[hand], m_grabbedMonName[hand], false);
+                m_grabbing[hand]   = false;
+                m_grabbedMon[hand] = -1;
+                m_grabbedMonName[hand].clear();
+            }
+        }
+
+        // While grabbed (every frame, incl. the frame a grab just began): thumbstick push/pull +
+        // resize, and a liveness check (monitor destroyed mid-grab -> force release, doc 04 §6).
+        if (m_grabbing[hand]) {
+            const SXRPointerTarget* target = nullptr;
+            for (const auto& t : targets)
+                if (t.id == m_grabbedMon[hand]) {
+                    target = &t;
+                    break;
+                }
+            if (!target || !target->anchor) {
+                emitGrabState(m_grabbedMon[hand], m_grabbedMonName[hand], false);
+                m_grabbing[hand]   = false;
+                m_grabbedMon[hand] = -1;
+                m_grabbedMonName[hand].clear();
+            } else {
+                const Vector2D stick = m_hands[hand].stick;
+                if (std::fabs(stick.y) > XR_STICK_DEADZONE)
+                    target->anchor->grabPushPull(stick.y * XR_GRAB_PUSHPULL_SPEED * solveIn.dt);
+                if (std::fabs(stick.x) > XR_STICK_DEADZONE)
+                    target->anchor->grabResize(stick.x * XR_GRAB_RESIZE_SPEED * solveIn.dt);
+            }
+        }
     }
 
     // MOTION_ABS for the owner, coalesced on (monitor, uv). monitorID == -1 signals the ray left
@@ -423,7 +543,7 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
 
     emitOwnerMotion();
 
-    // 2. Select + menu edges per hand. A press transfers ownership and (single pointer) is only
+    // 3. Select + menu edges per hand. A press transfers ownership and (single pointer) is only
     //    honored when no other hand already holds that button; a release always closes its own
     //    press so the button can never stick.
     for (auto hand : {XR_HAND_LEFT, XR_HAND_RIGHT}) {
@@ -482,7 +602,7 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
         }
     }
 
-    // 3. Scroll: only the owner hand, only while hovering (not grabbing). Thumbstick -> axis,
+    // 4. Scroll: only the owner hand, only while hovering (not grabbing). Thumbstick -> axis,
     //    one wheel notch per full deflection per frame batch (doc 04 §5).
     if (m_owner >= 0 && !m_grabbing[m_owner] && m_hoverMon[m_owner] >= 0) {
         const Vector2D stick = m_hands[m_owner].stick;
@@ -502,7 +622,7 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
         }
     }
 
-    // 4. Terminate the batch with a FRAME event (§5/§7) only when something was queued, so an
+    // 5. Terminate the batch with a FRAME event (§5/§7) only when something was queued, so an
     //    idle session adds zero wakeups.
     if (emittedAny) {
         SXRInputEvent frame;

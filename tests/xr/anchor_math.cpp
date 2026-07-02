@@ -487,3 +487,66 @@ TEST(XRAnchorMath, ReferenceSpaceChange) {
         EXPECT_NEAR(a.state().bodyHeight, expected, 1e-5f);
     }
 }
+
+// 13 (WP8 extension) ----------------------------------------------------------------------------
+// grabPushPull / grabResize (doc 03 §4.3, driven by the doc 04 §6 grab machine's thumbstick
+// handling): distance clamp 0.3-5.0 m, width clamp 0.2-4.0 m, direction preserved.
+TEST(XRAnchorMath, GrabPushPullResizeClamps) {
+    const auto     tune = defaultTuning();
+    const SXRPose  view{{0, 1.5f, 0}, Quat{}};
+    const SXRPose  grip{{0, 1.2f, -0.3f}, Quat{}};
+
+    CXRAnchor      a;
+    SXRAnchorState st;
+    st.mode           = XR_ANCHOR_LOCAL;
+    st.anchorPose.pos = Vec3{0.f, 1.4f, -1.0f}; // 1.0 m in front of the grip along -Z
+    st.widthMeters    = 1.6f;
+    a.initFromState(st);
+
+    SXRSolveInput in = viewInput(view);
+    in.gripLeft      = grip;
+
+    const SXRPose world0 = a.solve(in, tune).worldPose;
+    a.beginGrab(XR_HAND_LEFT, grip);
+
+    // grip -> quad offset direction should be preserved through push/pull.
+    const Vec3 dir0 = (world0.pos - grip.pos).normalized();
+
+    // Push far past the max: clamps at 5.0 m from the grip.
+    a.grabPushPull(100.f);
+    {
+        const SXRPose w = a.solve(in, tune).worldPose;
+        EXPECT_NEAR((w.pos - grip.pos).length(), 5.0f, 1e-4f);
+        expectVecNear((w.pos - grip.pos).normalized(), dir0, 1e-4f);
+    }
+
+    // Pull far past the min: clamps at 0.3 m from the grip.
+    a.grabPushPull(-100.f);
+    {
+        const SXRPose w = a.solve(in, tune).worldPose;
+        EXPECT_NEAR((w.pos - grip.pos).length(), 0.3f, 1e-4f);
+        expectVecNear((w.pos - grip.pos).normalized(), dir0, 1e-4f);
+    }
+
+    // A small, in-range push moves the distance by exactly the delta.
+    a.grabResize(0.f); // no-op sanity: width unaffected by push/pull
+    const float distBefore = (a.solve(in, tune).worldPose.pos - grip.pos).length();
+    a.grabPushPull(0.2f);
+    EXPECT_NEAR((a.solve(in, tune).worldPose.pos - grip.pos).length(), distBefore + 0.2f, 1e-4f);
+
+    // grabResize: width clamps at 4.0 m / 0.2 m, unaffected by push/pull state.
+    a.grabResize(100.f);
+    EXPECT_NEAR(a.state().widthMeters, 4.0f, 1e-4f);
+    a.grabResize(-100.f);
+    EXPECT_NEAR(a.state().widthMeters, 0.2f, 1e-4f);
+    a.grabResize(0.5f);
+    EXPECT_NEAR(a.state().widthMeters, 0.7f, 1e-4f);
+
+    // endGrab re-anchors LOCAL to the final grabbed world pose (round trip already covered by
+    // GrabRoundTripIdentity; here just check the mode stays LOCAL and the pose matches solve()'s
+    // last grabbed world pose).
+    const SXRPose lastGrabbedWorld = a.solve(in, tune).worldPose;
+    a.endGrab(in, tune);
+    EXPECT_EQ(a.state().mode, XR_ANCHOR_LOCAL);
+    expectVecNear(a.state().anchorPose.pos, lastGrabbedWorld.pos, 1e-4f);
+}
