@@ -17,6 +17,9 @@
 #include <cstring>
 #include <cstdint>
 #include <chrono>
+#include <cmath>
+#include <format>
+#include <ranges>
 
 #include <sys/eventfd.h>
 #include <unistd.h>
@@ -35,8 +38,10 @@
 #include "../managers/input/InputManager.hpp"
 #include "../output/Monitor.hpp"
 #include "../state/MonitorState.hpp"
+#include "../desktop/state/FocusState.hpp"
 #include "../config/shared/monitor/MonitorRuleManager.hpp"
 #include "../config/shared/monitor/MonitorRule.hpp"
+#include "../config/legacy/ConfigManager.hpp"
 
 #include <aquamarine/backend/Backend.hpp>
 #include <aquamarine/backend/Headless.hpp>
@@ -59,6 +64,11 @@ void COpenXRManager::init() {
     // a full reload, so listen to both; onConfigReload() is idempotent.
     m_configReloadListener   = Event::bus()->m_events.config.reloaded.listen([this] { onConfigReload(); });
     m_propsRefreshedListener = Event::bus()->m_events.config.props_refreshed.listen([this] { onConfigReload(); });
+
+    // Materialize any monitors declared in the config as plain headless outputs (doc 02 lazy
+    // binding). Their quads bind when a session later starts. Done before start() so start()'s
+    // bindExistingLayers() picks them up.
+    reconcileDeclaredMonitors();
 
     // Honor openxr:enabled at startup.
     static auto PENABLED = CConfigValue<Hyprlang::INT>("openxr:enabled");
@@ -184,23 +194,17 @@ void COpenXRManager::start() {
         return;
     }
 
-    m_running = true;
+    m_running     = true;
     m_frameThread = std::thread([this] { frameThread(); });
 
     setState(XR_STATE_RUNNING_IDLE);
     Log::logger->log(Log::DEBUG, "[OPENXR] session up (runtime: {}, system: {}), frame thread started", m_runtimeName, m_systemName);
 
-    // WP3: create one hard-coded test monitor so a live quad is submitted end-to-end. The
-    // full create funnel (config keyword / dispatcher / hyprctl) is WP4; this exercises the
-    // same createXRMonitor path with fixed params.
-    if (m_layers.empty()) {
-        SXRMonitorParams params;
-        params.m_name       = "XR-1";
-        params.m_resolution = Vector2D{1920, 1080};
-        auto res            = createXRMonitor(params);
-        if (!res)
-            Log::logger->log(Log::WARN, "[OPENXR] WP3 test monitor create failed: {}", res.error());
-    }
+    // Monitors now come only from the config keyword / dispatcher / hyprctl (WP4). Any monitors
+    // declared/created while disabled were already materialized as headless outputs and bound
+    // above (bindExistingLayers); create any declared-but-missing ones now that a session is up.
+    reconcileDeclaredMonitors();
+    recomputeQuadActive();
 }
 
 void COpenXRManager::abortStart() {
@@ -326,15 +330,15 @@ void COpenXRManager::reportState(eXRManagerState s) {
         m_pendingStates.push_back(s);
     }
     if (m_eventFd >= 0) {
-        const uint64_t one = 1;
-        [[maybe_unused]] auto _ = write(m_eventFd, &one, sizeof(one));
+        const uint64_t        one = 1;
+        [[maybe_unused]] auto _   = write(m_eventFd, &one, sizeof(one));
     }
 }
 
 void COpenXRManager::onFrameChannelReadable() {
     // Main thread: consume the eventfd and drain the queued transitions.
-    uint64_t v = 0;
-    [[maybe_unused]] auto _ = read(m_eventFd, &v, sizeof(v));
+    uint64_t                     v = 0;
+    [[maybe_unused]] auto        _ = read(m_eventFd, &v, sizeof(v));
 
     std::vector<eXRManagerState> pending;
     std::vector<std::string>     removed;
@@ -370,8 +374,8 @@ void COpenXRManager::frameThread() {
             // Signal the main thread to run teardown; the loop exits so the join is instant.
             m_frameRequestedTeardown.store(true);
             if (m_eventFd >= 0) {
-                const uint64_t one = 1;
-                [[maybe_unused]] auto _ = write(m_eventFd, &one, sizeof(one));
+                const uint64_t        one = 1;
+                [[maybe_unused]] auto _   = write(m_eventFd, &one, sizeof(one));
             }
             break;
         }
@@ -489,7 +493,8 @@ void COpenXRManager::frameThread() {
                 if (buf) {
                     m_graphics->blitBuffer(buf, *l, l->m_swapchainImages[imgIdx]);
                     if (!l->m_hasContent)
-                        Log::logger->log(Log::DEBUG, "[OPENXR] first blit landed for XR monitor '{}' ({}x{})", l->m_monitorName, (int)l->m_swapchainSize.x, (int)l->m_swapchainSize.y);
+                        Log::logger->log(Log::DEBUG, "[OPENXR] first blit landed for XR monitor '{}' ({}x{})", l->m_monitorName, (int)l->m_swapchainSize.x,
+                                         (int)l->m_swapchainSize.y);
                     l->m_hasContent = true;
                 } else
                     m_graphics->clearTex(l->m_swapchainImages[imgIdx], l->m_swapchainSize, 0.0f, 0.0f, 0.0f);
@@ -510,11 +515,11 @@ void COpenXRManager::frameThread() {
         // Static pose for WP3 (anchoring is WP5): centered ~1.5m in front, ~1.4m high. In the
         // LOCAL fallback (no LOCAL_FLOOR) subtract the assumed eye height so it stays roughly
         // eye-level relative to the head origin.
-        static auto  PDIST  = CConfigValue<Hyprlang::FLOAT>("openxr:default_distance");
-        static auto  PFLOOR = CConfigValue<Hyprlang::FLOAT>("openxr:floor_offset");
-        const float  dist   = (float)*PDIST;
-        const float  yFloor = 1.4f;
-        const float  y      = m_session->m_usingLocalFloor ? yFloor : (yFloor - (float)*PFLOOR);
+        static auto                                      PDIST  = CConfigValue<Hyprlang::FLOAT>("openxr:default_distance");
+        static auto                                      PFLOOR = CConfigValue<Hyprlang::FLOAT>("openxr:floor_offset");
+        const float                                      dist   = (float)*PDIST;
+        const float                                      yFloor = 1.4f;
+        const float                                      y      = m_session->m_usingLocalFloor ? yFloor : (yFloor - (float)*PFLOOR);
 
         std::vector<XrCompositionLayerQuad>              quads;
         std::vector<const XrCompositionLayerBaseHeader*> layerPtrs;
@@ -532,16 +537,16 @@ void COpenXRManager::frameThread() {
             if (w <= 0 || h <= 0)
                 continue;
 
-            XrCompositionLayerQuad quad = {XR_TYPE_COMPOSITION_LAYER_QUAD};
-            quad.layerFlags             = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-            quad.space                  = m_session->m_refSpace;
-            quad.eyeVisibility          = XR_EYE_VISIBILITY_BOTH;
-            quad.subImage.swapchain     = l->m_swapchain;
-            quad.subImage.imageRect     = {{0, 0}, {w, h}};
+            XrCompositionLayerQuad quad   = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+            quad.layerFlags               = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            quad.space                    = m_session->m_refSpace;
+            quad.eyeVisibility            = XR_EYE_VISIBILITY_BOTH;
+            quad.subImage.swapchain       = l->m_swapchain;
+            quad.subImage.imageRect       = {{0, 0}, {w, h}};
             quad.subImage.imageArrayIndex = 0;
-            quad.pose.orientation       = {0, 0, 0, 1};
-            quad.pose.position          = {0.0f, y, -dist};
-            quad.size                   = {l->m_sizeMeters, l->m_sizeMeters * (float)h / (float)w};
+            quad.pose.orientation         = {0, 0, 0, 1};
+            quad.pose.position            = {0.0f, y, -dist};
+            quad.size                     = {l->m_sizeMeters, l->m_sizeMeters * (float)h / (float)w};
             quads.push_back(quad);
         }
         for (auto& q : quads)
@@ -627,9 +632,12 @@ std::expected<SP<CXRMonitorLayer>, std::string> COpenXRManager::createXRMonitor(
     }
 
     // 2. Construct the layer (still unbound) and register it.
-    static auto PSIZE       = CConfigValue<Hyprlang::FLOAT>("openxr:default_size");
-    const float sizeMeters  = params.m_sizeMeters.value_or((float)*PSIZE);
-    auto        layer       = makeShared<CXRMonitorLayer>(params.m_name, ++m_seqCounter, sizeMeters);
+    static auto PSIZE      = CConfigValue<Hyprlang::FLOAT>("openxr:default_size");
+    const float sizeMeters = params.m_sizeMeters.value_or((float)*PSIZE);
+    auto        layer      = makeShared<CXRMonitorLayer>(params.m_name, ++m_seqCounter, sizeMeters);
+    layer->m_anchorSpec    = params.m_anchor; // parsed anchor (WP5 makes it live; WP4 static pose)
+    layer->m_reqResolution = params.m_resolution;
+    layer->m_reqRefresh    = params.m_refreshRate;
     {
         std::scoped_lock lock(m_layersMu);
         m_layers.push_back(layer);
@@ -681,17 +689,22 @@ std::expected<SP<CXRMonitorLayer>, std::string> COpenXRManager::createXRMonitor(
             finalizeLayerRemoval(name); // no frame thread — clean up directly
     });
 
-    // 5. Apply the requested pixel mode, if any (DEVIATION: the "explicit user monitor= rule
-    //    wins" subtlety of doc 02 step 5 is deferred to WP4 with the full keyword grammar).
+    // 5. Apply the requested pixel mode, if any. An explicit user `monitor=` rule matching this
+    //    name wins (doc 02 step 5): only override the resolution when the matched rule left it at
+    //    the default "preferred" (Vector2D{}). `xrmonitor=` owns existence + XR placement only.
     if (params.m_resolution && Config::monitorRuleMgr()) {
-        Config::CMonitorRule rule = Config::monitorRuleMgr()->get(mon);
-        rule.m_resolution         = *params.m_resolution;
-        if (params.m_refreshRate)
-            rule.m_refreshRate = *params.m_refreshRate;
-        mon->applyMonitorRule(std::move(rule));
+        Config::CMonitorRule rule       = Config::monitorRuleMgr()->get(mon);
+        const bool           userSetRes = rule.m_resolution != Vector2D{};
+        if (!userSetRes) {
+            rule.m_resolution = *params.m_resolution;
+            if (params.m_refreshRate)
+                rule.m_refreshRate = *params.m_refreshRate;
+            mon->applyMonitorRule(std::move(rule));
+        } else
+            Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}' keeps its explicit monitor= resolution", params.m_name);
     }
 
-    // 6. Notify (doc 05 event surface; full payload lands with WP4).
+    // 6. Notify (doc 05 event surface).
     if (g_pEventManager)
         g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitoradded", params.m_name});
 
@@ -699,6 +712,9 @@ std::expected<SP<CXRMonitorLayer>, std::string> COpenXRManager::createXRMonitor(
     //    already snapshots m_layers per frame, so no extra wakeup is needed).
     if (m_running.load())
         layer->m_swapchainDirty.store(true, std::memory_order_release);
+
+    // 8. Layer cap: a new quad may push the oldest past maxLayerCount (doc 02 recency policy).
+    recomputeQuadActive();
 
     Log::logger->log(Log::DEBUG, "[OPENXR] created XR monitor '{}' (seq {}, size {}m)", params.m_name, layer->m_seq, sizeMeters);
     return layer;
@@ -756,6 +772,15 @@ void COpenXRManager::finalizeLayerRemoval(const std::string& name) {
     if (auto mon = layer->m_monitor.lock(); mon && mon->m_output)
         mon->m_output->destroy(); // path B (external destroy) already gone -> mon expired, skipped
 
+    // Clear the explicit selection if it pointed at this monitor (doc 05 §3.2).
+    if (m_selectedMonitor == name)
+        m_selectedMonitor.clear();
+    if (m_lastHoveredMonitor == name)
+        m_lastHoveredMonitor.clear();
+
+    // Freeing capacity may re-activate a suspended quad (doc 02 recency policy).
+    recomputeQuadActive();
+
     if (g_pEventManager)
         g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitorremoved", name});
 
@@ -804,8 +829,8 @@ void COpenXRManager::bindExistingLayers() {
 void COpenXRManager::teardownLayers() {
     // Main thread, during stop() after the join (frame resources already freed there).
     // Monitor disposition per openxr:destroy_monitors_on_stop.
-    static auto PDESTROY = CConfigValue<Hyprlang::INT>("openxr:destroy_monitors_on_stop");
-    const bool  destroy  = *PDESTROY;
+    static auto                      PDESTROY = CConfigValue<Hyprlang::INT>("openxr:destroy_monitors_on_stop");
+    const bool                       destroy  = *PDESTROY;
 
     std::vector<SP<CXRMonitorLayer>> layers;
     {
@@ -822,9 +847,9 @@ void COpenXRManager::teardownLayers() {
         } else {
             // Keep the output as a plain headless monitor; unbind the layer record so the next
             // start() re-binds it (lazy binding).
-            l->m_swapchain    = XR_NULL_HANDLE;
+            l->m_swapchain = XR_NULL_HANDLE;
             l->m_swapchainImages.clear();
-            l->m_hasContent   = false;
+            l->m_hasContent = false;
             l->m_removalAcked.store(false);
             l->m_pendingRemoval.store(false);
         }
@@ -843,8 +868,8 @@ void COpenXRManager::reportLayerRemoved(const std::string& name) {
         m_removedLayerNames.push_back(name);
     }
     if (m_eventFd >= 0) {
-        const uint64_t one = 1;
-        [[maybe_unused]] auto _ = write(m_eventFd, &one, sizeof(one));
+        const uint64_t        one = 1;
+        [[maybe_unused]] auto _   = write(m_eventFd, &one, sizeof(one));
     }
 }
 
@@ -853,13 +878,327 @@ void COpenXRManager::onConfigReload() {
     const bool  enabled  = *PENABLED;
 
     if (enabled && m_state == XR_STATE_DISABLED)
-        start();
+        start(); // start() reconciles declared monitors itself
     else if (!enabled && m_state != XR_STATE_DISABLED)
         stop();
+    else
+        reconcileDeclaredMonitors(); // no state edge: still reconcile the declared set
 
     // Re-run so that toggling openxr:inhibit_idle takes effect immediately (WP9 hook).
     if (g_pInputManager)
         g_pInputManager->recheckIdleInhibitorStatus();
+}
+
+// ---------------------------------------------------------------------------------------------
+// WP4: reconciliation, verb funnel, selection, layer cap, status/layout serialization.
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+    // yaw (about +Y) then pitch (about +X): rot = qFromYaw ∘ qFromPitch (doc 03 §7). Local
+    // helper so this file needs no anchoring engine (that arrives in WP5). x,y,z,w out.
+    void yawPitchToQuat(float yawDeg, float pitchDeg, float& x, float& y, float& z, float& w) {
+        const float yr = yawDeg * (float)M_PI / 180.f;
+        const float pr = pitchDeg * (float)M_PI / 180.f;
+        // qFromYaw
+        const float ys = std::sin(yr * 0.5f), yc = std::cos(yr * 0.5f); // {0, ys, 0, yc}
+        const float ps = std::sin(pr * 0.5f), pc = std::cos(pr * 0.5f); // {ps, 0, 0, pc}
+        // Hamilton product a*b with a = yaw quat, b = pitch quat.
+        w = yc * pc; // aw*bw
+        x = yc * ps; // aw*bx
+        y = ys * pc; // ay*bw
+        z = ys * ps; // ay*bx (a.y*b.x term of z)
+    }
+}
+
+SP<CXRMonitorLayer> COpenXRManager::layerByName(const std::string& name) {
+    std::scoped_lock lock(m_layersMu);
+    for (auto& l : m_layers)
+        if (l->m_monitorName == name && !l->m_pendingRemoval.load(std::memory_order_acquire))
+            return l;
+    return nullptr;
+}
+
+SP<CXRMonitorLayer> COpenXRManager::resolveSelected() {
+    // doc 05 §3.2 resolution order.
+    if (!m_selectedMonitor.empty())
+        if (auto l = layerByName(m_selectedMonitor))
+            return l;
+    // 2. Last ray-hovered (WP7 sets m_lastHoveredMonitor).
+    if (!m_lastHoveredMonitor.empty())
+        if (auto l = layerByName(m_lastHoveredMonitor))
+            return l;
+    // 3. Focused-if-XR.
+    if (Desktop::focusState()) {
+        if (auto mon = Desktop::focusState()->monitor())
+            if (auto l = layerByName(mon->m_name))
+                return l;
+    }
+    return nullptr;
+}
+
+void COpenXRManager::reconcileDeclaredMonitors() {
+    // doc 05 §2.5: D = declared set (this parse), L = live layers created BY config
+    // (m_declaredByConfig). Runtime-created layers are never touched.
+    auto cm = Config::Legacy::mgr();
+    if (!cm)
+        return; // Lua config or no legacy manager: no declared xrmonitor set (v1 = classic only)
+
+    const auto& declared = cm->declaredXRMonitors();
+
+    // Snapshot current declared layer names.
+    std::vector<std::string> liveDeclared;
+    {
+        std::scoped_lock lock(m_layersMu);
+        for (auto& l : m_layers)
+            if (l->m_declaredByConfig && !l->m_pendingRemoval.load(std::memory_order_acquire))
+                liveDeclared.push_back(l->m_monitorName);
+    }
+
+    // D \ L -> create (declared);  D ∩ L -> diff (mode change / anchor change).
+    for (const auto& d : declared) {
+        auto existing = layerByName(d.m_name);
+        if (existing && existing->m_declaredByConfig) {
+            // D ∩ L: diff. Mode change -> apply new rule (emits modeChanged -> swapchain recreate).
+            const bool modeChanged = existing->m_reqResolution != d.m_resolution || existing->m_reqRefresh != d.m_refreshRate;
+            if (modeChanged && d.m_resolution && Config::monitorRuleMgr()) {
+                if (auto mon = existing->m_monitor.lock()) {
+                    Config::CMonitorRule rule = Config::monitorRuleMgr()->get(mon);
+                    rule.m_resolution         = *d.m_resolution;
+                    if (d.m_refreshRate)
+                        rule.m_refreshRate = *d.m_refreshRate;
+                    mon->applyMonitorRule(std::move(rule));
+                }
+                existing->m_reqResolution = d.m_resolution;
+                existing->m_reqRefresh    = d.m_refreshRate;
+            }
+            // Anchor / size change -> re-anchor in place (WP5 makes the pose live; WP4 stores it).
+            const bool anchorChanged = !(existing->m_anchorSpec == d.m_anchor);
+            if (anchorChanged) {
+                std::scoped_lock lock(m_layersMu);
+                existing->m_anchorSpec = d.m_anchor;
+                if (g_pEventManager)
+                    g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitoranchor", d.m_name + "," + OpenXR::anchorModeToString(d.m_anchor)});
+            }
+            static auto PSIZE    = CConfigValue<Hyprlang::FLOAT>("openxr:default_size");
+            const float wantSize = d.m_sizeMeters.value_or((float)*PSIZE);
+            if (existing->m_sizeMeters != wantSize) {
+                std::scoped_lock lock(m_layersMu);
+                existing->m_sizeMeters = wantSize;
+            }
+            continue;
+        }
+        if (existing && !existing->m_declaredByConfig) {
+            // Name collision with a runtime-created monitor: leave the runtime one alone.
+            Log::logger->log(Log::WARN, "[OPENXR] xrmonitor '{}' declared in config but a runtime monitor already owns the name; ignoring the declaration", d.m_name);
+            continue;
+        }
+        // D \ L: create.
+        auto res = createXRMonitor(d);
+        if (!res) {
+            Log::logger->log(Log::WARN, "[OPENXR] failed to create declared xrmonitor '{}': {}", d.m_name, res.error());
+            continue;
+        }
+        res.value()->m_declaredByConfig = true;
+    }
+
+    // L \ D: destroy declared layers no longer present in the declared set.
+    for (const auto& name : liveDeclared) {
+        const bool stillDeclared = std::ranges::any_of(declared, [&](const SXRMonitorParams& p) { return p.m_name == name; });
+        if (!stillDeclared)
+            destroyXRMonitor(name);
+    }
+}
+
+void COpenXRManager::recomputeQuadActive() {
+    // doc 02 recency policy: the newest maxLayerCount quads stay active; older ones suspend but
+    // keep rendering as plain headless outputs. Compute under the lock; post events after.
+    const uint32_t                            maxCount = m_session ? m_session->m_maxLayerCount : 16u;
+
+    std::vector<std::pair<std::string, bool>> flips; // name, nowActive
+    {
+        std::scoped_lock                 lock(m_layersMu);
+
+        std::vector<SP<CXRMonitorLayer>> active;
+        for (auto& l : m_layers)
+            if (!l->m_pendingRemoval.load(std::memory_order_acquire))
+                active.push_back(l);
+
+        // Oldest first; suspend everything past the cap counting from the newest.
+        std::sort(active.begin(), active.end(), [](const SP<CXRMonitorLayer>& a, const SP<CXRMonitorLayer>& b) { return a->m_seq < b->m_seq; });
+
+        const size_t n = active.size();
+        for (size_t i = 0; i < n; ++i) {
+            const bool shouldBeActive = (n <= maxCount) || (i >= n - maxCount);
+            if (active[i]->m_quadActive != shouldBeActive) {
+                active[i]->m_quadActive = shouldBeActive;
+                flips.emplace_back(active[i]->m_monitorName, shouldBeActive);
+            }
+        }
+    }
+
+    for (auto& [name, nowActive] : flips) {
+        if (!nowActive)
+            Log::logger->log(Log::WARN, "[OPENXR] XR monitor '{}' quad suspended: over the runtime layer cap ({})", name, maxCount);
+        if (g_pEventManager)
+            g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitorquad", name + (nowActive ? ",1" : ",0")});
+    }
+}
+
+std::expected<void, std::string> COpenXRManager::cmdCreate(const std::string& args) {
+    auto parsed = OpenXR::parseXRMonitorCreateArgs(args);
+    if (!parsed.has_value())
+        return std::unexpected(parsed.error());
+
+    // Defaults (doc 05 §3.1): mode 1920x1080@60; anchor:local placed along gaze at default
+    // distance/size (WP4 keeps WP3's static pose — full placement solve is WP5).
+    if (!parsed->m_resolution) {
+        parsed->m_resolution = Vector2D{1920, 1080};
+        if (!parsed->m_refreshRate)
+            parsed->m_refreshRate = 60.f;
+    }
+
+    auto res = createXRMonitor(*parsed);
+    if (!res)
+        return std::unexpected(res.error());
+    // Runtime-created: NOT declared, so reload reconciliation never touches it (doc 05 §2.5).
+    return {};
+}
+
+std::expected<void, std::string> COpenXRManager::cmdDestroy(const std::string& target) {
+    std::string name = target;
+    if (target == "active" || target.empty()) {
+        auto sel = resolveSelected();
+        if (!sel)
+            return std::unexpected<std::string>("no XR monitor selected");
+        name = sel->m_monitorName;
+    } else if (!layerByName(name))
+        return std::unexpected<std::string>("no XR monitor named '" + name + "'");
+
+    destroyXRMonitor(name);
+    return {};
+}
+
+std::expected<void, std::string> COpenXRManager::cmdSelect(const std::string& arg) {
+    if (arg.empty())
+        return std::unexpected<std::string>("select: expected <name|next|prev>");
+
+    if (arg == "next" || arg == "prev") {
+        // Cycle in creation order (m_seq).
+        std::vector<SP<CXRMonitorLayer>> ordered;
+        {
+            std::scoped_lock lock(m_layersMu);
+            for (auto& l : m_layers)
+                if (!l->m_pendingRemoval.load(std::memory_order_acquire))
+                    ordered.push_back(l);
+        }
+        if (ordered.empty())
+            return std::unexpected<std::string>("no XR monitors exist");
+        std::sort(ordered.begin(), ordered.end(), [](const SP<CXRMonitorLayer>& a, const SP<CXRMonitorLayer>& b) { return a->m_seq < b->m_seq; });
+
+        size_t cur = 0;
+        for (size_t i = 0; i < ordered.size(); ++i)
+            if (ordered[i]->m_monitorName == m_selectedMonitor) {
+                cur = i;
+                break;
+            }
+        const size_t next = arg == "next" ? (cur + 1) % ordered.size() : (cur + ordered.size() - 1) % ordered.size();
+        m_selectedMonitor = ordered[next]->m_monitorName;
+        return {};
+    }
+
+    if (!layerByName(arg))
+        return std::unexpected<std::string>("no XR monitor named '" + arg + "'");
+    m_selectedMonitor = arg;
+    return {};
+}
+
+std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
+    std::vector<SXRMonitorInfo> out;
+    std::scoped_lock            lock(m_layersMu);
+    for (auto& l : m_layers) {
+        if (l->m_pendingRemoval.load(std::memory_order_acquire))
+            continue;
+        SXRMonitorInfo info;
+        info.name       = l->m_monitorName;
+        info.sizeMeters = l->m_sizeMeters;
+        info.anchorMode = OpenXR::anchorModeToString(l->m_anchorSpec);
+        info.posX       = l->m_anchorSpec.posX;
+        info.posY       = l->m_anchorSpec.posY;
+        info.posZ       = l->m_anchorSpec.posZ;
+        // WP4: pose is the parsed-but-static anchor (WP5 reports the live solved pose).
+        yawPitchToQuat(l->m_anchorSpec.yawDeg, l->m_anchorSpec.pitchDeg, info.quatX, info.quatY, info.quatZ, info.quatW);
+        info.grabbed = false;        // WP8
+        info.hovered = l->m_hovered; // WP7
+        if (l->m_reqResolution) {
+            info.w = (int)l->m_reqResolution->x;
+            info.h = (int)l->m_reqResolution->y;
+        }
+        if (l->m_reqRefresh)
+            info.refresh = *l->m_reqRefresh;
+        if (auto mon = l->m_monitor.lock()) {
+            info.id = mon->m_id;
+            if (info.w == 0) {
+                info.w = (int)mon->m_pixelSize.x;
+                info.h = (int)mon->m_pixelSize.y;
+            }
+        }
+        out.push_back(std::move(info));
+    }
+    return out;
+}
+
+std::string COpenXRManager::layoutDump() {
+    // Paste-ready `xrmonitor = ...` lines (doc 05 §4.2). WP4 serializes the stored (static)
+    // anchor spec + mode + size, which round-trips through the WP4 parser. TODO(WP5): emit the
+    // live solved pose from the anchoring engine rather than the parsed spec.
+    std::string              out;
+    std::vector<std::string> lines;
+    {
+        std::scoped_lock lock(m_layersMu);
+        for (auto& l : m_layers) {
+            if (l->m_pendingRemoval.load(std::memory_order_acquire))
+                continue;
+
+            // Mode: prefer the requested mode; fall back to the monitor's current pixel size.
+            int   w = 0, h = 0;
+            float hz = 0.f;
+            if (l->m_reqResolution) {
+                w = (int)l->m_reqResolution->x;
+                h = (int)l->m_reqResolution->y;
+            } else if (auto mon = l->m_monitor.lock()) {
+                w = (int)mon->m_pixelSize.x;
+                h = (int)mon->m_pixelSize.y;
+            }
+            if (l->m_reqRefresh)
+                hz = *l->m_reqRefresh;
+
+            std::string mode = std::format("{}x{}", w, h);
+            if (hz > 0.f)
+                mode += std::format("@{:.0f}", hz);
+
+            const auto& a = l->m_anchorSpec;
+            std::string anchor;
+            switch (a.mode) {
+                case OpenXR::XR_ANCHOR_LOCAL: anchor = std::format("anchor:local pos:{:.3f},{:.3f},{:.3f}", a.posX, a.posY, a.posZ); break;
+                case OpenXR::XR_ANCHOR_HEAD: anchor = std::format("anchor:head offset:{:.3f},{:.3f},{:.3f}", a.posX, a.posY, a.posZ); break;
+                case OpenXR::XR_ANCHOR_BODY: anchor = std::format("anchor:body offset:{:.3f},{:.3f},{:.3f}", a.posX, a.posY, a.posZ); break;
+                case OpenXR::XR_ANCHOR_DEVICE:
+                    anchor = std::format("anchor:device:{} offset:{:.3f},{:.3f},{:.3f}", a.device == OpenXR::XR_HAND_RIGHT ? "right" : "left", a.posX, a.posY, a.posZ);
+                    break;
+            }
+            // Rotation serialization (doc 03 §7): head prints no rotation; body only yaw;
+            // local/device print yaw and (optional) pitch.
+            if (a.mode != OpenXR::XR_ANCHOR_HEAD && a.hasYaw)
+                anchor += std::format(" yaw:{:.1f}", a.yawDeg);
+            if ((a.mode == OpenXR::XR_ANCHOR_LOCAL || a.mode == OpenXR::XR_ANCHOR_DEVICE) && a.hasPitch)
+                anchor += std::format(" pitch:{:.1f}", a.pitchDeg);
+
+            lines.push_back(std::format("xrmonitor = {}, {}, {}, size:{:.2f}", l->m_monitorName, mode, anchor, l->m_sizeMeters));
+        }
+    }
+    for (auto& ln : lines)
+        out += ln + "\n";
+    return out;
 }
 
 #endif

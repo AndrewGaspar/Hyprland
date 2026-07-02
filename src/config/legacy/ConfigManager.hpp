@@ -12,6 +12,7 @@
 #include "../../managers/KeybindManager.hpp"
 
 #include "../ConfigManager.hpp"
+#include "../../openxr/XRMonitorConfig.hpp"
 
 #include <hyprlang.hpp>
 
@@ -84,6 +85,12 @@ namespace Config::Legacy {
         std::optional<std::string> handleExecRawOnce(const std::string&, const std::string&);
         std::optional<std::string> handleExecShutdown(const std::string&, const std::string&);
         std::optional<std::string> handleMonitor(const std::string&, const std::string&);
+        std::optional<std::string> handleXRMonitor(const std::string&, const std::string&);
+
+        // Declared XR monitors from the most recent parse (doc 05 §2.5 reconciliation source).
+        const std::vector<SXRMonitorParams>& declaredXRMonitors() const {
+            return m_declaredXRMonitors;
+        }
         std::optional<std::string> handleBind(const std::string&, const std::string&);
         std::optional<std::string> handleUnbind(const std::string&, const std::string&);
         std::optional<std::string> handleWorkspaceRules(const std::string&, const std::string&);
@@ -111,31 +118,36 @@ namespace Config::Legacy {
 
       private:
         // internal methods
-        std::optional<std::string>                       resetHLConfig();
-        std::optional<std::string>                       verifyConfigExists();
-        void                                             reloadRuleConfigs();
+        std::optional<std::string>            resetHLConfig();
+        std::optional<std::string>            verifyConfigExists();
+        void                                  reloadRuleConfigs();
 
-        void                                             postConfigReload(const Hyprlang::CParseResult& result);
+        void                                  postConfigReload(const Hyprlang::CParseResult& result);
 
-        void                                             registerConfigVar(const char* name, const Hyprlang::INT& val);
-        void                                             registerConfigVar(const char* name, const Hyprlang::FLOAT& val);
-        void                                             registerConfigVar(const char* name, const Hyprlang::VEC2& val);
-        void                                             registerConfigVar(const char* name, const Hyprlang::STRING& val);
-        void                                             registerConfigVar(const char* name, Hyprlang::CUSTOMTYPE&& val);
-        Hyprlang::CConfigValue*                          getConfigValueSafeDevice(const std::string& dev, const std::string& val, const std::string& fallback);
+        void                                  registerConfigVar(const char* name, const Hyprlang::INT& val);
+        void                                  registerConfigVar(const char* name, const Hyprlang::FLOAT& val);
+        void                                  registerConfigVar(const char* name, const Hyprlang::VEC2& val);
+        void                                  registerConfigVar(const char* name, const Hyprlang::STRING& val);
+        void                                  registerConfigVar(const char* name, Hyprlang::CUSTOMTYPE&& val);
+        Hyprlang::CConfigValue*               getConfigValueSafeDevice(const std::string& dev, const std::string& val, const std::string& fallback);
 
-        UP<Hyprlang::CConfig>                            m_config;
+        UP<Hyprlang::CConfig>                 m_config;
 
-        std::vector<std::string>                         m_configPaths;
-        std::string                                      m_mainConfigPath;
+        std::vector<std::string>              m_configPaths;
+        std::string                           m_mainConfigPath;
 
-        SSubmap                                          m_currentSubmap;
+        SSubmap                               m_currentSubmap;
 
-        std::vector<std::string>                         m_declaredPlugins;
-        std::vector<SPluginKeyword>                      m_pluginKeywords;
-        std::vector<SPluginVariable>                     m_pluginVariables;
+        std::vector<std::string>              m_declaredPlugins;
+        std::vector<SPluginKeyword>           m_pluginKeywords;
+        std::vector<SPluginVariable>          m_pluginVariables;
 
-        std::vector<SP<Desktop::Rule::IRule>>            m_keywordRules;
+        std::vector<SP<Desktop::Rule::IRule>> m_keywordRules;
+
+        // XR virtual monitors declared via the `xrmonitor` keyword (doc 05 §2). Rebuilt from
+        // scratch on every parse (cleared in resetHLConfig); COpenXRManager reconciles the
+        // live set against this after a successful reload. Compiles unconditionally.
+        std::vector<SXRMonitorParams>                    m_declaredXRMonitors;
 
         bool                                             m_isFirstLaunch = true; // For exec-once
 
