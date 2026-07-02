@@ -49,10 +49,13 @@ struct SXRInputEvent {
 };
 
 enum class eXRStateEventType : uint8_t {
-    SESSION_STATE, // XrSessionState changed -> openxrsessionstate / openxractive
-    GRAB,          // §6 -> xrmonitorgrab (WP8)
-    TRACKING,      // device-lock tracking gained/lost (informational, logged)
-    LAYER_REMOVED, // DEVIATION (doc 04 §7.1 lists 3): internal removal-barrier ack (str = name)
+    SESSION_STATE,   // XrSessionState changed -> openxrsessionstate / openxractive
+    GRAB,            // §6 -> xrmonitorgrab (WP8)
+    TRACKING,        // device-lock tracking gained/lost (informational, logged)
+    LAYER_REMOVED,   // DEVIATION (doc 04 §7.1 lists 3): internal removal-barrier ack (str = name)
+    SCHEDULE_FRAMES, // pacing: main thread must scheduleFrame() the visible XR monitors —
+                     // aquamarine's idle-callback list is not thread-safe, so the frame thread
+                     // may NOT call CMonitor::scheduleFrame() directly (heap corruption)
 };
 
 struct SXRStateEvent {
