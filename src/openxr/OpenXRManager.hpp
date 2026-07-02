@@ -33,6 +33,7 @@ class CXRIpc;
 class CXRSession;
 class CXRGraphics;
 class CXRMonitorLayer;
+class CXRPointerDevice;
 
 // The single main-thread entry point the rest of Hyprland touches for OpenXR.
 // Owns the lifecycle state machine and funnels the three enable/disable entry points
@@ -137,6 +138,17 @@ class COpenXRManager {
     // focused-if-XR. Returns null if none resolves.
     SP<CXRMonitorLayer> resolveSelected();
     SP<CXRMonitorLayer> layerByName(const std::string& name);
+    SP<CXRMonitorLayer> layerByMonitorID(MONITORID id);
+    // Main-thread hover bookkeeping driven by the ray pointer (doc 04 §3/§9): mark `name` (or "")
+    // as the owner's currently-hovered XR monitor, updating layer.m_hovered flags and the
+    // last-ray-hovered selection candidate.
+    void                setHoveredMonitor(const std::string& name);
+
+    // --- synthetic ray pointer (doc 04 §8, WP7). Main thread. ---
+    // Create the CXRPointerDevice + register it via g_pInputManager->newMouse, iff openxr:pointer
+    // is set and a session is running. Idempotent. removePointerDevice() destroys it live.
+    void ensurePointerDevice();
+    void removePointerDevice();
     // Recompute m_quadActive under the runtime layer cap (doc 02 recency policy): newest
     // maxLayerCount quads active, older suspended; posts xrmonitorquad on flips. Under m_layersMu.
     void recomputeQuadActive();
@@ -174,6 +186,10 @@ class COpenXRManager {
     UP<CXRGraphics>   m_graphics;
     UP<CXRInput>      m_input; // OpenXR action system (frame-thread sampling), created in start()
 
+    // Synthetic ray pointer (main thread). Registered on start() when openxr:pointer is set;
+    // driven by the frame->main queue drain (dispatchInputEvent). Destroyed on stop()/toggle.
+    SP<CXRPointerDevice> m_pointerDevice;
+
     std::thread       m_frameThread;
     std::atomic<bool> m_running{false};
 
@@ -188,8 +204,11 @@ class COpenXRManager {
 
     // Selected-monitor state (doc 05 §3.2). Explicit selection wins; cleared when destroyed.
     std::string m_selectedMonitor;
-    // WP7 hook: the ray pointer will set this to the last-hovered XR monitor name.
+    // Last ray-hovered XR monitor (doc 05 §3.2 rule 2 / doc 04 §9), set by the pointer drain.
     std::string m_lastHoveredMonitor;
+    // The owner's currently-hovered XR monitor (main-thread mirror), so m_hovered flags can be
+    // cleared when the ray moves off / onto a different quad.
+    std::string m_curHoveredMonitor;
 
     // Frame->main channel state (doc 04 §7.2): lock-free SPSC ring drained by an eventfd on the
     // wayland event loop. Single producer = frame thread, single consumer = main thread.

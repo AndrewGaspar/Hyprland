@@ -33,6 +33,7 @@
 #include "XRGraphics.hpp"
 #include "XRMonitorLayer.hpp"
 #include "XRInput.hpp"
+#include "XRPointerDevice.hpp"
 #include "../Compositor.hpp"
 #include "../debug/log/Logger.hpp"
 #include "../config/ConfigValue.hpp"
@@ -46,6 +47,7 @@
 #include "../config/shared/monitor/MonitorRuleManager.hpp"
 #include "../config/shared/monitor/MonitorRule.hpp"
 #include "../config/legacy/ConfigManager.hpp"
+#include "../helpers/time/Time.hpp"
 
 #include <aquamarine/backend/Backend.hpp>
 #include <aquamarine/backend/Headless.hpp>
@@ -231,6 +233,9 @@ void COpenXRManager::start() {
     // above (bindExistingLayers); create any declared-but-missing ones now that a session is up.
     reconcileDeclaredMonitors();
     recomputeQuadActive();
+
+    // Register the synthetic ray pointer (doc 04 §8), honoring openxr:pointer.
+    ensurePointerDevice();
 }
 
 void COpenXRManager::abortStart() {
@@ -264,6 +269,9 @@ void COpenXRManager::stop() {
     const bool lost = m_session && m_session->m_instanceLost;
 
     setState(XR_STATE_STOPPING);
+
+    // Remove the ray pointer first (main thread) so no further input routes while tearing down.
+    removePointerDevice();
 
     // Teardown ordering (doc 01): join the frame thread BEFORE touching any EGL/XR object.
     m_running = false;
@@ -405,18 +413,84 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
 }
 
 void COpenXRManager::dispatchInputEvent(const SXRInputEvent& e) {
-    // WP6 handoff point (WP7 replaces this with CXRPointerDevice signal emission). For now just
-    // prove that action state crossed the queue onto the main thread.
+    // Main thread: replay a frame-thread pointer event onto the synthetic device (doc 04 §8).
+    // Hover bookkeeping (m_hovered / last-hovered) is kept up to date even when the pointer device
+    // is absent (openxr:pointer = 0) so status JSON and selection still reflect the ray.
     switch (e.type) {
-        case eXRInputEventType::BUTTON:
-            Log::logger->log(Log::DEBUG, "[OPENXR] input event crossed queue: BUTTON 0x{:x} {} (monitor {})", e.button, e.pressed ? "press" : "release", (long long)e.monitorID);
+        case eXRInputEventType::MOTION_ABS: {
+            if (e.monitorID < 0) {
+                setHoveredMonitor(""); // ray left all quads
+                break;
+            }
+            auto layer = layerByMonitorID(e.monitorID);
+            if (!layer)
+                break; // monitor died in flight
+            setHoveredMonitor(layer->m_monitorName);
+            if (m_pointerDevice) {
+                // m_boundOutput routes the 0-1 absolute onto this monitor's box (doc 04 §8).
+                m_pointerDevice->m_boundOutput = layer->m_monitorName;
+                m_pointerDevice->m_pointerEvents.motionAbsolute.emit(IPointer::SMotionAbsoluteEvent{.timeMs = e.timeMs, .absolute = e.uv, .device = m_pointerDevice});
+            }
             break;
-        case eXRInputEventType::MOTION_ABS:
+        }
+        case eXRInputEventType::BUTTON:
+            if (m_pointerDevice)
+                m_pointerDevice->m_pointerEvents.button.emit(
+                    IPointer::SButtonEvent{.timeMs = e.timeMs, .button = e.button, .state = e.pressed ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED, .mouse = true});
+            break;
         case eXRInputEventType::AXIS:
+            if (m_pointerDevice)
+                m_pointerDevice->m_pointerEvents.axis.emit(
+                    IPointer::SAxisEvent{.timeMs = e.timeMs, .source = WL_POINTER_AXIS_SOURCE_CONTINUOUS, .axis = e.axis, .delta = e.axisDelta, .deltaDiscrete = 0, .mouse = true});
+            break;
         case eXRInputEventType::FRAME:
-            // Coalesced/positional events: no logging (would be noisy). Sink until WP7.
+            if (m_pointerDevice)
+                m_pointerDevice->m_pointerEvents.frame.emit();
             break;
     }
+}
+
+void COpenXRManager::setHoveredMonitor(const std::string& name) {
+    if (m_curHoveredMonitor == name)
+        return;
+    if (!m_curHoveredMonitor.empty())
+        if (auto prev = layerByName(m_curHoveredMonitor))
+            prev->m_hovered = false;
+    m_curHoveredMonitor = name;
+    if (!name.empty()) {
+        if (auto l = layerByName(name))
+            l->m_hovered = true;
+        m_lastHoveredMonitor = name; // selection rule 2 (doc 05 §3.2) — persists as "last"
+    }
+}
+
+SP<CXRMonitorLayer> COpenXRManager::layerByMonitorID(MONITORID id) {
+    std::scoped_lock lock(m_layersMu);
+    for (auto& l : m_layers) {
+        if (l->m_pendingRemoval.load(std::memory_order_acquire))
+            continue;
+        if (auto mon = l->m_monitor.lock(); mon && mon->m_id == id)
+            return l;
+    }
+    return nullptr;
+}
+
+void COpenXRManager::ensurePointerDevice() {
+    static auto PPOINTER = CConfigValue<Hyprlang::INT>("openxr:pointer");
+    if (!*PPOINTER || !m_running.load() || m_pointerDevice || !g_pInputManager)
+        return;
+    m_pointerDevice = CXRPointerDevice::create();
+    g_pInputManager->newMouse(m_pointerDevice); // -> setupMouse -> attachPointer + destroy listener
+    Log::logger->log(Log::DEBUG, "[OPENXR] ray pointer device registered");
+}
+
+void COpenXRManager::removePointerDevice() {
+    if (!m_pointerDevice)
+        return;
+    m_pointerDevice->destroy(); // fires m_events.destroy -> InputManager + PointerManager detach
+    m_pointerDevice.reset();
+    m_curHoveredMonitor.clear();
+    Log::logger->log(Log::DEBUG, "[OPENXR] ray pointer device removed");
 }
 
 void COpenXRManager::onFrameChannelReadable() {
@@ -684,6 +758,12 @@ void COpenXRManager::frameThread() {
         quads.reserve(active.size());
         layerPtrs.reserve(active.size());
 
+        // Ray-pointer targets: the same visible quads, with their solved world pose expressed in
+        // the reference frame the aim poses were sampled in (doc 04 §3). Built alongside the quad
+        // array below so the two sets stay in lockstep.
+        std::vector<SXRPointerTarget> pointerTargets;
+        pointerTargets.reserve(active.size());
+
         for (size_t i = 0; i < active.size(); ++i) {
             auto& l = active[i];
             if (quads.size() >= m_session->m_maxLayerCount)
@@ -729,9 +809,25 @@ void COpenXRManager::frameThread() {
             quad.pose                     = xrFromPose(quadPose);
             quad.size                     = {res.widthMeters, res.heightMeters};
             quads.push_back(quad);
+
+            // Ray-pointer target: hit-test against the world-composed pose (device/grip-locked
+            // quads included), expressed in the aim poses' reference frame (undo the LOCAL
+            // fallback floor shift, exactly as the reference-frame submission path above does).
+            if (auto mon = l->m_monitor.lock()) {
+                OpenXR::SXRPose worldRef = res.worldPose;
+                if (!m_session->m_usingLocalFloor)
+                    worldRef.pos.y -= floorOffset;
+                pointerTargets.push_back(SXRPointerTarget{mon->m_id, worldRef, res.widthMeters, res.heightMeters});
+            }
         }
         for (auto& q : quads)
             layerPtrs.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&q));
+
+        // Ray pointer (doc 04 §3-§5): cast every hand's aim ray against the visible quads and emit
+        // motion/button/axis/frame across the frame->main queue. Runs after the solve so hit tests
+        // use this frame's poses; only produces events while FOCUSED (aim poses are valid then).
+        if (m_input)
+            m_input->processPointer(pointerTargets, (uint32_t)Time::millis(Time::steadyNow()));
 
         // xrEndFrame with zero layers is valid (nothing composited yet) — doc 01.
         XrFrameEndInfo endInfo       = {XR_TYPE_FRAME_END_INFO};
@@ -1079,6 +1175,15 @@ void COpenXRManager::onConfigReload() {
         stop();
     else
         reconcileDeclaredMonitors(); // no state edge: still reconcile the declared set
+
+    // Hot-toggle the ray pointer device (doc 04 §8: openxr:pointer = 0 removes it live).
+    if (m_running.load()) {
+        static auto PPOINTER = CConfigValue<Hyprlang::INT>("openxr:pointer");
+        if (*PPOINTER)
+            ensurePointerDevice();
+        else
+            removePointerDevice();
+    }
 
     // Re-run so that toggling openxr:inhibit_idle takes effect immediately (WP9 hook).
     if (g_pInputManager)

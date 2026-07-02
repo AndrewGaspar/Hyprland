@@ -227,4 +227,44 @@ namespace OpenXR {
         const Quat ci = qConjugate(p.rot);
         return {-qRotate(ci, p.pos), ci};
     }
+
+    // ---- ray -> quad intersection (docs/openxr/04-input.md §3) ----
+    //
+    // Pure, unconditional (no OpenXR headers): the ray-pointer hit test and its UV mapping, so
+    // tests/xr/ray_intersect.cpp can exercise it with no runtime present.
+    struct SXRQuadHit {
+        bool  hit = false;
+        float t   = 0.F; // ray parameter (distance along dir if dir is unit length)
+        float u   = 0.F; // 0 at the quad's left edge, 1 at the right
+        float v   = 0.F; // 0 at the top edge, 1 at the bottom (surface v grows downward)
+    };
+
+    // Intersect a ray (world origin `o`, world direction `d`) with a quad at world pose `Q`,
+    // width `w` and height `h` in meters (the quad lies in its local x-y plane, centered at
+    // origin, +X right / +Y up). `slack` expands the half-extents for the grab cone forgiveness
+    // (doc 04 §6, WP8). Transform the ray into quad-local space, intersect z = 0, bounds-test.
+    inline SXRQuadHit rayQuadIntersect(const SXRPose& Q, const Vec3& o, const Vec3& d, float w, float h, float slack = 0.F) {
+        SXRQuadHit out;
+
+        const Quat qi = qInverse(Q.rot);
+        const Vec3 lo = qRotate(qi, o - Q.pos); // ray origin in quad-local space
+        const Vec3 ld = qRotate(qi, d);         // ray direction in quad-local space
+
+        if (std::fabs(ld.z) < 1e-6F)
+            return out; // ray parallel to the quad plane
+
+        const float t = -lo.z / ld.z;
+        if (t <= 0.F)
+            return out; // behind the ray origin
+
+        const Vec3 p = lo + ld * t;
+        if (std::fabs(p.x) > w * 0.5F + slack || std::fabs(p.y) > h * 0.5F + slack)
+            return out; // outside the quad bounds
+
+        out.hit = true;
+        out.t   = t;
+        out.u   = p.x / w + 0.5F;
+        out.v   = 0.5F - p.y / h;
+        return out;
+    }
 }

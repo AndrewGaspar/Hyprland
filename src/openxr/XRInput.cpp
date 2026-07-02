@@ -275,16 +275,7 @@ void CXRInput::sample(XrTime predictedDisplayTime, XrSpace refSpace) {
         return;
     }
 
-    const bool     focused = r == XR_SUCCESS; // XR_SESSION_NOT_FOCUSED => actions inactive
-
-    static auto    PSELON  = CConfigValue<Hyprlang::FLOAT>("openxr:pointer_trigger_threshold");
-    static auto    PSELOFF = CConfigValue<Hyprlang::FLOAT>("openxr:pointer_trigger_threshold_release");
-    const float    onT     = (float)*PSELON;
-    const float    offT    = (float)*PSELOFF;
-
-    const uint32_t timeMs = (uint32_t)Time::millis(Time::steadyNow());
-
-    bool           emittedAny = false;
+    const bool focused = r == XR_SUCCESS; // XR_SESSION_NOT_FOCUSED => actions inactive
 
     for (auto hand : {XR_HAND_LEFT, XR_HAND_RIGHT}) {
         SXRHandState h;
@@ -329,42 +320,194 @@ void CXRInput::sample(XrTime predictedDisplayTime, XrSpace refSpace) {
         if (XR_SUCCEEDED(xrGetActionStateBoolean(m_session, &gi, &bf)) && bf.isActive)
             h.menu = bf.currentState;
 
-        // WP6 instrumentation: a Schmitt trigger on select. On an edge, emit a BUTTON event
-        // across the frame->main queue so the plumbing can be proven on the main thread. The
-        // real ray cast + owner arbitration + monitor targeting lands in WP7.
-        bool& pressed = m_selectPressed[hand];
-        bool  edge    = false;
-        if (!pressed && h.select >= onT) {
-            pressed = true;
-            edge    = true;
-        } else if (pressed && h.select <= offT) {
-            pressed = false;
-            edge    = true;
-        }
-        if (edge && m_emit) {
-            SXRInputEvent ev;
-            ev.type      = eXRInputEventType::BUTTON;
-            ev.monitorID = -1; // WP7 fills the hovered monitor
-            ev.button    = BTN_LEFT;
-            ev.pressed   = pressed;
-            ev.timeMs    = timeMs;
-            m_emit(ev);
-            emittedAny = true;
-        }
-
         m_hands[hand] = h;
     }
 
     if (focused)
         logInteractionProfileOnce();
+}
 
-    // Terminate the batch with a FRAME event (doc 04 §5/§7) only when something was queued, so
-    // an idle session adds zero wakeups.
-    if (emittedAny && m_emit) {
+// ---------------------------------------------------------------------------------------------
+// processPointer: ray cast, hover/owner arbitration, hysteresis, scroll (frame thread, §3-§5).
+// ---------------------------------------------------------------------------------------------
+
+void CXRInput::hapticTick(OpenXR::eXRHand hand) {
+    if (m_hapticAction == XR_NULL_HANDLE)
+        return;
+    XrHapticVibration vib = {XR_TYPE_HAPTIC_VIBRATION};
+    vib.duration          = 10'000'000; // XR_HAPTIC_TICK_NS = 10 ms (doc 04 §6.3)
+    vib.frequency         = XR_FREQUENCY_UNSPECIFIED;
+    vib.amplitude         = 0.5f;
+    XrHapticActionInfo hai = {XR_TYPE_HAPTIC_ACTION_INFO};
+    hai.action             = m_hapticAction;
+    hai.subactionPath      = m_handPath[hand];
+    // Fire-and-forget: a profile without a haptic binding just returns an error we ignore.
+    xrApplyHapticFeedback(m_session, &hai, reinterpret_cast<const XrHapticBaseHeader*>(&vib));
+}
+
+void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint32_t timeMs) {
+    if (!m_emit)
+        return;
+
+    static auto PSELON      = CConfigValue<Hyprlang::FLOAT>("openxr:pointer_trigger_threshold");
+    static auto PSELOFF     = CConfigValue<Hyprlang::FLOAT>("openxr:pointer_trigger_threshold_release");
+    static auto PSCROLLSPD  = CConfigValue<Hyprlang::FLOAT>("openxr:scroll_speed");
+    const float onT         = (float)*PSELON;
+    const float offT        = (float)*PSELOFF;
+    const float scrollSpeed = (float)*PSCROLLSPD;
+
+    bool        emittedAny = false;
+
+    auto        emit       = [&](SXRInputEvent ev) {
+        ev.timeMs = timeMs;
+        m_emit(ev);
+        emittedAny = true;
+    };
+
+    // 1. Ray cast per hand: nearest-t hit across all targets wins (occlusion). A grabbing hand
+    //    casts nothing (WP8). Hover changes (incl. none<->some) transfer pointer ownership (§3).
+    for (auto hand : {XR_HAND_LEFT, XR_HAND_RIGHT}) {
+        MONITORID newMon = -1;
+        Vector2D  newUV;
+        if (!m_grabbing[hand] && m_hands[hand].aim) {
+            const OpenXR::SXRPose& aim    = *m_hands[hand].aim;
+            const OpenXR::Vec3     origin = aim.pos;
+            const OpenXR::Vec3     dir    = OpenXR::qRotate(aim.rot, OpenXR::Vec3{0.f, 0.f, -1.f});
+
+            float bestT = std::numeric_limits<float>::max();
+            for (const auto& t : targets) {
+                const OpenXR::SXRQuadHit hit = OpenXR::rayQuadIntersect(t.worldPose, origin, dir, t.w, t.h);
+                if (hit.hit && hit.t < bestT) {
+                    bestT  = hit.t;
+                    newMon = t.id;
+                    newUV  = Vector2D{hit.u, hit.v};
+                }
+            }
+        }
+
+        if (newMon != m_hoverMon[hand]) {
+            m_owner = hand; // hover change owns the pointer (§3)
+            Log::logger->log(Log::DEBUG, "[OPENXR] hand {} hover {} -> {} (uv {:.3f},{:.3f})", hand == XR_HAND_LEFT ? "L" : "R", (long long)m_hoverMon[hand], (long long)newMon, newUV.x,
+                             newUV.y);
+        }
+        m_hoverMon[hand] = newMon;
+        m_hoverUV[hand]  = newUV;
+    }
+
+    // MOTION_ABS for the owner, coalesced on (monitor, uv). monitorID == -1 signals the ray left
+    // all quads (a hover clear on the main thread). Emitted before buttons so a click lands on
+    // the freshly-warped pixel.
+    auto emitOwnerMotion = [&]() {
+        if (m_owner < 0)
+            return;
+        const MONITORID om  = m_hoverMon[m_owner];
+        const Vector2D  ouv = m_hoverUV[m_owner];
+        if (om >= 0) {
+            if (om != m_emittedMon || (ouv - m_emittedUV).size() > XR_UV_EPSILON) {
+                SXRInputEvent ev;
+                ev.type      = eXRInputEventType::MOTION_ABS;
+                ev.monitorID = om;
+                ev.uv        = ouv;
+                emit(ev);
+                m_emittedMon = om;
+                m_emittedUV  = ouv;
+            }
+        } else if (m_emittedMon >= 0) {
+            SXRInputEvent ev;
+            ev.type      = eXRInputEventType::MOTION_ABS;
+            ev.monitorID = -1; // hover clear
+            emit(ev);
+            m_emittedMon = -1;
+        }
+    };
+
+    emitOwnerMotion();
+
+    // 2. Select + menu edges per hand. A press transfers ownership and (single pointer) is only
+    //    honored when no other hand already holds that button; a release always closes its own
+    //    press so the button can never stick.
+    for (auto hand : {XR_HAND_LEFT, XR_HAND_RIGHT}) {
+        if (m_grabbing[hand])
+            continue;
+
+        // select -> BTN_LEFT
+        if (m_selectTrig[hand].update(m_hands[hand].select, onT, offT)) {
+            if (m_selectTrig[hand].state) {
+                m_owner = hand; // press owns the pointer (§4)
+                emitOwnerMotion();
+                if (m_hoverMon[hand] >= 0 && m_leftHolder < 0) {
+                    m_leftHolder = hand;
+                    SXRInputEvent ev;
+                    ev.type      = eXRInputEventType::BUTTON;
+                    ev.monitorID = m_hoverMon[hand];
+                    ev.button    = BTN_LEFT;
+                    ev.pressed   = true;
+                    emit(ev);
+                    hapticTick(hand); // press only (doc 04 §6.3)
+                }
+            } else if (m_leftHolder == hand) {
+                m_leftHolder = -1;
+                SXRInputEvent ev;
+                ev.type      = eXRInputEventType::BUTTON;
+                ev.monitorID = m_hoverMon[hand];
+                ev.button    = BTN_LEFT;
+                ev.pressed   = false; // release fires even if the ray has left the quad
+                emit(ev);
+            }
+        }
+
+        // menu -> BTN_RIGHT (bool via a 0.5 threshold Schmitt)
+        if (m_menuTrig[hand].update(m_hands[hand].menu ? 1.f : 0.f, 0.5f, 0.5f)) {
+            if (m_menuTrig[hand].state) {
+                m_owner = hand;
+                emitOwnerMotion();
+                if (m_hoverMon[hand] >= 0 && m_rightHolder < 0) {
+                    m_rightHolder = hand;
+                    SXRInputEvent ev;
+                    ev.type      = eXRInputEventType::BUTTON;
+                    ev.monitorID = m_hoverMon[hand];
+                    ev.button    = BTN_RIGHT;
+                    ev.pressed   = true;
+                    emit(ev);
+                }
+            } else if (m_rightHolder == hand) {
+                m_rightHolder = -1;
+                SXRInputEvent ev;
+                ev.type      = eXRInputEventType::BUTTON;
+                ev.monitorID = m_hoverMon[hand];
+                ev.button    = BTN_RIGHT;
+                ev.pressed   = false;
+                emit(ev);
+            }
+        }
+    }
+
+    // 3. Scroll: only the owner hand, only while hovering (not grabbing). Thumbstick -> axis,
+    //    one wheel notch per full deflection per frame batch (doc 04 §5).
+    if (m_owner >= 0 && !m_grabbing[m_owner] && m_hoverMon[m_owner] >= 0) {
+        const Vector2D stick = m_hands[m_owner].stick;
+        if (std::fabs(stick.y) > XR_STICK_DEADZONE) {
+            SXRInputEvent ev;
+            ev.type      = eXRInputEventType::AXIS;
+            ev.axis      = WL_POINTER_AXIS_VERTICAL_SCROLL;
+            ev.axisDelta = -stick.y * XR_SCROLL_NOTCH * scrollSpeed; // stick up => wheel up
+            emit(ev);
+        }
+        if (std::fabs(stick.x) > XR_STICK_DEADZONE) {
+            SXRInputEvent ev;
+            ev.type      = eXRInputEventType::AXIS;
+            ev.axis      = WL_POINTER_AXIS_HORIZONTAL_SCROLL;
+            ev.axisDelta = stick.x * XR_SCROLL_NOTCH * scrollSpeed;
+            emit(ev);
+        }
+    }
+
+    // 4. Terminate the batch with a FRAME event (§5/§7) only when something was queued, so an
+    //    idle session adds zero wakeups.
+    if (emittedAny) {
         SXRInputEvent frame;
-        frame.type   = eXRInputEventType::FRAME;
-        frame.timeMs = timeMs;
-        m_emit(frame);
+        frame.type = eXRInputEventType::FRAME;
+        emit(frame);
     }
 }
 
