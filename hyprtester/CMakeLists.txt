@@ -109,6 +109,8 @@ protocolnew("staging/pointer-warp" "pointer-warp-v1" false)
 protocolnew("staging/fractional-scale" "fractional-scale-v1" false)
 protocolnew("stable/xdg-shell" "xdg-shell" false)
 protocolnew("unstable/keyboard-shortcuts-inhibit" "keyboard-shortcuts-inhibit-unstable-v1" false)
+# docs/openxr/06-testing.md §6 row 8 (WP12): idle-notify test client.
+protocolnew("staging/ext-idle-notify" "ext-idle-notify-v1" false)
 
 clientNew("pointer-warp" PROTOS "pointer-warp-v1" "xdg-shell")
 clientNew("surface-scale-transform" PROTOS "fractional-scale-v1" "xdg-shell")
@@ -117,3 +119,4 @@ clientNew("child-window" PROTOS "xdg-shell")
 clientNew("xdg-interactive" PROTOS "xdg-shell")
 clientNew("shortcut-inhibitor" PROTOS "xdg-shell" "keyboard-shortcuts-inhibit-unstable-v1")
 clientNew("keyboard-modifiers" PROTOS "xdg-shell")
+clientNew("idle-notify" PROTOS "ext-idle-notify-v1")
