@@ -1113,6 +1113,18 @@ std::string CConfigManager::parseKeyword(const std::string& COMMAND, const std::
         }
     }
 
+    // openxr:inhibit_idle is documented (docs/openxr/05-ipc-config.md §1.2/§6.3) as a "hot"
+    // toggle that "triggers an idle recheck" via config.props_refreshed — but that event is
+    // Lua-config-only plumbing (only LuaBindingsConfigRules.cpp ever reads a value's
+    // refreshBits()/calls scheduleRefresh()); under the legacy parser a bare `hyprctl keyword`
+    // never emits it for a plain var, which is exactly why gaps_/dwindle:/master:/monitor needed
+    // their own special-case just above. Genuine blocking bug found by WP12 (openxr integration
+    // tests, xr_idle_inhibit): `hyprctl keyword openxr:inhibit_idle 0/1` never actually rechecked
+    // the idle-inhibit bit outside a full `/reload`. Minimal, targeted fix mirroring the existing
+    // special-case pattern in this function.
+    if (COMMAND == "openxr:inhibit_idle")
+        g_pInputManager->recheckIdleInhibitorStatus();
+
     // Update window border colors
     Desktop::globalWindowController()->updateAllWindowsDecorations();
 
