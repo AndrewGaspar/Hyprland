@@ -161,3 +161,94 @@ TEST(XRParser, CreateAnchorNoMode) {
     EXPECT_FALSE(r->m_resolution.has_value());
     EXPECT_EQ(r->m_anchor.mode, XR_ANCHOR_LOCAL);
 }
+
+// -------- layout round-trip (WP13, doc 03 §7 / `hyprctl openxr layout`) --------
+//
+// serializeXRMonitorLine (XRMonitorConfig.cpp) is the pure formatter COpenXRManager::layoutDump()
+// uses to emit paste-ready `xrmonitor = ...` lines from the live layout. These tests feed its
+// output straight back through parseXRMonitorLine and check the re-parsed params are equivalent
+// to what was serialized — the round-trip the WP5 doc 03 §7 acceptance criterion and the WP13
+// roadmap entry ask for.
+
+TEST(XRLayoutRoundTrip, Local) {
+    SXRAnchorState anchor;
+    anchor.mode         = XR_ANCHOR_LOCAL;
+    anchor.widthMeters   = 1.8f;
+    SXRPose pose;
+    pose.pos = Vec3{0.25f, 1.4f, -1.5f};
+    pose.rot = qMul(qFromYaw(30.f * (float)M_PI / 180.f), qFromPitch(-10.f * (float)M_PI / 180.f));
+
+    const std::string line = serializeXRMonitorLine("XR-rt-local", Vector2D(2560, 1440), 90.f, anchor, pose, 1.8f);
+
+    auto reparsed = parseXRMonitorLine(line.substr(std::string("xrmonitor = ").size()));
+    ASSERT_TRUE(reparsed.has_value()) << reparsed.error() << " (line was: " << line << ")";
+    EXPECT_EQ(reparsed->m_name, "XR-rt-local");
+    ASSERT_TRUE(reparsed->m_resolution.has_value());
+    EXPECT_EQ(*reparsed->m_resolution, Vector2D(2560, 1440));
+    ASSERT_TRUE(reparsed->m_refreshRate.has_value());
+    EXPECT_FLOAT_EQ(*reparsed->m_refreshRate, 90.f);
+    EXPECT_EQ(reparsed->m_anchor.mode, XR_ANCHOR_LOCAL);
+    EXPECT_NEAR(reparsed->m_anchor.anchorPose.pos.x, pose.pos.x, 1e-3f);
+    EXPECT_NEAR(reparsed->m_anchor.anchorPose.pos.y, pose.pos.y, 1e-3f);
+    EXPECT_NEAR(reparsed->m_anchor.anchorPose.pos.z, pose.pos.z, 1e-3f);
+    EXPECT_NEAR(qAngleBetween(reparsed->m_anchor.anchorPose.rot, pose.rot), 0.f, 1e-2f);
+    ASSERT_TRUE(reparsed->m_sizeMeters.has_value());
+    EXPECT_FLOAT_EQ(*reparsed->m_sizeMeters, 1.8f);
+}
+
+TEST(XRLayoutRoundTrip, Head) {
+    // head prints no rotation (display orientation is lookAt-driven, doc 03 §3.2) — the stored
+    // rot is irrelevant to the serialized line and the parser always leaves it identity.
+    SXRAnchorState anchor;
+    anchor.mode = XR_ANCHOR_HEAD;
+    SXRPose pose;
+    pose.pos = Vec3{0.4f, -0.2f, -1.0f};
+    pose.rot = Quat{}; // identity, per §3.2
+
+    const std::string line = serializeXRMonitorLine("XR-rt-head", Vector2D(1280, 720), std::nullopt, anchor, pose, 0.6f);
+
+    auto reparsed = parseXRMonitorLine(line.substr(std::string("xrmonitor = ").size()));
+    ASSERT_TRUE(reparsed.has_value()) << reparsed.error() << " (line was: " << line << ")";
+    EXPECT_EQ(reparsed->m_anchor.mode, XR_ANCHOR_HEAD);
+    EXPECT_NEAR(reparsed->m_anchor.anchorPose.pos.x, pose.pos.x, 1e-3f);
+    EXPECT_NEAR(reparsed->m_anchor.anchorPose.pos.y, pose.pos.y, 1e-3f);
+    EXPECT_NEAR(reparsed->m_anchor.anchorPose.pos.z, pose.pos.z, 1e-3f);
+    EXPECT_FLOAT_EQ(*reparsed->m_sizeMeters, 0.6f);
+}
+
+TEST(XRLayoutRoundTrip, Body) {
+    // body prints yaw only (pitch/roll forced to 0, doc 03 §3.3).
+    SXRAnchorState anchor;
+    anchor.mode = XR_ANCHOR_BODY;
+    SXRPose pose;
+    pose.pos = Vec3{-0.8f, 1.2f, -1.2f};
+    pose.rot = qFromYaw(45.f * (float)M_PI / 180.f);
+
+    const std::string line = serializeXRMonitorLine("XR-rt-body", Vector2D(1920, 1080), 60.f, anchor, pose, 0.9f);
+
+    auto reparsed = parseXRMonitorLine(line.substr(std::string("xrmonitor = ").size()));
+    ASSERT_TRUE(reparsed.has_value()) << reparsed.error() << " (line was: " << line << ")";
+    EXPECT_EQ(reparsed->m_anchor.mode, XR_ANCHOR_BODY);
+    EXPECT_NEAR(reparsed->m_anchor.anchorPose.pos.x, pose.pos.x, 1e-3f);
+    EXPECT_NEAR(reparsed->m_anchor.anchorPose.pos.y, pose.pos.y, 1e-3f);
+    EXPECT_NEAR(reparsed->m_anchor.anchorPose.pos.z, pose.pos.z, 1e-3f);
+    EXPECT_NEAR(qYawOf(reparsed->m_anchor.anchorPose.rot, 0.f), qYawOf(pose.rot, 0.f), 1e-2f);
+}
+
+TEST(XRLayoutRoundTrip, Device) {
+    SXRAnchorState anchor;
+    anchor.mode   = XR_ANCHOR_DEVICE;
+    anchor.device = XR_HAND_RIGHT;
+    SXRPose pose;
+    pose.pos = Vec3{0.f, 0.08f, -0.05f};
+    pose.rot = Quat{};
+
+    const std::string line = serializeXRMonitorLine("XR-rt-device", Vector2D(800, 800), std::nullopt, anchor, pose, 0.25f);
+
+    auto reparsed = parseXRMonitorLine(line.substr(std::string("xrmonitor = ").size()));
+    ASSERT_TRUE(reparsed.has_value()) << reparsed.error() << " (line was: " << line << ")";
+    EXPECT_EQ(reparsed->m_anchor.mode, XR_ANCHOR_DEVICE);
+    EXPECT_EQ(reparsed->m_anchor.device, XR_HAND_RIGHT);
+    EXPECT_NEAR(reparsed->m_anchor.anchorPose.pos.y, pose.pos.y, 1e-3f);
+    EXPECT_FLOAT_EQ(*reparsed->m_sizeMeters, 0.25f);
+}

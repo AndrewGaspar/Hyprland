@@ -5,6 +5,8 @@
 
 #include <charconv>
 #include <cctype>
+#include <cmath>
+#include <format>
 #include <sstream>
 #include <vector>
 
@@ -234,6 +236,48 @@ std::string OpenXR::anchorModeToString(eXRAnchorMode mode, eXRHand device) {
 
 std::string OpenXR::anchorModeToString(const SXRAnchorState& state) {
     return anchorModeToString(state.mode, state.device);
+}
+
+namespace {
+    // Derive yaw/pitch degrees from a pose's forward vector for serialization (doc 03 §7).
+    void quatToYawPitchDeg(const OpenXR::Quat& q, float& yawDeg, float& pitchDeg) {
+        const OpenXR::Vec3 f       = OpenXR::qRotate(q, OpenXR::Vec3{0.f, 0.f, -1.f});
+        const float        pitch   = std::asin(std::clamp(f.y, -1.f, 1.f));
+        const float        yaw     = (f.x * f.x + f.z * f.z < 1e-8f) ? 0.f : std::atan2(-f.x, -f.z);
+        constexpr float    RAD2DEG = 180.f / 3.14159265358979323846f;
+        yawDeg                     = yaw * RAD2DEG;
+        pitchDeg                   = pitch * RAD2DEG;
+    }
+}
+
+std::string OpenXR::serializeXRMonitorLine(const std::string& name, Vector2D resolution, std::optional<float> refreshHz, const SXRAnchorState& anchor, const SXRPose& pose,
+                                            float sizeMeters) {
+    std::string mode = std::format("{}x{}", (int)resolution.x, (int)resolution.y);
+    if (refreshHz.has_value() && *refreshHz > 0.f)
+        mode += std::format("@{:.0f}", *refreshHz);
+
+    const auto& p = pose.pos;
+    std::string spec;
+    switch (anchor.mode) {
+        case XR_ANCHOR_LOCAL: spec = std::format("anchor:local pos:{:.3f},{:.3f},{:.3f}", p.x, p.y, p.z); break;
+        case XR_ANCHOR_HEAD: spec = std::format("anchor:head offset:{:.3f},{:.3f},{:.3f}", p.x, p.y, p.z); break;
+        case XR_ANCHOR_BODY: spec = std::format("anchor:body offset:{:.3f},{:.3f},{:.3f}", p.x, p.y, p.z); break;
+        case XR_ANCHOR_DEVICE:
+            spec = std::format("anchor:device:{} offset:{:.3f},{:.3f},{:.3f}", anchor.device == XR_HAND_RIGHT ? "right" : "left", p.x, p.y, p.z);
+            break;
+    }
+
+    // Rotation (doc 03 §7): head prints no rotation (lookAt-driven); body prints yaw only
+    // (pitch/roll forced to 0); local/device print yaw and pitch (pitch omitted when
+    // |pitch| < 0.05°). Roll is not representable and is intentionally dropped (v1 limitation).
+    float yawDeg = 0.f, pitchDeg = 0.f;
+    quatToYawPitchDeg(pose.rot, yawDeg, pitchDeg);
+    if (anchor.mode != XR_ANCHOR_HEAD)
+        spec += std::format(" yaw:{:.1f}", yawDeg);
+    if ((anchor.mode == XR_ANCHOR_LOCAL || anchor.mode == XR_ANCHOR_DEVICE) && std::fabs(pitchDeg) >= 0.05f)
+        spec += std::format(" pitch:{:.1f}", pitchDeg);
+
+    return std::format("xrmonitor = {}, {}, {}, size:{:.2f}", name, mode, spec, sizeMeters);
 }
 
 std::expected<SXRMonitorParams, std::string> OpenXR::parseXRMonitorLine(const std::string& args) {

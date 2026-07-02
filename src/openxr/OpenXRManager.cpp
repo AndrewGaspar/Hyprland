@@ -1218,15 +1218,9 @@ void COpenXRManager::onConfigReload() {
 // ---------------------------------------------------------------------------------------------
 
 namespace {
-    // Derive yaw/pitch degrees from a stored quat for serialization (doc 03 §7).
-    void quatToYawPitchDeg(const OpenXR::Quat& q, float& yawDeg, float& pitchDeg) {
-        const OpenXR::Vec3 f       = OpenXR::qRotate(q, OpenXR::Vec3{0.f, 0.f, -1.f});
-        const float        pitch   = std::asin(std::clamp(f.y, -1.f, 1.f));
-        const float        yaw     = (f.x * f.x + f.z * f.z < 1e-8f) ? 0.f : std::atan2(-f.x, -f.z);
-        constexpr float    RAD2DEG = 180.f / (float)M_PI;
-        yawDeg                     = yaw * RAD2DEG;
-        pitchDeg                   = pitch * RAD2DEG;
-    }
+    // Note: yaw/pitch-from-quat serialization (doc 03 §7) now lives in the pure, unconditional
+    // OpenXR::serializeXRMonitorLine (XRMonitorConfig.cpp) so layoutDump() and the gtest
+    // round-trip test (tests/xr/parser.cpp) share one implementation.
 
     OpenXR::eXRAnchorMode parseAnchorModeSpec(const std::string& tok, OpenXR::eXRHand& hand, bool& ok) {
         ok = true;
@@ -1523,9 +1517,22 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
 }
 
 std::string COpenXRManager::layoutDump() {
-    // Paste-ready `xrmonitor = ...` lines (doc 05 §4.2). WP4 serializes the stored (static)
-    // anchor spec + mode + size, which round-trips through the WP4 parser. TODO(WP5): emit the
-    // live solved pose from the anchoring engine rather than the parsed spec.
+    // Paste-ready `xrmonitor = ...` lines (doc 05 §4.2 / doc 03 §7). Reflects the CURRENT live
+    // layout, not just the parsed/declared spec:
+    //  - anchor:local serializes the anchor's *live solved world pose* (CXRAnchor::lastWorld()),
+    //    not the persistent m_state.anchorPose. The two are identical for LOCAL whenever the
+    //    monitor isn't mid-grab (solve() sets m_lastWorld = anchorPose verbatim, doc 03 §3.1),
+    //    but diverge while grabbed (the solve override composes grip * offset, doc 03 §4.2) —
+    //    using lastWorld makes `hyprctl openxr layout` reproduce what the user actually sees
+    //    right now even mid-grab, rather than the stale pre-grab pose. Falls back to the stored
+    //    state if no solve has run yet (no session ever started for this layer).
+    //  - head/body/device serialize the persistent offset (m_state.anchorPose) unchanged: that
+    //    offset *is* the config representation for those modes (the live world position it
+    //    produces continuously tracks the head/body/grip by design, doc 03 §3.2-3.4, so it is
+    //    not itself a meaningful thing to freeze into a config line — only the offset is).
+    //    applyMove/rotate/distance/center verbs already mutate this offset directly, and
+    //    endGrab() re-derives it on grab release (doc 03 §4.4), so it stays live for those modes
+    //    without any extra plumbing here.
     std::string              out;
     std::vector<std::string> lines;
     {
@@ -1547,33 +1554,13 @@ std::string COpenXRManager::layoutDump() {
             if (l->m_reqRefresh)
                 hz = *l->m_reqRefresh;
 
-            std::string mode = std::format("{}x{}", w, h);
-            if (hz > 0.f)
-                mode += std::format("@{:.0f}", hz);
-
             const auto& st = l->m_anchor.state();
-            const auto& p  = st.anchorPose.pos;
-            std::string anchor;
-            switch (st.mode) {
-                case OpenXR::XR_ANCHOR_LOCAL: anchor = std::format("anchor:local pos:{:.3f},{:.3f},{:.3f}", p.x, p.y, p.z); break;
-                case OpenXR::XR_ANCHOR_HEAD: anchor = std::format("anchor:head offset:{:.3f},{:.3f},{:.3f}", p.x, p.y, p.z); break;
-                case OpenXR::XR_ANCHOR_BODY: anchor = std::format("anchor:body offset:{:.3f},{:.3f},{:.3f}", p.x, p.y, p.z); break;
-                case OpenXR::XR_ANCHOR_DEVICE:
-                    anchor = std::format("anchor:device:{} offset:{:.3f},{:.3f},{:.3f}", st.device == OpenXR::XR_HAND_RIGHT ? "right" : "left", p.x, p.y, p.z);
-                    break;
-            }
-            // Rotation serialization (doc 03 §7): derive yaw/pitch from the stored quat. head
-            // prints no rotation (lookAt-driven); body prints yaw only (pitch/roll forced to 0);
-            // local/device print yaw and pitch (pitch omitted when |pitch| < 0.05°). Roll is not
-            // representable and is intentionally dropped (documented v1 limitation).
-            float yawDeg = 0.f, pitchDeg = 0.f;
-            quatToYawPitchDeg(st.anchorPose.rot, yawDeg, pitchDeg);
-            if (st.mode != OpenXR::XR_ANCHOR_HEAD)
-                anchor += std::format(" yaw:{:.1f}", yawDeg);
-            if ((st.mode == OpenXR::XR_ANCHOR_LOCAL || st.mode == OpenXR::XR_ANCHOR_DEVICE) && std::fabs(pitchDeg) >= 0.05f)
-                anchor += std::format(" pitch:{:.1f}", pitchDeg);
+            // Live substitution for LOCAL only (see comment above).
+            const bool            useLive  = st.mode == OpenXR::XR_ANCHOR_LOCAL && l->m_anchor.hasLastWorld();
+            const OpenXR::SXRPose livePose = useLive ? l->m_anchor.lastWorld() : st.anchorPose;
 
-            lines.push_back(std::format("xrmonitor = {}, {}, {}, size:{:.2f}", l->m_monitorName, mode, anchor, st.widthMeters));
+            lines.push_back(OpenXR::serializeXRMonitorLine(l->m_monitorName, Vector2D{(double)w, (double)h}, hz > 0.f ? std::optional<float>(hz) : std::nullopt, st, livePose,
+                                                             st.widthMeters));
         }
     }
     for (auto& ln : lines)

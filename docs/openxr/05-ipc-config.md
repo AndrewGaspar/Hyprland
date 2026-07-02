@@ -96,11 +96,39 @@ m_configReloadListener = Event::bus()->m_events.config.reloaded.listen([this] { 
 
 `onConfigReload()` compares `*PENABLED` against the current lifecycle state and calls
 `start()`/`stop()` accordingly, then runs `xrmonitor` declared-set reconciliation (§2.4) and
-`g_pInputManager->recheckIdleInhibitorStatus()` (§6). Because
-`hyprctl keyword openxr:enabled 1` updates the value without a full reload, also listen to
-`Event::bus()->m_events.config.props_refreshed` with the same handler (it's idempotent), and
-`hyprctl openxr enable|disable` (§4) calls `start()`/`stop()` directly — all paths funnel to
-the same two methods.
+`g_pInputManager->recheckIdleInhibitorStatus()` (§6). A full config reload (`/reload`, or the
+file watcher) reaches it via the `config.reloaded` listener above; `onConfigReload()` is also
+public and idempotent so `hyprctl openxr enable|disable` (§4) can call `start()`/`stop()`
+directly — all paths funnel to the same two methods.
+
+**Legacy-parser gap and its fix (as built, WP13 reconciliation):** the original plan was that
+`hyprctl keyword openxr:enabled 1` would update the value and fire
+`Event::bus()->m_events.config.props_refreshed`, which `COpenXRManager` also listens to. In
+practice, under the **classic hyprlang config path**, `props_refreshed` is Lua-config-only
+plumbing (only the Lua config-rules bindings ever call `CPropRefresher::scheduleRefresh()`); a
+bare `hyprctl keyword <var> <value>` against the legacy parser goes through
+`CConfigManager::parseKeyword()` and fires **neither** `config.reloaded` nor
+`config.props_refreshed` for an ordinary var. `openxr:inhibit_idle` hit this same gap first (WP12,
+`xr_idle_inhibit`): `hyprctl keyword openxr:inhibit_idle 0/1` silently did nothing until a full
+reload. Both are fixed identically, with a small special-case cluster in `parseKeyword()`
+(`src/config/legacy/ConfigManager.cpp`, next to the existing `monitor`/`gaps_`/`dwindle:`/
+`master:` special cases that exist for the same reason):
+
+```cpp
+if (COMMAND == "openxr:inhibit_idle")
+    g_pInputManager->recheckIdleInhibitorStatus();
+
+#ifdef HAVE_OPENXR
+if (COMMAND == "openxr:enabled" && g_pOpenXRManager)
+    g_pOpenXRManager->onConfigReload();
+#endif
+```
+
+The `props_refreshed` listener in `COpenXRManager`'s constructor is still correct and harmless
+(it fires, and `onConfigReload()` is idempotent, under the Lua config path or a scheduled
+refresh) — just not sufficient on its own for a legacy-parser `hyprctl keyword`. A full
+`hyprctl reload` always works regardless of config front-end, since it fires `config.reloaded`
+unconditionally.
 
 ---
 
@@ -221,6 +249,32 @@ successful reload, from `COpenXRManager::onConfigReload()`:
 If no session is running (DISABLED/UNAVAILABLE), declared monitors still materialize as plain
 headless outputs; their quads bind lazily when a session starts (`02-virtual-monitors.md`).
 
+**Two distinct trigger paths, as built (WP13 reconciliation):** "reconciled once after a
+successful reload" above covers a **full** reload (`/reload`, file watcher, `hyprctl reload`) —
+`CConfigManager::handleXRMonitor()` (the trampoline's target, §2.1) only *accumulates* into the
+declared list per line during parsing; it never reconciles per-line for a full reload.
+Reconciliation for that path runs exactly once, after all keyword state has settled, from
+`COpenXRManager::onConfigReload()` (reached via the `config.reloaded` listener, §1.3).
+
+A **dynamic** `hyprctl keyword xrmonitor ...` is a second, separate path: like `openxr:enabled`
+(§1.3), it never fires `config.reloaded`/`config.props_refreshed` under the legacy parser, so
+`onConfigReload()` is never reached that way. `handleXRMonitor()` detects this case explicitly
+(`g_pHyprCtl->m_currentRequestParams.isDynamicKeyword`) and defers a direct reconcile call to the
+next event-loop iteration:
+
+```cpp
+if (g_pHyprCtl && g_pHyprCtl->m_currentRequestParams.isDynamicKeyword && g_pEventLoopManager)
+    g_pEventLoopManager->doLater([] {
+        if (g_pOpenXRManager)
+            g_pOpenXRManager->reconcileDeclaredMonitors();
+    });
+```
+
+The `doLater` deferral (not an inline call) matters: it lets a batch of dynamic keyword changes
+(e.g. `hyprctl --batch "keyword xrmonitor ...; keyword xrmonitor ..."`) all land in the declared
+list before reconciliation runs once, rather than reconciling — and potentially flickering — after
+every individual line.
+
 ---
 
 ## 3. The `xrmonitor` dispatcher
@@ -228,11 +282,21 @@ headless outputs; their quads bind lazily when a session starts (`02-virtual-mon
 One dispatcher, verb-based, bindable from `bind =` and callable via `hyprctl dispatch
 xrmonitor <verb> ...`. Registered in the in-tree dispatcher map,
 `src/config/legacy/DispatcherTranslator.cpp` — add to the `CDispatcherTranslator`
-constructor (line ~790):
+constructor (line ~915):
 
 ```cpp
 m_dispMap["xrmonitor"] = ::xrmonitorDispatch;
 ```
+
+**Two registration sites, as built (WP13 reconciliation):** the line above alone is not
+sufficient for `bind =` to reach the dispatcher. `bind =` resolution goes through
+`CKeybindManager::m_dispatchers`, not `CDispatcherTranslator::m_dispMap` directly — legacy
+dispatcher names have to be separately listed in `CKeybindManager`'s constructor
+(`src/managers/KeybindManager.cpp:111`, in the array of names each forwarded via
+`Config::Legacy::translator()->run(n, args)`) for `bind = ..., xrmonitor, ...` to work at all.
+`hyprctl dispatch xrmonitor ...` reaches the translator's `m_dispMap` through a different path
+and only needs the first registration. Both are required in practice; `xrmonitor` is present in
+both lists.
 
 `xrmonitorDispatch(const std::string& args)` returns `SDispatchResult`
 (`src/SharedDefs.hpp:51` — `{passEvent, success, error}`); split `args` on spaces, first token
@@ -340,6 +404,7 @@ present:
     "state": "focused",
     "runtimeName": "Monado(XRT) by Collabora et al.",
     "systemName": "Simulated HMD",
+    "inhibitingIdle": true,
     "monitors": [
         {
             "name": "XR-code",
@@ -364,11 +429,24 @@ present:
   reported directly).
 - `runtimeName`/`systemName` — from `xrInstanceProperties`/`xrSystemProperties`; empty
   strings when no session (`disabled`/`unavailable`).
+- `inhibitingIdle` (added WP12/WP13 reconciliation) — mirrors `shouldInhibitIdle()`'s own
+  predicate (`openxr:inhibit_idle && state == focused`, §6.1) as a read-only observability field.
+  There is otherwise no queryable surface for "is the compositor's idle-inhibit bit currently
+  raised because of XR" (`CIdleNotifyProtocol::isInhibited` is private with no getter, and folds
+  every inhibitor source anyway) — this lets tests and status consumers assert idle-inhibit
+  end-to-end without polling wall-clock idle timers.
 - `id` — the Hyprland `MONITORID` of the backing headless output; `-1` if the output is not
   (yet) mapped.
 - `anchor.mode` — `local` | `head` | `body` | `device:left` | `device:right`.
 - `anchor.pose` — for `local`: pose in LOCAL_FLOOR. For leashed/device modes: the configured
-  offset in the leash frame as `pos` and the relative rotation as `quat`.
+  offset in the leash frame as `pos` and the relative rotation as `quat`. **WP8 deviation (as
+  built, WP13 reconciliation):** while a monitor is grabbed, `anchor.pose` instead reports the
+  *live world-composed pose* (`CXRAnchor::lastWorld()`) for **every** anchor mode, not the frozen
+  configured offset — the offset field would otherwise go stale for the whole duration of the
+  grab (the grab override lives in a separate `m_grabOffset`, doc 03 §4.2, and is only folded
+  back into the persistent `anchorPose`/offset on release). This makes any status-polling
+  consumer (a bar, `hyprctl openxr layout`, tests) track the controller live during a grab; not
+  originally specified here (doc 05 predates grab, WP8), noted for WP13.
 - `quat` order is `[x, y, z, w]` (OpenXR convention).
 
 ---
@@ -389,7 +467,7 @@ originate on the main thread (create/destroy/anchor verbs, enable/disable) post 
 | `openxractive` | `1` \| `0` | Derived boolean: active ⇔ state ∈ {`visible`, `focused`}. Posted only when the boolean flips (immediately after the corresponding `openxrsessionstate`). This is the "is someone in the headset" signal for bars. |
 | `xrmonitoradded` | `<name>` | After an XR monitor is fully created (headless output up + registered with the manager). Fires from `createXRMonitor` on the main thread — for all three origins (keyword reconcile, dispatcher, hyprctl). Note the stock `monitoradded` event *also* fires for the underlying output; this event is the XR-specific one. |
 | `xrmonitorremoved` | `<name>` | After destruction of the XR monitor (any origin, including `destroy_monitors_on_stop` teardown). |
-| `xrmonitoranchor` | `<name>,<mode>` — mode as in §4.3 | Anchor mode changed: `anchor` verb, reload reconcile that changed the anchor, or grab-release re-anchor (`03-anchoring.md`; the latter arrives via the frame→main queue). |
+| `xrmonitoranchor` | `<name>,<mode>` — mode as in §4.3 | Anchor **mode** changed (not every pose mutation): the `anchor` verb (§3.1, when the resolved mode actually differs from the current one — `OpenXRManager.cpp` `cmdAnchor`'s `modeChanged` gate), or a reload reconcile whose declared anchor mode differs from the live one (`OpenXRManager.cpp`'s `anchorModeChanged` gate, §2.5). **WP13 reconciliation note: grab release does NOT fire this event**, even though `endGrab()` re-derives the persistent anchor representation (`03-anchoring.md` §4.4) — a normal grab where the mode is unchanged (e.g. local → local) only fires `xrmonitorgrab ...,0`; only the `anchor` verb / reload-reconcile paths above post `xrmonitoranchor`, both on the main thread (no frame→main queue involvement for this event). |
 | `xrmonitorgrab` | `<name>,1` \| `<name>,0` | Grab began / ended on a monitor (`04-input.md` grab state machine; frame thread → queue → main-thread post). |
 | `xrmonitorquad` | `<name>,1` \| `<name>,0` | Quad reactivated (`1`) / suspended (`0`) under the runtime layer cap (`02-virtual-monitors.md` layer-cap policy: oldest quads suspended first; the monitor keeps rendering as a plain headless output). Frame thread → queue → main-thread post. |
 
@@ -418,8 +496,9 @@ FOCUSED (and only FOCUSED) — the headset is on and this session has input focu
 
 `src/managers/input/IdleInhibitor.cpp`, inside
 `CInputManager::recheckIdleInhibitorStatus()`. The function is a chain of early-returning
-`setInhibit(true)` checks **ending in an unconditional `PROTO::idle->setInhibit(false)`
-(line 61)**. The XR check MUST live inside this function, before that final `false` — calling
+`setInhibit(true)` checks **ending in an unconditional `PROTO::idle->setInhibit(false)`**
+(as built: the `#ifdef HAVE_OPENXR` block sits just before it, with the unconditional `false`
+immediately after the block's `#endif`). The XR check MUST live inside this function, before that final `false` — calling
 `setInhibit(true)` from XR code directly would be clobbered by the very next recheck (which
 fires on every inhibitor/window change). This is the **only** XR touch outside `src/openxr/`
 apart from registration lines:

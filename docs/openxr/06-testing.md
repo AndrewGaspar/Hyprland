@@ -91,10 +91,22 @@ hyprtester/
             ├── session.cpp          # xr_session_up, xr_runtime_absent
             ├── monitors.cpp         # xr_monitor_create_destroy, xr_config_declared, xr_mirror
             ├── anchors.cpp          # xr_anchor_transitions
-            ├── input.cpp            # xr_ray_click_routing, xr_grab_move, xr_scroll
+            ├── input.cpp            # xr_ray_click_routing, xr_select_hysteresis, xr_two_hand_pointer, xr_scroll, xr_menu_right_click
+            ├── ray_live.cpp         # xr_ray_hover (WP7 bounded live smoke test, added alongside input.cpp's WP12 suite)
+            ├── grab_live.cpp        # xr_grab_move (WP8 bounded live smoke test — NOT in input.cpp, despite doc 07's WP12 deliverable list saying so)
             ├── idle.cpp             # xr_idle_inhibit
             └── teardown.cpp         # xr_disable_teardown
 ```
+
+**As built (WP13 reconciliation):** the file layout above is the actual one — `xr_grab_move`
+lives in its own `grab_live.cpp` (not folded into `input.cpp` as WP12's roadmap entry implied),
+and `xr_ray_hover` (a WP7 deliverable, predating WP12's input suite) lives in `ray_live.cpp`.
+`input.cpp` itself grew three more `TEST_CASE`s beyond the three originally scoped for WP12
+(`xr_select_hysteresis`, `xr_two_hand_pointer`, `xr_menu_right_click`) — see §6's table for all
+15. There is no dedicated integration (or unit) test for the layer-count cap policy
+(`02-virtual-monitors.md` "Layer-count limit") — it is implemented and code-reviewed but has no
+automated coverage as of WP13; a 16th-layer creation/suspension test remains a gap for a future
+WP, not something this doc set can currently claim passes.
 
 Group mechanism: copy `hyprtester/src/tests/main/tests.hpp` exactly — the group header
 defines `TEST_GROUP_NAME "xr"` and `GROUP_TEST_CASE_STORAGE xrTestCases`
@@ -141,6 +153,32 @@ xrmonitor = XR-conf-a, 1280x720@60, anchor:local pos:0,1.4,-1.5 yaw:0, size:1.0
 xrmonitor = XR-conf-b, 1024x768,    anchor:head offset:0.3,-0.1,-1.0, size:0.5
 ```
 
+### 2.2 Launch-mode fallback: nested Wayland (as built, WP13 reconciliation)
+
+The stock `HYPRLAND_HEADLESS_ONLY=1` launch (§2.1 step 1) can fail to bring up Aquamarine's
+headless backend in an isolated sandbox that has no seat — observed in this project's own dev
+environment. `hyprtester/src/main.cpp`'s `runXrSuite()` handles this with a fallback, not just
+a hard failure:
+
+1. Attempt the stock headless-only launch in the isolated `XDG_RUNTIME_DIR` (§3.1) and wait for
+   the instance to come up (`waitForHyprlandInstance`, 15 s budget).
+2. On failure: kill the process, symlink the **host's** `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`
+   socket (and its `.lock` file) into the isolated run directory, set `WAYLAND_DISPLAY` to that
+   name in the child's environment, and relaunch **without** `HYPRLAND_HEADLESS_ONLY` (i.e.
+   nested inside the host's own Wayland session) — up to 2 retries.
+
+**This changes the base output's name.** Under the stock headless-only launch the base monitor
+from `monitor = HEADLESS-1, ...` above is `HEADLESS-1`; under the nested fallback it is
+`WAYLAND-1` instead (Aquamarine's nested-Wayland backend names its output that way, regardless of
+what the config's `monitor =` line names). The config line's literal name (`HEADLESS-1`) then
+matches no real output when the fallback triggers, so that line's mode/position settings are
+effectively inert on a nested-fallback run — this is a known, currently-unaddressed gap in
+`xr-test.conf`, not a bug in the fallback logic itself. It does not affect the XR test cases
+themselves: every XR monitor the suite creates goes through `createXRMonitor`/`/output create
+headless` (both backend-independent), and `xr_mirror`'s `HEADLESS-2` target is likewise created
+dynamically. Don't assert a hard-coded `HEADLESS-1` in new XR tests; if a test needs the base
+monitor's name, query it rather than assuming.
+
 ---
 
 ## 3. MonadoOrchestrator
@@ -155,6 +193,14 @@ for a build dir `/home/ajg/code/monado/build`).
 Binary resolution order: `$HYPRTESTER_MONADO_SERVICE` (explicit override) →
 `/home/ajg/code/monado/build/src/xrt/targets/service/monado-service` → `monado-service` in
 `PATH`. If none exist → orchestrator state `unavailable` (suite SKIPs, §2.1).
+
+**The env override is authoritative, not merely first-priority (as built, WP13
+reconciliation):** if `$HYPRTESTER_MONADO_SERVICE` is set but does not resolve to a usable
+binary, `MonadoOrchestrator::resolveBinary()` does **not** fall through to the build-tree path or
+`PATH` — it fails immediately and the orchestrator reports `unavailable` (suite SKIPs). This is
+deliberate (source comment: "an explicit override is authoritative: if set, we use it exclusively
+— resolve or fail, no silent fallback to a different monado") and is also the supported way to
+force the no-monado/SKIP leg of the suite in development: point the var at a nonexistent path.
 
 Environment for the child (via `CProcess::addEnv`, same API `launchHyprland` uses):
 
@@ -332,6 +378,19 @@ settled JSON. Numeric pose assertions parse the JSON and use `EXPECT_MAX_DELTA` 
 
 A green run writes nothing (omedora rule). Print the artifact path in the failure message.
 
+**Known latent gap (as built, WP13 reconciliation):** the compositor's own log filename depends
+on the build type — `src/debug/log/Logger.cpp` writes to `hyprlandd.log` when `HYPRLAND_DEBUG`
+is defined (true CMake `Debug` builds) and `hyprland.log` otherwise. The exact `--xr` build
+command in §7 below does not pass `-DCMAKE_BUILD_TYPE=Debug` (a `build-debug`-named directory is
+not itself a `Debug` build unless you also set that flag), so under that command the filename is
+`hyprland.log` and `dumpXrArtifacts` reads the right file. `dumpXrArtifacts`
+(`hyprtester/src/xr/xr_helpers.cpp`) hard-codes `"/hyprland.log"` unconditionally, though — if
+`--xr` is ever run against a genuine `CMAKE_BUILD_TYPE=Debug` build, the real file is
+`hyprlandd.log` and artifact capture will silently miss the compositor log. This was flagged as a
+"WP6 bug to check" going into WP13 and remains unfixed as of this reconciliation pass: prefer a
+non-Debug (Release/RelWithDebInfo, i.e. the plain `--xr` build command below) build for `--xr`
+runs, or check both filenames by hand when debugging a Debug-build failure.
+
 ### 5.3 SKIP handling and TAP
 
 hyprtester's reporting is pass/fail line-based (`runTests` in `main.cpp`). For the XR suite,
@@ -362,6 +421,13 @@ the input-dependent tests (`xr_ray_click_routing`, `xr_grab_move`, `xr_scroll`) 
 `waitForXrState("visible")` and are marked expected-SKIP until focused is achievable — the
 non-input tests are unaffected.
 
+Note for any test reading `anchor.pose` from `j/openxr` (tests 4, 6, and any future ones): per
+`05-ipc-config.md` §4.3, head/body/device anchor modes report their **configured offset** over
+JSON in the normal case, and only switch to the **live world-composed pose** while the monitor is
+grabbed (`grabbed: true`) — this applies to all four modes, not just `local`. Assertions on
+`anchor.pose` for a leashed/device monitor that isn't grabbed should expect the stored offset, not
+a pose that tracks the head/body/grip frame-by-frame.
+
 | # | Test | Steps | Assertions |
 |---|---|---|---|
 | 1 | `xr_session_up` | Just the gate. | `waitForXrState("focused")` (or `visible`, caveat above); `j/openxr` has non-empty `runtimeName` containing `Monado`; `openxrsessionstate`/`openxractive` events observed if a socket2 listener is attached (optional v1). |
@@ -376,9 +442,57 @@ non-input tests are unaffected.
 | 10 | `xr_disable_teardown` | `hyprctl openxr disable` → wait `disabled`; then `hyprctl openxr enable` → wait up again. Run with one runtime-created monitor alive and `destroy_monitors_on_stop = 1`. | After disable: state `disabled`; the XR monitor is gone from `j/monitors` (destroy_monitors_on_stop); Hyprland alive and responsive (no crash on teardown — the whole point of the full state machine, `01-session-graphics.md`). After enable: state returns to `focused`/`visible`; declared monitors re-materialize with quads bound. |
 | 11 | `xr_runtime_absent` | **Runs when the orchestrator is `unavailable` OR in a dedicated sub-invocation without `XR_RUNTIME_JSON`** (§2.1 step 2): Hyprland launched with `openxr:enabled=1` but no runtime manifest. | `waitForXrState("unavailable")`; `hyprctl openxr` returns `state: unavailable` with empty runtime fields; `hyprctl openxr enable` returns a clean error (not a crash); compositor fully functional (run one trivial non-XR IPC assertion). This is the graceful-degradation contract of `00-overview.md`. |
 
+**As built, four more tests exist beyond the eleven above (WP13 reconciliation) — the implemented
+suite is 15 tests, not 11:**
+
+| # | Test | Steps | Assertions |
+|---|---|---|---|
+| 12 | `xr_ray_hover` (WP7, `ray_live.cpp`) | Bounded live smoke test predating the WP12 input suite: activate the left controller, sweep a small bracket of plausible poses aimed at a freshly-created quad. | Hover registers in `j/openxr` (name-scoped, §5.1-style helper — the WP13 fix in this reconciliation pass, see A.2). SKIPs (not fails) if hover never registers within budget — this test proves the pointer *can* work, it is not a strict gate; see the doc's dual-GPU/Monado-interop appendix below. |
+| 13 | `xr_select_hysteresis` (WP12, `input.cpp`) | Doc 04 §4 Schmitt-trigger coverage: drive `trigger_value` across the press (0.7) and release (0.4) thresholds while hovering, using a spawned pointer-scroll test client's button observability (hover alone can't distinguish "hovering" from "clicked"). | Press edge at/above 0.7 registers a button press on the client; release edge at/below 0.4 registers release; jitter between the thresholds does not double-fire. |
+| 14 | `xr_two_hand_pointer` (WP12, `input.cpp`) | Doc 04 §3 two-hand ownership: hover monitor A with the left hand, then produce a hover change with the right hand onto monitor B. | Pointer ownership (and `hovered`) transfers to the last-active hand; A stops being reported hovered once B is; transferring back to the left hand on A re-asserts A. |
+| 15 | `xr_menu_right_click` (WP12, `input.cpp`) | Doc 04 §1.2/§4: the `menu` action (bound to `a/click` on valve/index, the test profile) maps to a `BTN_RIGHT` edge. | A `menu` press/release edge while hovering produces a right-click on the spawned test client, verified via the same button-observability path as `xr_select_hysteresis`. |
+
+There is no dedicated 16-layer-cap integration test (§2's directory-layout note above) and no
+unit test for the layer-count-limit policy either — a gap, not an oversight to paper over.
+
 ---
 
-## 7. CI posture and local invocation
+## 7. Environment notes: dual-GPU interop (as built, WP13 reconciliation)
+
+Findings from running the `--xr` suite on a dual-GPU dev box (NVIDIA + AMD), recorded here so
+they aren't re-discovered from scratch. None of this is Hyprland-side application logic — it's
+runtime/driver behavior that shapes how to run and interpret the suite on this class of machine.
+
+- **Monado's null compositor picks a GPU independently of Hyprland.** On a machine with an
+  NVIDIA render node (`renderD128`) and an AMD one (`renderD129`), `monado-service`'s null
+  compositor selects NVIDIA/Vulkan for its `XRT_COMPOSITOR_NULL` device regardless of which GPU
+  Hyprland itself is rendering on.
+- **`openxr:gpu` must be pinned to match Monado's GPU on this class of setup.** `01-session-
+  graphics.md`'s default ("match Hyprland's primary GPU render node") picks the *wrong* device
+  when Hyprland's primary GPU differs from Monado's — the resulting cross-GPU dmabuf import
+  crashes inside Monado/Mesa at `xrCreateSwapchain` (the exact interop risk `01-session-
+  graphics.md`'s "GPU selection" section's historical-rationale comments describe). `xr-test.conf`
+  pins `openxr:gpu = /dev/dri/renderD128` (NVIDIA, matching Monado) specifically for this reason
+  — see the comment in that file.
+- **Known Monado/Mesa defects, runtime-side, not Hyprland bugs:** even with the GPU pinned
+  correctly (no swapchain crash, session reaches FOCUSED, quads render), long-running sessions on
+  this environment have been observed to spam `client_egl_insert_fence Failed` and, eventually, a
+  `corrupted double-linked list` heap-corruption abort during teardown. This is inside
+  Monado/Mesa, not `src/openxr/` — the WP3/WP10 implementation reports gdb-verified valid call
+  inputs (owned GBM display, correct format, correct size) at the crash site. **Practical
+  consequence for testing: keep individual XR sessions short.** The bounded-time, SKIP-not-FAIL
+  posture of `xr_ray_hover`/`xr_grab_move` (§6, tests 12 and 6) and the suite's overall design
+  (short-lived per-test sessions rather than one long-running session) already follow this
+  advice; don't add tests that hold a session open for extended periods on this class of
+  environment.
+- **Debugging tip:** the `hyprctl` binary in a `build-debug` tree can be a stale directory
+  artifact (pre-existing, unrelated build break) rather than the real CLI. Prefer raw socket IPC
+  (`echo -n "j/monitors" | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/hypr/$HIS/.socket.sock`) or the
+  system `hyprctl` for manual debugging outside the test harness.
+
+---
+
+## 8. CI posture and local invocation
 
 - **CI**: only the unit tier. `tests/xr/*.cpp` ride the existing `hyprland_gtests` target —
   zero new CI configuration. The integration tier is **not** wired into CI initially

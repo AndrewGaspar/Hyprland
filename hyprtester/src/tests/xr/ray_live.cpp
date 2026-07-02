@@ -27,6 +27,17 @@ namespace {
                 XR::dumpXrArtifacts(testName);
         }
     };
+
+    // Test-only, name-scoped bool-field check, built on WP11's XR::findAfter/XR::fieldAfter
+    // scraping primitives (same pattern as tests/xr/input.cpp's local scopedBoolField). xr-test.conf
+    // declares XR-conf-a/b fixtures alongside whatever this test creates, so `j/openxr` always has
+    // >= 2 monitor blocks — an unscoped "does '\"hovered\": true' appear anywhere in the blob"
+    // search would false-positive the instant either static fixture is (or becomes) hovered for
+    // any reason, unrelated to this test's own monitor/controller.
+    bool scopedBoolField(const std::string& json, const std::string& monName, const std::string& field, bool expect) {
+        const auto p = XR::findAfter(json, "\"name\": \"" + monName + "\"");
+        return p != std::string::npos && XR::fieldAfter(json, p, field) == (expect ? "true" : "false");
+    }
 }
 
 // xr_ray_hover — bounded live smoke test for WP7 (doc 04 §3): drives the Monado remote
@@ -88,7 +99,7 @@ TEST_CASE(xr_ray_hover) {
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
         if ((++idx % 20) == 0) {
             const std::string st = getFromSocket("j/openxr");
-            if (st.find("\"hovered\": true") != std::string::npos)
+            if (scopedBoolField(st, mon, "hovered", true))
                 gotHover = true;
         }
     }

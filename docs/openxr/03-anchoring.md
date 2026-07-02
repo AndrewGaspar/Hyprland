@@ -56,8 +56,15 @@ snapshot (see `00-overview.md`, thread model). `CXRAnchor` itself contains no lo
 - Angles are radians internally. Degrees appear only at the user-facing edges (config, dispatcher
   args, serialization) and are converted immediately.
 
-Hyprland only has `Vector2D` (`src/helpers/math/Math.hpp`), hence the new 3D types. They live at
-global scope like `Vector2D` does; `float` precision (matches `XrVector3f`/`XrQuaternionf`).
+Hyprland only has `Vector2D` (`src/helpers/math/Math.hpp`), hence the new 3D types. `float`
+precision (matches `XrVector3f`/`XrQuaternionf`).
+
+**Implementation note (as built, WP13 reconciliation):** unlike `Vector2D`, these types do not
+live at global scope — they live inside `namespace OpenXR { ... }`, matching the rest of
+`src/openxr/` (`XRMonitorConfig.hpp` etc. are likewise in that namespace). This is a plain named
+C++ namespace, not related to the OpenXR SDK headers, so it does not violate the "no OpenXR
+headers" constraint above. All type names below (`Vec3`, `Quat`, `SXRPose`, ...) should be read as
+`OpenXR::Vec3`, `OpenXR::Quat`, `OpenXR::SXRPose`, etc.
 
 ### 1.2 `XRMath.hpp` — required contents
 

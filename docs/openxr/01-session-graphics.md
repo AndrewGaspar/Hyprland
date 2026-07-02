@@ -152,7 +152,13 @@ binding.context        = gfx.m_xrContext;
    before the frame thread exists (WIP comment: *"All of this happens before
    startFrameThread() so m_xrContext is still available here"*).
 7. Enumerate + choose the swapchain format once (below); store on the session.
-8. Bind existing `CXRMonitorLayer`s (monitors created while disabled — doc 02),
+8. **Action system** (doc 04): build the `hyprland` action set, suggest bindings for all
+   profiles, create the aim/grip action spaces, and `xrAttachSessionActionSets` —
+   `CXRInput::init()`, called eagerly here (still on the main thread, still before the frame
+   thread exists). Doc 04's own text already says the action set is "created at session init,
+   before `xrAttachSessionActionSets`"; this step is where that happens — there is no lazy or
+   first-use deferral anywhere in the code.
+9. Bind existing `CXRMonitorLayer`s (monitors created while disabled — doc 02),
    spawn the frame thread (`m_running = true`), state → `XR_STATE_RUNNING_IDLE`.
 
 Note: **no swapchains are created here.** Per-layer swapchains are created lazily by
@@ -294,6 +300,13 @@ the standard loop (`XrEventDataBuffer` reset each iteration, `while (xrPollEvent
 
 `XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING`: forward to anchors (doc 03).
 
+**Dead-runtime case (as built, WP13 reconciliation):** `xrPollEvent` itself can return
+`XR_ERROR_INSTANCE_LOST`/`XR_ERROR_SESSION_LOST` directly (no event delivered at all — the
+runtime process is simply gone) rather than always delivering a well-formed
+`XrEventDataInstanceLossPending`. `pollEvents()` treats these return codes exactly like
+`LOSS_PENDING` (`m_instanceLost = true`, `m_exitRequested = true`) — add this as an implicit row
+alongside the `XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING` handling above.
+
 Every reported transition makes the main thread emit `openxrsessionstate` (doc 05)
 and re-run the idle-inhibit check.
 
@@ -307,8 +320,7 @@ while m_running:
     session.pollEvents()
     if session.m_exitRequested: break                      # EXITING / LOSS_PENDING
 
-    if !session.m_sessionBegan
-       or session.m_xrState not in {SYNCHRONIZED, VISIBLE, FOCUSED}:
+    if !session.m_sessionBegan:
         sleep 50ms; continue                               # WIP idle throttle
 
     layers = snapshot()          # lock m_layersMu; copy SP vector (bound, !m_pendingRemoval)
@@ -374,6 +386,18 @@ Notes:
 - `scheduleFrame()` from the frame thread is the WIP-proven pacing mechanism (WIP
   comment: *"this drives the ~90Hz render rate on the virtual monitor regardless of
   what mode it advertises"*). Only while VISIBLE/FOCUSED.
+- **DEVIATION from the original pseudocode (as built, WP13 reconciliation):** an earlier
+  draft of this loop gated the pump itself on `session.m_xrState` already being in
+  `{SYNCHRONIZED, VISIBLE, FOCUSED}`. In practice the runtime only advances
+  READY → SYNCHRONIZED → VISIBLE once the application *starts submitting frames*
+  (confirmed against Monado's null compositor) — gating the pump on those states is a
+  deadlock: the session sits at READY forever because nothing ever calls
+  `xrWaitFrame`/`xrBeginFrame`/`xrEndFrame` to let it progress. The implemented gate is
+  simply `!session.m_sessionBegan` (set `true` in the `READY` row's `xrBeginSession` above):
+  the pump runs continuously from `xrBeginSession` onward, and `xrEndFrame` with zero/blank
+  layers (first note above) is what correctly carries the session through SYNCHRONIZED. The
+  pacing gate (`scheduleFrame()` only while VISIBLE/FOCUSED) is unaffected and matches this
+  doc as written.
 
 ## Blit pipeline (`CXRGraphics::blitBuffer`)
 
@@ -437,6 +461,20 @@ right — generalize it):
 `stop()` must be idempotent and callable from: config hot-toggle, `hyprctl openxr
 disable`, EXITING/LOSS_PENDING notifications (channel [C] callback), and compositor
 shutdown (manager destructor).
+
+**Process-shutdown ordering, as built (WP13 reconciliation):** the sequence above is what runs
+inside `COpenXRManager::stop()` itself — but on a *full compositor shutdown* (not a session
+stop), the global `g_pOpenXRManager` (which owns the manager and would otherwise only be
+destroyed at static/global teardown, i.e. after `main()`'s local state is torn down) is instead
+reset **explicitly and very early** in `CCompositor::cleanup()`
+(`src/Compositor.cpp`, right after `g_pPluginSystem->unloadAllPlugins()`), well **before**
+`g_pInputManager`/`g_pSeatManager`/the renderer/`g_pXWayland` are reset. This is required, not
+incidental: if the manager were left to the default global-destructor order, its destructor would
+run `stop()` → `removePointerDevice()` → the pointer's destroy signal →
+`CInputManager::destroyPointer` → `CSeatManager::setMouse`, by which point `cleanup()` has
+already reset `g_pInputManager`/`g_pSeatManager` — a use-after-free. Doc 00's lifecycle section
+cross-references this; see also doc 04 §8 for the pointer-device teardown path this ordering
+protects.
 
 ## Logging
 

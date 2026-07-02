@@ -127,7 +127,15 @@ fire haptics when the current profile lacks a binding).
 | `grab` | `/user/hand/left/input/grasp_ext/value`, `/user/hand/right/input/grasp_ext/value` |
 | `scroll`, `menu`, `haptic` | *not suggested* |
 
-### 1.5 Grab fallback for profiles without an analog grab (simple_controller)
+### 1.5 Grab fallback for profiles without an analog grab (simple_controller) — **NOT IMPLEMENTED v1**
+
+> **Status (WP13 reconciliation): not implemented.** The design below was the intended v1
+> behavior, but no code path for it exists — `grep -rn "LONGPRESS\|XR_GRAB_LONGPRESS" src/`
+> returns nothing, and `khr/simple_controller` handling in `CXRInput` (§1.1's suggested bindings)
+> has no `grab`/`select` long-press state machine of any kind. As shipped, **`khr/simple_controller`
+> has no way to grab an XR monitor** — select-click still works for the normal pointer/click path
+> (§4), only the grab emulation described here is missing. Left in this doc as a known v1 gap /
+> future-work spec, not a description of current behavior.
 
 Detect the active profile with `xrGetCurrentInteractionProfile(session, "/user/hand/left|right")`
 (re-query on `XrEventDataInteractionProfileChanged`). When the hand's profile is
@@ -363,17 +371,27 @@ enum class eXRStateEventType : uint8_t {
     SESSION_STATE,   // XrSessionState changed → openxrsessionstate / openxractive (doc 05)
     GRAB,            // §6 → xrmonitorgrab
     TRACKING,        // device-lock tracking gained/lost (informational, logged)
+    LAYER_REMOVED,   // (as built, WP13 reconciliation — see below) removal-barrier ack
 };
 
 struct SXRStateEvent {
     eXRStateEventType type;
     MONITORID         monitorID = -1;
     int32_t           a         = 0;   // GRAB: 1/0; SESSION_STATE: XrSessionState value
-    std::string       str;             // optional payload (e.g. monitor name if id-lookup raced)
+    std::string       str;             // optional payload (e.g. monitor name if id-lookup raced);
+                                        // LAYER_REMOVED: the removed layer's monitor name
 };
 
 using XRQueueItem = std::variant<SXRInputEvent, SXRStateEvent>;
 ```
+
+**`LAYER_REMOVED` (as built, WP13 reconciliation):** doc 02's removal-barrier section ("Destroy
+paths") already describes the frame thread pushing a "`layer-removed(name)` ack onto the frame→
+main queue" once it has dropped a pending-removal layer from its snapshot and torn down that
+layer's frame-side resources — this is the fourth `eXRStateEventType` value, `LAYER_REMOVED`
+(`str` = the layer's monitor name). It is internal-only (not a socket2 event): the main-thread
+drain uses it purely to know when it is safe to erase the layer from `m_layers` and call
+`m_output->destroy()` (doc 02 step 3 of path A).
 
 Session/state events use the **same queue** as input so that *all* IPC emission
 (`g_pEventManager->postEvent`, `src/managers/EventManager.hpp:17`) happens on the main thread —
@@ -532,7 +550,7 @@ and is owned by `05-ipc-config.md` (the `recheckIdleInhibitorStatus()` hook).
 ## 12. Constants introduced by this doc
 
 ```cpp
-constexpr int   XR_GRAB_LONGPRESS_MS   = 400;          // §1.5 simple_controller fallback
+constexpr int   XR_GRAB_LONGPRESS_MS   = 400;          // §1.5 simple_controller fallback (NOT IMPLEMENTED v1, see §1.5)
 constexpr float XR_STICK_DEADZONE      = 0.1f;         // §5
 constexpr float XR_SCROLL_NOTCH        = 15.0f;        // §5, wl units per full deflection/frame
 constexpr float XR_GRAB_CONE_DEG       = 5.0f;         // §6 entry forgiveness
