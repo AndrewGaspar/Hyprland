@@ -706,6 +706,29 @@ std::vector<SP<IValue>> Values::getConfigValues() {
         MS<Bool>("scrolling:wrap_swapcol", "Determines if column movement wraps around", true),
 
         /*
+         * openxr:
+         */
+
+        MS<Bool>("openxr:enabled", "enable the OpenXR integration (session starts when a runtime is available)", false),
+        MS<String>("openxr:gpu", "DRM render node to use for XR (e.g. /dev/dri/renderD128). Empty = follow Hyprland's primary GPU", ""),
+        MS<Float>("openxr:floor_offset", "fallback eye height in meters when the runtime lacks LOCAL_FLOOR", 1.5, {.min = 0.0, .max = 3.0}),
+        MS<Float>("openxr:default_size", "default width of a new XR monitor quad, in meters", 1.6, {.min = 0.2, .max = 4.0}),
+        MS<Float>("openxr:default_distance", "default distance from the viewer for newly placed monitors, in meters", 1.5, {.min = 0.3, .max = 5.0}),
+        MS<Float>("openxr:leash_response", "head/body leash spring response time in seconds (smaller = snappier)", 0.35, {.min = 0.01, .max = 5.0}),
+        MS<Float>("openxr:leash_deadzone_angle", "head/body leash angular deadzone in degrees", 15.0, {.min = 0.0, .max = 180.0}),
+        MS<Float>("openxr:leash_deadzone_distance", "head/body leash positional deadzone in meters", 0.25, {.min = 0.0, .max = 5.0}),
+        MS<Bool>("openxr:body_leash_follow_height", "body-leashed monitors also follow vertical head movement", false),
+        MS<Bool>("openxr:pointer", "enable the XR ray pointer device", true),
+        MS<Float>("openxr:pointer_trigger_threshold", "trigger analog value that presses the pointer button", 0.7, {.min = 0.0, .max = 1.0}),
+        MS<Float>("openxr:pointer_trigger_threshold_release", "trigger analog value that releases the pointer button (hysteresis)", 0.4, {.min = 0.0, .max = 1.0}),
+        MS<Float>("openxr:grab_threshold", "squeeze analog value that starts a grab", 0.7, {.min = 0.0, .max = 1.0}),
+        MS<Float>("openxr:grab_threshold_release", "squeeze analog value that ends a grab (hysteresis)", 0.4, {.min = 0.0, .max = 1.0}),
+        MS<Float>("openxr:scroll_speed", "multiplier for thumbstick scrolling on XR monitors", 1.0, {.min = 0.0, .max = 100.0}),
+        MS<Bool>("openxr:inhibit_idle", "inhibit idle (hypridle etc.) while the XR session is focused", true),
+        MS<Bool>("openxr:destroy_monitors_on_stop",
+                 "destroy XR-created virtual monitors when the session stops. If false they persist as plain headless outputs", true),
+
+        /*
          * experimental:
          */
 
