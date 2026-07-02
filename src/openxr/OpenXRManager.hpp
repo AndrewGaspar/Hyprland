@@ -104,12 +104,18 @@ class COpenXRManager {
     // from onConfigReload() and from init() so declared monitors materialize even while disabled.
     void reconcileDeclaredMonitors();
 
+    // Re-check `openxr:enabled` (and other hot-live vars) against the current lifecycle state
+    // and start()/stop() accordingly. Normally reached via the config.reloaded/props_refreshed
+    // listeners registered in init() — but a bare `hyprctl keyword openxr:enabled 0/1` under the
+    // legacy config parser fires neither event (see CConfigManager::parseKeyword's special-case
+    // cluster), so that path calls this directly. Idempotent; safe to call redundantly.
+    void onConfigReload();
+
     // "disabled" | "unavailable" | "starting" | "idle" | "visible" | "focused" | "stopping"
     static const char* stateToString(eXRManagerState state);
 
   private:
     void setState(eXRManagerState newState);
-    void onConfigReload();
 
     // Aborts an in-progress start(), tearing down whatever was created, and lands in
     // UNAVAILABLE. Safe to call at any failure point in start().

@@ -17,6 +17,7 @@ The doc set:
 | `05-ipc-config.md` | full config/dispatcher/hyprctl/socket2 tables, idle-inhibit hook, consumer recipes |
 | `06-testing.md` | Monado orchestration, hyprtester XR suite |
 | `07-roadmap.md` | work packages, dependencies, acceptance criteria |
+| `08-wiki-notes.md` | ready-to-paste external-wiki reference: config vars, keyword/dispatcher/hyprctl syntax, events, hypridle recipe |
 
 ## Goals
 
@@ -173,6 +174,13 @@ Transition rules:
   the main thread (doc 01, "Session state handling").
 - Teardown ordering invariant (doc 01): **join the frame thread before destroying
   any EGL or XrInstance object**.
+- Full compositor shutdown ordering (as built, WP13 reconciliation): `g_pOpenXRManager` is not
+  left to the default global-destructor order. `CCompositor::cleanup()` resets it explicitly and
+  very early — right after unloading plugins, well before `g_pInputManager`, `g_pSeatManager`,
+  the renderer, or `g_pXWayland` are torn down. This avoids a use-after-free: the manager's
+  destructor calls `stop()`, which (via `removePointerDevice()`, doc 04 §8) reaches into
+  `CInputManager`/`CSeatManager` to detach the synthetic pointer — those must still be alive when
+  that runs. See doc 01's "Teardown ordering" section for the full sequence and rationale.
 
 ## Build gating
 

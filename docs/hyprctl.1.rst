@@ -105,6 +105,22 @@ INFO COMMANDS
 
     Returns internal status information like config format or backend.
 
+**openxr**
+
+    Query or control the OpenXR ("HypXRland") extension, when built with OpenXR support.
+    With no subcommand, prints session/monitor status (equivalent to *openxr status*).
+
+    Subcommands: *status*, *enable*, *disable*, *create*, *destroy*, *select*, *anchor*,
+    *move*, *rotate*, *scale*, *distance*, *center*, *layout*. See
+    *docs/openxr/08-wiki-notes.md* in the source tree for the full subcommand reference.
+
+    Examples:
+        **hyprctl** *openxr*
+
+        **hyprctl** *-j openxr*
+
+        **hyprctl** *openxr enable*
+
 OPTIONS
 =======
 
