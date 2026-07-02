@@ -61,8 +61,12 @@ class CXRMonitorLayer {
     // WP4 lifecycle/state (main thread, under COpenXRManager::m_layersMu):
     // m_declaredByConfig == true iff this monitor came from an `xrmonitor` keyword. Only these
     // are touched by reload reconciliation (doc 05 §2.5); runtime-created ones are left alone.
-    bool                    m_declaredByConfig = false;
-    OpenXR::SXRAnchorSpec   m_anchorSpec;      // parsed anchor (WP5 makes it live; WP4 static pose)
+    bool m_declaredByConfig = false;
+    // Live anchoring engine (WP5). solve() runs on the frame thread; verbs mutate it on the main
+    // thread under COpenXRManager::m_layersMu. m_declaredAnchor is the last state DECLARED by the
+    // config keyword, kept separate from the live (spring-mutating) engine for reconcile diffs.
+    OpenXR::CXRAnchor       m_anchor;
+    OpenXR::SXRAnchorState  m_declaredAnchor;
     std::optional<Vector2D> m_reqResolution;   // last requested pixel mode (for reconcile diff)
     std::optional<float>    m_reqRefresh;      // last requested refresh (for reconcile diff)
     bool                    m_hovered = false; // last ray-hovered (WP7 sets this; status field)
