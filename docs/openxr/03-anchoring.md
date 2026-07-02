@@ -543,6 +543,14 @@ worldPose = grip(m_grabHand).has_value() ? poseCompose(grip, m_grabOffset) : m_l
 
 Runtime late-latching makes the quad track the controller 1:1 with no added latency.
 
+AS-BUILT AMENDMENT — continuous re-orientation for user-facing modes: when the persistent mode is
+`head` or `body`, each grabbed solve refreshes `m_grabOffset.rot` from the current frame's poses
+(`head`: `lookAtNoRoll(worldPos → view.pos)`; `body`: yaw-only facing) before returning, so the
+quad keeps facing the user while carried instead of staying rigid to the wrist until release. Only
+the rotation part of the offset is rewritten — position stays a fixed grip-space offset, so the
+late-latched zero-latency positional tracking is unchanged. `local` and `device` grabs remain
+fully rigid (carrying like an object — tilt it with the wrist — is the intended metaphor there).
+
 ### 4.3 `grabPushPull` / `grabResize` (driven by thumbstick, see 04 §6)
 
 Both mutate the temporary `m_grabOffset` / width, formulated as ray scaling so the clamp semantics
