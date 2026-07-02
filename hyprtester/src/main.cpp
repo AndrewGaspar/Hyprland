@@ -23,6 +23,13 @@
 #include "tests/misc/tests.hpp"
 #include "tests/shared.hpp"
 
+#ifdef WITH_XR_TESTS
+#include "tests/xr/tests.hpp"
+#include "xr/MonadoOrchestrator.hpp"
+#include "xr/RemoteClient.hpp"
+#include "xr/xr_helpers.hpp"
+#endif
+
 #include <hyprutils/os/Process.hpp>
 #include <hyprutils/memory/WeakPtr.hpp>
 #include <hyprutils/memory/Casts.hpp>
@@ -31,7 +38,12 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
+#include <ctime>
 #include <filesystem>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <utility>
 #include <memory>
 #include <print>
 #include <string>
@@ -54,6 +66,7 @@ namespace {
         Path                     binaryPath;
         Path                     pluginPath;
         std::vector<std::string> requestedTests;
+        bool                     xrMode = false;
     };
 
     struct STestsRunResult {
@@ -64,10 +77,13 @@ namespace {
 
 static SP<CProcess> hyprlandProc;
 
-static bool         launchHyprland(Path configPath, Path binaryPath) {
+static bool         launchHyprland(Path configPath, Path binaryPath, const std::vector<std::pair<std::string, std::string>>& env = {}, bool headlessOnly = true) {
     NLog::yellow("Launching Hyprland");
     hyprlandProc = makeShared<CProcess>(binaryPath, std::vector<std::string>{"--config", configPath});
-    hyprlandProc->addEnv("HYPRLAND_HEADLESS_ONLY", "1");
+    if (headlessOnly)
+        hyprlandProc->addEnv("HYPRLAND_HEADLESS_ONLY", "1");
+    for (const auto& [k, v] : env)
+        hyprlandProc->addEnv(k, v);
 
     NLog::yellow("Launched async process");
 
@@ -131,6 +147,8 @@ static SSettings parseSettings(const std::span<const char*> args) {
 
             settings.pluginPath = validatePathOrDie(*std::next(it));
             it++;
+        } else if (value == "--xr") {
+            settings.xrMode = true;
         } else if (value == "--help" || value == "-h") {
             helpAndDie(EXIT_SUCCESS);
         } else if (!value.starts_with("-")) {
@@ -143,7 +161,7 @@ static SSettings parseSettings(const std::span<const char*> args) {
 
     // Default options
     if (settings.configPath.empty())
-        settings.configPath = validatePathOrDie(cwd / "test.lua");
+        settings.configPath = validatePathOrDie(cwd / (settings.xrMode ? "xr-test.conf" : "test.lua"));
     if (settings.binaryPath.empty())
         settings.binaryPath = validatePathOrDie(cwd / "../build/Hyprland");
     if (settings.pluginPath.empty())
@@ -152,7 +170,7 @@ static SSettings parseSettings(const std::span<const char*> args) {
     return settings;
 }
 
-static bool preTestCleanup() {
+static bool preTestCleanup(bool xrMode = false) {
     bool failed = false;
 
     if (!Tests::killAllWindows()) {
@@ -167,6 +185,12 @@ static bool preTestCleanup() {
         NLog::red("Internal failure: failed to reload");
         failed = true;
     }
+
+    // The remaining resets use Lua dispatchers (hl.dsp.*) that only exist under the
+    // standard test.lua config; xr-test.conf is classic hyprlang, so skip them.
+    if (xrMode)
+        return !failed;
+
     if (!getFromSocket("/activeworkspace").contains("workspace ID 1 (1)")) {
         if (getFromSocket("/dispatch hl.dsp.focus({ workspace = '1' })") != "ok") {
             NLog::red("Internal failure: failed to switch to workspace 1");
@@ -181,15 +205,19 @@ static bool preTestCleanup() {
     return !failed;
 }
 
-static STestsRunResult runTests(std::vector<std::shared_ptr<CTestCase>>& testCases) {
+static STestsRunResult runTests(std::vector<std::shared_ptr<CTestCase>>& testCases, bool xrMode = false) {
     struct STestsRunResult res{.total = testCases.size(), .failedNames = {}};
 
     for (auto& tc : testCases) {
         // Clean up before every test
         NLog::yellow("Cleaning up");
 
-        if (!preTestCleanup()) // damn it, something really went wrong
-            std::exit(1);
+        if (!preTestCleanup(xrMode)) { // damn it, something really went wrong
+            if (xrMode) {
+                NLog::red("XR pre-test cleanup failed; continuing (best-effort)");
+            } else
+                std::exit(1);
+        }
 
         NLog::log("{}Running test {}", Colors::BLUE, tc->name());
         tc->test();
@@ -221,10 +249,183 @@ static void cleanupAndReport(const STestsRunResult& tInfo) {
     hyprlandProc.reset();
 }
 
+#ifdef WITH_XR_TESTS
+
+// Poll for the Hyprland-under-test to register an instance (its lock lands under
+// XDG_RUNTIME_DIR/hypr). Fills HIS/WLDISPLAY. Returns false if it dies or times out.
+static bool waitForHyprlandInstance(int timeoutSec) {
+    for (int i = 0; i < timeoutSec * 10; ++i) {
+        if (!hyprlandProc || (kill(hyprlandProc->pid(), 0) != 0 && errno == ESRCH)) {
+            NLog::red("Hyprland process died during startup");
+            return false;
+        }
+        const auto INSTANCES = instances();
+        if (!INSTANCES.empty()) {
+            HIS       = INSTANCES.back().id;
+            WLDISPLAY = INSTANCES.back().wlSocket;
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
+}
+
+static void killHyprlandProc() {
+    if (hyprlandProc) {
+        if (kill(hyprlandProc->pid(), 0) == 0)
+            kill(hyprlandProc->pid(), SIGKILL);
+        // reap: CProcess detaches on runAsync, so just give it a moment
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        hyprlandProc.reset();
+    }
+}
+
+// The whole `--xr` run: bring up Monado (optional), bring up a Hyprland with the
+// XR runtime pointed at it, run the xr test group, tear everything down.
+static int runXrSuite(const SSettings& settings) {
+    static CMonadoOrchestrator orchestrator;
+    static CRemoteClient       remote;
+
+    // Isolated-but-shared XDG_RUNTIME_DIR for BOTH monado and Hyprland (docs §3.1).
+    // We create it and point our own env at it so getFromSocket()/instances() also
+    // resolve against it (they read $XDG_RUNTIME_DIR live).
+    const std::string origRuntimeDir = getenv("XDG_RUNTIME_DIR") ? getenv("XDG_RUNTIME_DIR") : "";
+    const std::string origWayland    = getenv("WAYLAND_DISPLAY") ? getenv("WAYLAND_DISPLAY") : "";
+    const std::string runDir         = "/tmp/hyprtester-xr-" + std::to_string(getpid());
+
+    std::error_code ec;
+    std::filesystem::remove_all(runDir, ec);
+    std::filesystem::create_directories(runDir, ec);
+    chmod(runDir.c_str(), 0700);
+    setenv("XDG_RUNTIME_DIR", runDir.c_str(), 1);
+
+    XR::g_ctx.runId      = std::format("xr-{}-{}", getpid(), sc<long long>(std::time(nullptr)));
+    XR::g_ctx.runtimeDir = runDir;
+
+    const bool monadoUp = orchestrator.start();
+
+    std::vector<std::pair<std::string, std::string>> hlEnv;
+
+    if (monadoUp) {
+        XR::g_ctx.monadoLog       = orchestrator.logPath();
+        XR::g_ctx.runtimeProvided = true;
+        hlEnv.emplace_back("XR_RUNTIME_JSON", orchestrator.runtimeManifest());
+
+        // Validate the remote wire ABI (runtime half of drift protection, §4.2).
+        const int fd = orchestrator.takeRemoteFd();
+        if (fd >= 0 && remote.connectAndValidate(fd)) {
+            XR::g_ctx.remote    = &remote;
+            XR::g_ctx.available = true;
+        } else {
+            XR::g_ctx.wireMismatch = true; // suite SKIPs (not fails)
+            NLog::yellow("XR: remote wire validation failed — suite will SKIP");
+        }
+    } else {
+        // No monado: launch Hyprland WITHOUT XR_RUNTIME_JSON so xr_runtime_absent can
+        // assert the graceful-unavailable path; all other xr tests SKIP.
+        XR::g_ctx.runtimeProvided = false;
+        XR::g_ctx.available       = false;
+        XR::g_ctx.skipReason      = "monado-service not found";
+    }
+
+    // --- Bring up Hyprland. First try the stock headless-only path in the isolated
+    // runtime dir; if that fails to come up, fall back to nesting under the host
+    // Wayland session (symlink its socket in) — nested startup is occasionally racy,
+    // so retry it. (See WP2 notes / docs §6 caveat.)
+    bool up = launchHyprland(settings.configPath, settings.binaryPath, hlEnv, /*headlessOnly*/ true) && waitForHyprlandInstance(15);
+
+    if (!up) {
+        NLog::yellow("XR: stock headless launch did not come up; trying nested-Wayland fallback");
+        killHyprlandProc();
+
+        if (!origRuntimeDir.empty() && !origWayland.empty()) {
+            for (const std::string suffix : {std::string(""), std::string(".lock")}) {
+                const std::string src = origRuntimeDir + "/" + origWayland + suffix;
+                const std::string dst = runDir + "/" + origWayland + suffix;
+                std::filesystem::remove(dst, ec);
+                if (std::filesystem::exists(src))
+                    std::filesystem::create_symlink(src, dst, ec);
+            }
+        }
+
+        auto nestedEnv = hlEnv;
+        if (!origWayland.empty())
+            nestedEnv.emplace_back("WAYLAND_DISPLAY", origWayland);
+
+        for (int attempt = 0; attempt < 2 && !up; ++attempt) {
+            NLog::yellow("XR: nested launch attempt {}", attempt + 1);
+            up = launchHyprland(settings.configPath, settings.binaryPath, nestedEnv, /*headlessOnly*/ false) && waitForHyprlandInstance(15);
+            if (!up)
+                killHyprlandProc();
+        }
+    }
+
+    if (!up) {
+        NLog::red("XR: Hyprland failed to launch in both headless and nested modes");
+        orchestrator.teardown(true);
+        NLog::red("XR: run dir preserved: {}", runDir);
+        return 1;
+    }
+
+    NLog::green("XR: Hyprland up (HIS={})", HIS);
+
+    // Select tests: requested subset, else the whole xr group.
+    std::vector<std::shared_ptr<CTestCase>> cases;
+    if (!settings.requestedTests.empty()) {
+        for (const auto& t : settings.requestedTests) {
+            if (testCases.contains(t))
+                cases.push_back(testCases.at(t));
+            else {
+                NLog::red("ERROR: Unknown test name '{}'", t);
+                killHyprlandProc();
+                orchestrator.teardown(false);
+                std::filesystem::remove_all(runDir, ec);
+                return EXIT_FAILURE;
+            }
+        }
+    } else
+        cases = xrTestCases;
+
+    STestsRunResult result = runTests(cases, /*xrMode*/ true);
+
+    // Report + teardown.
+    NLog::green("dispatching exit");
+    getFromSocket("/dispatch exit");
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    killHyprlandProc();
+
+    const bool anyFailed = !result.failedNames.empty();
+    orchestrator.teardown(anyFailed);
+
+    NLog::log("\nSummary:\n\tPASSED: {}{}{}/{}", Colors::GREEN, result.total - result.failedNames.size(), Colors::RESET, result.total);
+    NLog::log("\tFAILED: {}{}{}/{}", Colors::RED, result.failedNames.size(), Colors::RESET, result.total);
+    if (anyFailed) {
+        NLog::red("Failed tests:");
+        for (const auto& n : result.failedNames)
+            NLog::red("\t- {}", n);
+        NLog::red("XR: run dir preserved for inspection: {}", runDir);
+    } else
+        std::filesystem::remove_all(runDir, ec);
+
+    return anyFailed ? 1 : 0;
+}
+
+#endif // WITH_XR_TESTS
+
 int main(int argc, char** argv, char** envp) {
 
     std::span<const char*>                  args{const_cast<const char**>(argv + 1), sc<std::size_t>(argc - 1)};
     const SSettings                         settings = parseSettings(args);
+
+#ifdef WITH_XR_TESTS
+    if (settings.xrMode)
+        return runXrSuite(settings);
+#else
+    if (settings.xrMode) {
+        NLog::red("--xr requires building with -DWITH_XR_TESTS=ON");
+        return EXIT_FAILURE;
+    }
+#endif
 
     std::vector<std::shared_ptr<CTestCase>> requestedTestCases;
     for (auto& test : settings.requestedTests) {
