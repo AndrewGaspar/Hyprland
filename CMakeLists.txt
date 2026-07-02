@@ -694,6 +694,8 @@ install(
 if(BUILD_TESTING OR WITH_TESTS)
   message(STATUS "Building tests")
 
+  option(WITH_XR_TESTS "Build the OpenXR integration test suite into hyprtester (needs a local Monado for running)" OFF)
+
   # hyprtester
   add_subdirectory(hyprtester)
 
