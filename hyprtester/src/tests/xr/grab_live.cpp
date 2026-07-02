@@ -31,11 +31,18 @@ namespace {
         }
     };
 
-    // Test-only, no-JSON-library substring extraction: the first `"pos": [...]` array in a
-    // status blob. Good enough to detect "the pose changed" without a real JSON parser.
-    std::string extractPos(const std::string& json) {
+    // Test-only, no-JSON-library substring extraction: the `"pos": [...]` array belonging to
+    // `monitorName`'s block in a status blob. Scoped by name (WP11 note: xr-test.conf now
+    // declares XR-conf-a/b fixtures alongside whatever this test creates, so `j/openxr` always
+    // has >= 3 monitor blocks — a name-unscoped "first pos in the blob" search would silently
+    // pick up a *different*, static monitor and never see this test's own movement). Good
+    // enough to detect "the pose changed" without a real JSON parser.
+    std::string extractPos(const std::string& json, const std::string& monitorName) {
+        const auto namePos = json.find("\"name\": \"" + monitorName + "\"");
+        if (namePos == std::string::npos)
+            return "";
         const std::string key = "\"pos\": [";
-        auto               p  = json.find(key);
+        auto               p  = json.find(key, namePos);
         if (p == std::string::npos)
             return "";
         auto e = json.find(']', p);
@@ -137,7 +144,7 @@ TEST_CASE(xr_grab_move) {
     }
     NLog::green("xr_grab_move: grab began");
 
-    const std::string posBefore = extractPos(statusAfterGrab);
+    const std::string posBefore = extractPos(statusAfterGrab, mon);
 
     // Translate the controller 0.5 m along +X while still squeezing; the grabbed quad must
     // track it rigidly (doc 04 §6 / doc 03 §4.2 solve override).
@@ -150,7 +157,7 @@ TEST_CASE(xr_grab_move) {
         std::chrono::milliseconds(500), 60);
 
     const std::string statusMoved = getFromSocket("j/openxr");
-    const std::string posAfter    = extractPos(statusMoved);
+    const std::string posAfter    = extractPos(statusMoved, mon);
 
     ASSERT(posBefore.empty(), false);
     ASSERT(posAfter.empty(), false);

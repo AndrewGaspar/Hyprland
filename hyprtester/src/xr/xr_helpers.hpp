@@ -5,6 +5,7 @@
 #include <chrono>
 #include <functional>
 #include <string>
+#include <vector>
 
 class CRemoteClient;
 
@@ -46,6 +47,27 @@ namespace XR {
     // Dump monitors.json / openxr.json / monado.log tail / hyprland.log tail into
     // hyprtester/artifacts/<run-id>/<testName>/. Called on failure paths only.
     void dumpXrArtifacts(const std::string& testName);
+
+    // ---- tiny ad-hoc JSON scraping (WP11) --------------------------------------------------
+    // hyprtester has no JSON library. These handle exactly the flat shapes hyprctl's status
+    // JSON produces (quoted strings, bracketed float arrays, bare numbers/bools) — good enough
+    // for polling/asserting on specific fields without pulling in a dependency. Not a general
+    // parser: don't feed it arbitrary JSON.
+
+    // Byte offset of `marker` at/after `from` in `hay`, or std::string::npos.
+    size_t findAfter(const std::string& hay, const std::string& marker, size_t from = 0);
+
+    // The raw value text following `"key":` at/after `from` (scope the search by passing the
+    // offset of an enclosing marker, e.g. a `"name": "..."` block start). Quoted strings are
+    // returned unquoted; bracketed arrays are returned with brackets (see parseFloatArray);
+    // bare numbers/bools are trimmed. Empty string if `key` isn't found at/after `from`.
+    std::string fieldAfter(const std::string& json, size_t from, const std::string& key);
+
+    // Parse a "[a, b, c]" array (as returned by fieldAfter for pos:/quat: fields) into floats.
+    std::vector<float> parseFloatArray(const std::string& arr);
+
+    // std::stof that returns `fallback` instead of throwing on bad input.
+    float toFloatOr(const std::string& s, float fallback);
 
 } // namespace XR
 
