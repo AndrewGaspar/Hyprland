@@ -90,11 +90,26 @@ SXRSolveResult CXRAnchor::solve(const SXRSolveInput& in, const SXRAnchorTuning& 
     // Grab override (§4.2): behave as device-locked to the grabbing hand.
     if (m_grabbed) {
         res.space                          = m_grabHand == XR_HAND_LEFT ? XR_SPACE_GRIP_LEFT : XR_SPACE_GRIP_RIGHT;
-        res.pose                           = m_grabOffset;
         const std::optional<SXRPose>& grip = m_grabHand == XR_HAND_LEFT ? in.gripLeft : in.gripRight;
-        res.worldPose                      = grip ? poseCompose(*grip, m_grabOffset) : m_lastWorld;
-        m_lastWorld                        = res.worldPose;
-        m_hasLastWorld                     = true;
+
+        // §4.2 amendment: user-facing modes keep re-evaluating orientation continuously while
+        // carried instead of staying rigid to the wrist until release. Position remains a
+        // grip-space offset (late-latched by the runtime, zero added latency); only the
+        // offset's rotation is refreshed from this frame's poses — head faces the viewer,
+        // body faces yaw-only. local/device grabs stay fully rigid: carrying like an object
+        // (tilt it with the wrist) is the expected metaphor there.
+        if (grip && (m_state.mode == XR_ANCHOR_HEAD || m_state.mode == XR_ANCHOR_BODY)) {
+            const Vec3 worldPos = poseCompose(*grip, m_grabOffset).pos;
+            Quat       face     = lookAtNoRoll(worldPos, in.view.pos, m_lastWorld.rot);
+            if (m_state.mode == XR_ANCHOR_BODY)
+                face = qFromYaw(qYawOf(face, m_lastYaw));
+            m_grabOffset.rot = qMul(qInverse(grip->rot), face);
+        }
+
+        res.pose       = m_grabOffset;
+        res.worldPose  = grip ? poseCompose(*grip, m_grabOffset) : m_lastWorld;
+        m_lastWorld    = res.worldPose;
+        m_hasLastWorld = true;
         return res;
     }
 
