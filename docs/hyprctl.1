@@ -145,6 +145,31 @@ Returns the current random splash.
 .PP
 Returns internal status information like config format or backend.
 .RE
+.PP
+\f[B]openxr\f[R]
+.RS
+.PP
+Query or control the OpenXR (\[lq]HypXRland\[rq]) extension, when built with OpenXR
+support.
+With no subcommand, prints session/monitor status (equivalent to \f[I]openxr
+status\f[R]).
+.PP
+Subcommands: \f[I]status\f[R], \f[I]enable\f[R], \f[I]disable\f[R], \f[I]create\f[R],
+\f[I]destroy\f[R], \f[I]select\f[R], \f[I]anchor\f[R], \f[I]move\f[R], \f[I]rotate\f[R],
+\f[I]scale\f[R], \f[I]distance\f[R], \f[I]center\f[R], \f[I]layout\f[R].
+See \f[I]docs/openxr/08-wiki-notes.md\f[R] in the source tree for the full subcommand
+reference.
+.PP
+Examples:
+.RS
+.PP
+\f[B]hyprctl\f[R] \f[I]openxr\f[R]
+.PP
+\f[B]hyprctl\f[R] \f[I]-j openxr\f[R]
+.PP
+\f[B]hyprctl\f[R] \f[I]openxr enable\f[R]
+.RE
+.RE
 .SH OPTIONS
 .PP
 \f[B]--batch\f[R]

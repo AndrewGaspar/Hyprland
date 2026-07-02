@@ -1125,6 +1125,17 @@ std::string CConfigManager::parseKeyword(const std::string& COMMAND, const std::
     if (COMMAND == "openxr:inhibit_idle")
         g_pInputManager->recheckIdleInhibitorStatus();
 
+#ifdef HAVE_OPENXR
+    // openxr:enabled is documented (docs/openxr/05-ipc-config.md §1.3) as a "hot" toggle: setting
+    // it starts/stops the session immediately. That path is wired through
+    // COpenXRManager::onConfigReload(), reached via the config.reloaded/props_refreshed listeners
+    // — but exactly like openxr:inhibit_idle above, a bare `hyprctl keyword openxr:enabled 0/1`
+    // fires neither event under the legacy parser, so the toggle silently did nothing outside a
+    // full `/reload`. Same targeted fix, mirroring the inhibit_idle special-case.
+    if (COMMAND == "openxr:enabled" && g_pOpenXRManager)
+        g_pOpenXRManager->onConfigReload();
+#endif
+
     // Update window border colors
     Desktop::globalWindowController()->updateAllWindowsDecorations();
 

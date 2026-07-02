@@ -50,6 +50,15 @@ namespace {
             return "";
         return json.substr(p, e - p + 1);
     }
+
+    // Same name-scoping for bool fields ("hovered"/"grabbed") as extractPos above, built on
+    // WP11's XR::findAfter/XR::fieldAfter primitives. Without it, "hovered": true / "grabbed":
+    // true|false anywhere in the blob would match the XR-conf-a/b static fixtures xr-test.conf
+    // always declares, not necessarily this test's own monitor.
+    bool scopedBoolField(const std::string& json, const std::string& monitorName, const std::string& field, bool expect) {
+        const auto p = XR::findAfter(json, "\"name\": \"" + monitorName + "\"");
+        return p != std::string::npos && XR::fieldAfter(json, p, field) == (expect ? "true" : "false");
+    }
 }
 
 // xr_grab_move — bounded live smoke test for WP8 (doc 04 §6 / doc 03 §4): squeeze-grabs a
@@ -111,7 +120,7 @@ TEST_CASE(xr_grab_move) {
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
         if ((++idx % 20) == 0) {
             const std::string st = getFromSocket("j/openxr");
-            if (st.find("\"hovered\": true") != std::string::npos) {
+            if (scopedBoolField(st, mon, "hovered", true)) {
                 gotHover = true;
                 hoverPos = a.pos;
             }
@@ -132,7 +141,7 @@ TEST_CASE(xr_grab_move) {
         remote->pulse();
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
         const std::string st = getFromSocket("j/openxr");
-        if (st.find("\"grabbed\": true") != std::string::npos) {
+        if (scopedBoolField(st, mon, "grabbed", true)) {
             grabbed         = true;
             statusAfterGrab = st;
         }
@@ -174,7 +183,7 @@ TEST_CASE(xr_grab_move) {
         remote->pulse();
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
         const std::string st = getFromSocket("j/openxr");
-        if (st.find("\"grabbed\": false") != std::string::npos)
+        if (scopedBoolField(st, mon, "grabbed", false))
             released = true;
     }
     ASSERT(released, true);
