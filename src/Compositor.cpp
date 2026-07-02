@@ -581,6 +581,17 @@ void CCompositor::cleanup() {
     // still in a normal working state.
     g_pPluginSystem->unloadAllPlugins();
 
+#ifdef HAVE_OPENXR
+    // Tear down the OpenXR session (and its synthetic ray pointer, doc 04 §8) here, while
+    // g_pInputManager/g_pSeatManager/g_pHyprOpenGL/the aquamarine backend are all still alive.
+    // g_pOpenXRManager is otherwise only destroyed at static/global teardown (program exit),
+    // which runs AFTER this function has reset g_pInputManager/g_pSeatManager below — the
+    // manager's destructor would then call stop() -> removePointerDevice() -> destroy-signal ->
+    // CInputManager::destroyPointer -> CSeatManager::setMouse on an already-freed seat manager
+    // and segfault. Resetting it explicitly and early avoids that use-after-free.
+    g_pOpenXRManager.reset();
+#endif
+
     State::workspaceState()->clear();
     Desktop::windowState()->clear();
     Desktop::layerState()->clear();
