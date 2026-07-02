@@ -19,6 +19,10 @@
 #include <aquamarine/backend/Backend.hpp>
 #include <aquamarine/output/Output.hpp>
 
+#ifdef HAVE_OPENXR
+#include "openxr/OpenXRManager.hpp"
+#endif
+
 class CWLSurfaceResource;
 
 enum eManagersInitStage : uint8_t {
