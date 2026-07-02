@@ -239,7 +239,10 @@ bool CXRGraphics::initBlitGL() {
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    // Vertex shader: fullscreen triangle from gl_VertexID, no VBO needed.
+    // Vertex shader: fullscreen triangle from gl_VertexID, no VBO needed. V is flipped:
+    // OpenXR GL swapchain images have a bottom-left origin (quad row 0 renders at the quad's
+    // bottom), while Wayland buffers are top-left — sampling 1-y puts the screen's top row in
+    // the texture's last row so the quad displays upright (matches rayQuadIntersect's v=0=top).
     const char* vsSrc = R"(
         #version 300 es
         out vec2 vUV;
@@ -248,7 +251,7 @@ bool CXRGraphics::initBlitGL() {
             if (gl_VertexID == 0)      pos = vec2(-1.0, -1.0);
             else if (gl_VertexID == 1) pos = vec2( 3.0, -1.0);
             else                       pos = vec2(-1.0,  3.0);
-            vUV = pos * 0.5 + 0.5;
+            vUV = vec2(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
             gl_Position = vec4(pos, 0.0, 1.0);
         }
     )";
@@ -409,7 +412,8 @@ void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer
             glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, layer.m_cpuTex, 0);
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dstFBO);
             glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
-            glBlitFramebuffer(0, 0, (GLint)buf->size.x, (GLint)buf->size.y, 0, 0, dstW, dstH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+            // Source Y inverted: same top-left -> bottom-left origin flip as the dmabuf shader.
+            glBlitFramebuffer(0, (GLint)buf->size.y, (GLint)buf->size.x, 0, 0, 0, dstW, dstH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
             glDeleteFramebuffers(1, &srcFBO);
             glDeleteFramebuffers(1, &dstFBO);
             return;
