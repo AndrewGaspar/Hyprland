@@ -266,6 +266,10 @@ bool CXRGraphics::initBlitGL() {
         out vec4 fragColor;
         void main() {
             fragColor = texture(uTex, vUV);
+            // Force alpha opaque: Hyprland monitor buffers are typically XRGB (undefined alpha).
+            // Under XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND (passthrough) garbage alpha would punch
+            // see-through holes in monitors — pin it to 1.0 so quads stay fully opaque (doc 01).
+            fragColor.a = 1.0;
         }
     )";
 
@@ -414,6 +418,14 @@ void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer
             glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
             // Source Y inverted: same top-left -> bottom-left origin flip as the dmabuf shader.
             glBlitFramebuffer(0, (GLint)buf->size.y, (GLint)buf->size.x, 0, 0, 0, dstW, dstH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+            // Force dst alpha opaque (same reason as the dmabuf shader's fragColor.a = 1.0): the
+            // XRGB source has undefined alpha which would punch holes under ALPHA_BLEND. dstFBO is
+            // still bound as the DRAW framebuffer here; write ONLY the alpha channel to 1.0 (glClear
+            // is unaffected by viewport, so it covers the whole dst attachment).
+            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+            glClearColor(0.f, 0.f, 0.f, 1.f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
             glDeleteFramebuffers(1, &srcFBO);
             glDeleteFramebuffers(1, &dstFBO);
             return;
@@ -430,6 +442,8 @@ void CXRGraphics::clearTex(XR_GLuint dstTex, const Vector2D& size, float r, floa
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
     glViewport(0, 0, (GLsizei)size.x, (GLsizei)size.y);
+    // Alpha pinned to 1.0: a cleared quad (no content / clear fallback) must be fully opaque so it
+    // does not become see-through under XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND passthrough (doc 01).
     glClearColor(r, g, b, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     glDeleteFramebuffers(1, &fbo);

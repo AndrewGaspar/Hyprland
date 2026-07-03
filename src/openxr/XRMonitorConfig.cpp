@@ -224,6 +224,39 @@ namespace {
     }
 }
 
+std::string OpenXR::blendModeToString(eXRBlendMode mode) {
+    switch (mode) {
+        case XR_BLEND_OPAQUE: return "opaque";
+        case XR_BLEND_ALPHA: return "alpha";
+        case XR_BLEND_ADDITIVE: return "additive";
+    }
+    return "opaque";
+}
+
+OpenXR::SXRBlendModePick OpenXR::pickBlendMode(const std::vector<eXRBlendMode>& supported, const std::string& config) {
+    // The runtime's preferred mode = its first-listed one (empty list defends against a
+    // spec-noncompliant runtime by falling back to OPAQUE).
+    const eXRBlendMode preferred = supported.empty() ? XR_BLEND_OPAQUE : supported.front();
+
+    // "auto" (or any unrecognized value) => take the runtime preference, no fallback warning.
+    std::optional<eXRBlendMode> want;
+    if (config == "opaque")
+        want = XR_BLEND_OPAQUE;
+    else if (config == "alpha")
+        want = XR_BLEND_ALPHA;
+    else if (config == "additive")
+        want = XR_BLEND_ADDITIVE;
+
+    if (!want)
+        return {preferred, false};
+
+    // Explicit request: honor iff the runtime advertises it, else fall back with a flag.
+    for (const auto m : supported)
+        if (m == *want)
+            return {*want, false};
+    return {preferred, true};
+}
+
 std::string OpenXR::anchorModeToString(eXRAnchorMode mode, eXRHand device) {
     switch (mode) {
         case XR_ANCHOR_LOCAL: return "local";

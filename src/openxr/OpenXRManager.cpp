@@ -108,6 +108,14 @@ const std::string& COpenXRManager::systemName() const {
     return m_systemName;
 }
 
+std::string COpenXRManager::blendModeName() const {
+    // Reflect the mode the frame loop actually submits while a session exists; the OPAQUE default
+    // otherwise (nothing composited).
+    if (m_session)
+        return OpenXR::blendModeToString(xrBlendModeFromXr(m_session->m_blendMode));
+    return OpenXR::blendModeToString(OpenXR::XR_BLEND_OPAQUE);
+}
+
 bool COpenXRManager::shouldInhibitIdle() {
     // doc 05 §6.1. FOCUSED (and only FOCUSED) inhibits: the headset is on and this session has
     // input focus. VISIBLE (e.g. runtime dashboard in front) intentionally does not inhibit.
@@ -168,6 +176,21 @@ void COpenXRManager::start() {
     // Publish runtime/system names for `hyprctl openxr status` as soon as we have them.
     m_runtimeName = m_session->runtimeName();
     m_systemName  = m_session->systemName();
+
+    // Select the environment blend mode (doc 01) from openxr:blend_mode against the runtime's
+    // enumerated list (getSystem filled m_blendModes in preference order). Read once at session
+    // start — changing openxr:blend_mode takes effect on the next start. `auto` picks the runtime
+    // preferred mode; an explicit mode the runtime doesn't advertise falls back with a WARN.
+    {
+        static auto      PBLEND = CConfigValue<std::string>("openxr:blend_mode");
+        const auto       pick   = OpenXR::pickBlendMode(m_session->m_blendModes, *PBLEND);
+        m_session->m_blendMode  = xrBlendModeToXr(pick.mode);
+        if (pick.requestedUnsupported)
+            Log::logger->log(Log::WARN, "[OPENXR] openxr:blend_mode '{}' is not supported by this runtime; falling back to '{}'", *PBLEND,
+                             OpenXR::blendModeToString(pick.mode));
+        else
+            Log::logger->log(Log::DEBUG, "[OPENXR] environment blend mode: {} (openxr:blend_mode = {})", OpenXR::blendModeToString(pick.mode), *PBLEND);
+    }
 
     // 3. EGL/GBM display + context on the right GPU.
     static auto       PGPU = CConfigValue<std::string>("openxr:gpu");
@@ -884,7 +907,11 @@ void COpenXRManager::frameThread() {
         // xrEndFrame with zero layers is valid (nothing composited yet) — doc 01.
         XrFrameEndInfo endInfo       = {XR_TYPE_FRAME_END_INFO};
         endInfo.displayTime          = fs.predictedDisplayTime;
-        endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        // Blend mode selected once at session start from openxr:blend_mode (doc 01). On
+        // passthrough-capable runtimes ALPHA_BLEND composites quads over the on-device
+        // passthrough underlay instead of a black void; the blit forces dst alpha to 1.0 so
+        // monitors stay fully opaque against it (XRGraphics.cpp).
+        endInfo.environmentBlendMode = m_session->m_blendMode;
         endInfo.layerCount           = (uint32_t)layerPtrs.size();
         endInfo.layers               = layerPtrs.empty() ? nullptr : layerPtrs.data();
         {
