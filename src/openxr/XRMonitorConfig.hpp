@@ -4,12 +4,44 @@
 // config/parser layer can live outside the gate and hyprland_gtests can always exercise it
 // (docs/openxr/07-roadmap.md conventions; parser tests in tests/xr/parser.cpp).
 
+#include <cstdint>
 #include <string>
 #include <optional>
 #include <expected>
+#include <vector>
 
 #include "../helpers/math/Math.hpp"
 #include "XRAnchor.hpp" // OpenXR::SXRAnchorState + eXRAnchorMode/eXRHand (unconditional pure math)
+
+namespace OpenXR {
+    // Environment blend mode (doc 01). A HAVE_OPENXR-free mirror of XrEnvironmentBlendMode so the
+    // selection logic (pickBlendMode) is a pure, unconditionally-compiled function that
+    // hyprland_gtests can exercise without a runtime. The guarded session code converts to/from
+    // the real XrEnvironmentBlendMode enum (xrBlendModeToXr / xrBlendModeFromXr in XRSession.hpp).
+    enum eXRBlendMode : uint8_t {
+        XR_BLEND_OPAQUE = 0, // composite over black — the classic VR "floating in a void" look
+        XR_BLEND_ALPHA,      // composite over the runtime's passthrough underlay via layer alpha
+        XR_BLEND_ADDITIVE,   // additive (optical see-through / additive displays)
+    };
+
+    // "opaque" | "alpha" | "additive" — the config/IPC string form (doc 05).
+    std::string blendModeToString(eXRBlendMode mode);
+
+    // Result of pickBlendMode: the chosen mode plus whether the user's explicit request could not
+    // be honored (so the caller can emit the unsupported->fallback WARN — doc 01).
+    struct SXRBlendModePick {
+        eXRBlendMode mode                 = XR_BLEND_OPAQUE;
+        bool         requestedUnsupported = false;
+    };
+
+    // Pure blend-mode selection (doc 01). `supported` is the runtime's advertised list in
+    // preference order (xrEnumerateEnvironmentBlendModes returns preferred-first). `config` is the
+    // openxr:blend_mode value: "auto" (or anything unrecognized) => the runtime's first-listed
+    // (preferred) mode; an explicit "opaque"/"alpha"/"additive" is honored iff supported, else it
+    // falls back to the preferred mode with requestedUnsupported=true. An empty supported list
+    // (spec-illegal, but defended) yields XR_BLEND_OPAQUE.
+    SXRBlendModePick pickBlendMode(const std::vector<eXRBlendMode>& supported, const std::string& config);
+}
 
 namespace OpenXR {
     // WP5 unification: the parser now produces the canonical doc-03 SXRAnchorState directly

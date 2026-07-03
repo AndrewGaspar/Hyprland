@@ -103,6 +103,28 @@ bool CXRSession::getSystem() {
     }
 
     Log::logger->log(Log::DEBUG, "[OPENXR] system id {} ({}), maxLayerCount {}", (unsigned long long)m_systemId, m_systemName.empty() ? "?" : m_systemName, m_maxLayerCount);
+
+    // Enumerate the supported environment blend modes for the primary-stereo view configuration
+    // (doc 01). This needs only instance + system (not a session), so it runs here. The list is
+    // returned in runtime-preference order; OpenXR::pickBlendMode consumes it at session start.
+    uint32_t blendCount = 0;
+    XrResult br         = xrEnumerateEnvironmentBlendModes(m_instance, m_systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &blendCount, nullptr);
+    if (XR_SUCCEEDED(br) && blendCount > 0) {
+        std::vector<XrEnvironmentBlendMode> modes(blendCount);
+        if (XR_SUCCEEDED(xrEnumerateEnvironmentBlendModes(m_instance, m_systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, blendCount, &blendCount, modes.data()))) {
+            m_blendModes.clear();
+            std::string list;
+            for (auto m : modes) {
+                m_blendModes.push_back(xrBlendModeFromXr(m));
+                list += (list.empty() ? "" : ", ") + OpenXR::blendModeToString(xrBlendModeFromXr(m));
+            }
+            if (m_blendModes.empty()) // all values were unknown enums — keep a safe default
+                m_blendModes = {OpenXR::XR_BLEND_OPAQUE};
+            Log::logger->log(Log::DEBUG, "[OPENXR] environment blend modes (preferred first): {}", list);
+        }
+    } else
+        Log::logger->log(Log::WARN, "[OPENXR] xrEnumerateEnvironmentBlendModes failed/empty ({}); assuming OPAQUE only", (int)br);
+
     return true;
 }
 

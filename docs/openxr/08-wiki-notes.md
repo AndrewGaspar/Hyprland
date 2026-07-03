@@ -48,6 +48,7 @@ same thing live).
 |---|---|---|---|
 | `openxr:enabled` | bool | `false` | Master switch, hot toggle (see above). |
 | `openxr:gpu` | string | `""` | DRM render node for the XR EGL context (e.g. `/dev/dri/renderD128`). Empty = follow Hyprland's primary GPU. Set explicitly on hybrid/multi-GPU machines where the OpenXR runtime uses a different GPU than Hyprland — a mismatch can crash the runtime at swapchain creation. Read at session start only. |
+| `openxr:blend_mode` | string | `"auto"` | Environment blend mode: `auto` \| `opaque` \| `alpha` \| `additive`. `auto` uses the runtime's preferred mode. `alpha` enables **passthrough** on runtimes that support it (e.g. WiVRn on Quest 3) — monitors composite over your real room instead of a black void. An explicit mode the runtime doesn't advertise falls back to the preferred one with a warning. Read at session start only (`hyprctl openxr disable && hyprctl openxr enable` to re-apply). |
 | `openxr:floor_offset` | float (m) | `1.5` | Fallback eye height when the runtime lacks `XR_EXT_local_floor`. |
 | `openxr:default_size` | float (m) | `1.6` | Default quad width for a new XR monitor when not given explicitly. |
 | `openxr:default_distance` | float (m) | `1.5` | Default placement distance for a new/re-centered XR monitor. |

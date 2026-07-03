@@ -84,6 +84,9 @@ class CXRSession {
     bool           m_instanceLost  = false;                   // set on XrEventDataInstanceLossPending / LOSS_PENDING
     uint32_t       m_maxLayerCount = 16;  // XrSystemGraphicsProperties::maxLayerCount (spec floor 16)
     int64_t        m_swapchainFormat = 0; // chosen once after session creation
+
+    std::vector<OpenXR::eXRBlendMode> m_blendModes = {OpenXR::XR_BLEND_OPAQUE}; // enumerated in getSystem(), preference order
+    XrEnvironmentBlendMode            m_blendMode  = XR_ENVIRONMENT_BLEND_MODE_OPAQUE; // selected at session start; submitted every xrEndFrame
 };
 
 // src/openxr/XRGraphics.hpp
@@ -275,6 +278,41 @@ unsupported format, so always pick from this list."* Store on
 `sampleCount/faceCount/arraySize/mipCount = 1`, and `width/height` = the **monitor's
 pixel mode** (not eye resolution — quads have no eye resolution).
 
+## Environment blend mode (passthrough)
+
+The mode passed to `xrEndFrame` as `environmentBlendMode` decides what an XR quad is
+composited *over*:
+
+| `XrEnvironmentBlendMode` | `openxr:blend_mode` | Effect |
+|---|---|---|
+| `OPAQUE` | `opaque` | quads over black — the classic VR "floating in a void" look |
+| `ALPHA_BLEND` | `alpha` | quads over the runtime's **passthrough** underlay via layer alpha (e.g. WiVRn on Quest 3 — monitors float in the user's real room) |
+| `ADDITIVE` | `additive` | additive (optical see-through / additive displays) |
+
+**Enumeration.** `getSystem()` calls `xrEnumerateEnvironmentBlendModes(instance,
+systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, ...)` (two-call idiom) once and
+stores the result on `CXRSession::m_blendModes` as the unconditional
+`OpenXR::eXRBlendMode` mirror, **in the runtime's advertised order** (the spec returns
+it preferred-first). It needs only instance + system — no session — so it runs in
+`getSystem()`. A failed/empty enumeration falls back to `{OPAQUE}` with a WARN.
+
+**Selection (pure, unit-tested).** `OpenXR::pickBlendMode(supported, config)`
+(`XRMonitorConfig.cpp`, compiled unconditionally — tests in `tests/xr/blendmode.cpp`)
+maps `openxr:blend_mode` onto the enumerated list:
+
+- `auto` (or any unrecognized value) → the runtime's **first-listed** (preferred) mode.
+- an explicit `opaque`/`alpha`/`additive` → honored **iff supported**, else it falls
+  back to the preferred mode and sets `requestedUnsupported` so `start()` logs a WARN.
+- an empty supported list (spec-illegal, defended) → `OPAQUE`.
+
+`COpenXRManager::start()` reads `openxr:blend_mode` once, right after `getSystem()`,
+converts the pick to `XrEnvironmentBlendMode` via `xrBlendModeToXr` (XRSession.hpp), and
+stores it on `CXRSession::m_blendMode`. The value is read **once at session start** —
+changing `openxr:blend_mode` takes effect on the next session start (`hyprctl openxr
+disable && enable`, or a reload that toggles `openxr:enabled`). The frame loop just
+submits `m_session->m_blendMode`. The active mode is surfaced as `blendMode` in
+`hyprctl openxr status` (doc 05 §4.3).
+
 ## Session state handling (`CXRSession::pollEvents`, frame thread)
 
 The WIP only handled READY and STOPPING; this is the complete version. Pump with
@@ -372,7 +410,7 @@ while m_running:
         })
 
     xrEndFrame(displayTime = frameState.predictedDisplayTime,
-               environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE,
+               environmentBlendMode = session.m_blendMode, # selected at session start from openxr:blend_mode
                layers = quads)                             # array of quad layer pointers
 ```
 
@@ -432,6 +470,19 @@ and reallocated on mode change (doc 02).
 `glClear`. Black in production (WIP used cyan as a debug sentinel).
 
 All three run on the frame thread inside a `CScopedGLContext`.
+
+**Alpha is forced opaque in every path.** Hyprland monitor buffers are typically XRGB —
+the alpha channel is undefined. Under `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND`
+(passthrough) the runtime composites each quad over the passthrough underlay using that
+alpha, so undefined alpha would punch see-through holes in monitors. To keep monitors
+fully opaque against passthrough regardless of blend mode:
+
+- **DMA-BUF path:** the fragment shader writes `fragColor.a = 1.0` after sampling.
+- **CPU fallback:** after the `glBlitFramebuffer`, an alpha-only pass on the destination
+  (`glColorMask(F,F,F,T)` + `glClearColor(0,0,0,1)` + `glClear`, mask restored) forces
+  dst alpha to 1.0. `glClear` ignores the viewport, so it covers the whole attachment.
+- **Clear fallback:** `clearTex` already clears with alpha `1.0` — a cleared/blank quad
+  is opaque black, not a transparent hole.
 
 ## Teardown ordering (`COpenXRManager::stop()`, main thread)
 
