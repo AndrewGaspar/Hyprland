@@ -36,8 +36,9 @@ CMonadoOrchestrator::~CMonadoOrchestrator() {
 }
 
 bool CMonadoOrchestrator::resolveBinary() {
-    // Resolution order (docs §3.1): $HYPRTESTER_MONADO_SERVICE -> the known build
-    // path -> monado-service in PATH.
+    // Resolution order (docs §3.1): $HYPRTESTER_MONADO_SERVICE -> the vendored
+    // submodule build (subprojects/monado/build, see scripts/build-monado.sh) ->
+    // monado-service in PATH.
     auto tryPath = [](const std::string& p) -> bool { return !p.empty() && std::filesystem::is_regular_file(p) && ::access(p.c_str(), X_OK) == 0; };
 
     // An explicit override is authoritative: if set, we use it exclusively (resolve
@@ -50,7 +51,7 @@ bool CMonadoOrchestrator::resolveBinary() {
             NLog::yellow("MonadoOrchestrator: HYPRTESTER_MONADO_SERVICE='{}' is not an executable — treating monado as unavailable", env);
             return false;
         }
-    } else if (const std::string known = "/home/ajg/code/monado/build/src/xrt/targets/service/monado-service"; tryPath(known)) {
+    } else if (const std::string known = HYPRTESTER_SOURCE_ROOT "/subprojects/monado/build/src/xrt/targets/service/monado-service"; tryPath(known)) {
         m_binary = known;
     } else if (const auto* path = getenv("PATH"); path) {
         std::string              paths = path;
@@ -71,19 +72,17 @@ bool CMonadoOrchestrator::resolveBinary() {
     if (m_binary.empty())
         return false;
 
-    // Manifest: <monado-build>/openxr_monado-dev.json. Derive the build dir from
-    // the binary path (<build>/src/xrt/targets/service/monado-service).
+    // Manifest: $HYPRTESTER_MONADO_MANIFEST override, else derive from the binary path —
+    // a build tree (<build>/src/xrt/targets/service/monado-service) carries
+    // <build>/openxr_monado-dev.json; an installed binary (<prefix>/bin/monado-service)
+    // carries <prefix>/share/openxr/1/openxr_monado.json.
     const std::string suffix = "/src/xrt/targets/service/monado-service";
-    std::string       buildDir;
-    if (m_binary.size() > suffix.size() && m_binary.compare(m_binary.size() - suffix.size(), suffix.size(), suffix) == 0)
-        buildDir = m_binary.substr(0, m_binary.size() - suffix.size());
-    else
-        buildDir = "/home/ajg/code/monado/build";
-
     if (const auto* env = getenv("HYPRTESTER_MONADO_MANIFEST"); env)
         m_manifest = env;
+    else if (m_binary.size() > suffix.size() && m_binary.ends_with(suffix))
+        m_manifest = m_binary.substr(0, m_binary.size() - suffix.size()) + "/openxr_monado-dev.json";
     else
-        m_manifest = buildDir + "/openxr_monado-dev.json";
+        m_manifest = std::filesystem::path(m_binary).parent_path().parent_path().string() + "/share/openxr/1/openxr_monado.json";
 
     if (!std::filesystem::is_regular_file(m_manifest))
         NLog::yellow("MonadoOrchestrator: runtime manifest not found at {} (XR_RUNTIME_JSON will still be passed)", m_manifest);
