@@ -4,10 +4,31 @@
 #include <openxr/openxr.h> // XrInstance, XrSystemId, XrSession, XrSpace, XrSessionState, ...
 #include <cstdint>
 #include <string>
+#include <vector>
 
-#include "XRMath.hpp" // OpenXR::SXRPose (pure math) — conversion helpers below
+#include "XRMath.hpp"          // OpenXR::SXRPose (pure math) — conversion helpers below
+#include "XRMonitorConfig.hpp" // OpenXR::eXRBlendMode (unconditional) — blend-mode conversions below
 
 class CXRGraphics;
+
+// XrEnvironmentBlendMode <-> the unconditional OpenXR::eXRBlendMode mirror (doc 01). Kept here
+// (guarded, alongside the XrPosef conversions) so XRMonitorConfig can stay OpenXR-header-free.
+inline OpenXR::eXRBlendMode xrBlendModeFromXr(XrEnvironmentBlendMode m) {
+    switch (m) {
+        case XR_ENVIRONMENT_BLEND_MODE_OPAQUE: return OpenXR::XR_BLEND_OPAQUE;
+        case XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND: return OpenXR::XR_BLEND_ALPHA;
+        case XR_ENVIRONMENT_BLEND_MODE_ADDITIVE: return OpenXR::XR_BLEND_ADDITIVE;
+        default: return OpenXR::XR_BLEND_OPAQUE;
+    }
+}
+inline XrEnvironmentBlendMode xrBlendModeToXr(OpenXR::eXRBlendMode m) {
+    switch (m) {
+        case OpenXR::XR_BLEND_OPAQUE: return XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        case OpenXR::XR_BLEND_ALPHA: return XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
+        case OpenXR::XR_BLEND_ADDITIVE: return XR_ENVIRONMENT_BLEND_MODE_ADDITIVE;
+    }
+    return XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+}
 
 // Memberwise XrPosef <-> SXRPose conversions live in the session-side code (doc 03 §0), not in
 // XRMath.hpp (which must stay OpenXR-header-free).
@@ -34,7 +55,7 @@ class CXRSession {
     ~CXRSession();
 
     bool               createInstance();                // false => UNAVAILABLE (no runtime / missing required ext)
-    bool               getSystem();                     // xrGetSystem + xrGetSystemProperties
+    bool               getSystem();                     // xrGetSystem + xrGetSystemProperties + enumerate blend modes
     bool               createSession(CXRGraphics& gfx); // XrGraphicsBindingEGLMNDX
     bool               createSpaces(CXRGraphics& gfx);  // reference space (LOCAL_FLOOR/LOCAL) + VIEW space
     bool               chooseSwapchainFormat();         // enumerate + pick once; stored on m_swapchainFormat
@@ -65,6 +86,13 @@ class CXRSession {
 
     uint32_t       m_maxLayerCount   = 16; // XrSystemGraphicsProperties::maxLayerCount (spec floor 16)
     int64_t        m_swapchainFormat = 0;  // chosen once after session creation
+
+    // Environment blend modes (doc 01). m_blendModes is the runtime's advertised list in
+    // preference order (xrEnumerateEnvironmentBlendModes, preferred-first), enumerated once in
+    // getSystem(); it feeds OpenXR::pickBlendMode. m_blendMode is the selected mode submitted in
+    // every xrEndFrame — chosen from openxr:blend_mode by COpenXRManager::start() at session start.
+    std::vector<OpenXR::eXRBlendMode> m_blendModes = {OpenXR::XR_BLEND_OPAQUE};
+    XrEnvironmentBlendMode            m_blendMode  = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
 
     // Recenter (XrEventDataReferenceSpaceChangePending, doc 03 §6). Set on the frame thread by
     // pollEvents when the runtime recenters our reference space; consumed + cleared by the frame
