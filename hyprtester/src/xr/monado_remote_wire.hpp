@@ -3,9 +3,11 @@
 // =============================================================================
 //  VENDORED Monado remote-driver wire protocol structs.
 //
-//  Source of truth: /home/ajg/code/monado/src/xrt/drivers/remote/r_interface.h
+//  Source of truth: subprojects/monado/src/xrt/drivers/remote/r_interface.h
 //                   (+ the xrt_defines.h PODs it embeds)
+//  Upstream: https://gitlab.freedesktop.org/monado/monado
 //  PINNED TO Monado commit: c2ddab59dc41366fe520dc4e8abcfea257ecf0b8
+//  (the subprojects/monado submodule is pinned to the SAME commit — re-pin both together)
 //
 //  These are self-contained POD copies — we deliberately do NOT include or link
 //  against Monado (that would drag its headers/libs into every hyprtester build).

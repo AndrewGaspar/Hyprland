@@ -41,6 +41,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
@@ -302,6 +303,22 @@ static int runXrSuite(const SSettings& settings) {
     XR::g_ctx.runId      = std::format("xr-{}-{}", getpid(), sc<long long>(std::time(nullptr)));
     XR::g_ctx.runtimeDir = runDir;
 
+    // Launch through a generated wrapper config so machine-specific knobs stay out of the
+    // tracked xr-test.conf (docs §6.5): the tracked config, then an optional untracked
+    // hyprtester/xr-test-local.conf, then an optional $HYPRTESTER_XR_GPU pin (dual-GPU boxes:
+    // Hyprland's XR GPU must match the one monado's compositor picks, or swapchain creation
+    // crosses GPUs and crashes inside monado).
+    const Path launchConfig = Path(runDir) / "xr-wrapper.conf";
+    {
+        const std::string localConf = std::string(HYPRTESTER_SOURCE_ROOT) + "/hyprtester/xr-test-local.conf";
+        std::ofstream     wrap(launchConfig);
+        wrap << "source = " << std::filesystem::absolute(settings.configPath).string() << "\n";
+        if (std::filesystem::is_regular_file(localConf))
+            wrap << "source = " << localConf << "\n";
+        if (const auto* gpu = getenv("HYPRTESTER_XR_GPU"); gpu && *gpu)
+            wrap << "openxr:gpu = " << gpu << "\n";
+    }
+
     const bool monadoUp = orchestrator.start();
 
     std::vector<std::pair<std::string, std::string>> hlEnv;
@@ -332,7 +349,7 @@ static int runXrSuite(const SSettings& settings) {
     // runtime dir; if that fails to come up, fall back to nesting under the host
     // Wayland session (symlink its socket in) — nested startup is occasionally racy,
     // so retry it. (See WP2 notes / docs §6 caveat.)
-    bool up = launchHyprland(settings.configPath, settings.binaryPath, hlEnv, /*headlessOnly*/ true) && waitForHyprlandInstance(15);
+    bool up = launchHyprland(launchConfig, settings.binaryPath, hlEnv, /*headlessOnly*/ true) && waitForHyprlandInstance(15);
 
     if (!up) {
         NLog::yellow("XR: stock headless launch did not come up; trying nested-Wayland fallback");
@@ -354,7 +371,7 @@ static int runXrSuite(const SSettings& settings) {
 
         for (int attempt = 0; attempt < 2 && !up; ++attempt) {
             NLog::yellow("XR: nested launch attempt {}", attempt + 1);
-            up = launchHyprland(settings.configPath, settings.binaryPath, nestedEnv, /*headlessOnly*/ false) && waitForHyprlandInstance(15);
+            up = launchHyprland(launchConfig, settings.binaryPath, nestedEnv, /*headlessOnly*/ false) && waitForHyprlandInstance(15);
             if (!up)
                 killHyprlandProc();
         }
