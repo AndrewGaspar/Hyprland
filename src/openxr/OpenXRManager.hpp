@@ -16,6 +16,10 @@
 
 struct wl_event_source;
 
+namespace Aquamarine {
+    class IOutput;
+}
+
 // Top-level lifecycle state of the OpenXR integration. Kept verbatim from
 // docs/openxr/00-overview.md — do not reorder or renumber.
 enum eXRManagerState : uint8_t {
@@ -141,6 +145,10 @@ class COpenXRManager {
     void reportLayerRemoved(const std::string& name);
     // Main thread: erase the acked layer + destroy its output (removal barrier step 3).
     void finalizeLayerRemoval(const std::string& name);
+    // Main thread: destroy a headless XR output while keeping it alive until aquamarine has
+    // drained its idle-callback queue once, so a still-pending frame callback cannot fire on
+    // freed memory (works around an aquamarine lifetime bug — see the .cpp).
+    void destroyOutputDeferred(SP<Aquamarine::IOutput> output);
 
     // --- selection + layer cap (main thread) ---
     // Resolve the "the" monitor per doc 05 §3.2: explicit selection > last ray-hovered (WP7) >
