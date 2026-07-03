@@ -184,15 +184,24 @@ monitor's name, query it rather than assuming.
 ## 3. MonadoOrchestrator
 
 Owns the `monado-service` process for the whole `--xr` run (started once in `main`, torn down
-after `cleanupAndReport`). Monado source of truth on this machine:
-`/home/ajg/code/monado` (service binary at `<build>/src/xrt/targets/service/monado-service`
-for a build dir `/home/ajg/code/monado/build`).
+after `cleanupAndReport`). Monado source of truth: the `subprojects/monado` git submodule,
+pinned to the same commit as the vendored wire structs (§4.2); build it once with
+`scripts/build-monado.sh` (or `cmake --build build-debug --target monado`; service binary
+lands at `subprojects/monado/build/src/xrt/targets/service/monado-service`). Header-only
+build deps are vendored too: `subprojects/eigen` (3.4.0) and `subprojects/vulkan-headers`
+(v1.4.350) — only the Vulkan ICD loader library remains a system dependency.
 
 ### 3.1 Launch
 
 Binary resolution order: `$HYPRTESTER_MONADO_SERVICE` (explicit override) →
-`/home/ajg/code/monado/build/src/xrt/targets/service/monado-service` → `monado-service` in
-`PATH`. If none exist → orchestrator state `unavailable` (suite SKIPs, §2.1).
+`<repo>/subprojects/monado/build/src/xrt/targets/service/monado-service` (the vendored
+submodule build; repo root baked in via the `HYPRTESTER_SOURCE_ROOT` compile definition) →
+`monado-service` in `PATH`. If none exist → orchestrator state `unavailable` (suite SKIPs,
+§2.1). Machine-specific launch knobs stay out of the tracked config: the harness passes a
+generated wrapper config that sources `xr-test.conf`, then an optional untracked
+`hyprtester/xr-test-local.conf`, then `openxr:gpu = $HYPRTESTER_XR_GPU` when that env var is
+set (dual-GPU boxes: Hyprland must use the render node Monado's compositor picks, or
+xrCreateSwapchain crosses GPUs and crashes inside Monado — see §7).
 
 **The env override is authoritative, not merely first-priority (as built, WP13
 reconciliation):** if `$HYPRTESTER_MONADO_SERVICE` is set but does not resolve to a usable
@@ -249,7 +258,7 @@ Teardown runs even when tests fail (hook it next to the existing
 ### 4.1 What gets vendored, and why
 
 The remote driver's wire protocol is defined in
-`/home/ajg/code/monado/src/xrt/drivers/remote/r_interface.h`. We do **not** link against
+`subprojects/monado/src/xrt/drivers/remote/r_interface.h`. We do **not** link against
 Monado (that would drag its headers/libs into hyprtester's build for everyone). Instead,
 vendor the POD wire structs into `hyprtester/src/xr/monado_remote_wire.hpp`, **pinned to
 Monado commit `c2ddab59dc41366fe520dc4e8abcfea257ecf0b8`** (record the commit hash in the
@@ -506,8 +515,9 @@ runtime/driver behavior that shapes how to run and interpret the suite on this c
 cmake -B build-debug -DWITH_TESTS=ON -DWITH_XR_TESTS=ON
 cmake --build build-debug --target Hyprland hyprtester
 
-# 2. Have Monado available: either a build at /home/ajg/code/monado/build
-#    (default probe path, §3.1) or monado-service in PATH, or:
+# 2. Have Monado available: build the pinned submodule (one-time)
+scripts/build-monado.sh
+#    ...or have monado-service in PATH, or point at one explicitly:
 export HYPRTESTER_MONADO_SERVICE=/path/to/monado-service
 # optional, software Vulkan:
 export HYPRTESTER_VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
@@ -534,5 +544,5 @@ cd hyprtester
 - `hyprtester/src/tests/main/tests.hpp` — the group-header pattern to copy for `tests/xr/tests.hpp`
 - `hyprtester/src/hyprctlCompat.hpp` — `getFromSocket`, `instances()`
 - `hyprtester/CMakeLists.txt` + root `CMakeLists.txt` (~line 675–700) — build wiring, where `WITH_XR_TESTS` lands
-- `/home/ajg/code/monado/src/xrt/drivers/remote/r_interface.h` @ `c2ddab59dc41366fe520dc4e8abcfea257ecf0b8` — the structs to vendor, read it whole before writing `monado_remote_wire.hpp`
+- `subprojects/monado/src/xrt/drivers/remote/r_interface.h` @ `c2ddab59dc41366fe520dc4e8abcfea257ecf0b8` (the submodule pin) — the structs to vendor, read it whole before writing `monado_remote_wire.hpp`
 - `/home/ajg/code/omedora-4/omedora/testing.md` — the TAP/wait-assert/artifact conventions this suite adopts

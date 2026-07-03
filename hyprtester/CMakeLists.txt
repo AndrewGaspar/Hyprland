@@ -27,7 +27,20 @@ target_link_libraries(hyprtester PUBLIC PkgConfig::hyprtester_deps)
 # file under src/xr/ + src/tests/xr/ wraps its contents in #ifdef WITH_XR_TESTS.
 if(WITH_XR_TESTS)
   target_compile_definitions(hyprtester PRIVATE WITH_XR_TESTS)
+  # Repo root for discovering the vendored Monado build (subprojects/monado/build)
+  # and the tracked/local test configs — see MonadoOrchestrator::resolveBinary().
+  get_filename_component(HYPRTESTER_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+  target_compile_definitions(hyprtester PRIVATE HYPRTESTER_SOURCE_ROOT="${HYPRTESTER_REPO_ROOT}")
   message(STATUS "hyprtester: OpenXR integration suite enabled (WITH_XR_TESTS)")
+
+  # Convenience wrapper around the one-time vendored-Monado build. Deliberately NOT part of
+  # ALL / not a dependency of hyprtester: Monado is a multi-minute external build needed only
+  # to RUN the XR suite, and its own CMake project can't be add_subdirectory'd into ours.
+  # Invoke explicitly: cmake --build build-debug --target monado
+  add_custom_target(monado
+    COMMAND "${HYPRTESTER_REPO_ROOT}/scripts/build-monado.sh"
+    USES_TERMINAL
+    COMMENT "Building vendored Monado (subprojects/monado) via scripts/build-monado.sh")
 endif()
 
 install(TARGETS hyprtester)

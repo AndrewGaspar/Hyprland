@@ -9,21 +9,34 @@
 #      quads inside the Monado window.
 #
 # Then drive the fake head/controllers interactively with:
-#   /home/ajg/code/monado/build/src/xrt/targets/gui/monado-gui remote
+#   subprojects/monado/build/src/xrt/targets/gui/monado-gui remote
 #
 # Ctrl-C here stops everything. Kills ONLY the PIDs it spawned.
 
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MONADO_BUILD="${MONADO_BUILD:-/home/ajg/code/monado/build}"
+MONADO_BUILD="${MONADO_BUILD:-$REPO/subprojects/monado/build}"
 HYPRLAND_BIN="$REPO/build-debug/Hyprland"
-CONF="$REPO/scripts/preview-xr.conf"
 LOGDIR="${TMPDIR:-/tmp}/hypxrland-preview-$$"
 mkdir -p "$LOGDIR"
 
 [[ -x $HYPRLAND_BIN ]] || { echo "missing $HYPRLAND_BIN — build first: cmake --build build-debug --target Hyprland"; exit 1; }
-[[ -x $MONADO_BUILD/src/xrt/targets/service/monado-service ]] || { echo "missing monado-service under $MONADO_BUILD"; exit 1; }
+[[ -x $MONADO_BUILD/src/xrt/targets/service/monado-service ]] || {
+    echo "missing monado-service under $MONADO_BUILD — run scripts/build-monado.sh first (or set MONADO_BUILD)"
+    exit 1
+}
+
+# Merged launch config: the tracked preview config, an optional untracked machine-local
+# override (same file the test harness uses), and an optional XR_GPU env pin — machine
+# specifics stay out of the tracked files (dual-GPU: Hyprland must match Monado's GPU).
+CONF="$LOGDIR/preview-merged.conf"
+{
+    echo "source = $REPO/scripts/preview-xr.conf"
+    [[ -f $REPO/hyprtester/xr-test-local.conf ]] && echo "source = $REPO/hyprtester/xr-test-local.conf"
+    [[ -n ${XR_GPU:-} ]] && echo "openxr:gpu = $XR_GPU"
+    true
+} > "$CONF"
 
 MONADO_PID=""
 HL_PID=""
