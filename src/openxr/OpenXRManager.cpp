@@ -1151,7 +1151,7 @@ void COpenXRManager::finalizeLayerRemoval(const std::string& name) {
     }
 
     if (auto mon = layer->m_monitor.lock(); mon && mon->m_output)
-        mon->m_output->destroy(); // path B (external destroy) already gone -> mon expired, skipped
+        destroyOutputDeferred(mon->m_output); // path B (external destroy) already gone -> mon expired, skipped
 
     // Clear the explicit selection if it pointed at this monitor (doc 05 §3.2).
     if (m_selectedMonitor == name)
@@ -1166,6 +1166,40 @@ void COpenXRManager::finalizeLayerRemoval(const std::string& name) {
         g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitorremoved", name});
 
     Log::logger->log(Log::DEBUG, "[OPENXR] destroyed XR monitor '{}'", name);
+}
+
+void COpenXRManager::destroyOutputDeferred(SP<Aquamarine::IOutput> output) {
+    // Main thread. Works around an aquamarine headless-output lifetime bug that produced the
+    // dispatchIdle -> CSignalBase::emitInternal use-after-free crash during XR monitor teardown.
+    //
+    // CHeadlessOutput::scheduleFrame() enqueues the output's own `framecb` (an
+    // SP<std::function<void()>> that captures the output by raw `this` and holds no liveness guard)
+    // into CBackend::idle.pending via addIdleEvent(). Neither CHeadlessOutput::destroy() nor
+    // ~CHeadlessOutput removes that pending idle event. If the output is freed while a framecb is
+    // still queued, the next CBackend::dispatchIdle() invokes it on freed memory —
+    // events.frame.emit() on a dangling CSignal — which is exactly the observed crash
+    // (aquamarineFDWrite -> dispatchIdle -> emitInternal). Our XR frame pacing calls
+    // CMonitor::scheduleFrame() every runtime frame, so a headless XR output is almost always
+    // "due" (the immediate addIdleEvent path in scheduleFrame) when it is torn down during the
+    // heavy create/destroy churn of a config reload — hence the crash on most suite runs.
+    //
+    // We cannot remove the pending idle event (framecb is private to CHeadlessOutput) nor patch the
+    // system aquamarine library, so instead we guarantee the output outlives any stale callback.
+    // destroy() detaches it from the backend + monitor and (via CMonitor's destroy listener) clears
+    // its frame listener, so the pending framecb becomes a harmless listener-less emit. We then keep
+    // a reference alive inside a sentinel idle event, enqueued AFTER any pending framecb, which is
+    // processed in the same dispatchIdle pass right after that framecb fires — dropping the last
+    // reference only once the queue has drained past it.
+    if (!output)
+        return;
+
+    output->destroy();
+
+    if (!g_pCompositor || !g_pCompositor->m_aqBackend)
+        return; // no backend to dispatch idle again (shutdown) — release the reference now.
+
+    auto sentinel = makeShared<std::function<void(void)>>([output]() {}); // capture keeps `output` alive
+    g_pCompositor->m_aqBackend->addIdleEvent(sentinel);
 }
 
 void COpenXRManager::bindExistingLayers() {
@@ -1224,7 +1258,7 @@ void COpenXRManager::teardownLayers() {
             l->stopMainListeners();
             l->m_destroyListener.reset(); // avoid re-entering the removal path from our own destroy
             if (auto mon = l->m_monitor.lock(); mon && mon->m_output)
-                mon->m_output->destroy();
+                destroyOutputDeferred(mon->m_output);
         } else {
             // Keep the output as a plain headless monitor; unbind the layer record so the next
             // start() re-binds it (lazy binding).
