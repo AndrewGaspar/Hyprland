@@ -56,6 +56,7 @@ Add one block to `getConfigValues()` under a new `/* openxr: */` section comment
 |---|---|---|---|---|
 | `openxr:enabled` | `Bool` | `false` | enable the OpenXR integration (session starts when a runtime is available) | **hot** — toggling starts/stops the session (§1.3) |
 | `openxr:gpu` | `String` | `""` | DRM render node to use for XR (e.g. /dev/dri/renderD128). Empty = follow Hyprland's primary GPU | **start-only** — read at session start; changing it takes effect on the next start |
+| `openxr:blend_mode` | `String` | `"auto"` | environment blend mode: `auto` (runtime preferred) \| `opaque` \| `alpha` (passthrough) \| `additive`. `auto` = the runtime's first-enumerated mode; an explicit mode the runtime doesn't advertise falls back to the preferred with a WARN (doc 01) | **start-only** — read at session start; changing it takes effect on the next start |
 | `openxr:floor_offset` | `Float` | `1.5` | fallback eye height in meters when the runtime lacks LOCAL_FLOOR | start-only |
 | `openxr:default_size` | `Float` | `1.6` | default width of a new XR monitor quad, in meters | hot (affects subsequently created monitors) |
 | `openxr:default_distance` | `Float` | `1.5` | default distance from the viewer for newly placed monitors, in meters | hot (affects subsequently created monitors) |
@@ -393,6 +394,7 @@ Normal format (one line per field, hyprctl house style):
 state: focused
 runtime: Monado(XRT) by Collabora et al.
 system: Simulated HMD
+blend mode: opaque
 monitor XR-code (ID 3): 2560x1440@90.00 size 1.80m anchor local pos [0.00, 1.40, -1.50] grabbed: no hovered: yes
 ```
 
@@ -404,6 +406,7 @@ present:
     "state": "focused",
     "runtimeName": "Monado(XRT) by Collabora et al.",
     "systemName": "Simulated HMD",
+    "blendMode": "opaque",
     "inhibitingIdle": true,
     "monitors": [
         {
@@ -429,6 +432,9 @@ present:
   reported directly).
 - `runtimeName`/`systemName` — from `xrInstanceProperties`/`xrSystemProperties`; empty
   strings when no session (`disabled`/`unavailable`).
+- `blendMode` — the active environment blend mode: `opaque` | `alpha` | `additive` (doc 01).
+  Selected from `openxr:blend_mode` against the runtime's enumerated modes at session start;
+  `opaque` (the default) when there is no session.
 - `inhibitingIdle` (added WP12/WP13 reconciliation) — mirrors `shouldInhibitIdle()`'s own
   predicate (`openxr:inhibit_idle && state == focused`, §6.1) as a read-only observability field.
   There is otherwise no queryable surface for "is the compositor's idle-inhibit bit currently

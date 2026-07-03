@@ -54,6 +54,9 @@ class COpenXRManager {
     eXRManagerState    state() const;
     const std::string& runtimeName() const;
     const std::string& systemName() const;
+    // Currently-active environment blend mode as "opaque"|"alpha"|"additive" (doc 05 §4.3). The
+    // selected mode while a session exists; "opaque" (the default) otherwise.
+    std::string        blendModeName() const;
 
     // Idle-inhibit predicate (doc 05 §6.1). Main thread only. True iff openxr:inhibit_idle is
     // set AND the session currently has input focus (FOCUSED). CInputManager::recheckIdleInhibitorStatus()
