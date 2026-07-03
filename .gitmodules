@@ -7,3 +7,18 @@
 [submodule "subprojects/tracy"]
 	path = subprojects/tracy
 	url = https://github.com/wolfpld/tracy
+[submodule "subprojects/monado"]
+	path = subprojects/monado
+	url = https://gitlab.freedesktop.org/monado/monado.git
+	shallow = true
+	ignore = dirty
+[submodule "subprojects/eigen"]
+	path = subprojects/eigen
+	url = https://gitlab.com/libeigen/eigen.git
+	shallow = true
+	ignore = dirty
+[submodule "subprojects/vulkan-headers"]
+	path = subprojects/vulkan-headers
+	url = https://github.com/KhronosGroup/Vulkan-Headers.git
+	shallow = true
+	ignore = dirty
