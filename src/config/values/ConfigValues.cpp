@@ -733,6 +733,12 @@ std::vector<SP<IValue>> Values::getConfigValues() {
         MS<Bool>("openxr:inhibit_idle", "inhibit idle (hypridle etc.) while the XR session is focused", true),
         MS<Bool>("openxr:destroy_monitors_on_stop",
                  "destroy XR-created virtual monitors when the session stops. If false they persist as plain headless outputs", true),
+        MS<Bool>("openxr:overlay",
+                 "run as an XR_EXTX_overlay session so monitors composite ON TOP of another XR client (a game, or hypxrpaper). Requires a runtime that "
+                 "advertises XR_EXTX_overlay (Monado/WiVRn); ignored with a warning otherwise. Read at session start (disable/enable to change)",
+                 false),
+        MS<Int>("openxr:overlay_z", "overlay composition placement (XR_EXTX_overlay sessionLayersPlacement); higher composites later / on top. Read at session start", 1,
+                {.min = 0, .max = 1000000}),
 
         /*
          * experimental:

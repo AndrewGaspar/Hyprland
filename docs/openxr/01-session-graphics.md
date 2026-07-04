@@ -313,6 +313,53 @@ disable && enable`, or a reload that toggles `openxr:enabled`). The frame loop j
 submits `m_session->m_blendMode`. The active mode is surfaced as `blendMode` in
 `hyprctl openxr status` (doc 05 §4.3).
 
+## Overlay sessions (`XR_EXTX_overlay`)
+
+By default HypXRland runs as an **exclusive** XR client: it owns the frame and its quads
+composite over a black (or passthrough) void. Setting `openxr:overlay = 1` instead makes it an
+**overlay** session so its monitor quads composite ON TOP of *another* XR client's scene — a game,
+or the `hypxrpaper` ambient-background app. This is the `XR_EXTX_overlay` provisional extension
+(registry #34), implemented natively by Monado's out-of-process compositor (and inherited by
+WiVRn); SteamVR-Linux does **not** support it. See `research/01-vr-app-composition.md`.
+
+**What we do (tiny):**
+1. `createInstance()` probes `XR_EXTX_overlay` (records `m_hasOverlay`) and enables it *only* when
+   `openxr:overlay` was requested AND the runtime advertises it (`m_isOverlay = requested &&
+   supported`). Requested-but-unsupported logs a one-time WARN and creates a **normal** session —
+   overlay never fails startup.
+2. `createSession()` chains `XrSessionCreateInfoOverlayEXTX{ createFlags = 0,
+   sessionLayersPlacement = openxr:overlay_z }` into `xrCreateSession`'s `next` chain (between the
+   `XrSessionCreateInfo` and the EGL binding struct) when `m_isOverlay`.
+3. `COpenXRManager::start()` reads `openxr:overlay` / `openxr:overlay_z` **once at session start**
+   (same semantics as `blend_mode` — change requires `hyprctl openxr disable && enable`), *before*
+   `createInstance()`, and sets `m_session->m_overlayRequested` / `m_overlayZ`.
+
+The extension's struct/constants are provided by the installed `<openxr/openxr.h>` (the `openxr`
+package we build against defines `XR_EXTX_overlay`); `XRSession.cpp` carries an `#ifndef
+XR_EXTX_overlay` fallback that defines the (stable-shaped) struct locally for older headers.
+
+**Monado semantics (verified against the vendored tree @ `c2ddab59`):**
+- `ipc_server_process.c` `handle_focused_client_events` sets every overlay session
+  `visible = true, focused = true` **unconditionally** — even while a game is the primary client
+  and also focused, and even when no primary client exists at all. So our FOCUSED-gated input
+  (ray/grab/idle-inhibit) keeps working **unchanged** as an overlay. (Spike confirmed: overlay
+  session reaches FOCUSED both alone and with `hypxrpaper` as primary — two clients connected,
+  ours the overlay.)
+- `comp_multi_system.c` sorts delivered client frames by `state.z_order` and replays **all** layer
+  types bottom-to-top; the primary is pinned to `INT64_MIN`, so any `sessionLayersPlacement`
+  composites our quads above the game. `overlay_z` maps straight into `z_order` (higher = on top).
+- The environment blend mode comes from the *focused, bottom-most* client (the game), so our own
+  `m_blendMode` in `xrEndFrame` is effectively ignored when we're an overlay — quads blend over the
+  game via their layer alpha regardless.
+- **Idle note:** since overlays sit at FOCUSED whenever the service runs us, `openxr:inhibit_idle`
+  stays active for the whole time the runtime is up — acceptable, but worth knowing.
+- **Input caveat (not solved here):** Monado duplicates input to both clients; a trigger pull that
+  clicks a desktop window *also* reaches the game. Input arbitration ("point at desktop without
+  shooting") is deliberately out of scope for this change (see research doc Option D).
+
+The actual state is surfaced as `overlay` in `hyprctl openxr status` (doc 05 §4.3) — reflecting the
+real session type, not the config request (a downgraded request reads `false`).
+
 ## Session state handling (`CXRSession::pollEvents`, frame thread)
 
 The WIP only handled READY and STOPPING; this is the complete version. Pump with
