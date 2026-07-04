@@ -4,7 +4,10 @@
 # Launches:
 #   1. monado-service in WINDOWED mode (no XRT_COMPOSITOR_NULL) with the
 #      remote driver: a "Monado" window appears showing the rendered XR space.
-#   2. A nested dev Hyprland (build-debug) with the XR extension enabled
+#   2. (optional, with --env) hypxrpaper as the PRIMARY session, drawing an
+#      ambient background (gradient sky / panorama / 3D scene). HypXRland then
+#      runs as an XR_EXTX_overlay session composited on top of it.
+#   3. A nested dev Hyprland (build-debug) with the XR extension enabled
 #      (scripts/preview-xr.conf): its virtual monitors show up as floating
 #      quads inside the Monado window.
 #
@@ -12,8 +15,30 @@
 #   subprojects/monado/build/src/xrt/targets/gui/monado-gui remote
 #
 # Ctrl-C here stops everything. Kills ONLY the PIDs it spawned.
+#
+# Usage: preview-xr.sh [--env <spec>]
+#   --env pano              gradient-sky panorama background (hypxrpaper, no args)
+#   --env forest            bundled 'forest-clearing' 3D scene (--scene forest-clearing)
+#   --env <path>            *.hdr/*.png/*.jpg -> equirect panorama; else -> --scene <path>
+# When --env is given, hypxrpaper is discovered via $HYPXRPAPER_BIN, then
+# `hypxrpaper` on PATH, and openxr:overlay is enabled in the generated config.
 
 set -euo pipefail
+
+ENV_SPEC=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --env)
+            [[ $# -ge 2 ]] || { echo "--env requires an argument (pano | forest | <path>)"; exit 2; }
+            ENV_SPEC="$2"; shift 2 ;;
+        --env=*)
+            ENV_SPEC="${1#--env=}"; shift ;;
+        -h|--help)
+            grep -E '^# ' "${BASH_SOURCE[0]}" | sed 's/^# //'; exit 0 ;;
+        *)
+            echo "unknown argument: $1"; echo "usage: preview-xr.sh [--env <spec>]"; exit 2 ;;
+    esac
+done
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MONADO_BUILD="${MONADO_BUILD:-$REPO/subprojects/monado/build}"
@@ -35,14 +60,28 @@ CONF="$LOGDIR/preview-merged.conf"
     echo "source = $REPO/scripts/preview-xr.conf"
     [[ -f $REPO/hyprtester/xr-test-local.conf ]] && echo "source = $REPO/hyprtester/xr-test-local.conf"
     [[ -n ${XR_GPU:-} ]] && echo "openxr:gpu = $XR_GPU"
+    # Overlay mode ONLY when an ambient background is requested: HypXRland then composites its
+    # monitors on top of the hypxrpaper primary session instead of owning the whole view.
+    [[ -n $ENV_SPEC ]] && echo "openxr:overlay = 1"
     true
 } > "$CONF"
 
+# Resolve the GPU render node the merged config pins Hyprland to (dual-GPU boxes), so we can hand
+# hypxrpaper the SAME node via --gpu — a cross-GPU primary would crash Monado at swapchain time.
+# Prefer $XR_GPU, else scrape openxr:gpu out of the untracked local override.
+XR_GPU_NODE="${XR_GPU:-}"
+if [[ -z $XR_GPU_NODE && -f $REPO/hyprtester/xr-test-local.conf ]]; then
+    XR_GPU_NODE="$(sed -nE 's/^[[:space:]]*openxr:gpu[[:space:]]*=[[:space:]]*(\S+).*/\1/p' \
+        "$REPO/hyprtester/xr-test-local.conf" | tail -n1)"
+fi
+
 MONADO_PID=""
 HL_PID=""
+PAPER_PID=""
 cleanup() {
     # PID-targeted only — never kill by name (the host compositor is also "Hyprland").
     [[ -n $HL_PID ]] && kill "$HL_PID" 2>/dev/null && sleep 1 && kill -9 "$HL_PID" 2>/dev/null
+    [[ -n $PAPER_PID ]] && kill "$PAPER_PID" 2>/dev/null && sleep 1 && kill -9 "$PAPER_PID" 2>/dev/null
     [[ -n $MONADO_PID ]] && kill "$MONADO_PID" 2>/dev/null && sleep 1 && kill -9 "$MONADO_PID" 2>/dev/null
     echo "stopped. logs in $LOGDIR"
 }
@@ -58,6 +97,35 @@ env P_OVERRIDE_ACTIVE_CONFIG=remote XRT_NO_STDIN=1 XRT_COMPOSITOR_FORCE_XCB=1 \
 MONADO_PID=$!
 sleep 3
 kill -0 "$MONADO_PID" 2>/dev/null || { echo "monado-service died, see $LOGDIR/monado.log"; exit 1; }
+
+# Optional ambient background: hypxrpaper as the PRIMARY OpenXR session, under HypXRland's overlay.
+if [[ -n $ENV_SPEC ]]; then
+    PAPER_BIN="${HYPXRPAPER_BIN:-$(command -v hypxrpaper || true)}"
+    [[ -n $PAPER_BIN && -x $PAPER_BIN ]] || {
+        echo "hypxrpaper not found — set \$HYPXRPAPER_BIN to its path or put 'hypxrpaper' on \$PATH"
+        exit 1
+    }
+
+    # Map the --env spec to hypxrpaper args.
+    PAPER_ARGS=()
+    case "$ENV_SPEC" in
+        pano)   ;; # no args = built-in gradient sky
+        forest) PAPER_ARGS=(--scene forest-clearing) ;;
+        *.hdr|*.HDR|*.png|*.PNG|*.jpg|*.JPG|*.jpeg|*.JPEG)
+                PAPER_ARGS=("$ENV_SPEC") ;;         # equirectangular panorama (positional)
+        *)      PAPER_ARGS=(--scene "$ENV_SPEC") ;; # a .glb/.gltf/scene.json or bundled scene name
+    esac
+    # Same GPU node the merged config pins Hyprland to (cross-GPU primary crashes Monado).
+    [[ -n $XR_GPU_NODE ]] && PAPER_ARGS+=(--gpu "$XR_GPU_NODE")
+
+    echo ">> starting hypxrpaper ambient background (--env $ENV_SPEC)..."
+    env XR_RUNTIME_JSON="$MONADO_BUILD/openxr_monado-dev.json" \
+        "$PAPER_BIN" "${PAPER_ARGS[@]}" \
+        >"$LOGDIR/hypxrpaper.log" 2>&1 &
+    PAPER_PID=$!
+    sleep 2
+    kill -0 "$PAPER_PID" 2>/dev/null || { echo "hypxrpaper died, see $LOGDIR/hypxrpaper.log"; exit 1; }
+fi
 
 echo ">> starting nested dev Hyprland with XR enabled..."
 # Snapshot existing instance signatures so we can spot the new one.
@@ -86,7 +154,13 @@ cat <<EOF
   Two new windows should appear on your desktop:
     - the nested Hyprland (normal desktop view of the virtual monitors)
     - the Monado compositor window (the 3D XR view with floating quads)
-
+${ENV_SPEC:+"
+  Ambient background: hypxrpaper (--env $ENV_SPEC) is the PRIMARY session; HypXRland
+  runs as an XR_EXTX_overlay on top of it (openxr:overlay = 1). Its monitors should
+  float over the ambient scene instead of a black void. Confirm the overlay took:
+    hyprctl -i \$SIG openxr status    # -> overlay: yes
+  (hypxrpaper log: $LOGDIR/hypxrpaper.log)
+"}
   Nested instance signature: ${SIG:-<run 'hyprctl instances'>}
 
   Drive the fake HMD and controllers (third window, run in another terminal):
