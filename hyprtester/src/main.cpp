@@ -326,6 +326,7 @@ static int runXrSuite(const SSettings& settings) {
     if (monadoUp) {
         XR::g_ctx.monadoLog       = orchestrator.logPath();
         XR::g_ctx.runtimeProvided = true;
+        XR::g_ctx.runtimeManifest = orchestrator.runtimeManifest();
         hlEnv.emplace_back("XR_RUNTIME_JSON", orchestrator.runtimeManifest());
 
         // Validate the remote wire ABI (runtime half of drift protection, §4.2).

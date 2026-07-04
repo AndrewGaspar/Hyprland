@@ -461,6 +461,13 @@ suite is 15 tests, not 11:**
 | 14 | `xr_two_hand_pointer` (WP12, `input.cpp`) | Doc 04 §3 two-hand ownership: hover monitor A with the left hand, then produce a hover change with the right hand onto monitor B. | Pointer ownership (and `hovered`) transfers to the last-active hand; A stops being reported hovered once B is; transferring back to the left hand on A re-asserts A. |
 | 15 | `xr_menu_right_click` (WP12, `input.cpp`) | Doc 04 §1.2/§4: the `menu` action (bound to `a/click` on valve/index, the test profile) maps to a `BTN_RIGHT` edge. | A `menu` press/release edge while hovering produces a right-click on the spawned test client, verified via the same button-observability path as `xr_select_hysteresis`. |
 
+**A 16th test exists for the overlay/ambient-background integration (WP-P5) — the implemented
+suite is 16 tests:**
+
+| # | Test | Steps | Assertions |
+|---|---|---|---|
+| 16 | `xr_overlay_composition` (WP-P5, `overlay.cpp`) | **Opt-in**, gated on `$HYPRTESTER_HYPXRPAPER` (path to a `hypxrpaper` binary; unset/invalid → SKIP, never fail). Wait for the default (exclusive) session to reach focused, then: `/openxr disable` → launch `hypxrpaper` in gradient-panorama mode (no args, no scene asset) as the **primary** OpenXR session (PID-tracked, same `XR_RUNTIME_JSON`/runtime dir as the suite's Monado, `--gpu $HYPRTESTER_XR_GPU` forwarded) → `keyword openxr:overlay 1` → `/openxr enable`. Restore on exit (RAII guard): `disable` → `keyword openxr:overlay 0` → `enable` → kill hypxrpaper by PID. | HypXRland re-reaches `focused` as an `XR_EXTX_overlay` session; `j/openxr` reports `"overlay": true` and still names `Monado`; the declared fixture monitors are bound (`"monitors": [ ... "name": ...]`). `openxr:overlay` is read in `COpenXRManager::start()` (which `/openxr enable` calls directly), so a plain `keyword`-set before `enable` applies it — **no `parseKeyword` special-case is needed** (unlike the `openxr:enabled`/`inhibit_idle` hot-toggles). All phases are bounded (≤20 s) and SKIP on env flake per suite convention. |
+
 There is no dedicated 16-layer-cap integration test (§2's directory-layout note above) and no
 unit test for the layer-count-limit policy either — a gap, not an oversight to paper over.
 
@@ -521,6 +528,10 @@ scripts/build-monado.sh
 export HYPRTESTER_MONADO_SERVICE=/path/to/monado-service
 # optional, software Vulkan:
 export HYPRTESTER_VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+# optional, opt into the overlay/ambient-background test (xr_overlay_composition):
+#   point at a hypxrpaper binary (see hypxrpaper's own README to build it). When unset,
+#   that single test SKIPs (counts as a pass); everything else is unaffected.
+export HYPRTESTER_HYPXRPAPER=/path/to/hypxrpaper
 
 # 3. Run from the hyprtester directory (hyprtester requirement)
 cd hyprtester
