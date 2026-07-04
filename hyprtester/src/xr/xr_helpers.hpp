@@ -20,6 +20,7 @@ namespace XR {
         bool           runtimeProvided = false; // XR_RUNTIME_JSON was passed to Hyprland-under-test
         std::string    skipReason;           // human-readable reason when !available
         std::string    runtimeDir;           // the isolated, shared XDG_RUNTIME_DIR
+        std::string    runtimeManifest;      // XR_RUNTIME_JSON handed to Hyprland (and any XR client the tests spawn)
         std::string    monadoLog;            // <run-dir>/monado.log
         std::string    runId;                // xr-<pid>-<unixtime>
         CRemoteClient* remote = nullptr;     // shared, connected client (null if unavailable)

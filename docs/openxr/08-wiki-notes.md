@@ -288,15 +288,52 @@ openxr {
 }
 ```
 
+### hypxrpaper — the ambient-background app
+
+`hypxrpaper` is a tiny standalone OpenXR client that draws an ambient backdrop and nothing else,
+so HypXRland's overlay has something to float over. It is a **separate project** (build it from
+its own repo — see its `README.md`; `cmake -B build && cmake --build build` produces `hypxrpaper`)
+and, like any OpenXR app, it needs `XR_RUNTIME_JSON` pointed at your runtime's manifest.
+
+```
+hypxrpaper [panorama.{hdr,png,jpg}]   # equirect panorama; omit for a built-in gradient sky
+hypxrpaper --scene forest-clearing    # a bundled 3D scene (stereo projection layer)
+hypxrpaper --scene path/to/model.glb  # any .glb/.gltf, scene.json, or bundled scene name
+hypxrpaper --gpu /dev/dri/renderD128  # pin to the runtime's GPU on multi-GPU boxes
+```
+
 Recipe:
 
 1. Start the runtime service first (Monado: `monado-service`; WiVRn: its server).
 2. Start the **primary** app — the thing you want underneath. For an ambient backdrop that's
-   `hypxrpaper` (`XR_RUNTIME_JSON=<runtime manifest> hypxrpaper` — no args = gradient sky). For a
-   game, launch it normally against the same runtime (Steam VR titles via OpenComposite/xrizer on
+   `hypxrpaper` (`XR_RUNTIME_JSON=<runtime manifest> hypxrpaper` — no args = gradient sky;
+   `--scene forest-clearing` for the bundled 3D scene; a panorama image path for a photo sky). For
+   a game, launch it normally against the same runtime (Steam VR titles via OpenComposite/xrizer on
    Monado/WiVRn).
 3. Enable HypXRland (`hyprctl openxr enable`, or start with `openxr:enabled = 1`). Your monitors
    appear over the primary app's scene.
+
+### Autostart it from your Hyprland config
+
+Let Hyprland launch the backdrop for you with `exec-once`, alongside `openxr:overlay = 1`:
+
+```ini
+openxr {
+    enabled = true
+    overlay = true          # composite our monitors over hypxrpaper
+}
+
+# 3D scene backdrop:
+exec-once = hypxrpaper --scene forest-clearing
+# ...or a panorama image instead:
+# exec-once = hypxrpaper ~/pictures/panoramas/sunset.hdr
+# ...or the built-in gradient sky (no args):
+# exec-once = hypxrpaper
+```
+
+`hypxrpaper` inherits Hyprland's environment, so as long as your session has `XR_RUNTIME_JSON` set
+(most OpenXR setups do) it just works; otherwise prefix it, e.g.
+`exec-once = env XR_RUNTIME_JSON=/path/to/runtime.json hypxrpaper --scene forest-clearing`.
 
 Notes:
 
