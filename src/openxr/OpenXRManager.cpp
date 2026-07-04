@@ -116,6 +116,10 @@ std::string COpenXRManager::blendModeName() const {
     return OpenXR::blendModeToString(OpenXR::XR_BLEND_OPAQUE);
 }
 
+bool COpenXRManager::isOverlay() const {
+    return m_session && m_session->m_isOverlay;
+}
+
 bool COpenXRManager::shouldInhibitIdle() {
     // doc 05 §6.1. FOCUSED (and only FOCUSED) inhibits: the headset is on and this session has
     // input focus. VISIBLE (e.g. runtime dashboard in front) intentionally does not inhibit.
@@ -158,6 +162,17 @@ void COpenXRManager::start() {
 
     m_session  = makeUnique<CXRSession>();
     m_graphics = makeUnique<CXRGraphics>();
+
+    // Overlay session (doc 01). Read openxr:overlay / openxr:overlay_z once, BEFORE createInstance
+    // (which enables XR_EXTX_overlay only if requested AND advertised). Same semantics as
+    // blend_mode: read at session start — changing requires disable/enable. Requested-but-
+    // unsupported downgrades to a normal session with a WARN (never fails startup).
+    {
+        static auto POVERLAY          = CConfigValue<Hyprlang::INT>("openxr:overlay");
+        static auto POVERLAYZ         = CConfigValue<Hyprlang::INT>("openxr:overlay_z");
+        m_session->m_overlayRequested = (*POVERLAY != 0);
+        m_session->m_overlayZ         = (uint32_t)std::max<int64_t>(0, (int64_t)*POVERLAYZ);
+    }
 
     // 1. Instance (extension checks; missing runtime / required extensions -> UNAVAILABLE).
     if (!m_session->createInstance()) {

@@ -64,6 +64,8 @@ same thing live).
 | `openxr:scroll_speed` | float | `1.0` | Thumbstick scroll multiplier on XR monitors. |
 | `openxr:inhibit_idle` | bool | `true` | Inhibit hypridle/idle while the session is `focused`. |
 | `openxr:destroy_monitors_on_stop` | bool | `true` | Destroy XR-created monitors when the session stops; if `false` they persist as plain headless outputs. |
+| `openxr:overlay` | bool | `false` | Run as an `XR_EXTX_overlay` session so your monitors composite **on top of another VR app** (a game, or `hypxrpaper`) instead of owning the view. Needs a runtime that supports `XR_EXTX_overlay` — Monado and WiVRn do; **SteamVR-Linux does not** (the session is created as a normal exclusive one, with a warning). Read at session start only (`hyprctl openxr disable && hyprctl openxr enable` to re-apply). See §8. |
+| `openxr:overlay_z` | int | `1` | Overlay stacking order (`sessionLayersPlacement`). Higher composites later / on top; the primary app is always beneath. Only meaningful with `openxr:overlay = 1`. Read at session start only. |
 
 Full descriptions (including min/max clamps): `hyprctl descriptions | grep openxr`.
 
@@ -265,6 +267,50 @@ socat -U - "UNIX-CONNECT:$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.soc
 ... openxractive>>1 -> hyprctl dispatch dpms off
 ... openxractive>>0 -> hyprctl dispatch dpms on
 ```
+
+---
+
+## 8. Compose over another VR app / hypxrpaper (overlay mode)
+
+By default HypXRland owns the headset view — your monitors float in a black void (or over
+passthrough with `blend_mode = alpha`). With `openxr:overlay = 1` it instead runs as an
+**`XR_EXTX_overlay`** session and its monitors composite **on top of another OpenXR application**:
+a VR game, or `hypxrpaper` for an ambient sky/room backdrop. Requires a runtime that supports the
+extension — **Monado** and **WiVRn** do; **SteamVR-Linux does not** (requesting overlay there just
+logs a warning and runs exclusive as usual).
+
+```ini
+openxr {
+    enabled  = true
+    overlay  = true    # composite over whatever else is running
+    overlay_z = 1       # stacking order; higher = on top (primary app is always beneath)
+    # gpu = /dev/dri/renderD128   # pin to the runtime's GPU on multi-GPU boxes
+}
+```
+
+Recipe:
+
+1. Start the runtime service first (Monado: `monado-service`; WiVRn: its server).
+2. Start the **primary** app — the thing you want underneath. For an ambient backdrop that's
+   `hypxrpaper` (`XR_RUNTIME_JSON=<runtime manifest> hypxrpaper` — no args = gradient sky). For a
+   game, launch it normally against the same runtime (Steam VR titles via OpenComposite/xrizer on
+   Monado/WiVRn).
+3. Enable HypXRland (`hyprctl openxr enable`, or start with `openxr:enabled = 1`). Your monitors
+   appear over the primary app's scene.
+
+Notes:
+
+- On Monado an overlay session is held **visible + focused** the whole time the service runs — so
+  ray input, grab, and idle-inhibit behave exactly as in exclusive mode. It reaches `focused` even
+  with no primary app running (you'll just see monitors over black until one starts).
+- `overlay` is reported by `hyprctl openxr status` (`"overlay": true` in JSON, `overlay: yes` in
+  text) — reflecting the real session type, so you can confirm the runtime accepted it.
+- **Input is not arbitrated between the two apps.** Monado delivers controller input to the game
+  *and* to HypXRland simultaneously, so a trigger pull that clicks a desktop window also reaches
+  the game. A modal "desktop mode" toggle is future work (see
+  `research/01-vr-app-composition.md`).
+- Changing `overlay`/`overlay_z` takes effect on the next session start
+  (`hyprctl openxr disable && hyprctl openxr enable`).
 
 ---
 
