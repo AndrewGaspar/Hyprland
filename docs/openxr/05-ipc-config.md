@@ -72,6 +72,8 @@ Add one block to `getConfigValues()` under a new `/* openxr: */` section comment
 | `openxr:scroll_speed` | `Float` | `1.0` | multiplier for thumbstick scrolling on XR monitors | hot-live |
 | `openxr:inhibit_idle` | `Bool` | `true` | inhibit idle (hypridle etc.) while the XR session is focused | hot — triggers an idle recheck (§6) |
 | `openxr:destroy_monitors_on_stop` | `Bool` | `true` | destroy XR-created virtual monitors when the session stops. If false they persist as plain headless outputs | hot-live (consulted at stop time) |
+| `openxr:overlay` | `Bool` | `false` | run as an `XR_EXTX_overlay` session so monitors composite ON TOP of another XR client (a game, or `hypxrpaper`). Requires a runtime that advertises `XR_EXTX_overlay` (Monado/WiVRn); requested-but-unsupported downgrades to a normal exclusive session with a WARN, never failing startup (doc 01) | **start-only** — read at session start; changing it takes effect on the next start |
+| `openxr:overlay_z` | `Int` | `1` | overlay composition placement (`XR_EXTX_overlay` `sessionLayersPlacement`); higher composites later / on top. On Monado this maps straight into the layer `z_order` (primary pinned to `INT64_MIN`), so any value puts our quads above the primary | **start-only** — read at session start |
 
 Float entries should carry sane `{.min, .max}` options (e.g. thresholds `{.min = 0.0, .max = 1.0}`,
 `leash_response {.min = 0.01, .max = 5.0}`). "hot-live" means the code reads the
@@ -407,6 +409,7 @@ present:
     "runtimeName": "Monado(XRT) by Collabora et al.",
     "systemName": "Simulated HMD",
     "blendMode": "opaque",
+    "overlay": false,
     "inhibitingIdle": true,
     "monitors": [
         {
@@ -435,6 +438,10 @@ present:
 - `blendMode` — the active environment blend mode: `opaque` | `alpha` | `additive` (doc 01).
   Selected from `openxr:blend_mode` against the runtime's enumerated modes at session start;
   `opaque` (the default) when there is no session.
+- `overlay` — whether the current session is an `XR_EXTX_overlay` session (doc 01). Reflects the
+  ACTUAL state, not the `openxr:overlay` request: `false` when there is no session, or when overlay
+  was requested but the runtime didn't advertise the extension (downgraded to exclusive). Also
+  emitted in the text form as `overlay: yes|no`.
 - `inhibitingIdle` (added WP12/WP13 reconciliation) — mirrors `shouldInhibitIdle()`'s own
   predicate (`openxr:inhibit_idle && state == focused`, §6.1) as a read-only observability field.
   There is otherwise no queryable surface for "is the compositor's idle-inhibit bit currently
