@@ -13,6 +13,22 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
+// XR_EXTX_overlay (provisional extension #34) — chained into xrCreateSession for overlay mode
+// (doc 01). Present in the openxr package we build against; define locally as a fallback for
+// older headers. The struct is stable-shaped — copied verbatim from the OpenXR registry.
+#ifndef XR_EXTX_overlay
+#define XR_EXTX_overlay 1
+#define XR_EXTX_OVERLAY_EXTENSION_NAME "XR_EXTX_overlay"
+#define XR_TYPE_SESSION_CREATE_INFO_OVERLAY_EXTX ((XrStructureType)1000033000)
+typedef XrFlags64 XrOverlaySessionCreateFlagsEXTX;
+typedef struct XrSessionCreateInfoOverlayEXTX {
+    XrStructureType                 type;
+    const void* XR_MAY_ALIAS        next;
+    XrOverlaySessionCreateFlagsEXTX createFlags;
+    uint32_t                        sessionLayersPlacement;
+} XrSessionCreateInfoOverlayEXTX;
+#endif
+
 #include <cstring>
 #include <vector>
 
@@ -67,6 +83,17 @@ bool CXRSession::createInstance() {
         exts.push_back("XR_EXT_hand_tracking");
     m_usingLocalFloor = m_hasLocalFloor;
 
+    // Overlay session (doc 01): enable XR_EXTX_overlay only when requested (openxr:overlay) AND
+    // advertised by the runtime. Requested-but-unsupported downgrades to a normal session with a
+    // one-time WARN — never fail startup for this. m_isOverlay is the actual decision, consumed by
+    // createSession() to chain XrSessionCreateInfoOverlayEXTX.
+    m_hasOverlay = hasExt(XR_EXTX_OVERLAY_EXTENSION_NAME);
+    m_isOverlay  = m_overlayRequested && m_hasOverlay;
+    if (m_isOverlay)
+        exts.push_back(XR_EXTX_OVERLAY_EXTENSION_NAME);
+    else if (m_overlayRequested && !m_hasOverlay)
+        Log::logger->log(Log::WARN, "[OPENXR] openxr:overlay requested but this runtime does not advertise XR_EXTX_overlay; creating a normal (exclusive) session");
+
     XrApplicationInfo appInfo = {};
     strncpy(appInfo.applicationName, "Hyprland", XR_MAX_APPLICATION_NAME_SIZE - 1);
     appInfo.applicationVersion = 1;
@@ -84,8 +111,8 @@ bool CXRSession::createInstance() {
     if (XR_SUCCEEDED(xrGetInstanceProperties(m_instance, &props)))
         m_runtimeName = props.runtimeName;
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] instance created (runtime: {}, local_floor: {}, hand_interaction: {}, hand_tracking: {})", m_runtimeName.empty() ? "?" : m_runtimeName,
-                     m_hasLocalFloor, m_hasHandInteraction, m_hasHandTracking);
+    Log::logger->log(Log::DEBUG, "[OPENXR] instance created (runtime: {}, local_floor: {}, hand_interaction: {}, hand_tracking: {}, overlay: {})",
+                     m_runtimeName.empty() ? "?" : m_runtimeName, m_hasLocalFloor, m_hasHandInteraction, m_hasHandTracking, m_isOverlay);
     return true;
 }
 
@@ -145,6 +172,19 @@ bool CXRSession::createSession(CXRGraphics& gfx) {
     sessionInfo.systemId            = m_systemId;
     sessionInfo.next                = &binding;
 
+    // Overlay session (doc 01): chain XrSessionCreateInfoOverlayEXTX between sessionInfo and the
+    // EGL binding. On Monado the placement maps straight into z_order (primary pinned to INT64_MIN),
+    // so any value composites our quads above the primary client. m_isOverlay was decided in
+    // createInstance (requested AND the extension is enabled).
+    XrSessionCreateInfoOverlayEXTX overlayInfo = {XR_TYPE_SESSION_CREATE_INFO_OVERLAY_EXTX};
+    if (m_isOverlay) {
+        overlayInfo.createFlags            = 0;
+        overlayInfo.sessionLayersPlacement = m_overlayZ;
+        overlayInfo.next                   = &binding;
+        sessionInfo.next                   = &overlayInfo;
+        Log::logger->log(Log::DEBUG, "[OPENXR] creating overlay session (sessionLayersPlacement = {})", m_overlayZ);
+    }
+
     // The WIP binds m_xrContext current around xrCreateSession and unbinds after — keep it.
     eglMakeCurrent(gfx.m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, gfx.m_xrContext);
     XrResult r = xrCreateSession(m_instance, &sessionInfo, &m_session);
@@ -155,7 +195,7 @@ bool CXRSession::createSession(CXRGraphics& gfx) {
         return false;
     }
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] session created");
+    Log::logger->log(Log::DEBUG, "[OPENXR] session created ({})", m_isOverlay ? "overlay" : "exclusive");
     return true;
 }
 

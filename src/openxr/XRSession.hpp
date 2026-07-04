@@ -78,6 +78,16 @@ class CXRSession {
     bool       m_usingLocalFloor = false;
     bool       m_hasLocalFloor = false, m_hasHandInteraction = false, m_hasHandTracking = false;
 
+    // Overlay session (XR_EXTX_overlay, doc 01). COpenXRManager::start() sets m_overlayRequested /
+    // m_overlayZ from openxr:overlay / openxr:overlay_z BEFORE createInstance(). m_hasOverlay records
+    // whether the runtime advertises the extension; m_isOverlay is the ACTUAL state — true only when
+    // overlay was requested AND supported, i.e. an XrSessionCreateInfoOverlayEXTX was chained into
+    // xrCreateSession. Requested-but-unsupported downgrades to a normal session (one-time WARN).
+    bool       m_overlayRequested = false;
+    uint32_t   m_overlayZ         = 1; // sessionLayersPlacement; higher composites later / on top
+    bool       m_hasOverlay       = false;
+    bool       m_isOverlay        = false;
+
     // Frame-thread-only after start().
     XrSessionState m_xrState       = XR_SESSION_STATE_UNKNOWN;
     bool           m_sessionBegan  = false;

@@ -61,6 +61,9 @@ class COpenXRManager {
     // Currently-active environment blend mode as "opaque"|"alpha"|"additive" (doc 05 §4.3). The
     // selected mode while a session exists; "opaque" (the default) otherwise.
     std::string        blendModeName() const;
+    // Whether the current session is an XR_EXTX_overlay session (doc 01). Actual state, not the
+    // openxr:overlay request — false when no session exists or the runtime lacked the extension.
+    bool               isOverlay() const;
 
     // Idle-inhibit predicate (doc 05 §6.1). Main thread only. True iff openxr:inhibit_idle is
     // set AND the session currently has input focus (FOCUSED). CInputManager::recheckIdleInhibitorStatus()
