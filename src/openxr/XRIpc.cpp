@@ -18,6 +18,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     const std::string RUNTIME = g_pOpenXRManager->runtimeName();
     const std::string SYSTEM  = g_pOpenXRManager->systemName();
     const std::string BLEND   = g_pOpenXRManager->blendModeName();
+    const bool        OVERLAY = g_pOpenXRManager->isOverlay();
     const auto        MONS    = g_pOpenXRManager->monitorInfos();
     // Read-only observability for the idle-inhibit predicate (doc 05 §6.1). There is otherwise
     // no queryable surface for "is the compositor's idle-inhibit bit currently raised because of
@@ -59,14 +60,16 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "runtimeName": "{}",
     "systemName": "{}",
     "blendMode": "{}",
+    "overlay": {},
     "inhibitingIdle": {},
     "monitors": [{}{}]
 }}
 )#",
-                           STATE, RUNTIME, SYSTEM, BLEND, INHIBITING_IDLE ? "true" : "false", MONS.empty() ? "" : "\n", mons);
+                           STATE, RUNTIME, SYSTEM, BLEND, OVERLAY ? "true" : "false", INHIBITING_IDLE ? "true" : "false", MONS.empty() ? "" : "\n", mons);
     }
 
-    std::string out = std::format("state: {}\nruntime: {}\nsystem: {}\nblend mode: {}\nidle inhibited: {}\n", STATE, RUNTIME, SYSTEM, BLEND, INHIBITING_IDLE ? "yes" : "no");
+    std::string out =
+        std::format("state: {}\nruntime: {}\nsystem: {}\nblend mode: {}\noverlay: {}\nidle inhibited: {}\n", STATE, RUNTIME, SYSTEM, BLEND, OVERLAY ? "yes" : "no", INHIBITING_IDLE ? "yes" : "no");
     for (const auto& m : MONS) {
         out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} hovered: {}\n", m.name, m.id, m.w, m.h, m.refresh,
                            m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.grabbed ? "yes" : "no", m.hovered ? "yes" : "no");
