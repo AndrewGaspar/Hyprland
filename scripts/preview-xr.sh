@@ -16,7 +16,10 @@
 #
 # Ctrl-C here stops everything. Kills ONLY the PIDs it spawned.
 #
-# Usage: preview-xr.sh [--env <spec>]
+# Usage: preview-xr.sh [--wivrn] [--env <spec>]
+#   --wivrn                 use the system WiVRn runtime (real headset!) instead of
+#                           launching the vendored windowed monado-service. Requires
+#                           wivrn-server running with the headset connected.
 #   --env pano              gradient-sky panorama background (hypxrpaper, no args)
 #   --env forest            bundled 'forest-clearing' 3D scene (--scene forest-clearing)
 #   --env <path>            *.hdr/*.png/*.jpg -> equirect panorama; else -> --scene <path>
@@ -26,8 +29,11 @@
 set -euo pipefail
 
 ENV_SPEC=""
+USE_WIVRN=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --wivrn)
+            USE_WIVRN=1; shift ;;
         --env)
             [[ $# -ge 2 ]] || { echo "--env requires an argument (pano | forest | <path>)"; exit 2; }
             ENV_SPEC="$2"; shift 2 ;;
@@ -36,7 +42,7 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             grep -E '^# ' "${BASH_SOURCE[0]}" | sed 's/^# //'; exit 0 ;;
         *)
-            echo "unknown argument: $1"; echo "usage: preview-xr.sh [--env <spec>]"; exit 2 ;;
+            echo "unknown argument: $1"; echo "usage: preview-xr.sh [--wivrn] [--env <spec>]"; exit 2 ;;
     esac
 done
 
@@ -47,10 +53,24 @@ LOGDIR="${TMPDIR:-/tmp}/hypxrland-preview-$$"
 mkdir -p "$LOGDIR"
 
 [[ -x $HYPRLAND_BIN ]] || { echo "missing $HYPRLAND_BIN — build first: cmake --build build-debug --target Hyprland"; exit 1; }
-[[ -x $MONADO_BUILD/src/xrt/targets/service/monado-service ]] || {
-    echo "missing monado-service under $MONADO_BUILD — run scripts/build-monado.sh first (or set MONADO_BUILD)"
-    exit 1
-}
+
+if [[ $USE_WIVRN -eq 1 ]]; then
+    # Real-headset mode: talk to the system WiVRn runtime instead of our vendored Monado.
+    RUNTIME_JSON="${WIVRN_RUNTIME_JSON:-/usr/share/openxr/1/openxr_wivrn.json}"
+    [[ -f $RUNTIME_JSON ]] || { echo "WiVRn runtime manifest not found at $RUNTIME_JSON (set WIVRN_RUNTIME_JSON)"; exit 1; }
+    pgrep -x wivrn-server >/dev/null || {
+        echo "wivrn-server is not running — start it (wivrn-dashboard) and connect the headset first"
+        exit 1
+    }
+    echo ">> WiVRn mode: using $RUNTIME_JSON (make sure the headset client is CONNECTED,"
+    echo "   or session creation will fail)"
+else
+    [[ -x $MONADO_BUILD/src/xrt/targets/service/monado-service ]] || {
+        echo "missing monado-service under $MONADO_BUILD — run scripts/build-monado.sh first (or set MONADO_BUILD)"
+        exit 1
+    }
+    RUNTIME_JSON="$MONADO_BUILD/openxr_monado-dev.json"
+fi
 
 # Merged launch config: the tracked preview config, an optional untracked machine-local
 # override (same file the test harness uses), and an optional XR_GPU env pin — machine
@@ -87,16 +107,18 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo ">> starting windowed monado-service (remote driver, TCP 4242)..."
-# XRT_COMPOSITOR_FORCE_XCB: Monado's Wayland window backend asserts with 0
-# swapchain images under Hyprland (surface not configured before swapchain
-# creation); the X11-via-XWayland window path works.
-env P_OVERRIDE_ACTIVE_CONFIG=remote XRT_NO_STDIN=1 XRT_COMPOSITOR_FORCE_XCB=1 \
-    "$MONADO_BUILD/src/xrt/targets/service/monado-service" \
-    >"$LOGDIR/monado.log" 2>&1 &
-MONADO_PID=$!
-sleep 3
-kill -0 "$MONADO_PID" 2>/dev/null || { echo "monado-service died, see $LOGDIR/monado.log"; exit 1; }
+if [[ $USE_WIVRN -eq 0 ]]; then
+    echo ">> starting windowed monado-service (remote driver, TCP 4242)..."
+    # XRT_COMPOSITOR_FORCE_XCB: Monado's Wayland window backend asserts with 0
+    # swapchain images under Hyprland (surface not configured before swapchain
+    # creation); the X11-via-XWayland window path works.
+    env P_OVERRIDE_ACTIVE_CONFIG=remote XRT_NO_STDIN=1 XRT_COMPOSITOR_FORCE_XCB=1 \
+        "$MONADO_BUILD/src/xrt/targets/service/monado-service" \
+        >"$LOGDIR/monado.log" 2>&1 &
+    MONADO_PID=$!
+    sleep 3
+    kill -0 "$MONADO_PID" 2>/dev/null || { echo "monado-service died, see $LOGDIR/monado.log"; exit 1; }
+fi
 
 # Optional ambient background: hypxrpaper as the PRIMARY OpenXR session, under HypXRland's overlay.
 if [[ -n $ENV_SPEC ]]; then
@@ -119,7 +141,7 @@ if [[ -n $ENV_SPEC ]]; then
     [[ -n $XR_GPU_NODE ]] && PAPER_ARGS+=(--gpu "$XR_GPU_NODE")
 
     echo ">> starting hypxrpaper ambient background (--env $ENV_SPEC)..."
-    env XR_RUNTIME_JSON="$MONADO_BUILD/openxr_monado-dev.json" \
+    env XR_RUNTIME_JSON="$RUNTIME_JSON" \
         "$PAPER_BIN" "${PAPER_ARGS[@]}" \
         >"$LOGDIR/hypxrpaper.log" 2>&1 &
     PAPER_PID=$!
@@ -132,7 +154,7 @@ echo ">> starting nested dev Hyprland with XR enabled..."
 HYPR_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/hypr"
 mapfile -t SIGS_BEFORE < <(ls -1 "$HYPR_DIR" 2>/dev/null)
 
-env XR_RUNTIME_JSON="$MONADO_BUILD/openxr_monado-dev.json" \
+env XR_RUNTIME_JSON="$RUNTIME_JSON" \
     "$HYPRLAND_BIN" --config "$CONF" \
     >"$LOGDIR/hyprland.log" 2>&1 &
 HL_PID=$!
@@ -149,11 +171,36 @@ for _ in $(seq 1 20); do
 done
 [[ -n $SIG ]] || echo "warning: could not detect nested instance signature; use 'hyprctl instances'"
 
+if [[ $USE_WIVRN -eq 1 ]]; then
+cat <<EOF
+
+  WiVRn mode: put the headset ON — the floating monitors render there, not in
+  a desktop window. The nested Hyprland window on your desktop is the same
+  content in flat form (and where keyboard/mouse input goes).
+
+  If nothing appears in the headset, check:
+    grep -iE 'openxr|session|instance' $LOGDIR/hyprland.log
+  (a headset that isn't connected, or a runtime without XR_MNDX_egl_enable,
+  fails at instance/session creation with a clear error there)
+EOF
+else
 cat <<EOF
 
   Two new windows should appear on your desktop:
     - the nested Hyprland (normal desktop view of the virtual monitors)
     - the Monado compositor window (the 3D XR view with floating quads)
+
+  Drive the fake HMD and controllers (third window, run in another terminal):
+    $MONADO_BUILD/src/xrt/targets/gui/monado-gui remote
+      -> tick 'active' on left/right controller, then use the pose sliders,
+         trigger (select = click), squeeze (grab = move a quad).
+
+  Known env quirk on this box (dual GPU): the Monado session can die with heap
+  corruption after some minutes — just Ctrl-C and rerun.
+EOF
+fi
+
+cat <<EOF
 ${ENV_SPEC:+"
   Ambient background: hypxrpaper (--env $ENV_SPEC) is the PRIMARY session; HypXRland
   runs as an XR_EXTX_overlay on top of it (openxr:overlay = 1). Its monitors should
@@ -163,11 +210,6 @@ ${ENV_SPEC:+"
 "}
   Nested instance signature: ${SIG:-<run 'hyprctl instances'>}
 
-  Drive the fake HMD and controllers (third window, run in another terminal):
-    $MONADO_BUILD/src/xrt/targets/gui/monado-gui remote
-      -> tick 'active' on left/right controller, then use the pose sliders,
-         trigger (select = click), squeeze (grab = move a quad).
-
   Talk to the nested instance (paste-ready):
     hyprctl -i $SIG openxr status
     hyprctl -i $SIG dispatch xrmonitor create XR-demo 1280x720 anchor:local pos:0.8,1.4,-1.4
@@ -175,9 +217,6 @@ ${ENV_SPEC:+"
 
   Watch the socket2 events (bar integration surface):
     socat - UNIX-CONNECT:$HYPR_DIR/$SIG/.socket2.sock | grep -E 'openxr|xrmonitor'
-
-  Known env quirk on this box (dual GPU): the Monado session can die with heap
-  corruption after some minutes — just Ctrl-C and rerun.
 
   Ctrl-C to stop.
 EOF
