@@ -34,6 +34,14 @@ set -uo pipefail
 : "${XR_MODE:?}"; : "${XR_GPU_NODE:?}"; : "${XR_RUNTIME_JSON:?}"; : "${HL_WAYLAND_DISPLAY:?}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
+# Omarchy's helper scripts (omarchy-launch-walker, omarchy-menu, ...) live in the
+# cloned tree's bin/, wired onto PATH by omarchy's shell setup on a real install —
+# a host-oriented stage our curated install skips. Every omarchy-* keybind needs
+# them, so wire PATH here: Hyprland's exec children inherit it, and the omarchy
+# autostart's import-environment propagates it to the systemd user manager for
+# uwsm-app-routed launches.
+export PATH="$HOME/.local/share/omarchy/bin:$PATH"
+
 # --- nest into the host wayland compositor -----------------------------------
 # WAYLAND_DISPLAY is an ABSOLUTE path (starts with /), so libwayland connects to
 # it directly and skips the XDG_RUNTIME_DIR 0700-owner check entirely.
