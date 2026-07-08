@@ -10,7 +10,17 @@
 # resolve_render_node <spec> — echo the /dev/dri/renderD* node for a GPU spec.
 #
 #   spec:  amd | nvidia | intel        vendor keyword (case-insensitive), OR
+#          host                        the host-compositor GPU heuristic (below), OR
 #          /dev/dri/renderDNNN         an explicit render-node path.
+#
+#   host heuristic: the split-GPU session nests its flat window into the HOST
+#   compositor, so the nested compositor must render on the SAME GPU the host
+#   compositor uses. We approximate that as "the first NON-NVIDIA present render
+#   node" — on a laptop the host compositor runs on the integrated AMD/Intel GPU
+#   while NVIDIA is the discrete GPU reserved for XR encode (WiVRn). Falls back to
+#   the first present node on NVIDIA-only boxes. Override with an explicit
+#   `--nested-gpu /dev/dri/renderDNNN` (or `--nested-gpu amd|intel`) if the guess
+#   is wrong for your machine.
 #
 #   Precedence (highest first):
 #     1. explicit path         — spec begins with '/'; used verbatim if it exists.
@@ -39,12 +49,34 @@ resolve_render_node() {
         printf '%s\n' "$spec"; return 0
     fi
 
+    # 1b. host-compositor GPU heuristic (see header): first NON-NVIDIA present
+    # render node, else the first present node. Overridable via $HYPXRLAND_HOST_NODE.
+    if [[ ${spec,,} == host ]]; then
+        local host_env="${HYPXRLAND_HOST_NODE:-}"
+        if [[ -n $host_env ]]; then
+            [[ -e $host_env ]] || { echo "resolve_render_node: \$HYPXRLAND_HOST_NODE=$host_env does not exist" >&2; return 1; }
+            printf '%s\n' "$host_env"; return 0
+        fi
+        local sysnode vid dev first=""
+        for sysnode in /sys/class/drm/renderD*; do
+            [[ -r $sysnode/device/vendor ]] || continue
+            dev="/dev/dri/$(basename "$sysnode")"
+            [[ -e $dev ]] || continue
+            [[ -z $first ]] && first="$dev"
+            vid=$(cat "$sysnode/device/vendor" 2>/dev/null || true)
+            [[ $vid != 0x10de ]] && { printf '%s\n' "$dev"; return 0; }
+        done
+        [[ -n $first ]] && { printf '%s\n' "$first"; return 0; }
+        echo "resolve_render_node: no present render node for 'host' (/sys/class/drm empty?)" >&2
+        return 1
+    fi
+
     local vendor_id envvar
     case "${spec,,}" in
         amd)    vendor_id=0x1002; envvar=HYPXRLAND_AMD_NODE ;;
         nvidia) vendor_id=0x10de; envvar=HYPXRLAND_NVIDIA_NODE ;;
         intel)  vendor_id=0x8086; envvar=HYPXRLAND_INTEL_NODE ;;
-        *) echo "resolve_render_node: unknown GPU spec '$spec' (want amd|nvidia|intel|/dev/dri/renderD*)" >&2; return 2 ;;
+        *) echo "resolve_render_node: unknown GPU spec '$spec' (want amd|nvidia|intel|host|/dev/dri/renderD*)" >&2; return 2 ;;
     esac
 
     # 2. env override (kept working as an escape hatch; must exist if set).
