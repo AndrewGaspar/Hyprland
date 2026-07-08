@@ -109,10 +109,12 @@ void CXRMonitorLayer::releaseBuffers() {
 void CXRMonitorLayer::destroyFrameResourcesGL(CXRGraphics& gfx) {
     // Context must be current (caller's responsibility). Uses CXRGraphics for the EGLImage
     // destructor proc + the GL delete.
-    gfx.destroyLayerGL(m_lastEGLImg, m_cpuTex);
-    m_lastEGLImg = nullptr;
-    m_cpuTex     = 0;
-    m_cpuTexSize = Vector2D{};
+    gfx.destroyLayerGL(m_lastEGLImg, m_cpuTex, m_contentTex);
+    m_lastEGLImg    = nullptr;
+    m_cpuTex        = 0;
+    m_cpuTexSize    = Vector2D{};
+    m_contentTex    = 0;
+    m_contentTexSize = Vector2D{};
 }
 
 void CXRMonitorLayer::destroySwapchain() {
