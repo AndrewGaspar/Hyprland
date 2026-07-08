@@ -1,9 +1,12 @@
 # Design: "screenkey for OpenXR" — a head-locked keystroke display
 
-Design memo (2026-07-07). **No implementation.** Proposes a new standalone
-OpenXR utility, a sibling to `hypxrpaper`, that displays the user's keystrokes as
-a head-locked composition layer, composited alongside HypXRland's monitor quads
-and hypxrpaper's ambient background. The user reviews this before any code.
+Design memo (2026-07-07; **revised 2026-07-08** — added §8 "IPC command
+display", the second lane showing issued hyprctl commands / bind dispatches /
+xr events for demo recordings, plus WPs K9–K12). **No implementation.** Proposes
+a new standalone OpenXR utility, a sibling to `hypxrpaper`, that displays the
+user's keystrokes as a head-locked composition layer, composited alongside
+HypXRland's monitor quads and hypxrpaper's ambient background. The user reviews
+this before any code.
 
 Evidence base: the vendored Monado tree at `subprojects/monado` (pinned
 `c2ddab59d`, the exact runtime the test suite runs against); `hypxrpaper`
@@ -38,6 +41,14 @@ Evidence base: the vendored Monado tree at `subprojects/monado` (pinned
 6. **v1 scope:** panel of recent keystrokes, chords, coalescing, timeout fade,
    opacity, z-order, position/size, mods-only. Deferred: mouse, per-app secure
    masking beyond a global hotkey, IME/text, the HypXRland "enhanced mode" IPC.
+7. **(REVISION 2026-07-08) IPC activity lane.** hypxrkeys also displays issued
+   hyprctl commands, bind-triggered dispatchers, and the existing xr socket2
+   events on a second per-lane quad, fed by one socket2 subscription plus a new
+   **opt-in compositor-side `ipcecho` event** (`misc:ipc_echo`, default off)
+   hooked at the single `CHyprCtl::getReply` choke-point and the 4 keybind
+   dispatch sites. Keybinds never pass through hyprctl, so a wrapper/shim
+   cannot capture them — only a compositor-side echo can. See §8; WPs K9–K12
+   added.
 
 ---
 
@@ -79,7 +90,9 @@ Evidence base: the vendored Monado tree at `subprojects/monado` (pinned
 Key property inherited from hypxrpaper: **single-threaded, EGL context held
 current across the whole session**, which satisfies Monado's GL-fence contract by
 construction (HypXRland commit `95c541a8`). All OpenXR + GL + libinput pumping
-happens on one thread.
+happens on one thread. *(REVISED 2026-07-08: the loop gains a second input
+source — a socket2 subscription feeding an IPC activity lane on a second quad;
+see §8. Sketch above shows the key lane only.)*
 
 ---
 
@@ -377,10 +390,53 @@ hypxrkeys [options]
 `colorScale.a = opacity * fadeFactor`, recomputed each frame from a
 `steady_clock` timer since the last key. No texture work per fade tick — this is
 strictly better than re-baking alpha. On a new key, snap `fadeFactor` to 1 and
-restart the timer; ramp down after `--timeout`.
+restart the timer; ramp down after `--timeout`. *(REVISED 2026-07-08: fade state
+is now per-lane — each lane's quad carries its own ColorScaleBias, see §8.3.)*
 
-**Config file.** v1 is CLI-only (like hypxrpaper). A `~/.config/hypxrkeys.conf`
-mirroring the flags is a trivial later add; not needed for v1.
+**REVISED 2026-07-08 — IPC lane flags (see §8 for semantics):**
+
+```
+  --ipc / --no-ipc       Enable/disable the IPC activity lane (default: on
+                         when a Hyprland socket2 is discoverable, else off).
+  --keys-only            Alias for --no-ipc.
+  --ipc-only             Disable the key lane (and key capture entirely — no
+                         evdev access is opened; pure IPC display mode).
+  --instance <sig>       HYPRLAND_INSTANCE_SIGNATURE override for socket2.
+  --ipc-position <x,y,z> VIEW-space centre of the IPC panel (default: directly
+                         above the key panel).
+  --ipc-size <w[,h]>     IPC panel size (same units as --size).
+  --ipc-lines <n>        Visible history lines (default 4).
+  --ipc-timeout <s>      Per-lane idle fade (default 5; keys keep --timeout).
+  --ipc-opacity <0..1>   Per-lane opacity (default: --opacity).
+  --ipc-format {full,compact}   Verbatim command line vs shortened verbs
+                         (default compact).
+  --ipc-filter <regex>   Show only matching lines (repeatable, OR-ed). Matches
+                         against "SOURCE COMMAND" / "EVENT DATA". Example for a
+                         HypXRland demo: --ipc-filter '(openxr|xrmonitor)'.
+  --ipc-exclude <regex>  Drop matching lines (applied after --ipc-filter).
+  --ipc-mask <regex>     Redact the args of matching commands (default masks
+                         exec/execr arguments; pass '' to disable).
+  --highlight-pattern <regex>   Flash matching lines in the accent colour and
+                         hold them one extra timeout cycle (demo nicety).
+  --ipc-color / --ipc-ok-color / --ipc-err-color / --key-color / --bg-color
+                         Per-lane theming, hex RGBA (defaults: neutral fg,
+                         green ok, red err, translucent dark bg).
+  --ipc-font-size <px>   IPC lane atlas size (default: --font-size).
+```
+
+**Config file (REVISED 2026-07-08 — now recommended, WP-K12).** The option
+surface roughly doubled with the IPC lane (~30 flags, mostly theming), and demo
+setups are naturally *reusable profiles* — pure CLI (hypxrpaper-style) stops
+being ergonomic at this size. Recommendation: an optional config file in
+**hyprlang syntax** (`~/.config/hypxrkeys/hypxrkeys.conf`, `section { key = value }`
+mirroring the flags 1:1; CLI always overrides), plus `--config <path>` and
+`--profile <name>` → `~/.config/hypxrkeys/<name>.conf` (e.g. a `demo` profile
+with the xr filter + highlight preset). Why hyprlang over TOML: it is a small
+standalone library already universal in the hypr family, users get one config
+dialect across hyprland/hypxrkeys, and it keeps the door open for hyprlang
+features (variables, source=) in profiles. hypxrpaper stays CLI-only — its
+surface is small; this is not a family-wide mandate. No config file present ⇒
+behavior identical to CLI-only.
 
 ---
 
@@ -440,6 +496,207 @@ name that could match unrelated processes, and never anything resembling
 
 ---
 
+## §8 REVISION 2026-07-08 — IPC command display (the "IPC activity lane")
+
+**New requirement.** hypxrkeys must also display **issued hyprctl commands**, not
+just keystrokes, so demo videos can show HypXRland's integration with the hypr
+IPC surface: viewers see `openxr layout` or `xrmonitor rotate 15` pop up as it
+happens, alongside the keys pressed. This section resolves the capture mechanism,
+presentation, config surface, and WP impact. Everything above stands; changed
+subsections below are marked **REVISED**.
+
+### 8.1 Capture mechanism — the options, verified against the source
+
+The relevant Hyprland plumbing (all verified in-tree, 2026-07-08):
+
+- **Command socket (`.socket.sock`)** is request/response with **no broadcast**:
+  `CHyprCtl::startHyprCtlSocket()` (`src/debug/HyprCtl.cpp:2304`) accepts in
+  `hyprCtlFDTick` (`:2215`), reads the request, and — critically — **every
+  command string passes exactly once through a single choke-point**:
+  `std::string CHyprCtl::getReply(std::string request)` (`HyprCtl.cpp:2045`).
+  Batch requests (`[[BATCH]]`, `:1292`) recursively re-enter `getReply` per
+  sub-command; the plugin-facing `makeDynamicCall` (`:2149`) routes through it
+  too. The **response string is fully capturable** at the same point (`:2146`),
+  and the requester's pid is available (`m_currentRequestParams.pid`, `:2237`).
+- **socket2 (`.socket2.sock`)** is a plain `AF_UNIX` **stream** socket a client
+  merely `connect()`s to — no subscription handshake, server never reads
+  (`src/managers/EventManager.cpp:14-41,60-96`). Wire format is
+  **`EVENT>>DATA\n`** with DATA truncated to **1024 bytes** and embedded
+  newlines replaced by spaces (`formatEvent`, `EventManager.cpp:126-131`).
+  Emission is `g_pEventManager->postEvent(SHyprIPCEvent{event, data})`
+  (`EventManager.hpp:7-10,17`). Per-client queue cap **64 events**; a stalled
+  subscriber is dropped (`EventManager.cpp:169`) — hypxrkeys must keep the fd
+  drained in its poll loop.
+- **The XR socket2 event set today** (all in `src/openxr/OpenXRManager.cpp`):
+  `openxrsessionstate` (`:153`, state string), `openxractive` (`:160`, `1|0`),
+  `xrmonitorgrab` (`:467`, `<name>,1|0`), `xrmonitoradded` (`:1302`, `<name>`),
+  `xrmonitorremoved` (`:1383`, `<name>`), `xrmonitoranchor` (`:1682` reload
+  reconcile and `:2019` anchor verb, `<name>,<anchorMode>`), `xrmonitorquad`
+  (`:1739`, `<name>,1|0`). These describe **effects**, not commands: a pure
+  query like `openxr layout` emits nothing, and `openxr rotate` emits nothing
+  (only anchor/create/destroy/grab/quad-cap changes do).
+- **Keybind dispatch never touches hyprctl.** A bound key goes
+  `CKeybindManager::onKeyEvent` (`KeybindManager.cpp:347`) →
+  `handleKeybinds` (`:601`) → direct lookup+call on the
+  `m_dispatchers` map (`find` at `:781`, invoke at `:806`/`:808`; plus the
+  long-press timer `:127-130` and repeat timer `:150-153`). hyprctl's
+  `dispatchRequest` (`HyprCtl.cpp:1109`) does its own independent lookup on the
+  **same map** (`KeybindManager.hpp:136`). There is **no shared "invoke
+  dispatcher" function** — the map is the only convergence — and **no socket2
+  event fires when a bind or dispatcher runs** (only side-effect events from
+  inside individual dispatchers, e.g. `submap`).
+
+**Options evaluated:**
+
+- **(a) Subscribe to socket2 and render the existing event stream.** Zero
+  compositor changes; hypxrkeys stays compositor-version-agnostic. But it shows
+  *effects*, not *commands*: `openxr layout` (a flagship demo command) is
+  invisible, `rotate`/`move`/`scale` are invisible, and event payloads
+  (`XR-1,1`) don't read like the command the presenter typed. Insufficient
+  alone — but the xr events are valuable *garnish* (grab begin/end has no
+  command at all, it's a gesture, and only surfaces here).
+- **(b) Compositor-side echo: emit a socket2 event for each received command.**
+  A hook in `getReply` sees **every** hyprctl command exactly once (skip the
+  `[[BATCH]]` wrapper string; each sub-command re-enters), and hooking at the
+  return captures the **response** for ok/error coloring. Opt-in config,
+  default off. Covers every socket client (hyprctl, scripts, hyprtester) —
+  but **not** keybind-triggered dispatchers, which need their own echo at the
+  4 keybind invocation sites (a tiny shared helper; `SDispatchResult` gives
+  accurate success/error there). Both hooks are small, localized, and gated on
+  one config var.
+- **(c) hyprctl wrapper/shim that tees commands to hypxrkeys' own socket.**
+  Structurally dead for the stated use case: binds never exec hyprctl
+  (verified above), so `bind = SUPER, R, xrmonitor, rotate 15` — exactly what
+  a demo shows — would never appear. Also misses every non-wrapper IPC client
+  (waybar, scripts, other tools talking to the socket directly). Rejected.
+- **(d) Combination: (b) for commands + (a) for effects.** Recommended.
+
+**Recommendation: (d), with (b) as the new compositor-side piece.**
+hypxrkeys' IPC lane renders three source classes from one socket2 subscription:
+echoed socket commands, echoed bind dispatches, and the existing
+`openxr*`/`xrmonitor*` effect events. **Demo acceptance test:** record a session
+where the presenter (1) types `hyprctl openxr rotate XR-1 15` in a terminal and
+(2) presses a `bind = ..., xrmonitor, rotate 15` chord — **both** appear in the
+IPC lane (with distinct source prefixes) while the keystrokes appear in the key
+lane, and an `xrmonitorgrab` line appears when they grab a monitor.
+
+### 8.2 The compositor-side echo (Hyprland repo change — new WP-K9)
+
+**New socket2 event `ipcecho`**, following the existing naming convention
+(lowercase, no separators; cf. `activewindow`, `workspacev2`):
+
+```
+ipcecho>>SOURCE,STATUS,COMMAND
+  SOURCE  ∈ {socket, bind}          (future: lua, plugin)
+  STATUS  ∈ {ok, err, na}
+  COMMAND = the command string, verbatim, LAST field (commands contain commas;
+            parsers split on the first two commas only). Subject to socket2's
+            1024-byte truncation + newline flattening — fine for display.
+```
+
+- **Socket hook:** in `CHyprCtl::getReply` (`HyprCtl.cpp:2045`) after
+  flag-stripping (echo the cleaned command, not `j/...`), emitting at return so
+  STATUS is known. Skip requests starting `[[BATCH]]` (sub-commands echo
+  individually on re-entry). STATUS heuristic: `ok` for `"ok"`/structured
+  output, `err` for the known error shapes (`unknown request`, `Invalid...`,
+  `Err:`, `error`), else `na` — conservative; `dispatch`/`keyword` (the
+  demo-relevant verbs) return exactly `"ok"` or an error string, so those color
+  reliably.
+- **Bind hook:** a small helper (e.g. `echoDispatch(handler, arg, result)`)
+  called at the 4 dispatcher invocation sites in `KeybindManager.cpp`
+  (`:806`, `:808`, long-press `:130`, repeat `:153`), emitting
+  `ipcecho>>bind,<ok|err from SDispatchResult>,dispatch <handler> <arg>` —
+  formatted as the equivalent hyprctl command so the lane reads uniformly.
+- **Config: `misc:ipc_echo`** (INT, default **0** = off; registered in
+  `Values::getConfigValues()` per the current config system). Levels:
+  `1` = mutating commands + all bind dispatches (a static query-command
+  denylist — `monitors`, `clients`, `getoption`, `openxr status|layout`, etc. —
+  suppresses poll noise from waybar-style scripts); `2` = everything including
+  queries. Read via `static CConfigValue` at emit time, so
+  `hyprctl keyword misc:ipc_echo 1` applies immediately with **no**
+  `parseKeyword` special-case (nothing here hangs off `props_refreshed`, unlike
+  the `openxr:enabled` hot-toggles). Named `misc:` not `openxr:` because the
+  mechanism is XR-agnostic.
+- **Privacy/noise:** socket2 lives in the same per-instance, user-owned
+  directory as the command socket — same trust domain, so echoing grants no new
+  capability to any process that couldn't already issue commands itself. The
+  residual concern is *the demo recording itself* (e.g. a `dispatch exec` line
+  containing a token) — handled hypxrkeys-side (`--ipc-mask`, §8.4) plus
+  default-off. Cost is one `postEvent` per command — negligible; the level-1
+  denylist keeps poller spam out at the source.
+- **Upstreamability: plausible.** Zero-cost when off, opt-in, general-purpose
+  (screencast tutorials, IPC debugging, latency tracing), follows existing
+  event conventions, ~40 lines. The bind-site helper is the only part touching
+  a hot-ish path — a single branch on a config read when disabled. Worth
+  offering upstream independently of the XR work; until then it rides the
+  hypxrland branch.
+
+### 8.3 Presentation — two lanes, two quads (amends Decision 4/5)
+
+- **Two independent quads in the one overlay session** (a session may submit
+  multiple layers; runtimes guarantee ≥16 via `maxLayerCount`): the existing
+  key panel, plus an **IPC panel** defaulting just above it. Each quad gets its
+  own VIEW-space position, its own texture/swapchain, and its own chained
+  `XrCompositionLayerColorScaleBiasKHR` — which makes **per-lane opacity and
+  per-lane idle fade free at the layer level**, preserving Decision 4's
+  "upload only on text change" rule (a shared single texture would force
+  re-uploads whenever one lane fades independently). Fade state becomes
+  per-lane: `--timeout` for keys (default 3 s), `--ipc-timeout` for commands
+  (default 5 s — commands deserve more dwell time than keystrokes).
+- **Lane content:** the IPC lane is a short scrolling list (default 4 lines,
+  newest at bottom) rather than the key lane's single coalescing caption. Each
+  line: a source prefix + the formatted command, colored by STATUS
+  (`ok` = accent, `err` = red, `na`/effect events = neutral). Suggested
+  prefixes: `$` socket commands, `⌨` bind dispatches, `✦` xr effect events.
+- **Formatting:** `--ipc-format full|compact` (default `compact`): compact
+  strips the `dispatch ` prefix from bind echoes and renders effect events as
+  short verbs (`xrmonitorgrab>>XR-1,1` → `grab XR-1`); full shows the verbatim
+  command line.
+- **Rate/coalescing:** identical consecutive lines coalesce to `×N` (reuse the
+  key lane's logic); additionally a 150 ms **burst window** folds event storms
+  (a config reload reconciling several monitors fires `xrmonitoranchor` per
+  monitor) into one line with a count. The compositor-side level-1 denylist
+  already removes the worst noise (status pollers) at the source.
+- **Shared controls:** the `--toggle-key` chord suspends both lanes (capture
+  and display); both lanes empty ⇒ both quads fully faded/hidden.
+
+### 8.4 Client-side capture in hypxrkeys (new WP-K10)
+
+- Discover the socket at
+  `$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock`
+  (`--instance <sig>` override); plain `connect()` + line-buffered reads,
+  parsing `EVENT>>DATA`. This is simply a **third fd in the existing
+  single-threaded poll loop** (libinput fd, XR frame pacing, socket2) — no
+  threading change, the Monado fence contract stays satisfied by construction.
+- **Keep it drained:** socket2 drops subscribers whose queue exceeds 64 events;
+  the poll loop makes starvation implausible, but treat EOF/drop as a reconnect
+  case anyway, with backoff, surfacing a neutral
+  `[hyprland ipc reconnected]` lane line rather than dying.
+- **Masking:** `--ipc-mask <regex>` (repeatable; default masks the argument of
+  `exec`/`execr` echoes to `exec …`) so recordings don't leak launcher args or
+  tokens.
+- **Degradation:** without `misc:ipc_echo` enabled (or on stock upstream
+  Hyprland), the lane still renders the effect-event vocabulary from option (a)
+  — reduced but useful; hypxrkeys logs a one-time hint that command echo needs
+  `misc:ipc_echo`. No socket at all (non-Hyprland compositor) ⇒ the IPC lane
+  disables itself and hypxrkeys remains a pure screenkey tool.
+
+### 8.5 Testing additions
+
+- **Unit-level (no compositor):** a fake socket2 server in the test (bind a
+  unix socket in the scratch dir, write scripted `ipcecho>>...` /
+  `xrmonitoradded>>...` lines) drives the parser/filter/coalescer; assert the
+  rendered lane text via the `HYPXRKEYS_DUMP` path. This covers WP-K10/K11
+  hermetically — no Hyprland needed.
+- **Integration (hyprtester, extends WP-K8):** in the existing nested harness
+  with `misc:ipc_echo = 2` in the test config, issue a socket command and
+  assert the corresponding `ipcecho` line arrives on socket2 — this half tests
+  WP-K9 alone, with no hypxrkeys binary needed. The optional
+  `$HYPRTESTER_HYPXRKEYS` leg additionally asserts hypxrkeys stays alive and
+  reports the line captured.
+
+---
+
 ## Privacy section (consolidated)
 
 This tool captures **all** global key input while running — treat it as a
@@ -459,84 +716,162 @@ disclosed, benign keylogger:
 - **Honest v1 limitation:** a pure-Wayland client cannot see other apps'
   password-field focus, so v1 does **not** claim automatic secret masking — it
   offers the toggle + mods-only instead.
+- **(REVISED 2026-07-08) IPC echo:** `misc:ipc_echo` defaults to **off**; when
+  on, it broadcasts command lines on socket2 — same trust domain as the command
+  socket itself (per-instance, user-owned dir), so no new capability is granted
+  to other processes. The real exposure is the *recording*: command lines can
+  contain launcher args/tokens, so hypxrkeys masks `exec`/`execr` arguments by
+  default (`--ipc-mask`) and the README documents that `ipc_echo` should be
+  enabled only while demoing/debugging.
 
 ---
 
 ## v1 scope cut (explicitly deferred)
 
-**In v1:** overlay session with distinct z; head-locked VIEW-space quad; global
-opacity + idle-timeout fade via color-scale-bias; stb_truetype caption of recent
-keystrokes; chord rendering; repeat suppression + `×N` coalescing; `--mods-only`;
-`--toggle-key`; libinput-on-logind-seat capture with `input`-group fallback;
-xkb-from-env keymap with CLI override; `--gpu` pin; `preview-xr.sh --keys`;
-uinput selftest.
+**In v1:** overlay session with distinct z; head-locked VIEW-space quads (one
+per lane); global + per-lane opacity and idle-timeout fade via color-scale-bias;
+stb_truetype caption of recent keystrokes; chord rendering; repeat suppression +
+`×N` coalescing; `--mods-only`; `--toggle-key`; libinput-on-logind-seat capture
+with `input`-group fallback; xkb-from-env keymap with CLI override; `--gpu` pin;
+`preview-xr.sh --keys`; uinput selftest. *(REVISED 2026-07-08, added:)* the IPC
+activity lane (§8) — socket2 subscription, `ipcecho` + xr effect events,
+filters/masking/highlight, per-lane theming; the `misc:ipc_echo` compositor
+change (WP-K9, Hyprland repo); hyprlang config file + `--profile` (WP-K12).
 
 **Deferred:**
 
 - Mouse-button display (`--mouse` reserved, not implemented).
-- HypXRland "enhanced mode" IPC source (`--source hyprland` reserved).
+- HypXRland "enhanced mode" IPC source for *keystrokes* (`--source hyprland`
+  reserved; note the IPC lane's socket2 use is unrelated to key capture).
 - Automatic password-field / secure-input masking.
 - Body/wrist-locked or leashed (smoothed) placement modes; grabbable repositioning.
 - IME / dead-key / compose / full UTF-8 text reconstruction beyond single keysyms.
-- Config file, theming beyond font/size/opacity, per-key colouring.
+- Per-key colouring in the key lane (the IPC lane does get per-status colours).
+- Echoing Lua-config / plugin-originated dispatches with their own SOURCE tags
+  (`ipcecho` reserves the field).
 - OpenVR/SteamVR backend (same story as doc `01`: out of scope, separate project).
 
 ---
 
 ## Work-package breakdown (one subagent each)
 
-Sized like the HypXRland WPs; each is independently reviewable with a crisp
-acceptance test. Critical path: **K1 → K2 → K3 → (K4 ∥ K5) → K6 → K7 → K8**.
+**(REVISED 2026-07-08 — WPs K9–K12 added for the IPC lane; per-WP status marked
+`[stands]` / `[changed]` / `[new]`.)**
 
-- **WP-K1 — Repo skeleton + XR overlay session bring-up.**
+Sized like the HypXRland WPs; each is independently reviewable with a crisp
+acceptance test. Key-lane critical path unchanged:
+**K1 → K2 → K3 → (K4 ∥ K5) → K6 → K7 → K8**. IPC-lane branch:
+**K9 (Hyprland repo, independent — can land first)**; **K1 → K10 → K11** (K11
+also needs K4's text renderer and K5's per-lane quads); **K12 after K6**. K7/K8
+close out both lanes.
+
+- **WP-K1 `[stands]` — Repo skeleton + XR overlay session bring-up.**
   New `hypxrkeys` repo (BSD-3), CMake + `Log`/`Egl` copied from hypxrpaper, a
   `Session` that opens an **overlay** session (`XrSessionCreateInfoOverlayEXTX`,
   `--overlay-z`), one VIEW-space reference space, and submits an empty/solid test
   quad. *Accept:* reaches FOCUSED under vendored Monado as a second overlay over a
   running primary; quad visible in the Monado window; `--gpu` honored.
 
-- **WP-K2 — libinput capture on a logind seat (+ input-group fallback).**
+- **WP-K2 `[stands]` — libinput capture on a logind seat (+ input-group fallback).**
   Bring up libinput (udev+logind seat; fallback path backend), pump `EV_KEY`,
   emit raw keycode+state events to an internal queue. Clean teardown. *Accept:* a
   `--selftest` prints each pressed keycode; works from a real session; SKIPs
   cleanly with a clear message when no device access.
 
-- **WP-K3 — xkbcommon keymap + label/chord model.**
+- **WP-K3 `[stands]` — xkbcommon keymap + label/chord model.**
   Compile keymap from env (+ `--layout/--variant/--options`), track `xkb_state`,
   produce labels, modifier chords, repeat suppression, `×N` coalescing, the
   caption/line model, and the `--mods-only` filter + `--toggle-key` suspend.
   *Accept:* unit-level: a scripted keycode sequence yields the expected caption
   strings (incl. `Super+Shift+E`, `a ×3`); mods-only hides characters.
 
-- **WP-K4 — Text rendering (stb_truetype atlas → RGBA swapchain).**
-  Vendor `stb_truetype.h`; bake atlas from `--font`; render caption to a CPU RGBA
+- **WP-K4 `[changed]` — Text rendering (stb_truetype atlas → RGBA panels).**
+  Vendor `stb_truetype.h`; bake atlas from `--font`; render text to a CPU RGBA
   buffer (bg box + glyphs, premultiplied alpha); upload-on-change into the
-  swapchain; wire `--size`, texture DPI. *Accept:* `HYPXRKEYS_DUMP` writes a PPM of
-  the panel showing a known string; upload happens only on text change.
+  swapchain; wire `--size`, texture DPI. *Revision:* the renderer becomes a
+  reusable **panel** abstraction (own texture + swapchain + dirty flag) able to
+  render either a single caption (key lane) or an N-line list with **per-line
+  colour** (IPC lane); instantiated twice. *Accept:* `HYPXRKEYS_DUMP` writes a
+  PPM per panel showing a known caption and a known multi-line coloured list;
+  upload happens only on that panel's text change.
 
-- **WP-K5 — Opacity + fade via color-scale-bias, positioning.**
-  Chain `XrCompositionLayerColorScaleBiasKHR` (feature-detect; texture-alpha
-  fallback); `--opacity`; idle `--timeout` fade ramp at layer level; `--position`.
-  `XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT`. *Accept:* panel fades out
-  after timeout and snaps back on keypress; `--opacity 0.5` visibly semi-transparent
-  over hypxrpaper; no texture re-upload during fade.
+- **WP-K5 `[changed]` — Per-lane opacity/fade via color-scale-bias, positioning.**
+  Chain `XrCompositionLayerColorScaleBiasKHR` **per quad** (feature-detect;
+  texture-alpha fallback); `--opacity`/`--ipc-opacity`; independent idle fade
+  ramps (`--timeout`/`--ipc-timeout`); `--position`/`--ipc-position`; submit
+  both quads each frame with
+  `XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT`. *Accept:* the key panel
+  fades after its timeout while the IPC panel (later activity) stays up, and
+  vice versa; `--opacity 0.5` visibly semi-transparent over hypxrpaper; no
+  texture re-upload during fades.
 
-- **WP-K6 — CLI/UX polish + README + privacy disclosure.**
-  Full argv parser (hypxrpaper style), `--help`, defaults, the privacy section in
-  README, distinct-`overlay-z` guidance vs HypXRland. *Accept:* `--help` documents
-  every flag; bad args exit 2 with a message; README states the capture model.
+- **WP-K6 `[changed]` — CLI/UX polish + README + privacy disclosure.**
+  Full argv parser (hypxrpaper style) **including the §8 IPC-lane flags**,
+  `--help`, defaults, the privacy section in README (now incl. the `ipc_echo`
+  disclosure + default exec masking), distinct-`overlay-z` guidance vs
+  HypXRland. *Accept:* `--help` documents every flag; bad args exit 2 with a
+  message; README states the capture model and the `misc:ipc_echo` opt-in.
 
-- **WP-K7 — `preview-xr.sh --keys` (three-way composition).**
+- **WP-K7 `[changed, minor]` — `preview-xr.sh --keys` (three-way composition).**
   Extend HypXRland's preview to launch hypxrkeys as a third overlay
-  (`$HYPXRKEYS_BIN`, `--gpu` pin, distinct `--overlay-z`). *Accept:* running
-  `preview-xr.sh --env pano --keys` shows monitors + ambient bg + key panel all
-  composited, correct z-order.
+  (`$HYPXRKEYS_BIN`, `--gpu` pin, distinct `--overlay-z`), and have the
+  generated preview config set `misc:ipc_echo = 1` so the IPC lane is live.
+  *Accept:* `preview-xr.sh --env pano --keys` shows monitors + ambient bg + key
+  panel composited with correct z-order, and a `hyprctl openxr rotate ...`
+  issued against the nested instance appears in the IPC lane.
 
-- **WP-K8 — Tests: uinput selftest + optional hyprtester hook.**
-  A uinput-driven capture test (SKIP without device access); optional
-  `xr_keys_composition` in hyprtester gated on `$HYPRTESTER_HYPXRKEYS`, mirroring
-  `overlay.cpp`. *Accept:* uinput test types a known string and asserts the
-  captured caption; hyprtester hook reaches three-way FOCUSED composition or SKIPs.
+- **WP-K8 `[changed]` — Tests: uinput selftest + socket2 fakes + hyprtester hook.**
+  A uinput-driven capture test (SKIP without device access); the **fake-socket2
+  unit test** (§8.5) driving parser/filter/coalescer/mask assertions via
+  `HYPXRKEYS_DUMP`; a hyprtester `ipcecho` wire test (issue a socket command
+  with `misc:ipc_echo = 2`, assert the event arrives — tests WP-K9 without
+  hypxrkeys); optional `xr_keys_composition` gated on `$HYPRTESTER_HYPXRKEYS`,
+  mirroring `overlay.cpp`. *Accept:* uinput test asserts the captured caption;
+  fake-socket2 test asserts rendered lane text incl. `×N` coalescing and exec
+  masking; `ipcecho` test green; hyprtester hook reaches three-way FOCUSED
+  composition or SKIPs.
+
+- **WP-K9 `[new, Hyprland repo]` — `misc:ipc_echo` + `ipcecho` socket2 event.**
+  Register `misc:ipc_echo` (INT, 0/1/2, default 0) in
+  `Values::getConfigValues()`; emit `ipcecho>>socket,<status>,<command>` from
+  `CHyprCtl::getReply` (post flag-strip, at return; skip the `[[BATCH]]`
+  wrapper; level-1 query denylist) and `ipcecho>>bind,<status>,dispatch ...`
+  via a helper at the 4 dispatcher invocation sites in `KeybindManager.cpp`
+  (`:806`, `:808`, `:130`, `:153`). No behavior change at level 0. *Accept:*
+  with `ipc_echo = 2`, `hyprctl dispatch xrmonitor "rotate 15"` and a bound
+  `xrmonitor` chord each produce exactly one correctly-formed `ipcecho` line on
+  socket2 (bind line carries `SDispatchResult` status); a `[[BATCH]]` request
+  echoes each sub-command once and never the wrapper; level 1 suppresses
+  `monitors`/`getoption`; level 0 emits nothing; existing hyprtester suite +
+  gtests stay green.
+
+- **WP-K10 `[new]` — socket2 subscriber + IPC event model.**
+  Discover/connect/reconnect the socket2 stream (`--instance` override), parse
+  `EVENT>>DATA`, classify into the three source classes (`ipcecho` socket/bind,
+  xr effect events, other), apply `--ipc-filter`/`--ipc-exclude`/`--ipc-mask`,
+  and feed a bounded in-memory lane model. Third fd in the single-threaded poll
+  loop; drain-always; degrade gracefully per §8.4. *Accept:* against the fake
+  socket2 server, scripted lines yield the expected filtered/masked lane model;
+  kill/restart of the fake server exercises reconnect; absent socket ⇒ lane
+  disabled, key lane unaffected.
+
+- **WP-K11 `[new]` — IPC lane rendering + formatting.**
+  Wire the K10 lane model into a second K4 panel on the K5 second quad: source
+  prefixes, per-status colours, `--ipc-format` compact/full verb rendering
+  (incl. the xr effect-event verb table), `×N` coalescing + 150 ms burst
+  folding, `--ipc-lines` scrollback, `--highlight-pattern` flash-and-hold.
+  *Accept:* `HYPXRKEYS_DUMP` of a scripted mixed stream (socket cmd, bind
+  dispatch, `xrmonitorgrab`, an error, a 6-event reload burst) shows correct
+  prefixes/colours/coalescing; live: the §8.1 demo acceptance test passes under
+  `preview-xr.sh --keys`.
+
+- **WP-K12 `[new]` — hyprlang config file + profiles.**
+  Optional `~/.config/hypxrkeys/hypxrkeys.conf` (hyprlang syntax, keys mirror
+  flags 1:1, CLI overrides), `--config <path>`, `--profile <name>`, and a
+  shipped example `demo` profile (xr filter + highlight preset). *Accept:* a
+  conf setting is applied, the same flag on the CLI wins, `--profile demo`
+  loads the example, no conf file ⇒ identical to CLI-only behavior; parse
+  errors exit 2 with file:line.
 
 ---
 
@@ -556,6 +891,25 @@ acceptance test. Critical path: **K1 → K2 → K3 → (K4 ∥ K5) → K6 → K7
    binary?
 7. **Head-lock feel:** ship the simple rigid VIEW-space quad for v1, with a
    smoothed/leashed mode deferred — acceptable?
+
+**(REVISED 2026-07-08 — IPC lane questions:)**
+
+8. **Echo namespace:** `misc:ipc_echo` (XR-agnostic, upstreamable) vs
+   `openxr:ipc_echo` (stays in our subtree)? Recommendation is `misc:`; note
+   `misc:` puts WP-K9's diff in shared upstream files rather than `src/openxr/`.
+9. **IPC lane default:** on-when-socket2-present (recommended — zero extra
+   privilege, silent without `ipc_echo` beyond xr events) or strictly opt-in
+   via `--ipc`?
+10. **Level-1 semantics:** at `misc:ipc_echo = 1`, echo **all** bind dispatches
+    (including every `exec` a busy session fires — hypxrkeys masks args but the
+    lines still appear) or only non-`exec` dispatchers? Recommendation:
+    all, and let `--ipc-exclude '^bind exec'` trim it client-side.
+11. **hyprlang dependency:** OK to take libhyprlang as hypxrkeys' config-file
+    parser (WP-K12), or prefer keeping the tool dependency-minimal (drop K12 to
+    a plain key=value parser / defer it)?
+12. **Upstream PR:** should WP-K9 be written PR-ready for upstream Hyprland
+    (event name/format bikeshed-able there), or tailored to the hypxrland
+    branch only for now?
 
 ---
 
@@ -594,4 +948,20 @@ create), `:214-215` (VIEW space), `KeybindManager.cpp:368-369` (xkb translate),
 `EventManager.cpp` (socket2 bus); hypxrpaper `src/Session.cpp:216-255` (upload-once
 swapchain), `src/Egl.cpp` (GBM/`--gpu` node), `src/main.cpp:142-174` (argv style);
 `scripts/preview-xr.sh`, `hyprtester/src/tests/xr/overlay.cpp` (overlay test model).
-```
+
+**Hyprland IPC plumbing (in-tree, for §8, verified 2026-07-08):**
+`src/debug/HyprCtl.cpp:2045` (`CHyprCtl::getReply` — single command choke-point;
+result at `:2146`), `:1109` (`dispatchRequest`), `:1292`/`:2024` (`[[BATCH]]`
+re-entry), `:2149-2151` (`makeDynamicCall` routes through `getReply`),
+`:2215-2296` (`hyprCtlFDTick` accept/read/reply, peer pid at `:2237`), `:2304`
+(`startHyprCtlSocket`); `src/managers/EventManager.cpp:14-41,60-96` (socket2
+create/accept, connect-only subscription), `:126-131` (`formatEvent` —
+`EVENT>>DATA\n`, 1024-byte cap), `:163-192` (`postEvent`, 64-event client queue
+cap at `:169`), `src/managers/EventManager.hpp:7-10,17` (`SHyprIPCEvent`);
+`src/managers/KeybindManager.cpp:347` (`onKeyEvent`), `:601` (`handleKeybinds`),
+`:781,806,808` + timers `:127-130,150-153` (the 4 dispatcher invocation sites),
+`src/managers/KeybindManager.hpp:136` (`m_dispatchers` map — sole convergence of
+socket + bind dispatch); `src/openxr/OpenXRManager.cpp:153,160,467,1302,1383,
+1682,1739,2019` (the full xr socket2 event set), `src/openxr/XRIpc.cpp:95-178`
+(`openxr` hyprctl command + subverbs),
+`src/config/legacy/DispatcherTranslator.cpp:798,915` (`xrmonitor` dispatcher).
