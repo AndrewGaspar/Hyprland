@@ -4,8 +4,9 @@ Rootless-podman Arch container that boots real PID-1 systemd, installs a curated
 Omarchy v3.8.2 desktop, and builds the dev Hyprland + hyprtester + vendored
 Monado inside — full session/input/GPU isolation for XR dev and hermetic tests.
 
-Driver: [`scripts/xr-container.sh`](../scripts/xr-container.sh). WP1 ships
-`build`, `shell`, and `check-gpu`; `session` (WP3) and `test` (WP2) are stubs.
+Driver: [`scripts/xr-container.sh`](../scripts/xr-container.sh). Ships
+`build`, `shell`, `check-gpu`, and `test` (hermetic `hyprtester --xr`);
+`session` (WP3, interactive) is still a stub.
 
 ## Images (built by `xr-container.sh build`)
 
@@ -31,6 +32,35 @@ bash /src/containers/build-in-ctr.sh       # build Hyprland + hyprtester + monad
 
 Iterate on the desktop config without a full repackage:
 `scripts/xr-container.sh build --config` (re-runs only the config tail on `:pkgs`).
+
+## Hermetic XR tests (`test`)
+
+```sh
+scripts/xr-container.sh test --gpu amd        # full hyprtester --xr suite in-container
+scripts/xr-container.sh test --gpu amd xr_session_up   # a subset (test-name filter)
+scripts/xr-container.sh test --gpu amd --keep # leave the container up for debugging
+scripts/xr-container.sh test --gpu amd --build # force an in-container rebuild first
+```
+
+Boots `:session` with **no host wayland/X11/wivrn mounts** — only the `/src`
+overlay, the `/build` + ccache volumes and one GPU device. A headless **labwc**
+(`systemd-run --user`, `WLR_BACKENDS=headless`, GPU-pinned via
+`WLR_RENDER_DRM_DEVICE`) is the nesting host: `hyprtester`'s `runXrSuite` tries
+the stock `HYPRLAND_HEADLESS_ONLY` path first — which **cannot** work here
+(rootless podman is seatless, so aquamarine fails at `CBackend::create()`) — then
+nests into labwc's `wayland-0`. labwc is the only light compositor advertising
+both protocols aquamarine's nested backend hard-requires: `xdg_wm_base >= v6` and
+`zwp_linux_dmabuf_v1` (the runner logs them). The vendored Monado null-compositor
+runs fully inside the container; nothing crosses the boundary.
+
+The real exit code comes from a sentinel file (`machinectl shell` always exits
+0). On failure the run log plus every preserved `/tmp/hyprtester-xr-*` dir
+(hyprland + monado logs) are copied to `containers/artifacts/<timestamp>/`. The
+container is `podman rm -f`'d on every exit path (success, failure, Ctrl-C)
+unless `--keep`.
+
+`--gpu amd` uses `/dev/dri/renderD129`. `--gpu nvidia` needs the host CDI spec
+(see below); it is refused with setup instructions if the spec is absent.
 
 ## Layout
 
