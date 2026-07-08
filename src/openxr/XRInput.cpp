@@ -619,7 +619,9 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                         target->anchor->beginResize(hand, region, *newDevPose, aspect);
                         m_grabKind[hand] = OpenXR::XR_GRABKIND_RESIZE;
                     } else {
-                        target->anchor->beginGrab(hand, *newDevPose, wantPinch);
+                        // WP-G6: pass handIsHands so a hand MOVE grab is eligible for the 1€ carry
+                        // filter (openxr:grab_filter); controllers pass false and are never filtered.
+                        target->anchor->beginGrab(hand, *newDevPose, wantPinch, handIsHands);
                         m_grabKind[hand] = OpenXR::XR_GRABKIND_MOVE;
                     }
                     m_grabbing[hand]       = true;

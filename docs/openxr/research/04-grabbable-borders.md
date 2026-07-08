@@ -579,3 +579,66 @@ Dependency graph: `G1 → {G2, G3}`, `G4` (parallel, depends only on current cod
 - **Config**: one new var `openxr:grab_anywhere` (bool, default true), read per-frame (hot-toggles).
 - **Status**: `hyprctl openxr status` adds `grabKind` (`none`|`move`|`resize`); JSON keeps `grabbed`
   boolean for back-compat and adds a `"grabKind"` string.
+
+## 10. WP-G6 as implemented (2026-07-08) — optional 1€ carry filter
+
+- **Filter math** (`XRMath.hpp`, pure/unconditional/gtest): `SXROneEuro` (POD per-axis state:
+  `init`, `xPrevRaw`, `xHat`, `dxHat`) + `oneEuroStep(state, value, dt, minCutoff, beta, dCutoff)`
+  — a faithful transcription of the Casiez CHI'12 reference (github.com/casiez/OneEuroFilter,
+  `1eurofilter.cc`): `dvalue = (value − lastRaw)/dt`, derivative low-passed at `dCutoff` (=1 Hz),
+  speed-adaptive `cutoff = minCutoff + beta·|edvalue|`, value low-passed at that cutoff. First
+  sample passes through; a non-positive `dt` holds the last output (guards the reference's `1/dt`).
+  `SXROneEuroPose` bundles 3 position + 4 quaternion filters; `oneEuroStepPose` filters position
+  per axis and the quaternion **component-wise + renormalize**, first flipping the incoming quat
+  into the last filtered quat's hemisphere (q ≡ −q as a rotation, but a component low-pass across
+  the antipode collapses toward 0). This is the reference repo's own guidance for rotations.
+- **Reference-value derivation** (`tests/xr/one_euro.cpp`): the load-bearing gtest ports the
+  reference `LowPassFilter`/`OneEuroFilter` C++ **verbatim in double precision** and drives it and
+  `oneEuroStep` with the *same* 400-sample timestamped noisy ramp at the canonical params
+  (minCutoff 1.0, beta 0.007, dCutoff 1.0, 90 Hz); every output must match within 2e-4 (float vs
+  double drift). Two hand-computed anchors (beta 0 ⇒ constant cutoff, dt 0.1 s ⇒ α=0.3858695:
+  feeding 0 then 1.0 gives 0.3858695 then 0.6228438) pin the algebra independently of the port.
+  Plus: first-sample passthrough, monotone step-response convergence + no overshoot, ≥4× jitter
+  variance reduction, dt robustness (hold on dt≤0, finite under varied dt), reset re-arms
+  passthrough, pose axis-independence + unit-quaternion + hemisphere handling.
+- **Carry-path change** (`CXRAnchor::solve` grab override): when `openxr:grab_filter` is set AND
+  the grab is a hand grab (`beginGrab(..., handActive=true)`), the carried world pose
+  `device ∘ offset` is run through `oneEuroStepPose` and the result is submitted **in LOCAL_FLOOR**
+  (`res.space = XR_SPACE_LOCAL_FLOOR`) instead of the grip/pinch **device-space late-latch**.
+  Rationale (§5.4): a filtered pose is no longer a rigid device-space offset, so the runtime's
+  zero-latency late-latch cannot express it — we trade ~1 frame of latency for the removal of
+  hand-tracking jitter. **Controllers and filter-off are bit-for-bit unchanged**: the gate is
+  `in.grabFilter && m_grabHandActive && dev`, and the else-branch is the original
+  `res.pose = m_grabOffset` + device-space selector. Only MOVE grabs filter (resize routes through
+  `reanchorFromWorld`, untouched). Filter state resets at every `beginGrab`.
+- **Latch interaction (WP-G4)**: `m_lastWorld` becomes the *filtered* pose, and the WP-G4 release
+  ring pushes `anchor->lastWorld()` each frame, so in filtered mode the ring records the **filtered**
+  carry poses. On release `pickReleasePose` → `endGrab(releaseWorld, …)` therefore re-anchors to a
+  pose on the *smoothed* trajectory the user actually saw — the latch and the filter compose without
+  a pop (the single-frame-grab fallback `endGrab(in,tune)` still uses the raw release pose, which is
+  harmless with no history to smooth).
+- **Config** (all read per-frame from the frame loop, hot-toggle): `openxr:grab_filter` (bool,
+  default **false** for safety — flip after live tuning), `openxr:grab_filter_min_cutoff` (float Hz,
+  default 1.0, 0.01–10), `openxr:grab_filter_beta` (float, default 0.007, 0–1).
+- **Status**: `hyprctl openxr status` appends `, filtered` to a hand's input label
+  (`hands (pinch, filtered)`) and a `"filtered"` bool per hand in JSON, true when `grab_filter` is on
+  AND that hand is on the hand-interaction profile.
+
+### Tuning guide (for the live Quest session — G6 is default-off until tuned)
+
+Turn it on with `openxr:grab_filter = true` (hot-reloadable), then grab a monitor **by the bar with
+a pinch** and adjust the two knobs while watching a held-still panel and a fast drag:
+
+- **`min_cutoff` (Hz, default 1.0)** — the floor cutoff, i.e. how much smoothing applies when your
+  hand is nearly still. **Lower it** (toward 0.1–0.5) if a panel you are holding *still* still
+  jitters/shimmers. **Raise it** (toward 2–4) if slow, deliberate moves feel mushy/laggy. Too low ⇒
+  visible lag and a "floaty" panel that trails your hand; too high ⇒ jitter returns at rest.
+- **`beta` (default 0.007)** — how fast the cutoff opens up as you move faster (lag-vs-jitter during
+  motion). **Raise it** (0.05–0.5) if *fast* drags feel laggy or rubber-banded; **lower it**
+  (toward 0.001) if fast moves overshoot or the panel jitters while moving. Too low ⇒ fast moves
+  lag; too high ⇒ you lose smoothing exactly when the hand is shakiest.
+- **Method (from the 1€ paper):** set `beta = 0` first and lower `min_cutoff` until a *held-still*
+  panel stops jittering with acceptable lag; then raise `beta` until *fast* moves have acceptable
+  lag. Suggested trials: `(min_cutoff, beta)` = `(1.0, 0.007)` → `(0.5, 0.05)` → `(0.3, 0.2)`.
+- If the pinch-pose anchor (WP-G5) alone already feels good, you may not need the filter at all —
+  leaving `grab_filter = false` keeps the zero-latency device-space carry.

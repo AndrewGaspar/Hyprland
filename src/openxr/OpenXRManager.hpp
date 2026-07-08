@@ -122,8 +122,10 @@ class COpenXRManager {
     // when that hand is on the ext/hand_interaction_ext profile; `gesture` is the hand_grab mode
     // string then (else empty). Both default to controller when no session/input exists.
     struct SXRHandInputInfo {
-        bool        hands   = false;
-        std::string gesture = ""; // "pinch" | "grasp" | "both" when hands, else ""
+        bool        hands    = false;
+        std::string gesture  = "";    // "pinch" | "grasp" | "both" when hands, else ""
+        bool        filtered = false; // WP-G6: this hand's move-grabs run the 1€ carry filter
+                                      // (openxr:grab_filter on AND hands active)
     };
     std::array<SXRHandInputInfo, 2> handInputInfos() const;
 
