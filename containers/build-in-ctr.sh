@@ -38,6 +38,31 @@ cmake --build "$BUILD" --target Hyprland hyprtester -j"$(nproc)"
 echo "==> Building vendored Monado into $BUILD/monado (redirected out of read-only source)"
 MONADO_BUILD="$BUILD/monado" EIGEN_BUILD="$BUILD/eigen" bash "$SRC/scripts/build-monado.sh"
 
+# hypxrpaper (ambient XR backgrounds) — the primary OpenXR session the container
+# `session --env` mode composites HypXRland's monitors over. Built OUT OF TREE into
+# $BUILD/hypxrpaper because /src is a read-only overlay (same reason monado is
+# redirected above). Its deps (openxr/egl/glesv2/gbm/libdrm) are already in the
+# image's Hyprland dep set; stb_image + cgltf are vendored in the submodule's
+# third_party/. Assets (the bundled forest-clearing scene) are NOT copied — they
+# ride along in the read-only /src checkout and are located at session time via
+# HYPXRPAPER_ASSET_DIR (see containers/session/session-launch.sh); an out-of-tree
+# $BUILD binary's exe-relative search would never find /src's assets.
+HYPXRPAPER_SRC="$SRC/subprojects/hypxrpaper"
+HYPXRPAPER_BUILD="$BUILD/hypxrpaper"
+if [[ -f $HYPXRPAPER_SRC/CMakeLists.txt ]]; then
+    echo "==> Configuring hypxrpaper into $HYPXRPAPER_BUILD (out-of-tree; read-only /src)"
+    cmake -S "$HYPXRPAPER_SRC" -B "$HYPXRPAPER_BUILD" -G Ninja \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+    echo "==> Building hypxrpaper"
+    cmake --build "$HYPXRPAPER_BUILD" --target hypxrpaper -j"$(nproc)"
+else
+    echo "!! hypxrpaper submodule not checked out at $HYPXRPAPER_SRC — run:" >&2
+    echo "     git submodule update --init subprojects/hypxrpaper" >&2
+    echo "   (skipping; container 'session --env' will be unavailable)" >&2
+fi
+
 echo "==> ccache stats (after):"
 ccache -s 2>/dev/null || true
 
@@ -45,7 +70,8 @@ echo "==> Build artifacts:"
 for f in "$BUILD/Hyprland" \
          "$BUILD/hyprtester/hyprtester" \
          "$BUILD/monado/src/xrt/targets/service/monado-service" \
-         "$BUILD/monado/openxr_monado-dev.json"; do
+         "$BUILD/monado/openxr_monado-dev.json" \
+         "$BUILD/hypxrpaper/hypxrpaper"; do
     if [[ -e $f ]]; then echo "   OK  $f"; else echo "   MISSING  $f"; fi
 done
 echo "==> Done."
