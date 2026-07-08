@@ -17,17 +17,17 @@
 #       --rebuild   force a clean rebuild of :base (and everything above it).
 #       --check-gpu after building, smoke-test GPU access (eglinfo/vulkaninfo).
 #
-#   shell [--gpu nvidia|amd]
+#   shell [--gpu amd|nvidia|intel|/dev/dri/renderD*]
 #       Boot :session and drop into a real logind shell as `dev` (machinectl
 #       shell). Repo is overlay-mounted at /src (host tree untouched), build
 #       tree in the hypxrland-build volume at /build, ccache in hypxrland-ccache.
 #       Build inside with:  bash /src/containers/build-in-ctr.sh
 #       Container is removed on shell exit.
 #
-#   check-gpu [--gpu nvidia|amd]
+#   check-gpu [--gpu amd|nvidia|intel|/dev/dri/renderD*]
 #       Standalone GPU smoke test (same as build --check-gpu).
 #
-#   test [--gpu nvidia|amd] [--build] [--keep] [TEST_NAMES...]
+#   test [--gpu amd|nvidia|intel|/dev/dri/renderD*] [--build] [--keep] [TEST_NAMES...]
 #       Hermetic in-container `hyprtester --xr` (WP2). Boots :session with NO
 #       host wayland/X/wivrn mounts, brings up a headless labwc as the nesting
 #       host inside, runs the XR suite nested into it, and reports the real
@@ -41,7 +41,8 @@
 #       On failure, artifacts (run log + preserved /tmp/hyprtester-xr-* dirs
 #       with hyprland + monado logs) are copied to containers/artifacts/<ts>/.
 #
-#   session [--wivrn] [--conf FILE] [--gpu nvidia|amd] [--passthrough]
+#   session [--wivrn] [--conf FILE] [--gpu amd|nvidia|intel|/dev/dri/renderD*]
+#           [--passthrough] [--publish-remote[=PORT]]
 #       Boot :session and launch a full Omarchy desktop as a NESTED window on the
 #       host, with the dev Hyprland's XR extension enabled. waybar/mako/walker/
 #       portals autostart on the container's OWN private buses (no shim; verify
@@ -54,7 +55,13 @@
 #         --conf FILE            source FILE (bind-mounted ro) as the base config
 #                                instead of the image's ~/.config/hypr/hyprland.conf.
 #         --passthrough          openxr:blend_mode = alpha (composite over passthrough).
-#         --gpu nvidia|amd       single-GPU pin (default amd = /dev/dri/renderD129).
+#         --gpu SPEC             single-GPU pin, resolved by vendor scan (default:
+#                                nvidia with --wivrn, else amd). SPEC is a vendor
+#                                keyword (amd|nvidia|intel) or a /dev/dri/renderD* path.
+#         --publish-remote[=PORT] publish the in-container Monado remote-driver port
+#                                (container 4242) to the host on an EPHEMERAL free
+#                                port (or PORT). OFF by default — a fixed 4242 publish
+#                                once poisoned a concurrent host suite run.
 #       Runs interactively (attached logs); teardown on exit = `podman rm -f` its
 #       container, which cleanly kills the whole session tree.
 #
@@ -68,15 +75,21 @@
 # kills by process name. Container teardown is `podman rm -f <tracked-name>`
 # only; every container name is unique per-invocation ($$) and tracked.
 #
-# GPU: NVIDIA needs the host CDI spec (nvidia-container-toolkit +
-# `nvidia-ctk cdi generate`); if it's absent this script prints the exact setup
-# commands and (for build/check-gpu) falls back to AMD. AMD uses a plain
-# --device /dev/dri/renderD129.
+# GPU: render nodes are resolved at run time by a vendor scan of /sys/class/drm
+# (scripts/lib/gpu.sh) — no node names are hardcoded. `--gpu amd|nvidia|intel`
+# picks the first node of that vendor; `--gpu /dev/dri/renderDNNN` forces one;
+# $HYPXRLAND_{AMD,NVIDIA,INTEL}_NODE override the scan. NVIDIA additionally needs
+# the host CDI spec (nvidia-container-toolkit + `nvidia-ctk cdi generate`); if it's
+# absent the script prints the setup commands (and, for check-gpu, falls back to
+# AMD). AMD/Intel are plain --device <node>; NVIDIA is --device nvidia.com/gpu=all.
 
 set -euo pipefail
 
 # --- constants ---------------------------------------------------------------
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Shared GPU render-node resolver (vendor scan + env overrides + explicit path).
+# shellcheck source=lib/gpu.sh
+source "$REPO/scripts/lib/gpu.sh"
 IMG_BASE="hypxrland-ctr:base"
 IMG_PKGS="hypxrland-ctr:pkgs"
 IMG_SESSION="hypxrland-ctr:session"
@@ -91,9 +104,10 @@ BUILD_IN_CTR_SCRIPT="$REPO/containers/build-in-ctr.sh"
 RUN_XR_TESTS_SCRIPT="$REPO/containers/test/run-xr-tests.sh"
 ARTIFACTS_DIR="$REPO/containers/artifacts"
 
-# Host GPU render nodes (this box): renderD128 = NVIDIA, renderD129 = AMD.
-AMD_RENDER_NODE="${HYPXRLAND_AMD_NODE:-/dev/dri/renderD129}"
-NVIDIA_RENDER_NODE="${HYPXRLAND_NVIDIA_NODE:-/dev/dri/renderD128}"
+# GPU render nodes are resolved at run time by resolve_render_node (scripts/lib/
+# gpu.sh) — a vendor scan of /sys/class/drm, overridable per-vendor via
+# $HYPXRLAND_{AMD,NVIDIA,INTEL}_NODE or an explicit `--gpu /dev/dri/renderDNNN`.
+# No node names are hardcoded here (they differ box to box).
 CDI_NVIDIA_SPEC_YAML="/etc/cdi/nvidia.yaml"
 CDI_NVIDIA_SPEC_JSON="/etc/cdi/nvidia.json"
 
@@ -102,8 +116,6 @@ CDI_NVIDIA_SPEC_JSON="/etc/cdi/nvidia.json"
 HOST_MNT="/hypxrland-host"
 WIVRN_MANIFEST="${WIVRN_RUNTIME_JSON:-/usr/share/openxr/1/openxr_wivrn.json}"
 WIVRN_LIB_DIR="/usr/lib/wivrn"
-CDI_NVIDIA_SPEC_YAML="/etc/cdi/nvidia.yaml"
-CDI_NVIDIA_SPEC_JSON="/etc/cdi/nvidia.json"
 
 log()  { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m==> WARN: %s\033[0m\n' "$*" >&2; }
@@ -167,8 +179,7 @@ commit_systemd() {
         "$ctr" "$img" >/dev/null
 }
 
-# resolve_gpu_args <gpu> — echo the podman --device args for the requested GPU,
-# or fail with setup guidance. For nvidia, verifies the CDI spec exists.
+# --- GPU device selection ----------------------------------------------------
 nvidia_cdi_available() {
     [[ -f $CDI_NVIDIA_SPEC_YAML || -f $CDI_NVIDIA_SPEC_JSON ]]
 }
@@ -183,26 +194,77 @@ print_nvidia_cdi_setup() {
 EOF
 }
 
+# check_nvidia_cdi_freshness — belt-and-braces UX: if the CDI spec's baked driver
+# version disagrees with the loaded kernel module, print the one-line regen hint.
+# Non-fatal (a pacman hook regenerates on driver updates); silent when they match.
+check_nvidia_cdi_freshness() {
+    local spec="$CDI_NVIDIA_SPEC_YAML"
+    [[ -f $spec ]] || spec="$CDI_NVIDIA_SPEC_JSON"
+    [[ -f $spec ]] || return 0
+    local loaded spec_ver
+    loaded=$(cat /sys/module/nvidia/version 2>/dev/null || true)
+    spec_ver=$(grep -oE 'host-driver-version=[0-9][0-9.]*' "$spec" 2>/dev/null | head -1 | cut -d= -f2)
+    [[ -n $loaded && -n $spec_ver && $loaded != "$spec_ver" ]] || return 0
+    warn "NVIDIA CDI spec driver version ($spec_ver) != loaded module ($loaded) — spec is stale."
+    warn "Regenerate:  sudo nvidia-ctk cdi generate --output=$CDI_NVIDIA_SPEC_YAML"
+}
+
+# gpu_devargs <gpu> [--allow-amd-fallback] — set REPLY_DEVARGS (podman --device
+# array) and REPLY_GPU (the effective gpu keyword, possibly changed by fallback)
+# for a `--gpu` spec (amd|nvidia|intel|/dev/dri/renderD*). NVIDIA goes through
+# CDI (nvidia.com/gpu=all); everything else resolves to a host render node via
+# resolve_render_node. Dies with setup guidance on an unusable request unless
+# --allow-amd-fallback, in which case an unavailable NVIDIA CDI degrades to AMD.
+gpu_devargs() {
+    local gpu="$1" allow_fallback=0
+    [[ "${2:-}" == --allow-amd-fallback ]] && allow_fallback=1
+    REPLY_DEVARGS=()
+    REPLY_GPU="$gpu"
+    case "${gpu,,}" in
+        nvidia)
+            if nvidia_cdi_available; then
+                check_nvidia_cdi_freshness
+                REPLY_DEVARGS=(--device nvidia.com/gpu=all)
+            elif [[ $allow_fallback -eq 1 ]]; then
+                warn "requested --gpu nvidia but CDI is unavailable on this host."
+                print_nvidia_cdi_setup
+                local n; n=$(resolve_render_node amd) || die "no NVIDIA CDI and no AMD node to fall back to"
+                warn "falling back to AMD ($n)."
+                REPLY_GPU=amd; REPLY_DEVARGS=(--device "$n")
+            else
+                print_nvidia_cdi_setup
+                die "NVIDIA CDI unavailable on this host; use --gpu amd"
+            fi
+            ;;
+        amd|intel|/*)
+            local n; n=$(resolve_render_node "$gpu") || die "could not resolve --gpu $gpu (see above)"
+            REPLY_DEVARGS=(--device "$n") ;;
+        *) die "--gpu must be amd|nvidia|intel|/dev/dri/renderD* (got '$gpu')" ;;
+    esac
+}
+
+# gpu_node_in_ctr <ctr> <gpu> — resolve the render node INSIDE a running
+# container by re-running the shared resolver there (/src/scripts/lib/gpu.sh).
+# For CDI NVIDIA the node keeps its host name but this verifies it is actually
+# present; for AMD/explicit it confirms the bind-mounted node. Echoes the node.
+gpu_node_in_ctr() {
+    local ctr="$1" gpu="$2" node
+    node=$(podman exec "$ctr" /usr/bin/bash -lc \
+        "source /src/scripts/lib/gpu.sh && resolve_render_node '$gpu'" 2>/dev/null) \
+        || die "could not resolve GPU node for '$gpu' inside container $ctr (in-container scan failed)"
+    printf '%s\n' "$node"
+}
+
 # --- check-gpu ---------------------------------------------------------------
 # Smoke-test GPU access inside a short-lived container: eglinfo + vulkaninfo.
 check_gpu() {
     local gpu="${1:-amd}" img="${2:-$IMG_BASE}"
     podman image exists "$img" || die "image $img not built yet (run: $0 build)"
 
-    local -a devargs=()
-    case "$gpu" in
-        nvidia)
-            if nvidia_cdi_available; then
-                devargs=(--device nvidia.com/gpu=all)
-            else
-                warn "requested --gpu nvidia but CDI is unavailable on this host."
-                print_nvidia_cdi_setup
-                warn "falling back to AMD ($AMD_RENDER_NODE) for the smoke test."
-                gpu=amd
-            fi
-            ;;
-    esac
-    [[ $gpu == amd ]] && devargs=(--device "$AMD_RENDER_NODE")
+    # A missing NVIDIA CDI degrades to AMD here (smoke test is best-effort).
+    gpu_devargs "$gpu" --allow-amd-fallback
+    gpu="$REPLY_GPU"
+    local -a devargs=("${REPLY_DEVARGS[@]}")
 
     log "GPU smoke test (--gpu $gpu, devices: ${devargs[*]})"
     local ctr="hypxrland-gpucheck-$$"
@@ -337,14 +399,8 @@ cmd_shell() {
     done
     podman image exists "$IMG_SESSION" || die "session image not built (run: $0 build)"
 
-    local -a devargs=()
-    case "$gpu" in
-        nvidia)
-            nvidia_cdi_available || { print_nvidia_cdi_setup; die "NVIDIA CDI unavailable; use --gpu amd"; }
-            devargs=(--device nvidia.com/gpu=all) ;;
-        amd) devargs=(--device "$AMD_RENDER_NODE") ;;
-        *) die "shell: --gpu must be nvidia or amd" ;;
-    esac
+    gpu_devargs "$gpu"; gpu="$REPLY_GPU"
+    local -a devargs=("${REPLY_DEVARGS[@]}")
 
     ensure_volumes "$VOL_BUILD" "$VOL_CCACHE"
     local ctr="hypxrland-shell-$$"
@@ -401,20 +457,12 @@ cmd_test() {
     podman image exists "$IMG_SESSION" || die "session image not built (run: $0 build)"
     [[ -f $RUN_XR_TESTS_SCRIPT ]] || die "missing $RUN_XR_TESTS_SCRIPT"
 
-    # GPU device args + the render node the suite pins (single-GPU by construction).
-    local gpu_node
-    local -a devargs=()
-    case "$gpu" in
-        nvidia)
-            nvidia_cdi_available || { print_nvidia_cdi_setup; die "NVIDIA CDI unavailable on this host; use --gpu amd"; }
-            devargs=(--device nvidia.com/gpu=all)
-            # CDI injects the driver; renderD128 is this box's NVIDIA node.
-            gpu_node="${HYPXRLAND_NVIDIA_NODE:-/dev/dri/renderD128}" ;;
-        amd)
-            devargs=(--device "$AMD_RENDER_NODE")
-            gpu_node="$AMD_RENDER_NODE" ;;
-        *) die "test: --gpu must be nvidia or amd" ;;
-    esac
+    # GPU device args (host-side). The render node the suite pins (gpu_node) is
+    # resolved INSIDE the container after boot — see gpu_node_in_ctr below — so a
+    # CDI-injected NVIDIA node is verified present rather than assumed by name.
+    gpu_devargs "$gpu"; gpu="$REPLY_GPU"
+    local -a devargs=("${REPLY_DEVARGS[@]}")
+    local gpu_node=""
 
     ensure_volumes "$VOL_BUILD" "$VOL_CCACHE"
     local ctr="hypxrland-test-$$"
@@ -425,7 +473,7 @@ cmd_test() {
     # HERMETIC: mounts are ONLY the overlay source, the build+ccache volumes and
     # the GPU device — NO host wayland/X11/wivrn sockets. (Proven in the report by
     # echoing this invocation.) --systemd=always gives real logind for machinectl.
-    log "Booting $IMG_SESSION (test, --gpu $gpu, node $gpu_node)"
+    log "Booting $IMG_SESSION (test, --gpu $gpu)"
     podman rm -f "$ctr" >/dev/null 2>&1 || true
     podman run -d --name "$ctr" --systemd=always --userns=keep-id --user root \
         --security-opt label=disable \
@@ -436,6 +484,11 @@ cmd_test() {
         "$IMG_SESSION" >/dev/null
     wait_for_systemd "$ctr"
     podman exec "$ctr" chown -R dev:dev /build "$CCACHE_DIR_IN_CTR" >/dev/null 2>&1 || true
+
+    # Resolve the render node the suite pins by scanning INSIDE the container
+    # (CDI-injected NVIDIA keeps host names, but verify presence rather than assume).
+    gpu_node=$(gpu_node_in_ctr "$ctr" "$gpu")
+    log "In-container render node for --gpu $gpu: $gpu_node"
 
     # Ensure /build is populated. Auto-build if the binaries are missing, or if
     # --build was passed (force a fresh build-in-ctr run).
@@ -499,26 +552,24 @@ cmd_test() {
 }
 
 # --- session -----------------------------------------------------------------
-# resolve_gpu_devargs <gpu> — set REPLY_DEVARGS (array) + REPLY_GPU_NODE for the
-# requested GPU, or die with setup guidance. (Shared by session; mirrors the
-# inline logic in cmd_shell without restructuring it.)
-resolve_gpu_devargs() {
-    local gpu="$1"
-    REPLY_DEVARGS=()
-    case "$gpu" in
-        nvidia)
-            nvidia_cdi_available || { print_nvidia_cdi_setup; die "NVIDIA CDI unavailable; use --gpu amd"; }
-            REPLY_DEVARGS=(--device nvidia.com/gpu=all)
-            REPLY_GPU_NODE="$NVIDIA_RENDER_NODE" ;;
-        amd)
-            REPLY_DEVARGS=(--device "$AMD_RENDER_NODE")
-            REPLY_GPU_NODE="$AMD_RENDER_NODE" ;;
-        *) die "--gpu must be nvidia or amd" ;;
-    esac
+# find_free_tcp_port — echo an unused localhost TCP port (kernel-assigned).
+find_free_tcp_port() {
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()'
+        return 0
+    fi
+    # Fallback: probe a handful of high ports with ss.
+    local p
+    for _ in $(seq 1 50); do
+        p=$(( (RANDOM % 20000) + 20000 ))
+        ss -Htln "sport = :$p" 2>/dev/null | grep -q . || { printf '%s\n' "$p"; return 0; }
+    done
+    return 1
 }
 
 cmd_session() {
-    local gpu="amd" use_wivrn=0 passthrough=0 user_conf=""
+    local gpu="" use_wivrn=0 passthrough=0 user_conf=""
+    local publish_remote=0 remote_port=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --wivrn)      use_wivrn=1 ;;
@@ -527,6 +578,8 @@ cmd_session() {
             --gpu=*)      gpu="${1#--gpu=}" ;;
             --conf)       [[ $# -ge 2 ]] || die "--conf needs a FILE argument"; user_conf="$2"; shift ;;
             --conf=*)     user_conf="${1#--conf=}" ;;
+            --publish-remote)   publish_remote=1 ;;                       # ephemeral host port
+            --publish-remote=*) publish_remote=1; remote_port="${1#--publish-remote=}" ;;
             -h|--help)    usage; exit 0 ;;
             *) die "session: unknown flag $1" ;;
         esac
@@ -534,9 +587,19 @@ cmd_session() {
     done
     podman image exists "$IMG_SESSION" || die "session image not built (run: $0 build)"
 
-    resolve_gpu_devargs "$gpu"   # sets REPLY_DEVARGS + REPLY_GPU_NODE
-    local gpu_node="$REPLY_GPU_NODE"
+    # Default GPU: --wivrn must render on the host's ENCODE GPU (NVIDIA on this
+    # box) or it cross-GPU-crashes at swapchain setup — force NVIDIA when the GPU
+    # is unspecified. Windowed default stays AMD (no CDI dependency for the common
+    # no-headset case). An explicit --gpu always wins.
+    if [[ -z $gpu ]]; then
+        [[ $use_wivrn -eq 1 ]] && gpu=nvidia || gpu=amd
+    elif [[ $use_wivrn -eq 1 && ${gpu,,} != nvidia && $gpu != /* ]]; then
+        warn "--wivrn encodes on the host GPU; --gpu $gpu may cross-GPU-crash at swapchain setup."
+    fi
+
+    gpu_devargs "$gpu"; gpu="$REPLY_GPU"
     local -a devargs=("${REPLY_DEVARGS[@]}")
+    local gpu_node=""   # resolved in-container after boot
 
     # --- host wayland socket (nested output) ---
     local host_xdg="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -559,8 +622,8 @@ cmd_session() {
 
     # launch_env: passed INLINE to session-launch.sh (a `machinectl shell` login
     # does NOT inherit `podman run -e` env, so we can't rely on container env).
+    # XR_GPU_NODE is appended after boot (resolved in-container by gpu_node_in_ctr).
     local -a launch_env=(
-        "XR_GPU_NODE=$gpu_node"
         "HL_WAYLAND_DISPLAY=$ctr_wl"
         "XR_PASSTHROUGH=$passthrough"
     )
@@ -602,13 +665,18 @@ cmd_session() {
             "XR_MODE=windowed"
             "XR_RUNTIME_JSON=/build/monado/openxr_monado-dev.json"
         )
-        # Publish the monado remote-driver port so you can drive it with monado-gui
-        # from the host — ONLY when the host isn't already using 4242 (one per box).
-        if pgrep -x monado-service >/dev/null; then
-            warn "a host monado-service is running (owns TCP 4242) — NOT publishing the port."
-            warn "monado-gui remote drive from the host is unavailable this run."
-        else
-            portargs=(-p 127.0.0.1:4242:4242)
+        # The monado remote-driver port is NOT published by default (a fixed
+        # 127.0.0.1:4242 publish once poisoned a concurrent host suite run). Opt in
+        # with --publish-remote for an EPHEMERAL free host port (or a fixed one via
+        # --publish-remote=PORT); container-side stays 4242.
+        if [[ $publish_remote -eq 1 ]]; then
+            if [[ -z $remote_port ]]; then
+                remote_port=$(find_free_tcp_port) || die "could not find a free TCP port to publish"
+            fi
+            if [[ $remote_port == 4242 ]] && pgrep -x monado-service >/dev/null; then
+                die "--publish-remote=4242 but a host monado-service owns TCP 4242; pick another port or omit for ephemeral."
+            fi
+            portargs=(-p "127.0.0.1:${remote_port}:4242")
         fi
     fi
 
@@ -626,7 +694,12 @@ cmd_session() {
     # Named volumes come up root-owned; make them writable by dev (uid 1000).
     podman exec "$ctr" chown -R dev:dev /build "$CCACHE_DIR_IN_CTR" >/dev/null 2>&1 || true
 
-    print_session_banner "$ctr" "$use_wivrn" "${portargs[*]:-}"
+    # Resolve the render node in-container (verifies the injected/mounted GPU node).
+    gpu_node=$(gpu_node_in_ctr "$ctr" "$gpu")
+    log "In-container render node for --gpu $gpu: $gpu_node"
+    launch_env+=("XR_GPU_NODE=$gpu_node")
+
+    print_session_banner "$ctr" "$use_wivrn" "$remote_port"
 
     # Build the inline env prefix for the machinectl login (which won't inherit env).
     local envstr=""; local kv
@@ -641,7 +714,7 @@ cmd_session() {
 }
 
 print_session_banner() {
-    local ctr="$1" use_wivrn="$2" ports="$3"
+    local ctr="$1" use_wivrn="$2" remote_port="$3"
     cat <<EOF
 
   ============================ HypXRland session ============================
@@ -661,11 +734,19 @@ EOF
     - the nested Omarchy session (themed waybar at the top, wallpaper, …)
     - the Monado compositor window (the 3D XR view with the floating monitors)
 EOF
-        [[ -n $ports ]] && cat <<EOF
-    Drive the fake HMD/controllers from the host (port published):
-      subprojects/monado/build/src/xrt/targets/gui/monado-gui remote
-      (or the in-container gui: xr-container.sh exec monado-gui remote)
+        if [[ -n $remote_port ]]; then
+            cat <<EOF
+    Monado remote-driver port published on 127.0.0.1:$remote_port  (container 4242).
+    Drive the fake HMD/controllers from the host:
+      subprojects/monado/build/src/xrt/targets/gui/monado-gui remote 127.0.0.1:$remote_port
+      (or the in-container gui: $0 exec monado-gui remote)
 EOF
+        else
+            cat <<EOF
+    (Remote-driver port NOT published — pass --publish-remote to drive the fake
+     HMD/controllers with monado-gui from the host on an ephemeral port.)
+EOF
+        fi
     fi
     cat <<EOF
 
