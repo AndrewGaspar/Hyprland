@@ -59,7 +59,6 @@ warn() { printf '\033[1;33m[omarchy-ctr] WARN: %s\033[0m\n' "$*" | tee -a "$OMAR
 #   limine/snapper (login/) grub    bootloader — not our concern (login/ skipped)
 #   signal-desktop spotify obsidian typora libreoffice-fresh obs-studio kdenlive
 #                   heavy GUI apps irrelevant to an XR compositor session
-#   chromium        heavy browser; theme/mimetype chromium steps run tolerantly
 #   cups* system-config-printer     printing stack tied to host hardware
 #   bluetui impala iwd              bluetooth/wifi radios — no radios in container
 #   avahi nss-mdns  mDNS — unneeded, wants host/system integration
@@ -77,7 +76,6 @@ warn() { printf '\033[1;33m[omarchy-ctr] WARN: %s\033[0m\n' "$*" | tee -a "$OMAR
 #   noto-fonts-cjk                  huge CJK font set
 #   gnome-keyring libsecret         secret daemon — no session secrets needed
 #   pinta xournalpp imagemagick ffmpegthumbnailer tesseract* inxi  image/OCR/thumb tools
-#   webapps (HEY.desktop, …)        need chromium — skipped with it
 #   alsa-utils wiremix wireplumber pamixer playerctl cliamp  audio stack — XR test has no audio
 #   1password/webapp/spotify done above
 CURATED_PKGS=(
@@ -90,6 +88,8 @@ CURATED_PKGS=(
   hypridle hyprlock hyprpicker
   xdg-desktop-portal-hyprland xdg-desktop-portal-gtk
   polkit-gnome                       # polkit auth agent for the session
+  # --- browser (Omarchy default) ---
+  chromium                           # Omarchy's default browser: omarchy-launch-browser / SUPER+SHIFT+RETURN, the webapp helpers (omarchy-webapp-*), and the theme.sh chromium policy/appearance step all target it. Arch's /usr/bin/chromium wrapper sources ~/.config/chromium-flags.conf (seeded below).
   # --- terminal, fonts, theme ---
   alacritty                          # Omarchy default terminal
   ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji woff2-font-awesome ttf-ia-writer
@@ -148,6 +148,25 @@ config_session() {
   cp -R "$OMARCHY_PATH"/config/* ~/.config/ 2>>"$OMARCHY_INSTALL_LOG_FILE" || warn "config copy had issues"
   cp "$OMARCHY_PATH/default/bashrc" ~/.bashrc 2>>"$OMARCHY_INSTALL_LOG_FILE" || true
 
+  # Container chromium sandbox: chromium's namespace sandbox spawns a NESTED
+  # unprivileged user namespace. On this dev box that works (rootless podman +
+  # kernel.unprivileged_userns_clone=1, verified: GUI chromium runs sandboxed with
+  # no --no-sandbox), but hosts that lock nested userns down (unprivileged_userns_
+  # clone=0 / max_user_namespaces=0 — common on hardened/Debian kernels) make
+  # chromium abort with "Failed to move to new namespace" / "No usable sandbox!".
+  # This is a CONTAINER-portability constraint, not an Omarchy one, so we append
+  # --no-sandbox to the Omarchy chromium-flags.conf (seeded above) rather than
+  # editing the tracked Omarchy default — the image then works on any host without
+  # per-box kernel tuning. Arch's /usr/bin/chromium wrapper sources ~/.config/
+  # chromium-flags.conf, so omarchy-launch-browser (and bare chromium) both pick
+  # it up; --test-type drops the resulting "unsupported flag" infobar. Idempotent
+  # (guarded so a config re-run doesn't duplicate the lines).
+  local cflags="$HOME/.config/chromium-flags.conf"
+  if [[ -f $cflags ]] && ! grep -qx -- '--no-sandbox' "$cflags"; then
+    printf '%s\n' '--no-sandbox' '--test-type' >>"$cflags"
+    log "chromium-flags.conf: appended --no-sandbox --test-type (rootless-podman nested userns)"
+  fi
+
   log "Branding (branding.sh)"
   mkdir -p ~/.config/omarchy/branding
   cp "$OMARCHY_PATH/icon.txt" ~/.config/omarchy/branding/about.txt 2>/dev/null || true
@@ -162,17 +181,25 @@ config_session() {
   mkdir -p ~/.local/share/applications/icons
   cp "$OMARCHY_PATH"/applications/icons/*.png ~/.local/share/applications/icons/ 2>/dev/null || true
 
-  log "Theme: Tokyo Night (trimmed theme.sh — chromium/nautilus system links skipped)"
+  log "Theme: Tokyo Night (trimmed theme.sh — chromium steps now RUN; nautilus system links skipped)"
   mkdir -p ~/.config/omarchy/themes ~/.config/btop/themes ~/.config/mako
   # Yaru action-icon links that theme.sh makes with sudo — tolerant (yaru present).
   sudo ln -snf /usr/share/icons/Adwaita/symbolic/actions/go-previous-symbolic.svg \
        /usr/share/icons/Yaru/scalable/actions/go-previous-symbolic.svg 2>/dev/null || true
   sudo ln -snf /usr/share/icons/Adwaita/symbolic/actions/go-next-symbolic.svg \
        /usr/share/icons/Yaru/scalable/actions/go-next-symbolic.svg 2>/dev/null || true
+  # Chromium theme integration (theme.sh's chromium block) — now that chromium is
+  # installed these should apply for real, not tolerantly: a managed-policy dir
+  # (so omarchy-install-chromium-google-account / browser policies have a home)
+  # and a chromium initial_preferences that follows system appearance ("device").
+  sudo mkdir -p /etc/chromium/policies/managed 2>/dev/null || true
+  sudo chmod a+rw /etc/chromium/policies/managed 2>/dev/null || true
+  echo '{"browser":{"theme":{"color_scheme":0,"color_scheme2":0}}}' \
+    | sudo tee /usr/lib/chromium/initial_preferences >/dev/null 2>&1 || true
   # Skip the wallpaper swap at build time (no compositor running); the session
   # launcher applies it. Restarts are pgrep-guarded and no-op with nothing running.
   OMARCHY_THEME_SKIP_BACKGROUND=1 omarchy-theme-set "Tokyo Night" \
-    >>"$OMARCHY_INSTALL_LOG_FILE" 2>&1 || warn "theme-set had non-fatal issues (gsettings/chromium absent)"
+    >>"$OMARCHY_INSTALL_LOG_FILE" 2>&1 || warn "theme-set had non-fatal issues (gsettings)"
   ln -snf ~/.config/omarchy/current/theme/btop.theme ~/.config/btop/themes/current.theme 2>/dev/null || true
   ln -snf ~/.config/omarchy/current/theme/mako.ini ~/.config/mako/config 2>/dev/null || true
 
