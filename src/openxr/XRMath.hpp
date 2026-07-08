@@ -230,6 +230,108 @@ namespace OpenXR {
         return {-qRotate(ci, p.pos), ci};
     }
 
+    // ---- 1€ filter (grabbable-borders WP-G6, research 04-grabbable-borders.md §4/§5.4) ----
+    //
+    // Casiez, Roussel & Vogel, "1€ Filter: A Simple Speed-based Low-pass Filter for Noisy Input in
+    // Interactive Systems," CHI '12. Reference implementation: github.com/casiez/OneEuroFilter
+    // (1eurofilter.cc). This is a faithful, allocation-free transcription of that algorithm as a POD
+    // step function so it is gtest-covered (tests/xr/one_euro.cpp asserts bit-for-bit against a
+    // direct port of the reference C++) and usable on the frame thread with ZERO hyprutils refcount
+    // ops (XRMonitorLayer.hpp rule). Used ONLY for the optional hand-grab carry filter — a first-order
+    // low-pass whose cutoff rises with the signal speed, so it kills jitter when the panel is nearly
+    // still (low cutoff) yet does not lag when it is moved fast (high cutoff).
+    //
+    // Mapping to the reference: a OneEuroFilter owns two LowPassFilters, `x` (value) and `dx`
+    // (derivative). xPrevRaw == x->lastRawValue() (x.y), xHat == x->hatxprev (x.s), dxHat ==
+    // dx->hatxprev (dx.s). Both LowPassFilters become "initialized" on the SAME first filter() call,
+    // so one `init` flag suffices.
+
+    constexpr float XR_ONEEURO_DCUTOFF = 1.0F; // reference default derivative cutoff (Hz)
+
+    struct SXROneEuro {
+        bool  init     = false;
+        float xPrevRaw = 0.F; // last RAW input        (reference LowPassFilter x.y)
+        float xHat     = 0.F; // last FILTERED value    (reference LowPassFilter x.s)
+        float dxHat    = 0.F; // last FILTERED derivative (reference LowPassFilter dx.s)
+
+        void  reset() {
+            *this = SXROneEuro{};
+        }
+    };
+
+    // One 1€ step for a scalar signal. `dt` is seconds since the previous step (the reference
+    // recovers freq = 1/(t_now - t_prev) from timestamps; te = 1/freq = dt). minCutoff/beta are the
+    // two user parameters; dCutoff is the derivative cutoff (XR_ONEEURO_DCUTOFF). Returns the
+    // filtered value and advances `s`. First sample passes through (seeds state); a non-positive dt
+    // holds the last filtered value (guards the reference's 1/dt against a zero/negative step).
+    inline float oneEuroStep(SXROneEuro& s, float value, float dt, float minCutoff, float beta, float dCutoff = XR_ONEEURO_DCUTOFF) {
+        constexpr float PI = 3.14159265358979323846F;
+        // alpha(cutoff) = 1 / (1 + tau/te), tau = 1/(2*pi*cutoff), te = dt.
+        auto alpha = [&](float cutoff) -> float {
+            const float tau = 1.F / (2.F * PI * cutoff);
+            return 1.F / (1.F + tau / dt);
+        };
+
+        if (!s.init) {
+            s.init     = true;
+            s.xPrevRaw = value;
+            s.xHat     = value;
+            s.dxHat    = 0.F; // dx->filterWithAlpha(0, ...) on the first call returns 0 in the reference
+            return value;
+        }
+        if (dt <= 0.F)
+            return s.xHat; // no time advanced -> hold (avoid the reference's 1/dt blow-up)
+
+        const float dvalue  = (value - s.xPrevRaw) / dt;               // (value - lastRaw) * freq
+        const float aD      = alpha(dCutoff);
+        const float edvalue = aD * dvalue + (1.F - aD) * s.dxHat;      // dx low-pass
+        const float cutoff  = minCutoff + beta * std::fabs(edvalue);
+        const float aC      = alpha(cutoff);
+        const float result  = aC * value + (1.F - aC) * s.xHat;        // x low-pass at speed-adaptive cutoff
+
+        s.xPrevRaw = value;
+        s.xHat     = result;
+        s.dxHat    = edvalue;
+        return result;
+    }
+
+    // Per-axis 1€ filter state for a full pose: xyz position + the 4 quaternion components.
+    struct SXROneEuroPose {
+        SXROneEuro px, py, pz;     // position
+        SXROneEuro qx, qy, qz, qw; // orientation components
+
+        void       reset() {
+            *this = SXROneEuroPose{};
+        }
+    };
+
+    // 1€-filter a pose. Position filters each axis independently. Orientation: the reference OneEuro
+    // repo has no canonical quaternion path, and its guidance for rotations is to low-pass the
+    // components and renormalize; we do exactly that, first flipping the incoming quat into the same
+    // hemisphere as the last filtered quat (q and -q are the same rotation, but a component-wise
+    // low-pass across the antipode would collapse toward zero). The small per-frame rotation deltas
+    // of a hand carry keep the component-wise result faithful, and qNormalize restores a unit quat.
+    inline SXRPose oneEuroStepPose(SXROneEuroPose& s, const SXRPose& pose, float dt, float minCutoff, float beta, float dCutoff = XR_ONEEURO_DCUTOFF) {
+        SXRPose out;
+        out.pos.x = oneEuroStep(s.px, pose.pos.x, dt, minCutoff, beta, dCutoff);
+        out.pos.y = oneEuroStep(s.py, pose.pos.y, dt, minCutoff, beta, dCutoff);
+        out.pos.z = oneEuroStep(s.pz, pose.pos.z, dt, minCutoff, beta, dCutoff);
+
+        Quat q = pose.rot;
+        if (s.qw.init) {
+            const float d = q.x * s.qx.xHat + q.y * s.qy.xHat + q.z * s.qz.xHat + q.w * s.qw.xHat;
+            if (d < 0.F)
+                q = Quat{-q.x, -q.y, -q.z, -q.w};
+        }
+        Quat f;
+        f.x     = oneEuroStep(s.qx, q.x, dt, minCutoff, beta, dCutoff);
+        f.y     = oneEuroStep(s.qy, q.y, dt, minCutoff, beta, dCutoff);
+        f.z     = oneEuroStep(s.qz, q.z, dt, minCutoff, beta, dCutoff);
+        f.w     = oneEuroStep(s.qw, q.w, dt, minCutoff, beta, dCutoff);
+        out.rot = qNormalize(f);
+        return out;
+    }
+
     // ---- ray -> quad intersection (docs/openxr/04-input.md §3) ----
     //
     // Pure, unconditional (no OpenXR headers): the ray-pointer hit test and its UV mapping, so
