@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdint>
 #include <algorithm>
+#include <string>
 
 namespace OpenXR {
     struct Vec3 {
@@ -353,6 +354,79 @@ namespace OpenXR {
             case XR_REGION_CORNER_BR: return "corner-br";
             case XR_REGION_MARGIN: return "margin";
             default: return "none";
+        }
+    }
+
+    // ---- hand-interaction active-device detection + gesture selection (WP-G5, research §5.3/§8) ----
+    //
+    // Pure, unconditional (gtest-covered in tests/xr/hand_grab.cpp): no OpenXR headers. The frame
+    // thread caches each hand's current interaction profile path (xrGetCurrentInteractionProfile,
+    // refreshed on XrEventDataInteractionProfileChanged) and maps it here to an input KIND. "Hands
+    // are active" ⟺ the profile is the ext/hand_interaction_ext profile we suggest pinch/grasp
+    // bindings for — the only profile that yields a stable pinch pose. Every controller profile
+    // (incl. microsoft/hand_interaction, which we bind no hand actions for) maps to CONTROLLER so
+    // the squeeze/grip path is used unchanged.
+
+    enum eXRInputKind : uint8_t {
+        XR_INPUT_CONTROLLER = 0,
+        XR_INPUT_HANDS,
+    };
+
+    inline constexpr const char* XR_PROFILE_HAND_INTERACTION = "/interaction_profiles/ext/hand_interaction_ext";
+
+    inline eXRInputKind xrInputKindForProfile(const std::string& profilePath) {
+        return profilePath == XR_PROFILE_HAND_INTERACTION ? XR_INPUT_HANDS : XR_INPUT_CONTROLLER;
+    }
+
+    inline const char* xrInputKindName(eXRInputKind k) {
+        return k == XR_INPUT_HANDS ? "hands" : "controllers";
+    }
+
+    // Which hand gesture(s) start a grab when hands are the active device (openxr:hand_grab). PINCH
+    // (default, research §8) disables the pose-perturbing fist for hands entirely; GRASP restores the
+    // old fist behavior; BOTH accepts either. Controllers ignore this — they always squeeze.
+    enum eXRHandGrab : uint8_t {
+        XR_HANDGRAB_PINCH = 0,
+        XR_HANDGRAB_GRASP,
+        XR_HANDGRAB_BOTH,
+    };
+
+    inline eXRHandGrab xrParseHandGrab(const std::string& s) {
+        if (s == "grasp")
+            return XR_HANDGRAB_GRASP;
+        if (s == "both")
+            return XR_HANDGRAB_BOTH;
+        return XR_HANDGRAB_PINCH; // default + explicit "pinch"
+    }
+
+    inline const char* xrHandGrabName(eXRHandGrab m) {
+        switch (m) {
+            case XR_HANDGRAB_GRASP: return "grasp";
+            case XR_HANDGRAB_BOTH: return "both";
+            default: return "pinch";
+        }
+    }
+
+    // The analog grab value fed to the grab Schmitt when hands are active: pinch strength, fist-curl
+    // strength, or the max of the two (BOTH), per the hand_grab mode.
+    inline float xrHandGrabValue(eXRHandGrab mode, float pinchVal, float graspVal) {
+        switch (mode) {
+            case XR_HANDGRAB_GRASP: return graspVal;
+            case XR_HANDGRAB_BOTH: return std::max(pinchVal, graspVal);
+            default: return pinchVal; // XR_HANDGRAB_PINCH
+        }
+    }
+
+    // Whether a hand grab under `mode` (with these strengths at the trigger instant) should anchor
+    // to the stable pinch pose (pinch_ext/pose) rather than the wrist grip pose. PINCH → always pinch;
+    // GRASP → always grip (grasp_ext has no pose); BOTH → whichever gesture is the stronger contributor
+    // (pinch on a tie, since the pinch pose is the steadier anchor). Callers additionally require a
+    // valid pinch pose this frame before honoring a true result.
+    inline bool xrHandGrabUsesPinch(eXRHandGrab mode, float pinchVal, float graspVal) {
+        switch (mode) {
+            case XR_HANDGRAB_GRASP: return false;
+            case XR_HANDGRAB_BOTH: return pinchVal >= graspVal;
+            default: return true; // XR_HANDGRAB_PINCH
         }
     }
 
