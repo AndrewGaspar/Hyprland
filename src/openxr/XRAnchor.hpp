@@ -8,6 +8,7 @@
 // no clocks, globals, or config lookups here — the caller (COpenXRManager) reads config and
 // passes it in. CXRAnchor contains no locking; threading is the caller's responsibility.
 
+#include <array>
 #include <cstdint>
 #include <optional>
 
@@ -43,6 +44,65 @@ namespace OpenXR {
     constexpr float XR_DISTANCE_MIN     = 0.3F; // m (§4.3, §5.4)
     constexpr float XR_DISTANCE_MAX     = 5.0F;
     constexpr float XR_SOLVE_DT_MAX     = 0.1F; // s, dt clamp (§2.3)
+
+    // ---- release-latching ring (grabbable-borders WP-G4, research 04-grabbable-borders.md §5.4) ----
+    //
+    // The grab-release lurch: on a squeeze/grasp/pinch release, the input device (especially a
+    // fist-open on hand tracking, but also a controller flick) swings the grip pose exactly on the
+    // release frame; re-anchoring from that frame's pose bakes the swing into the persistent anchor
+    // and the window lurches. The fix is to keep a short per-hand history of the CARRIED world pose
+    // and, on release, re-anchor from a pose a little earlier than the release edge — before the
+    // perturbation — and/or from the last "calm" (below-velocity-threshold) sample.
+    //
+    // Everything here is POD math (SXRPose = Vec3 + Quat) with ZERO hyprutils SP/WP refcount ops,
+    // satisfying the frame-thread rule in XRMonitorLayer.hpp by construction. The per-hand ring
+    // instances live in CXRInput (frame thread); the struct lives here (unconditional) so the pure
+    // interpolation / velocity-rejection math is gtest-covered like the rest of the anchor engine.
+
+    constexpr uint32_t XR_GRAB_MAX_REWIND_MS = 500; // cap on how far velocity-rejection may rewind
+
+    struct SXRGrabSample {
+        SXRPose  world;           // carried quad world pose (LOCAL_FLOOR) this frame
+        uint32_t timeMs   = 0;    // monotonic sample stamp
+        float    linSpeed = 0.F;  // m/s of world.pos vs the previous sample (0 for the first)
+    };
+
+    // Fixed-capacity circular buffer of recent carry poses. index 0 in the "back" accessors is the
+    // NEWEST sample. Not thread-safe (single-thread, frame-owned by design).
+    struct SXRGrabRing {
+        static constexpr uint32_t CAP = 128; // ~1.4 s at 90 Hz; power of two
+
+        std::array<SXRGrabSample, CAP> buf{};
+        uint32_t                       count = 0; // logical size, saturates at CAP
+        uint32_t                       head  = 0; // index of the next write
+
+        void     reset() {
+            count = 0;
+            head  = 0;
+        }
+        uint32_t size() const {
+            return count < CAP ? count : CAP;
+        }
+        // back == 0 -> newest; caller guarantees back < size().
+        const SXRGrabSample& at(uint32_t back) const {
+            return buf[(head + CAP - 1 - back) % CAP];
+        }
+        // Append a carried pose; computes linSpeed against the previous newest sample.
+        void push(const SXRPose& world, uint32_t timeMs);
+        // World pose at (nowMs - latencyMs), linearly (pos) / slerp (rot) interpolated between the
+        // bracketing samples; clamps to newest/oldest; identity if empty.
+        SXRPose sampleBack(uint32_t nowMs, uint32_t latencyMs) const;
+        // Most recent sample whose linSpeed < linThresh, searching back from newest but never past
+        // (nowMs - maxBackMs). If the whole in-window span is above threshold, returns the
+        // furthest-back in-window sample (maximally rewound). Identity if empty.
+        SXRPose lastCalm(float linThresh, uint32_t nowMs, uint32_t maxBackMs) const;
+    };
+
+    // Pure release-pose selector (gtest truth table). If velReject > 0 and the newest sample is
+    // moving faster than velReject, walk back to the last calm sample (velocity-outlier rejection);
+    // otherwise rewind by latencyMs. Identity if the ring is empty (caller should fall back to the
+    // release-frame endGrab in that case).
+    SXRPose pickReleasePose(const SXRGrabRing& ring, uint32_t nowMs, uint32_t latencyMs, float velReject);
 
     // ---- per-layer persistent state (doc 03 §2.1) ----
     struct SXRAnchorState {
@@ -113,7 +173,13 @@ namespace OpenXR {
         void beginGrab(eXRHand hand, const SXRPose& gripWorld);
         void grabPushPull(float deltaMeters);
         void grabResize(float deltaMeters);
+        // Re-anchor from the quad's world pose at the release frame (grip ∘ offset). Kept for
+        // callers with no release-latch ring available.
         void endGrab(const SXRSolveInput& in, const SXRAnchorTuning& tune);
+        // WP-G4: re-anchor from an EXPLICIT world pose (the latched / velocity-rejected release
+        // pose from SXRGrabRing) instead of the release-frame grip pose. `in`/`tune` still supply
+        // the view + grip context needed to re-express the world pose into the persistent mode.
+        void endGrab(const SXRPose& releaseWorld, const SXRSolveInput& in, const SXRAnchorTuning& tune);
 
         // ---- verbs (§5) — main thread, under the layer mutex ----
         // d = (dx, dy, dz) as given by the user; the solver forms view -Z for dz.

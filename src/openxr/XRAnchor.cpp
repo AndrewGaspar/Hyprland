@@ -8,6 +8,78 @@
 using namespace OpenXR;
 
 namespace {
+    // Linear-pos / shortest-arc-rot interpolation between two carried poses (§5.4 ring).
+    SXRPose lerpPose(const SXRPose& a, const SXRPose& b, float f) {
+        return SXRPose{a.pos + (b.pos - a.pos) * f, qSlerp(a.rot, b.rot, f)};
+    }
+} // namespace
+
+// ---- release-latching ring (WP-G4) — pure POD math, frame-thread-owned by CXRInput ----
+
+void SXRGrabRing::push(const SXRPose& world, uint32_t timeMs) {
+    float sp = 0.F;
+    if (size() > 0) {
+        const SXRGrabSample& prev = at(0);
+        const float          dtS  = timeMs > prev.timeMs ? (float)(timeMs - prev.timeMs) / 1000.F : 0.F;
+        if (dtS > 0.F)
+            sp = (world.pos - prev.world.pos).length() / dtS;
+    }
+    buf[head] = SXRGrabSample{world, timeMs, sp};
+    head      = (head + 1) % CAP;
+    if (count < CAP)
+        ++count;
+}
+
+SXRPose SXRGrabRing::sampleBack(uint32_t nowMs, uint32_t latencyMs) const {
+    if (size() == 0)
+        return SXRPose{};
+
+    const uint32_t targetMs = nowMs > latencyMs ? nowMs - latencyMs : 0;
+    const SXRGrabSample& newest = at(0);
+    if (targetMs >= newest.timeMs)
+        return newest.world;
+    const SXRGrabSample& oldest = at(size() - 1);
+    if (targetMs <= oldest.timeMs)
+        return oldest.world;
+
+    for (uint32_t b = 0; b + 1 < size(); ++b) {
+        const SXRGrabSample& newer = at(b);
+        const SXRGrabSample& older = at(b + 1);
+        if (older.timeMs <= targetMs && targetMs <= newer.timeMs) {
+            const uint32_t span = newer.timeMs - older.timeMs;
+            const float    f    = span > 0 ? (float)(targetMs - older.timeMs) / (float)span : 0.F;
+            return lerpPose(older.world, newer.world, f);
+        }
+    }
+    return newest.world; // unreachable given the clamps above
+}
+
+SXRPose SXRGrabRing::lastCalm(float linThresh, uint32_t nowMs, uint32_t maxBackMs) const {
+    if (size() == 0)
+        return SXRPose{};
+
+    const uint32_t floorMs  = nowMs > maxBackMs ? nowMs - maxBackMs : 0;
+    SXRPose        fallback = at(0).world; // furthest-back in-window sample seen so far
+    for (uint32_t b = 0; b < size(); ++b) {
+        const SXRGrabSample& s = at(b);
+        if (s.timeMs < floorMs)
+            break; // do not rewind past the window
+        fallback = s.world;
+        if (s.linSpeed < linThresh)
+            return s.world;
+    }
+    return fallback; // the whole in-window span was above threshold -> maximally rewound
+}
+
+SXRPose OpenXR::pickReleasePose(const SXRGrabRing& ring, uint32_t nowMs, uint32_t latencyMs, float velReject) {
+    if (ring.size() == 0)
+        return SXRPose{};
+    if (velReject > 0.F && ring.size() >= 2 && ring.at(0).linSpeed > velReject)
+        return ring.lastCalm(velReject, nowMs, XR_GRAB_MAX_REWIND_MS);
+    return ring.sampleBack(nowMs, latencyMs);
+}
+
+namespace {
     // Critically-damped spring exact step (§3.2). Unconditionally stable for any dt; applied
     // per Vec3 component via the vector ops.
     void springStep(Vec3& x, Vec3& v, const Vec3& target, float response, float dt) {
@@ -259,16 +331,21 @@ void CXRAnchor::grabResize(float deltaMeters) {
 }
 
 void CXRAnchor::endGrab(const SXRSolveInput& in, const SXRAnchorTuning& tune) {
+    // Release-frame pose (unlatched): grip ∘ offset this frame == m_lastWorld from the solve.
     const std::optional<SXRPose>& grip = m_grabHand == XR_HAND_LEFT ? in.gripLeft : in.gripRight;
     const SXRPose                 W    = grip ? poseCompose(*grip, m_grabOffset) : m_lastWorld;
-    m_grabbed                          = false;
+    endGrab(W, in, tune);
+}
+
+void CXRAnchor::endGrab(const SXRPose& releaseWorld, const SXRSolveInput& in, const SXRAnchorTuning& tune) {
+    m_grabbed = false;
 
     SXRVerbContext ctx;
     ctx.view      = in.view;
     ctx.viewValid = true;
     ctx.gripLeft  = in.gripLeft;
     ctx.gripRight = in.gripRight;
-    reanchorFromWorld(W, ctx, tune);
+    reanchorFromWorld(releaseWorld, ctx, tune);
 }
 
 void CXRAnchor::reanchorFromWorld(const SXRPose& W, const SXRVerbContext& ctx, const SXRAnchorTuning& tune) {

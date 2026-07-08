@@ -354,11 +354,16 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
     static auto PGRABON     = CConfigValue<Hyprlang::FLOAT>("openxr:grab_threshold");
     static auto PGRABOFF    = CConfigValue<Hyprlang::FLOAT>("openxr:grab_threshold_release");
     static auto PSCROLLSPD  = CConfigValue<Hyprlang::FLOAT>("openxr:scroll_speed");
+    static auto PRELLATENCY = CConfigValue<Hyprlang::INT>("openxr:grab_release_latency_ms");
+    static auto PRELVELREJ  = CConfigValue<Hyprlang::FLOAT>("openxr:grab_release_velocity_reject");
     const float onT         = (float)*PSELON;
     const float offT        = (float)*PSELOFF;
     const float grabOnT     = (float)*PGRABON;
     const float grabOffT    = (float)*PGRABOFF;
     const float scrollSpeed = (float)*PSCROLLSPD;
+    const int64_t  relLatencyRaw = (int64_t)*PRELLATENCY;
+    const uint32_t relLatencyMs  = relLatencyRaw > 0 ? (uint32_t)relLatencyRaw : 0;
+    const float    relVelReject  = (float)*PRELVELREJ;
 
     bool        emittedAny = false;
 
@@ -464,6 +469,7 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                     m_grabbing[hand]       = true;
                     m_grabbedMon[hand]     = target->id;
                     m_grabbedMonName[hand] = target->name;
+                    m_grabRing[hand].reset(); // start a fresh carry history (WP-G4)
                     if (m_owner == (int)hand)
                         m_owner = -1; // pointer ownership free-for-take by the other hand (§6)
                     hapticTick(hand);
@@ -472,21 +478,31 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                 // else: no target even with cone forgiveness, or it's already grabbed by the
                 // other hand -> the squeeze is ignored, no state change (doc 04 §6).
             } else if (m_grabbing[hand]) {
-                // Falling edge: end the grab and re-anchor into the persistent mode.
+                // Falling edge: end the grab and re-anchor into the persistent mode. WP-G4: instead
+                // of re-anchoring from THIS frame's grip pose (which the release gesture just
+                // perturbed — the lurch), re-anchor from the latched / velocity-rejected pose out of
+                // the carry ring. Falls back to the release-frame endGrab if the ring is empty
+                // (e.g. a grab that lasted a single frame).
                 const SXRPointerTarget* target = nullptr;
                 for (const auto& t : targets)
                     if (t.id == m_grabbedMon[hand]) {
                         target = &t;
                         break;
                     }
-                if (target && target->anchor)
-                    target->anchor->endGrab(solveIn, tune);
+                if (target && target->anchor) {
+                    if (m_grabRing[hand].size() > 0) {
+                        const OpenXR::SXRPose releaseWorld = OpenXR::pickReleasePose(m_grabRing[hand], timeMs, relLatencyMs, relVelReject);
+                        target->anchor->endGrab(releaseWorld, solveIn, tune);
+                    } else
+                        target->anchor->endGrab(solveIn, tune);
+                }
                 // else: the layer is gone (destroyed mid-grab) -> force release, no re-anchor.
                 hapticTick(hand);
                 emitGrabState(m_grabbedMon[hand], m_grabbedMonName[hand], false);
                 m_grabbing[hand]   = false;
                 m_grabbedMon[hand] = -1;
                 m_grabbedMonName[hand].clear();
+                m_grabRing[hand].reset();
             }
         }
 
@@ -510,6 +526,10 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                     target->anchor->grabPushPull(stick.y * XR_GRAB_PUSHPULL_SPEED * solveIn.dt);
                 if (std::fabs(stick.x) > XR_STICK_DEADZONE)
                     target->anchor->grabResize(stick.x * XR_GRAB_RESIZE_SPEED * solveIn.dt);
+                // Record the carried world pose for the release latch (WP-G4). The solve already
+                // ran this frame, so lastWorld() is this frame's grip ∘ offset composed pose.
+                if (target->anchor->hasLastWorld())
+                    m_grabRing[hand].push(target->anchor->lastWorld(), timeMs);
             }
         }
     }
