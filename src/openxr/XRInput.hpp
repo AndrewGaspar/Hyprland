@@ -88,12 +88,13 @@ constexpr float XR_GRAB_RESIZE_SPEED   = 1.0F; // m/s of width at full stick.x
 // frame that produced this target vector (backed by the frame loop's own PXRLAYER
 // snapshot) — never cached across frames.
 struct SXRPointerTarget {
-    MONITORID          id = -1;
-    OpenXR::SXRPose    worldPose;
-    float              w = 0.F; // width in meters
-    float              h = 0.F; // height in meters
-    std::string        name;    // monitor name (grab event payload / re-lookup by name)
-    OpenXR::CXRAnchor* anchor = nullptr;
+    MONITORID                 id = -1;
+    OpenXR::SXRPose           worldPose;        // FULL quad (content + chrome margins) center pose
+    float                     w = 0.F;          // FULL quad width in meters
+    float                     h = 0.F;          // FULL quad height in meters
+    std::string               name;             // monitor name (grab event payload / re-lookup by name)
+    OpenXR::CXRAnchor*        anchor = nullptr;
+    OpenXR::SXRChromeGeometry chrome;           // WP-G1: normalized chrome layout for hit classification + content-uv remap
 };
 
 // Schmitt trigger for analog buttons (doc 04 §4). update() returns true on an edge.
@@ -208,8 +209,13 @@ class CXRInput {
     // ---- ray pointer state (frame thread, doc 04 §3-§5) ----
     std::array<SXRSchmitt, 2> m_selectTrig;       // per-hand select hysteresis
     std::array<SXRSchmitt, 2> m_menuTrig;         // per-hand menu press/release (bool via 0.5/0.5)
-    std::array<MONITORID, 2>  m_hoverMon{-1, -1}; // current ray-hit monitor per hand (-1 = none)
-    std::array<Vector2D, 2>   m_hoverUV;          // current ray-hit uv per hand
+    std::array<MONITORID, 2>  m_hoverMon{-1, -1}; // current BODY-hovered monitor per hand (-1 = none); drives motion/click/scroll
+    std::array<Vector2D, 2>   m_hoverUV;          // current BODY-hover uv per hand, REMAPPED to content uv (WP-G1)
+    // WP-G1 chrome bookkeeping: the region + quad the ray last classified for each hand, over the
+    // FULL quad (incl. transparent margins). Distinct from m_hoverMon (body only) — non-body hits
+    // are hover-only (no pointer events; WP-G2 will drive chrome visuals from this). Frame thread.
+    std::array<MONITORID, 2>          m_hoverChromeMon{-1, -1};
+    std::array<OpenXR::eXRQuadRegion, 2> m_hoverRegion{OpenXR::XR_REGION_NONE, OpenXR::XR_REGION_NONE};
     // While a hand grabs, it casts no ray, drives no pointer, and its stick feeds the grab
     // machine instead of scroll (doc 04 §2/§6).
     std::array<bool, 2> m_grabbing{false, false};

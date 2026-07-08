@@ -397,33 +397,62 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
     };
 
     // 1. Ray cast per hand: nearest-t hit across all targets wins (occlusion). A grabbing hand
-    //    casts nothing (WP8). Hover changes (incl. none<->some) transfer pointer ownership (§3).
+    //    casts nothing (WP8). Hits are classified against each quad's chrome layout (WP-G1): a
+    //    BODY hit drives the pointer (uv REMAPPED to content uv so clicks land on the same desktop
+    //    pixel as before the chrome margins existed); bar/corner/margin hits are hover-only (no
+    //    pointer events — chrome visuals come in WP-G2). BODY-hover changes (incl. none<->some)
+    //    transfer pointer ownership (§3), preserving today's click/scroll semantics exactly.
     for (auto hand : {XR_HAND_LEFT, XR_HAND_RIGHT}) {
-        MONITORID newMon = -1;
-        Vector2D  newUV;
+        MONITORID            newBodyMon = -1; // BODY hover (drives pointer); remapped content uv
+        Vector2D             newBodyUV;
+        MONITORID            newChromeMon = -1;                     // whichever quad the ray hit (any region)
+        OpenXR::eXRQuadRegion newRegion   = OpenXR::XR_REGION_NONE; // its region
+
         if (!m_grabbing[hand] && m_hands[hand].aim) {
             const OpenXR::SXRPose& aim    = *m_hands[hand].aim;
             const OpenXR::Vec3     origin = aim.pos;
             const OpenXR::Vec3     dir    = OpenXR::qRotate(aim.rot, OpenXR::Vec3{0.f, 0.f, -1.f});
 
-            float                  bestT = std::numeric_limits<float>::max();
+            float                        bestT   = std::numeric_limits<float>::max();
+            const SXRPointerTarget*      bestTgt = nullptr;
+            OpenXR::SXRQuadHit           bestHit;
             for (const auto& t : targets) {
                 const OpenXR::SXRQuadHit hit = OpenXR::rayQuadIntersect(t.worldPose, origin, dir, t.w, t.h);
                 if (hit.hit && hit.t < bestT) {
-                    bestT  = hit.t;
-                    newMon = t.id;
-                    newUV  = Vector2D{hit.u, hit.v};
+                    bestT   = hit.t;
+                    bestTgt = &t;
+                    bestHit = hit;
+                }
+            }
+            if (bestTgt) {
+                newChromeMon = bestTgt->id;
+                newRegion    = OpenXR::classifyQuadHit(bestHit.u, bestHit.v, bestTgt->chrome);
+                if (newRegion == OpenXR::XR_REGION_BODY) {
+                    float cu = 0.f, cv = 0.f;
+                    if (OpenXR::remapToContentUV(bestHit.u, bestHit.v, bestTgt->chrome, cu, cv)) {
+                        newBodyMon = bestTgt->id;
+                        newBodyUV  = Vector2D{cu, cv};
+                    }
                 }
             }
         }
 
-        if (newMon != m_hoverMon[hand]) {
+        // Body hover (pointer). Ownership transfers on a body-hover change, exactly as before.
+        if (newBodyMon != m_hoverMon[hand]) {
             m_owner = hand; // hover change owns the pointer (§3)
-            Log::logger->log(Log::DEBUG, "[OPENXR] hand {} hover {} -> {} (uv {:.3f},{:.3f})", hand == XR_HAND_LEFT ? "L" : "R", (long long)m_hoverMon[hand], (long long)newMon,
-                             newUV.x, newUV.y);
+            Log::logger->log(Log::DEBUG, "[OPENXR] hand {} body-hover {} -> {} (content uv {:.3f},{:.3f})", hand == XR_HAND_LEFT ? "L" : "R", (long long)m_hoverMon[hand],
+                             (long long)newBodyMon, newBodyUV.x, newBodyUV.y);
         }
-        m_hoverMon[hand] = newMon;
-        m_hoverUV[hand]  = newUV;
+        m_hoverMon[hand] = newBodyMon;
+        m_hoverUV[hand]  = newBodyUV;
+
+        // Chrome region transition (hover-only; aids WP-G2 chrome visuals / WP-G3 grab gating).
+        if (newChromeMon != m_hoverChromeMon[hand] || newRegion != m_hoverRegion[hand]) {
+            Log::logger->log(Log::DEBUG, "[OPENXR] hand {} region {}@{} -> {}@{}", hand == XR_HAND_LEFT ? "L" : "R", OpenXR::xrRegionName(m_hoverRegion[hand]),
+                             (long long)m_hoverChromeMon[hand], OpenXR::xrRegionName(newRegion), (long long)newChromeMon);
+        }
+        m_hoverChromeMon[hand] = newChromeMon;
+        m_hoverRegion[hand]    = newRegion;
     }
 
     // 2. Grab state machine (doc 04 §6 / doc 03 §4). Uses this frame's just-updated hover (step
@@ -434,8 +463,11 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
 
         if (m_grabTrig[hand].update(m_hands[hand].grab, grabOnT, grabOffT)) {
             if (m_grabTrig[hand].state) {
-                // Rising edge: try to begin a grab on the hovered quad, or (if hovering nothing)
-                // redo the intersection with the 5-degree entry cone (doc 04 §6).
+                // Rising edge: try to begin a grab on the BODY-hovered quad, or (if not hovering a
+                // body) redo the intersection with the 5-degree entry cone (doc 04 §6). WP-G1 keeps
+                // grab gated to the BODY region only (the bar/corner grab semantics arrive in WP-G3)
+                // so behavior is identical to today: the quad body IS the whole content, and grab-
+                // anywhere-on-content still works. Chrome margin hits never grab here.
                 const SXRPointerTarget* target = nullptr;
                 if (m_hoverMon[hand] >= 0) {
                     for (const auto& t : targets)
@@ -456,7 +488,9 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                             continue;
                         const float              slack = std::tan(XR_GRAB_CONE_DEG * (float)M_PI / 180.F) * (*pt);
                         const OpenXR::SXRQuadHit hit   = OpenXR::rayQuadIntersect(t.worldPose, origin, dir, t.w, t.h, slack);
-                        if (hit.hit && hit.t < bestT) {
+                        // Only a BODY hit grabs (WP-G1). The cone forgiveness expands the bounds, so
+                        // a hit can land in the transparent margin — classify and require BODY.
+                        if (hit.hit && hit.t < bestT && OpenXR::classifyQuadHit(hit.u, hit.v, t.chrome) == OpenXR::XR_REGION_BODY) {
                             bestT = hit.t;
                             best  = &t;
                         }
