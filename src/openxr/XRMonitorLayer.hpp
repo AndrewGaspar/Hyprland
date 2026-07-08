@@ -113,7 +113,14 @@ class CXRMonitorLayer {
     // ---- frame thread only ----
     XrSwapchain           m_swapchain = XR_NULL_HANDLE;
     std::vector<uint32_t> m_swapchainImages;      // GLuints from XrSwapchainImageOpenGLESKHR
-    Vector2D              m_swapchainSize;        // size the swapchain was created at
+    Vector2D              m_swapchainSize;        // size the swapchain was created at (FULL: content + chrome margins)
+    // Chrome margins (WP-G1): the swapchain is content + a transparent alpha margin; the desktop
+    // blits into the inner content rect and the margin holds the move-bar / corner handles. These
+    // are set alongside m_swapchainSize in createLayerSwapchain and read on the frame thread by the
+    // blit (px insets) and the quad-submit/pointer path (m_chrome fractions). See XRMath.hpp §8.
+    Vector2D                 m_contentSize;    // inner content rect size, px (the monitor's pixel mode)
+    Vector2D                 m_contentOffsetPx;// top-left of the content rect within the swapchain, px
+    OpenXR::SXRChromeGeometry m_chrome;        // normalized full-quad layout (single source of truth)
     XR_GLuint             m_cpuTex = 0;           // CPU-fallback staging tex, sized to mode
     Vector2D              m_cpuTexSize;           // size m_cpuTex was allocated at
     XR_EGLImageKHR        m_lastEGLImg = nullptr; // last dmabuf EGLImage (destroyed on next blit)
