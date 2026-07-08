@@ -57,3 +57,6 @@ meta/hl.meta.lua
 
 hyprtester/pointer-scroll.txt
 hyprtester/xr-test-local.conf
+
+# HypXRland container artifacts (podman build/test scratch, preserved test dirs)
+containers/artifacts/
