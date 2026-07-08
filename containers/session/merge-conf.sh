@@ -11,7 +11,8 @@
 #
 # Env inputs:
 #   XR_BASE_CONF    base config to source (default ~/.config/hypr/hyprland.conf)
-#   XR_GPU_NODE     render node for openxr:gpu (e.g. /dev/dri/renderD129)
+#   XR_GPU_NODE     render node for openxr:gpu (resolved by the wrapper; e.g.
+#                   a /dev/dri/renderD* path)
 #   XR_OVERLAY      1 -> openxr:overlay = 1 (XR_EXTX_overlay; the --env hook, unused
 #                   in WP3 but wired so a later ambient-background mode is a one-liner)
 #   XR_PASSTHROUGH  1 -> openxr:blend_mode = alpha (composite over passthrough)
