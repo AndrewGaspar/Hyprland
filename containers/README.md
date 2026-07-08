@@ -12,7 +12,8 @@ Driver: [`scripts/xr-container.sh`](../scripts/xr-container.sh). Ships
 ```sh
 scripts/xr-container.sh session                    # windowed Monado (no headset), --gpu amd
 scripts/xr-container.sh session --conf FILE        # source FILE as the base config
-scripts/xr-container.sh session --wivrn            # real headset via host WiVRn (forces --gpu nvidia)
+scripts/xr-container.sh session --wivrn            # real headset via host WiVRn (default --gpu split)
+scripts/xr-container.sh session --wivrn --nested-gpu amd --xr-gpu nvidia  # explicit split roles
 scripts/xr-container.sh session --passthrough      # openxr:blend_mode = alpha
 scripts/xr-container.sh session --publish-remote   # + expose Monado remote driver on an ephemeral host port
 scripts/xr-container.sh exec hyprctl openxr status # talk to the running session
@@ -38,19 +39,27 @@ default XR monitors) and launched by `session/session-launch.sh`.
 - **--wivrn**: mounts the host `/usr/lib/wivrn` + manifest + `wivrn/comp_ipc`
   socket (symlinked to `$XDG_RUNTIME_DIR/wivrn/comp_ipc` inside) and points
   `XR_RUNTIME_JSON` at the WiVRn manifest. This container never runs wivrn-server.
-  `--wivrn` defaults `--gpu` to `nvidia` (WiVRn's encode GPU); a mismatched
-  `--gpu amd` warns and cross-GPU-crashes at swapchain setup (WP3's SEGV).
+  `--wivrn` defaults `--gpu` to **`split`** (see below). A single-GPU pin
+  (`--gpu amd|nvidia|/dev/dri/...`) is kept for experiments but warns: it is
+  known-broken on a dual-GPU box.
 
-  **Dual-GPU-laptop caveat (this box):** the *nested* container Hyprland renders
-  its flat window into the **host** compositor, so it must render on the **host's**
-  GPU (the AMD 890M iGPU here) — nesting on NVIDIA fails at `CBackend::create()`
-  (aquamarine can't stand up its nested wayland backend on the NVIDIA node while
-  the host runs on AMD). But WiVRn encodes on NVIDIA. On such a machine no single
-  GPU satisfies both the nested-window path (host GPU) and the XR-encode path
-  (WiVRn GPU); a true single-GPU `--wivrn` run needs the host compositor itself on
-  the encode GPU, or a split-GPU session (nested compositor on the host GPU,
-  `openxr:gpu` on the encode GPU) — future work, see
-  [`06-testing.md` § 9](../docs/openxr/06-testing.md) and the research doc.
+  **Split-GPU session (the dual-GPU `--wivrn` fix).** The *nested* container
+  Hyprland renders its flat window into the **host** compositor, so it must render
+  on the **host's** GPU (the AMD 890M iGPU here) — nesting on NVIDIA fails at
+  `CBackend::create()`. But WiVRn **encodes** on NVIDIA. No single GPU satisfies
+  both, so `--gpu split` exposes **both** GPUs to the container and assigns them
+  to separate roles:
+  - **nested compositor** (`AQ_DRM_DEVICES`) → the host-compositor GPU
+    (`--nested-gpu`, default `host` = first non-NVIDIA present node).
+  - **XR encode** (`openxr:gpu`) → the encode GPU (`--xr-gpu`, default `nvidia`).
+
+  This mirrors exactly how the **native** preview already works (host Hyprland on
+  AMD + `openxr:gpu=<NVIDIA node>`). Both nodes are re-resolved *inside* the
+  container after boot so a CDI-injected NVIDIA node is verified present. On a
+  machine with only **one** GPU, `split` degrades to that single node for both
+  roles (a legitimate single-GPU `--wivrn` when the host compositor already runs
+  on the encode GPU). Passing either `--nested-gpu` or `--xr-gpu` implies
+  `--gpu split`. See [`06-testing.md` § 9](../docs/openxr/06-testing.md).
 
 Teardown = `podman rm -f` the tracked container, which reaps the whole session
 tree (Hyprland, Monado/Xwayland, waybar/mako/walker). NEVER kill by process name:
@@ -126,9 +135,13 @@ present rather than assumed by name.
 
 ## GPU
 
-**Single-GPU by construction** — the container renders XR on exactly one GPU, so
-it never hits the cross-GPU `xrCreateSwapchain` crash that a container-AMD-renderer
-vs host-NVIDIA-encoder split produces (WP3's `--wivrn --gpu amd` SEGV).
+**Single-GPU by default** — `test`, `shell` and windowed `session` render XR on
+exactly one GPU, so they never hit the cross-GPU `xrCreateSwapchain` crash that a
+container-AMD-renderer vs host-NVIDIA-encoder split produces (WP3's
+`--wivrn --gpu amd` SEGV). The one exception is `session --wivrn`, which *needs*
+two GPUs on a dual-GPU box and so defaults to **`--gpu split`** (nested compositor
+and XR encode on different nodes — see [Split-GPU](#split-gpu-session-the-dual-gpu---wivrn-fix)
+above and the [role table](#vendor-resolution---gpu)).
 
 ### Vendor resolution (`--gpu`)
 
@@ -139,8 +152,10 @@ which scans `/sys/class/drm/renderD*/device/vendor`:
 | SPEC | Meaning |
 | --- | --- |
 | `amd` | first `0x1002` node (default for `test`/`shell`/windowed `session`) |
-| `nvidia` | first `0x10de` node, via CDI (default for `--wivrn`) |
+| `nvidia` | first `0x10de` node, via CDI |
 | `intel` | first `0x8086` node |
+| `host` | host-compositor GPU heuristic: first **non-NVIDIA** present node (default nested role in `split`) |
+| `split` | *(`session` only)* expose **both** GPUs; assign `--nested-gpu` (default `host`) → `AQ_DRM_DEVICES` and `--xr-gpu` (default `nvidia`) → `openxr:gpu`. Default for `--wivrn`. |
 | `/dev/dri/renderDNNN` | that exact node, verbatim |
 
 Precedence: **explicit path** > **env override** (`$HYPXRLAND_{AMD,NVIDIA,INTEL}_NODE`)
@@ -168,9 +183,11 @@ instructions (`check-gpu`/`build --check-gpu` fall back to AMD instead).
 
 ### Cross-GPU rule of thumb
 
-Whatever runs the OpenXR **runtime/encoder** dictates the GPU. `--wivrn` encodes
-on the host's WiVRn GPU (NVIDIA here), so it forces `--gpu nvidia`; a mismatched
-`--gpu amd` crashes at swapchain setup. The vendored windowed Monado's null
+Whatever runs the OpenXR **runtime/encoder** dictates the XR GPU. `--wivrn`
+encodes on the host's WiVRn GPU (NVIDIA here) *while* the nested compositor must
+render on the host-compositor GPU (AMD here) — two different GPUs, hence
+`--gpu split` (default). A single-GPU `--wivrn` pin only works when the host
+compositor already runs on the encode GPU. The vendored windowed Monado's null
 compositor likewise picks a GPU independently — pin the container to match it.
 
 ### Future work

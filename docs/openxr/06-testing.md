@@ -561,7 +561,7 @@ image/build details; this section is the testing-oriented view.
 | --- | --- | --- | --- | --- |
 | `test` | vendored Monado **null**, in-container | headless **labwc** (in-container) | **none** (hermetic) | CI-style suite run |
 | `session` (windowed) | vendored **windowed** Monado, in-container | host wayland socket (nested window) | wayland socket only | interactive dev, no headset |
-| `session --wivrn` | **host WiVRn** runtime | host wayland socket | wayland socket + `/usr/lib/wivrn` + manifest + `wivrn/comp_ipc` | real Quest 3 |
+| `session --wivrn` | **host WiVRn** runtime | host wayland socket | wayland socket + `/usr/lib/wivrn` + manifest + `wivrn/comp_ipc` | real Quest 3 (default `--gpu split`) |
 
 ### The three invocations
 
@@ -569,15 +569,25 @@ image/build details; this section is the testing-oriented view.
 scripts/xr-container.sh test --gpu amd            # hermetic hyprtester --xr, AMD
 scripts/xr-container.sh test --gpu nvidia         # …on NVIDIA via CDI
 scripts/xr-container.sh session                   # windowed Monado desktop (no headset)
-scripts/xr-container.sh session --wivrn           # real headset (forces --gpu nvidia here)
+scripts/xr-container.sh session --wivrn           # real headset (default --gpu split)
 scripts/xr-container.sh check-gpu --gpu nvidia    # eglinfo/vulkaninfo smoke test
 ```
 
 GPU selection is by **vendor scan** (`scripts/lib/gpu.sh`), not hardcoded node
-names — `--gpu amd|nvidia|intel` or an explicit `/dev/dri/renderD*`. The node is
-resolved host-side (for `--device`) and again **inside** the container (for the
-`openxr:gpu` pin), so a CDI-injected NVIDIA node is verified present rather than
-assumed. See [`containers/README.md` § GPU](../../containers/README.md#gpu).
+names — `--gpu split|amd|nvidia|intel` or an explicit `/dev/dri/renderD*`. The
+node is resolved host-side (for `--device`) and again **inside** the container
+(for the `openxr:gpu` pin), so a CDI-injected NVIDIA node is verified present
+rather than assumed. See [`containers/README.md` § GPU](../../containers/README.md#gpu).
+
+**Split-GPU (`--gpu split`, the dual-GPU `--wivrn` default).** On a machine
+where the host compositor and WiVRn's encoder live on **different** GPUs, no
+single GPU works: the nested compositor must render on the host-compositor GPU
+(`AQ_DRM_DEVICES`) while XR encodes on the other (`openxr:gpu`). `--gpu split`
+exposes both GPUs to the container and plumbs the two roles separately —
+`--nested-gpu` (default `host` = first non-NVIDIA node) and `--xr-gpu`
+(default `nvidia`). This is exactly the native preview's topology (host Hyprland
+on AMD, `openxr:gpu` on the NVIDIA node). It degrades to single-GPU on a
+one-GPU box.
 
 ### Validation matrix (observed on the dual-GPU dev laptop: AMD 890M iGPU + RTX 5070)
 
@@ -585,7 +595,8 @@ assumed. See [`containers/README.md` § GPU](../../containers/README.md#gpu).
 | --- | --- | --- |
 | `check-gpu` | AMD ICD (radv/radeonsi) | NVIDIA ICD (RTX 5070 EGL + Vulkan) — CDI end-to-end |
 | `test` (hermetic suite) | **green** (18/18, ×2) | 1 deterministic fail (`xr_mirror`) + flaky input SKIPs |
-| `session --wivrn` | nested backend up → cross-GPU swapchain SEGV (WP3) | nested `CBackend::create()` fails on NVIDIA (see below) |
+| `session --wivrn` | *(single-GPU pin, kept for experiments)* nested backend up → cross-GPU swapchain SEGV (WP3) | *(single-GPU pin)* nested `CBackend::create()` fails on NVIDIA (see below) |
+| `session --wivrn` (default **`--gpu split`**) | nested compositor on AMD (`AQ_DRM_DEVICES`) + XR encode on NVIDIA (`openxr:gpu`, CDI) — the working dual-GPU topology (see below) ||
 
 **NVIDIA hermetic finding.** On NVIDIA the nested-into-labwc topology hits an
 aquamarine GBM limitation — `GBM: Failed to allocate a GBM buffer: bo null …
@@ -596,17 +607,23 @@ the nested-wlroots-style topology, **not** compositor application logic. **AMD i
 the reliable hermetic GPU** (18/18 twice); use `--gpu nvidia` for `check-gpu`
 (proving the CDI ICDs) but prefer AMD for the suite on this class of machine.
 
-**`session --wivrn` finding (dual-GPU laptop).** The money-shot single-GPU NVIDIA
-`--wivrn` run is **blocked by topology, not by WP4**: the nested container Hyprland
-renders its flat window into the host compositor and so must render on the *host's*
-GPU (AMD 890M here) — nesting on NVIDIA fails at `CBackend::create()`. With `--gpu
-amd` the nested backend comes up and reaches WiVRn (as in WP3) but SEGVs at the
-cross-GPU swapchain. No single GPU satisfies both the nested-window path (host GPU)
-and WiVRn's encode path (NVIDIA). The tractable fixes are (a) the host compositor
-itself on the encode GPU (single-GPU by construction), or (b) a **split-GPU**
-session — nested compositor on the host GPU, `openxr:gpu` on the encode GPU — which
-needs cross-GPU XR-blit validation and a headset. **Marked pending.** The NVIDIA
-CDI plumbing itself is proven by `check-gpu` (full RTX 5070 EGL + Vulkan inside the
+**`session --wivrn` finding (dual-GPU laptop).** A *single-GPU* `--wivrn` run is
+**blocked by topology, not by WP4**: the nested container Hyprland renders its flat
+window into the host compositor and so must render on the *host's* GPU (AMD 890M
+here) — nesting on NVIDIA fails at `CBackend::create()`. With `--gpu amd` the
+nested backend comes up and reaches WiVRn (as in WP3) but SEGVs at the cross-GPU
+swapchain. No single GPU satisfies both the nested-window path (host GPU) and
+WiVRn's encode path (NVIDIA).
+
+The fix (this WP) is **`--gpu split`**, now the `--wivrn` default: expose both
+GPUs and assign them separately — nested compositor (`AQ_DRM_DEVICES`) on the host
+GPU (AMD), XR encode (`openxr:gpu`) on the encode GPU (NVIDIA, via CDI). This is
+the identical topology the *native* preview already runs (host Hyprland on AMD +
+`openxr:gpu=<NVIDIA node>`), so the cross-GPU XR blit is the proven native path,
+not a new one. Roles are overridable (`--nested-gpu`/`--xr-gpu`); the plumbing
+degrades to single-GPU on a one-GPU machine. A single-GPU `--gpu` pin with
+`--wivrn` is retained for experiments but warns. The NVIDIA CDI plumbing is
+independently proven by `check-gpu` (full RTX 5070 EGL + Vulkan inside the
 container).
 
 ### Hermetic vs host suite, and the 4242 story
