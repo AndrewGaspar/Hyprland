@@ -328,6 +328,15 @@ void CXRSession::pollEvents() {
                 m_instanceLost  = true;
                 break;
             }
+            case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED: {
+                // WP-G5: a hand/controller (dis)connected or the runtime rebound a profile. Flag it
+                // so the frame loop tells CXRInput to re-read each hand's current interaction profile
+                // (active-device detection). The event carries only the session; per-hand queries
+                // happen in CXRInput::refreshHandProfiles.
+                m_interactionProfileChanged = true;
+                Log::logger->log(Log::DEBUG, "[OPENXR] interaction profile changed");
+                break;
+            }
             case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING: {
                 // Runtime recenter (doc 03 §6). Forward to the anchor engine via the frame loop.
                 auto*      ev      = reinterpret_cast<XrEventDataReferenceSpaceChangePending*>(&event);

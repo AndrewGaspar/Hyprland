@@ -14,6 +14,7 @@
 #include <openxr/openxr.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -116,10 +117,12 @@ struct SXRSchmitt {
 // Per-hand sampled action state, produced each frame by sample() and read by the frame loop
 // (anchor solve grip poses now; ray cast / hysteresis / grab in WP7/WP8).
 struct SXRHandState {
-    std::optional<OpenXR::SXRPose> aim;  // aim pose in the reference space (nullopt = invalid)
-    std::optional<OpenXR::SXRPose> grip; // grip pose in the reference space (nullopt = invalid)
+    std::optional<OpenXR::SXRPose> aim;   // aim pose in the reference space (nullopt = invalid)
+    std::optional<OpenXR::SXRPose> grip;  // grip pose in the reference space (nullopt = invalid)
+    std::optional<OpenXR::SXRPose> pinch; // WP-G5: pinch pose (ext/hand_interaction_ext), reference space
     float                          select = 0.f;
-    float                          grab   = 0.f;
+    float                          grab   = 0.f;      // grasp_ext (fist) / squeeze value
+    float                          pinchValue = 0.f;  // WP-G5: pinch_ext strength (hands only)
     Vector2D                       stick; // thumbstick
     bool                           menu   = false;
     bool                           active = false; // any action bound + active this frame (FOCUSED)
@@ -162,10 +165,37 @@ class CXRInput {
     std::optional<OpenXR::SXRPose> grip(OpenXR::eXRHand h) const {
         return m_hands[h].grip;
     }
+    // WP-G5: pinch pose (ext/hand_interaction_ext), reference space. nullopt unless hands are the
+    // active device and the pinch pose is valid this frame.
+    std::optional<OpenXR::SXRPose> pinch(OpenXR::eXRHand h) const {
+        return m_hands[h].pinch;
+    }
     // Grip action space handles for the device-lock late-latch path (doc 03 §3.4). XR_NULL_HANDLE
     // when input is unavailable.
     XrSpace gripSpace(OpenXR::eXRHand h) const {
         return m_gripSpace[h];
+    }
+    // WP-G5: pinch pose action space for a pinch-anchored hand MOVE grab's late-latch. XR_NULL_HANDLE
+    // when XR_EXT_hand_interaction is absent or the space failed to create.
+    XrSpace pinchSpace(OpenXR::eXRHand h) const {
+        return m_pinchSpace[h];
+    }
+
+    // WP-G5 active-device detection: the current interaction-profile KIND for a hand, cached from
+    // xrGetCurrentInteractionProfile (refreshed on XrEventDataInteractionProfileChanged). Frame
+    // thread writes it in sample(); handInputKind() also reads a main-thread-safe atomic mirror for
+    // `hyprctl openxr status`. handActive(h) == true iff that hand is on ext/hand_interaction_ext.
+    bool                handActive(OpenXR::eXRHand h) const {
+        return m_handActive[h];
+    }
+    OpenXR::eXRInputKind handInputKind(OpenXR::eXRHand h) const {
+        return (OpenXR::eXRInputKind)m_handInputKindAtomic[h].load(std::memory_order_acquire);
+    }
+
+    // Main thread (frame loop forwards the session's XrEventDataInteractionProfileChanged). Marks the
+    // per-hand profile cache dirty so the next sample() re-reads xrGetCurrentInteractionProfile.
+    void notifyInteractionProfileChanged() {
+        m_profileDirty.store(true, std::memory_order_release);
     }
 
     // Frame-thread READ-ONLY exports for the WP-G2 chrome draw pass. These only surface state that
@@ -189,6 +219,9 @@ class CXRInput {
     bool suggestBindings();
     bool createActionSpaces();
     void logInteractionProfileOnce();
+    // WP-G5: re-read each hand's current interaction profile (xrGetCurrentInteractionProfile) and
+    // update m_handActive + the status atomic. Called from sample() when m_profileDirty.
+    void refreshHandProfiles();
     // Fire-and-forget haptic tick on a hand (doc 04 §6.3). No-op / ignored if the current
     // profile has no haptic binding.
     void                             hapticTick(OpenXR::eXRHand hand);
@@ -199,20 +232,33 @@ class CXRInput {
     XrSession                        m_session            = XR_NULL_HANDLE;
     bool                             m_hasHandInteraction = false;
 
-    XrActionSet                      m_actionSet    = XR_NULL_HANDLE;
-    XrAction                         m_aimAction    = XR_NULL_HANDLE;
-    XrAction                         m_gripAction   = XR_NULL_HANDLE;
-    XrAction                         m_selectAction = XR_NULL_HANDLE;
-    XrAction                         m_grabAction   = XR_NULL_HANDLE;
-    XrAction                         m_scrollAction = XR_NULL_HANDLE;
-    XrAction                         m_menuAction   = XR_NULL_HANDLE;
-    XrAction                         m_hapticAction = XR_NULL_HANDLE;
+    XrActionSet                      m_actionSet       = XR_NULL_HANDLE;
+    XrAction                         m_aimAction       = XR_NULL_HANDLE;
+    XrAction                         m_gripAction      = XR_NULL_HANDLE;
+    XrAction                         m_selectAction    = XR_NULL_HANDLE;
+    XrAction                         m_grabAction      = XR_NULL_HANDLE;
+    XrAction                         m_scrollAction    = XR_NULL_HANDLE;
+    XrAction                         m_menuAction      = XR_NULL_HANDLE;
+    XrAction                         m_hapticAction    = XR_NULL_HANDLE;
+    // WP-G5: hand pinch (ext/hand_interaction_ext). pinch_ext/value drives the hand grab gesture;
+    // pinch_ext/pose is the stable MOVE-grab anchor. Both created only when hasHandInteraction.
+    XrAction                         m_pinchValueAction = XR_NULL_HANDLE;
+    XrAction                         m_pinchPoseAction  = XR_NULL_HANDLE;
 
     std::array<XrPath, 2>            m_handPath{XR_NULL_PATH, XR_NULL_PATH};
     std::array<XrSpace, 2>           m_aimSpace{XR_NULL_HANDLE, XR_NULL_HANDLE};
     std::array<XrSpace, 2>           m_gripSpace{XR_NULL_HANDLE, XR_NULL_HANDLE};
+    std::array<XrSpace, 2>           m_pinchSpace{XR_NULL_HANDLE, XR_NULL_HANDLE};
 
     std::array<SXRHandState, 2>      m_hands;
+
+    // WP-G5 active-device cache (frame thread). m_handActive[h] is true iff hand h's current
+    // interaction profile is ext/hand_interaction_ext; refreshed in sample() when m_profileDirty
+    // (set at attach + on XrEventDataInteractionProfileChanged via notifyInteractionProfileChanged).
+    // m_handInputKindAtomic mirrors the kind for the main-thread status read.
+    std::array<bool, 2>                    m_handActive{false, false};
+    std::array<std::atomic<uint8_t>, 2>    m_handInputKindAtomic{}; // OpenXR::eXRInputKind
+    std::atomic<bool>                      m_profileDirty{true};
 
     bool                             m_attached      = false;
     bool                             m_profileLogged = false; // interaction profile logged once for debuggability
@@ -240,6 +286,10 @@ class CXRInput {
     // push-pull/resize for MOVE vs grabResizeCorner for RESIZE) and the release path (endGrab vs
     // endResize). The ring holds carried QUAD poses for MOVE, GRIP poses for RESIZE (both latched).
     std::array<OpenXR::eXRGrabKind, 2> m_grabKind{OpenXR::XR_GRABKIND_NONE, OpenXR::XR_GRABKIND_NONE};
+    // WP-G5: whether each hand's active grab is anchored to the pinch pose (hands) vs the grip pose
+    // (controllers/grasp). Drives which device pose feeds beginGrab/per-frame carry/resize + the
+    // release latch, so begin and every subsequent frame use a consistent device space.
+    std::array<bool, 2> m_grabDevicePinch{false, false};
 
     // ---- release-latching (WP-G4, research 04-grabbable-borders.md §5.4) ----
     // Per-hand ring of the carried quad's world pose, pushed every grabbed frame. On the release
