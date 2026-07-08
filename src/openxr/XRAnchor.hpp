@@ -28,6 +28,15 @@ namespace OpenXR {
         XR_HAND_RIGHT,
     };
 
+    // What kind of grab currently owns a quad (WP-G3). MOVE re-poses the quad rigidly to the grip
+    // (the solve device-lock override); RESIZE keeps the quad in its persistent mode but scales its
+    // CONTENT size about the pinned opposite corner. Surfaced in `hyprctl openxr status`.
+    enum eXRGrabKind : uint8_t {
+        XR_GRABKIND_NONE = 0,
+        XR_GRABKIND_MOVE,
+        XR_GRABKIND_RESIZE,
+    };
+
     // Which XrSpace the quad layer must reference; mapped to real handles by CXRMonitorLayer.
     enum eXRSpaceSelector : uint8_t {
         XR_SPACE_LOCAL_FLOOR = 0,
@@ -181,6 +190,23 @@ namespace OpenXR {
         // the view + grip context needed to re-express the world pose into the persistent mode.
         void endGrab(const SXRPose& releaseWorld, const SXRSolveInput& in, const SXRAnchorTuning& tune);
 
+        // ---- corner resize grab (WP-G3) ----
+        // A resize grab does NOT device-lock the quad to the grip (m_grabbed stays false, so solve()
+        // keeps running the persistent anchor mode); it scales the CONTENT width in meters while the
+        // OPPOSITE corner stays pinned (visionOS-like). Aspect is fixed by the pixel mode, so the new
+        // width comes from projecting the grabbing hand's motion onto the content diagonal through the
+        // grabbed corner. `aspectHW` = contentHeight/contentWidth. `beginResize` snapshots the pinned
+        // corner + diagonal from the current displayed pose (needs hasLastWorld()); `grabResizeCorner`
+        // updates size + re-anchors every frame from the current grip world pose; `endResize` applies
+        // one final update from a latched grip pose (WP-G4 ring — the size/position is computed from
+        // the pre-release sample, not the release frame, so a release jerk can't perturb the size) and
+        // clears the resize. All re-express through reanchorFromWorld, so head/body/device modes keep
+        // their offset semantics (the opposite corner is pinned in the quad's frame, not fighting the
+        // leash — reanchor re-seeds the spring at the resized pose each frame rather than chasing it).
+        void beginResize(eXRHand hand, eXRQuadRegion corner, const SXRPose& gripWorld, float aspectHW);
+        void grabResizeCorner(const SXRPose& gripWorld, const SXRSolveInput& in, const SXRAnchorTuning& tune);
+        void endResize(const SXRPose& gripWorldLatched, const SXRSolveInput& in, const SXRAnchorTuning& tune);
+
         // ---- verbs (§5) — main thread, under the layer mutex ----
         // d = (dx, dy, dz) as given by the user; the solver forms view -Z for dz.
         bool applyMove(const Vec3& d, const SXRVerbContext& ctx);
@@ -203,8 +229,13 @@ namespace OpenXR {
         bool hasLastWorld() const {
             return m_hasLastWorld;
         }
+        // A quad is "grabbed" (exclusive; no other hand may grab it, IPC reports it) for EITHER a
+        // move grab or a corner resize grab (WP-G3).
         bool grabbed() const {
-            return m_grabbed;
+            return m_grabbed || m_resizing;
+        }
+        eXRGrabKind grabKind() const {
+            return m_resizing ? XR_GRABKIND_RESIZE : (m_grabbed ? XR_GRABKIND_MOVE : XR_GRABKIND_NONE);
         }
 
         SXRAnchorState m_state;
@@ -233,6 +264,18 @@ namespace OpenXR {
         eXRHand m_grabHand = XR_HAND_LEFT;
         SXRPose m_grabOffset;                // in grabbing hand's grip space
         bool    m_deviceOffsetDirty = false; // DEVICE: recompute offset on first valid grip
+        // corner resize grab (WP-G3): begin-snapshot of the pinned corner + diagonal in WORLD
+        // (LOCAL_FLOOR), so every frame derives width from the grip's projection onto that fixed
+        // diagonal and pins the opposite corner exactly (no per-frame drift).
+        bool    m_resizing = false;
+        float   m_resizeSx = 1.F, m_resizeSy = 1.F; // grabbed-corner signs (content world frame)
+        Vec3    m_resizePin;                         // opposite corner, world, fixed for the grab
+        Vec3    m_resizeDiagUnit;                    // unit pin->grabbed-corner direction, fixed
+        float   m_resizeL0     = 1.F;                // content diagonal length at grab start
+        float   m_resizeW0     = 1.F;                // content width (m) at grab start
+        float   m_resizeAspect = 1.F;                // contentH/contentW, fixed for the grab
+        SXRPose m_resizeGrip0;                        // grip world pose at grab start
+        Quat    m_resizeRot;                          // content orientation held during the resize
         // last composed world pose (LOCAL_FLOOR)
         SXRPose m_lastWorld;
         bool    m_hasLastWorld = false;

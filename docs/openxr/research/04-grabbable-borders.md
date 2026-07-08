@@ -548,3 +548,34 @@ Dependency graph: `G1 → {G2, G3}`, `G4` (parallel, depends only on current cod
    from optional).
 5. New scope vs §6: corner-resize handles (hands pinch a corner to resize; controllers keep
    stick-resize too) and bar auto-hide need to be folded into the WP slicing.
+
+## 9. WP-G3 as implemented (2026-07-08)
+
+- **Gating helper** (`XRMath.hpp`, pure/gtest): `grabActionForRegion(region, grabAnywhere,
+  handActive) -> {NONE, MOVE, RESIZE_TL/TR/BL/BR}`. BAR→MOVE always; CORNER_*→RESIZE (that corner)
+  always; BODY→MOVE iff `grab_anywhere && !handActive`; MARGIN/NONE→NONE. `handActive` is the
+  WP-G5 slot (hands forced to chrome) — passed `false` today; G5 flips it with no rework. Replaces
+  WP-G1's BODY hard-gate in both `CXRInput::processPointer` grab paths (hover + cone fallback).
+- **Bar move-grab** reuses the existing move machine verbatim (`beginGrab`/`endGrab` + WP-G4 ring
+  of carried QUAD poses); only the trigger region changed.
+- **Corner resize** (`CXRAnchor::beginResize/grabResizeCorner/endResize`, pure/gtest): a resize
+  does NOT device-lock the quad (`m_grabbed` stays false → `solve()` keeps running the persistent
+  mode); instead it scales the CONTENT width in meters with the OPPOSITE corner pinned. `beginResize`
+  snapshots the pinned corner + pin→corner diagonal (world) + start width; each frame the width comes
+  from the grabbing grip's projection onto that fixed diagonal (aspect fixed by the pixel mode), the
+  new content center is the diagonal midpoint, and the resized content pose is re-expressed via the
+  existing `reanchorFromWorld`. Clamps to the SAME `XR_WIDTH_MIN/MAX` (0.2–4.0 m) the stick-resize
+  uses — no new min/max vars; both paths mutate `m_state.widthMeters` under `m_layersMu`.
+- **Anchor modes**: because resize routes through `reanchorFromWorld`, LOCAL pins the opposite
+  corner exactly in world; head/body/device re-seed the offset (and spring) at the resized pose each
+  frame, so the leash FOLLOWS the size change instead of fighting it and the mode is preserved (a
+  head-leashed quad stays head-leashed). Orientation is held at the grab-start value for a stable
+  diagonal.
+- **Release latch reuse**: the WP-G4 ring is repurposed per grab kind — it holds carried QUAD poses
+  for a MOVE (pose latch, as before) and GRIP poses for a RESIZE. `endResize` runs one final
+  `grabResizeCorner` from `pickReleasePose(...)` (the latched / velocity-rejected GRIP sample), so a
+  release jerk perturbs neither the final size nor the pinned-corner position — size gets the same
+  lurch rejection the move path gets for free.
+- **Config**: one new var `openxr:grab_anywhere` (bool, default true), read per-frame (hot-toggles).
+- **Status**: `hyprctl openxr status` adds `grabKind` (`none`|`move`|`resize`); JSON keeps `grabbed`
+  boolean for back-compat and adds a `"grabKind"` string.

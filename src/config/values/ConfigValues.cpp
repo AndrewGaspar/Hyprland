@@ -724,6 +724,10 @@ std::vector<SP<IValue>> Values::getConfigValues() {
         MS<Float>("openxr:pointer_trigger_threshold_release", "trigger analog value that releases the pointer button (hysteresis)", 0.4, {.min = 0.0, .max = 1.0}),
         MS<Float>("openxr:grab_threshold", "squeeze analog value that starts a grab", 0.7, {.min = 0.0, .max = 1.0}),
         MS<Float>("openxr:grab_threshold_release", "squeeze analog value that ends a grab (hysteresis)", 0.4, {.min = 0.0, .max = 1.0}),
+        MS<Bool>("openxr:grab_anywhere",
+                 "let a squeeze/grip on a monitor's CONTENT body move it (the controller convenience). true keeps grab-anywhere for controllers; false confines moving "
+                 "to the bottom move-bar and resizing to the corner handles. The bar and corners always grab regardless. Read per-frame (hot-toggles)",
+                 true),
         MS<Int>("openxr:grab_release_latency_ms",
                 "on grab release, re-anchor from the quad pose sampled this many ms BEFORE the release edge, to reject the release-motion lurch (the grip/hand "
                 "swing on the release frame). 0 = use the release frame. ~100 clears the perturbation; raise it if releases still lurch, lower it if a quick "

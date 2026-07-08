@@ -356,6 +356,8 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
     static auto PSCROLLSPD  = CConfigValue<Hyprlang::FLOAT>("openxr:scroll_speed");
     static auto PRELLATENCY = CConfigValue<Hyprlang::INT>("openxr:grab_release_latency_ms");
     static auto PRELVELREJ  = CConfigValue<Hyprlang::FLOAT>("openxr:grab_release_velocity_reject");
+    static auto PGRABANY    = CConfigValue<Hyprlang::INT>("openxr:grab_anywhere");
+    const bool  grabAnywhere = *PGRABANY != 0;
     const float onT         = (float)*PSELON;
     const float offT        = (float)*PSELOFF;
     const float grabOnT     = (float)*PGRABON;
@@ -463,43 +465,66 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
 
         if (m_grabTrig[hand].update(m_hands[hand].grab, grabOnT, grabOffT)) {
             if (m_grabTrig[hand].state) {
-                // Rising edge: try to begin a grab on the BODY-hovered quad, or (if not hovering a
-                // body) redo the intersection with the 5-degree entry cone (doc 04 §6). WP-G1 keeps
-                // grab gated to the BODY region only (the bar/corner grab semantics arrive in WP-G3)
-                // so behavior is identical to today: the quad body IS the whole content, and grab-
-                // anywhere-on-content still works. Chrome margin hits never grab here.
+                // Rising edge: the grab gesture is gated by the chrome region it landed on (WP-G3).
+                // The BAR moves; a CORNER resizes (from that corner); the BODY moves only with
+                // openxr:grab_anywhere (the controller-grip convenience); the transparent MARGIN
+                // never grabs. grabActionForRegion() is the single decision point (handActive=false
+                // until WP-G5 forces hands to the chrome). Prefer the region the hover step already
+                // classified this frame; otherwise redo the intersection with the 5-degree entry
+                // cone (doc 04 §6) and take the nearest hit whose region yields a grab action.
                 const SXRPointerTarget* target = nullptr;
-                if (m_hoverMon[hand] >= 0) {
-                    for (const auto& t : targets)
-                        if (t.id == m_hoverMon[hand]) {
-                            target = &t;
-                            break;
-                        }
+                OpenXR::eXRGrabAction   action = OpenXR::XR_GRAB_ACTION_NONE;
+                OpenXR::eXRQuadRegion   region = OpenXR::XR_REGION_NONE;
+
+                if (m_hoverChromeMon[hand] >= 0) {
+                    const OpenXR::eXRGrabAction a = OpenXR::grabActionForRegion(m_hoverRegion[hand], grabAnywhere, /*handActive*/ false);
+                    if (a != OpenXR::XR_GRAB_ACTION_NONE) {
+                        for (const auto& t : targets)
+                            if (t.id == m_hoverChromeMon[hand]) {
+                                target = &t;
+                                action = a;
+                                region = m_hoverRegion[hand];
+                                break;
+                            }
+                    }
                 }
                 if (!target && m_hands[hand].aim) {
                     const OpenXR::SXRPose&  aim    = *m_hands[hand].aim;
                     const OpenXR::Vec3      origin = aim.pos;
                     const OpenXR::Vec3      dir    = OpenXR::qRotate(aim.rot, OpenXR::Vec3{0.f, 0.f, -1.f});
                     float                   bestT  = std::numeric_limits<float>::max();
-                    const SXRPointerTarget* best   = nullptr;
                     for (const auto& t : targets) {
                         const auto pt = planeT(t.worldPose, origin, dir);
                         if (!pt)
                             continue;
                         const float              slack = std::tan(XR_GRAB_CONE_DEG * (float)M_PI / 180.F) * (*pt);
                         const OpenXR::SXRQuadHit hit   = OpenXR::rayQuadIntersect(t.worldPose, origin, dir, t.w, t.h, slack);
-                        // Only a BODY hit grabs (WP-G1). The cone forgiveness expands the bounds, so
-                        // a hit can land in the transparent margin — classify and require BODY.
-                        if (hit.hit && hit.t < bestT && OpenXR::classifyQuadHit(hit.u, hit.v, t.chrome) == OpenXR::XR_REGION_BODY) {
-                            bestT = hit.t;
-                            best  = &t;
-                        }
+                        if (!hit.hit || hit.t >= bestT)
+                            continue;
+                        const OpenXR::eXRQuadRegion  reg = OpenXR::classifyQuadHit(hit.u, hit.v, t.chrome);
+                        const OpenXR::eXRGrabAction  a   = OpenXR::grabActionForRegion(reg, grabAnywhere, /*handActive*/ false);
+                        if (a == OpenXR::XR_GRAB_ACTION_NONE)
+                            continue;
+                        bestT  = hit.t;
+                        target = &t;
+                        action = a;
+                        region = reg;
                     }
-                    target = best;
                 }
 
-                if (target && target->anchor && !target->anchor->grabbed() && worldGrip) {
-                    target->anchor->beginGrab(hand, *worldGrip);
+                if (target && target->anchor && !target->anchor->grabbed() && worldGrip && action != OpenXR::XR_GRAB_ACTION_NONE) {
+                    if (OpenXR::xrGrabActionIsResize(action)) {
+                        // Content aspect (h/w) from the target's full-quad meters * chrome content
+                        // fractions — held fixed for the resize (matches the solve's pixel aspect).
+                        const float contentW = target->w * target->chrome.contentFracW();
+                        const float contentH = target->h * target->chrome.contentFracH();
+                        const float aspect   = contentW > 0.f ? contentH / contentW : 1.f;
+                        target->anchor->beginResize(hand, region, *worldGrip, aspect);
+                        m_grabKind[hand] = OpenXR::XR_GRABKIND_RESIZE;
+                    } else {
+                        target->anchor->beginGrab(hand, *worldGrip);
+                        m_grabKind[hand] = OpenXR::XR_GRABKIND_MOVE;
+                    }
                     m_grabbing[hand]       = true;
                     m_grabbedMon[hand]     = target->id;
                     m_grabbedMonName[hand] = target->name;
@@ -509,8 +534,9 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                     hapticTick(hand);
                     emitGrabState(target->id, target->name, true);
                 }
-                // else: no target even with cone forgiveness, or it's already grabbed by the
-                // other hand -> the squeeze is ignored, no state change (doc 04 §6).
+                // else: the region isn't grabbable (margin / body without grab_anywhere), no target
+                // even with cone forgiveness, or it's already grabbed by the other hand -> the
+                // squeeze is ignored, no state change (doc 04 §6 / research §5.2).
             } else if (m_grabbing[hand]) {
                 // Falling edge: end the grab and re-anchor into the persistent mode. WP-G4: instead
                 // of re-anchoring from THIS frame's grip pose (which the release gesture just
@@ -524,7 +550,17 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                         break;
                     }
                 if (target && target->anchor) {
-                    if (m_grabRing[hand].size() > 0) {
+                    if (m_grabKind[hand] == OpenXR::XR_GRABKIND_RESIZE) {
+                        // The ring holds GRIP poses for a resize; the latched/velocity-rejected grip
+                        // gives the FINAL size + pinned-corner position, rejecting the release jerk.
+                        const std::optional<OpenXR::SXRPose>& grip = hand == XR_HAND_LEFT ? solveIn.gripLeft : solveIn.gripRight;
+                        if (m_grabRing[hand].size() > 0) {
+                            const OpenXR::SXRPose latchedGrip = OpenXR::pickReleasePose(m_grabRing[hand], timeMs, relLatencyMs, relVelReject);
+                            target->anchor->endResize(latchedGrip, solveIn, tune);
+                        } else if (grip)
+                            target->anchor->endResize(*grip, solveIn, tune);
+                        // else: no grip and no history -> leave the last resized size in place.
+                    } else if (m_grabRing[hand].size() > 0) {
                         const OpenXR::SXRPose releaseWorld = OpenXR::pickReleasePose(m_grabRing[hand], timeMs, relLatencyMs, relVelReject);
                         target->anchor->endGrab(releaseWorld, solveIn, tune);
                     } else
@@ -536,6 +572,7 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                 m_grabbing[hand]   = false;
                 m_grabbedMon[hand] = -1;
                 m_grabbedMonName[hand].clear();
+                m_grabKind[hand]   = OpenXR::XR_GRABKIND_NONE;
                 m_grabRing[hand].reset();
             }
         }
@@ -554,6 +591,16 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                 m_grabbing[hand]   = false;
                 m_grabbedMon[hand] = -1;
                 m_grabbedMonName[hand].clear();
+                m_grabKind[hand]   = OpenXR::XR_GRABKIND_NONE;
+            } else if (m_grabKind[hand] == OpenXR::XR_GRABKIND_RESIZE) {
+                // Corner resize: drive the size from THIS frame's grip world pose and record the grip
+                // for the release latch. No stick verbs — the hand's motion is the resize. (Runs
+                // under m_layersMu, same discipline as the stick-resize path — both mutate widthMeters.)
+                const std::optional<OpenXR::SXRPose>& grip = hand == XR_HAND_LEFT ? solveIn.gripLeft : solveIn.gripRight;
+                if (grip) {
+                    target->anchor->grabResizeCorner(*grip, solveIn, tune);
+                    m_grabRing[hand].push(*grip, timeMs);
+                }
             } else {
                 const Vector2D stick = m_hands[hand].stick;
                 if (std::fabs(stick.y) > XR_STICK_DEADZONE)
