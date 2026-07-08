@@ -14,7 +14,10 @@
 # Then drive the fake head/controllers interactively with:
 #   subprojects/monado/build/src/xrt/targets/gui/monado-gui remote
 #
-# Ctrl-C here stops everything. Kills ONLY the PIDs it spawned.
+# The nested Hyprland runs under its OWN private DBus session bus (dbus-run-session)
+# in an isolated process group, so DBus/GApplication singletons (walker, mako, the
+# browser, …) start fresh nested instead of routing to their HOST instances.
+# Ctrl-C here stops everything. Kills ONLY the PIDs/process group it spawned.
 #
 # Usage: preview-xr.sh [--wivrn] [--passthrough] [--env <spec>] [--conf <file>]
 #   --wivrn                 use the system WiVRn runtime (real headset!) instead of
@@ -90,6 +93,19 @@ mkdir -p "$LOGDIR"
 
 [[ -x $HYPRLAND_BIN ]] || { echo "missing $HYPRLAND_BIN — build first (or set HYPRLAND_BIN, e.g. to build-rel/Hyprland)"; exit 1; }
 
+# The nested Hyprland runs under a PRIVATE DBus session bus (see the launch below):
+# without it the nested session shares the HOST's session bus (same XDG_RUNTIME_DIR),
+# so DBus/GApplication singletons (walker, the browser, nautilus, obsidian, mako…)
+# delegate a nested launch to their already-running HOST instance and the window
+# opens on the HOST display instead of nested. dbus-run-session gives the nested
+# session its own bus so those singletons start fresh inside it.
+command -v dbus-run-session >/dev/null || {
+    echo "dbus-run-session not found (install 'dbus' / dbus-daemon) — required to give the"
+    echo "nested session a private DBus bus so app launches land nested, not on the host."
+    exit 1
+}
+command -v setsid >/dev/null || { echo "setsid not found (install util-linux) — required for signal-safe nested teardown"; exit 1; }
+
 if [[ $USE_WIVRN -eq 1 ]]; then
     # Real-headset mode: talk to the system WiVRn runtime instead of our vendored Monado.
     RUNTIME_JSON="${WIVRN_RUNTIME_JSON:-/usr/share/openxr/1/openxr_wivrn.json}"
@@ -143,8 +159,28 @@ MONADO_PID=""
 HL_PID=""
 PAPER_PID=""
 cleanup() {
-    # PID-targeted only — never kill by name (the host compositor is also "Hyprland").
-    [[ -n $HL_PID ]] && kill "$HL_PID" 2>/dev/null && sleep 1 && kill -9 "$HL_PID" 2>/dev/null
+    # PID/PGID-targeted only — never kill by name (the host compositor is also "Hyprland").
+    #
+    # The nested Hyprland is launched via `setsid dbus-run-session -- Hyprland …`,
+    # so HL_PID is dbus-run-session, sitting at the head of its OWN session/process
+    # group (leader PID == HL_PID) that also holds the private dbus-daemon, Hyprland,
+    # and Hyprland's in-group exec children (waybar, mako, walker/elephant, …).
+    # dbus-run-session does NOT reliably forward signals to its child, so we kill the
+    # whole group by NEGATIVE pgid — that reaps the private bus AND the nested session
+    # in one shot. Guard: only group-kill when HL_PID really is its group's leader
+    # (setsid succeeded); setsid isolated this group from the SCRIPT's own group, so
+    # this can never signal ourselves or the host session. Fall back to a plain PID
+    # kill if the group can't be confirmed.
+    if [[ -n $HL_PID ]]; then
+        local pgid
+        pgid="$(ps -o pgid= -p "$HL_PID" 2>/dev/null | tr -d ' ' || true)"
+        if [[ -n $pgid && $pgid == "$HL_PID" ]]; then
+            kill -TERM -"$pgid" 2>/dev/null && sleep 1
+            kill -KILL -"$pgid" 2>/dev/null
+        else
+            kill "$HL_PID" 2>/dev/null && sleep 1 && kill -9 "$HL_PID" 2>/dev/null
+        fi
+    fi
     [[ -n $PAPER_PID ]] && kill "$PAPER_PID" 2>/dev/null && sleep 1 && kill -9 "$PAPER_PID" 2>/dev/null
     [[ -n $MONADO_PID ]] && kill "$MONADO_PID" 2>/dev/null && sleep 1 && kill -9 "$MONADO_PID" 2>/dev/null
     echo "stopped. logs in $LOGDIR"
@@ -193,12 +229,29 @@ if [[ -n $ENV_SPEC ]]; then
     kill -0 "$PAPER_PID" 2>/dev/null || { echo "hypxrpaper died, see $LOGDIR/hypxrpaper.log"; exit 1; }
 fi
 
-echo ">> starting nested dev Hyprland with XR enabled..."
+echo ">> starting nested dev Hyprland with XR enabled (private DBus session bus)..."
 # Snapshot existing instance signatures so we can spot the new one.
 HYPR_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/hypr"
 mapfile -t SIGS_BEFORE < <(ls -1 "$HYPR_DIR" 2>/dev/null)
 
-env XR_RUNTIME_JSON="$RUNTIME_JSON" \
+# Private DBus session bus for the nested session:
+#   setsid            -> put the nested tree in its OWN session/process group,
+#                        isolated from this script's group, so cleanup can kill the
+#                        whole group (bus + compositor + children) without touching
+#                        the script or the host session.
+#   dbus-run-session  -> start a fresh dbus-daemon, export DBUS_SESSION_BUS_ADDRESS,
+#                        and exec Hyprland under it. Hyprland's exec/keybind spawns
+#                        fork+exec, preserving env, so every nested app inherits this
+#                        private bus — GApplication/DBus singletons (walker, mako, the
+#                        browser, …) start FRESH here instead of routing to the host.
+# NOTE side effects of the private bus (acceptable for a preview):
+#   * notifications from nested apps go to the nested mako, not the host.
+#   * xdg-desktop-portal dbus-activates fresh on this bus (file pickers/screencast may
+#     be limited until a nested portal backend answers — observe, don't rely on it).
+#   * host DBus services (NetworkManager applet, etc.) are absent on this bus — a
+#     nested tray applet talks to an empty bus. Fine for a desktop preview.
+setsid env XR_RUNTIME_JSON="$RUNTIME_JSON" \
+    dbus-run-session -- \
     "$HYPRLAND_BIN" --config "$CONF" \
     >"$LOGDIR/hyprland.log" 2>&1 &
 HL_PID=$!
