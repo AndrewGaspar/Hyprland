@@ -117,6 +117,8 @@ void CXRAnchor::initFromState(const SXRAnchorState& state) {
     m_deviceOffsetDirty  = false;
     m_grabbed            = false;
     m_grabPinch          = false;
+    m_grabHandActive     = false;
+    m_carryFilter.reset();
     m_resizing           = false;
     // m_lastWorld / m_hasLastWorld intentionally preserved: switching representation of an
     // existing on-screen quad should not lose where it currently is.
@@ -187,9 +189,21 @@ SXRSolveResult CXRAnchor::solve(const SXRSolveInput& in, const SXRAnchorTuning& 
             m_grabOffset.rot = qMul(qInverse(dev->rot), face);
         }
 
-        res.pose       = m_grabOffset;
-        res.worldPose  = dev ? poseCompose(*dev, m_grabOffset) : m_lastWorld;
-        m_lastWorld    = res.worldPose;
+        // WP-G6: optional 1€ low-pass on the carried pose (hands only, opt-in). Filtering means we
+        // can no longer use the runtime's zero-latency device-space late-latch — the smoothed pose no
+        // longer equals a rigid device-space offset — so submit the FILTERED world pose in LOCAL_FLOOR
+        // instead (§5.4 trade-off: +~1 frame latency, −jitter). Controllers and filter-off keep the
+        // exact device-space path below. m_lastWorld becomes the filtered pose, so the WP-G4 release
+        // ring records what the user actually saw and the release re-anchors to match.
+        SXRPose world = dev ? poseCompose(*dev, m_grabOffset) : m_lastWorld;
+        if (in.grabFilter && m_grabHandActive && dev) {
+            world     = oneEuroStepPose(m_carryFilter, world, dt, in.grabFilterMinCutoff, in.grabFilterBeta);
+            res.space = XR_SPACE_LOCAL_FLOOR;
+            res.pose  = world;
+        } else
+            res.pose = m_grabOffset;
+        res.worldPose  = world;
+        m_lastWorld    = world;
         m_hasLastWorld = true;
         return res;
     }
@@ -321,13 +335,15 @@ SXRSolveResult CXRAnchor::solve(const SXRSolveInput& in, const SXRAnchorTuning& 
 
 // ---- grab pose math (§4) ----
 
-void CXRAnchor::beginGrab(eXRHand hand, const SXRPose& deviceWorld, bool usePinch) {
+void CXRAnchor::beginGrab(eXRHand hand, const SXRPose& deviceWorld, bool usePinch, bool handActive) {
     // Capture the quad's current displayed world pose relative to the grabbing hand's device
     // pose (§4.1). `deviceWorld` is the grip pose (controllers/grasp) or the pinch pose (WP-G5).
-    m_grabOffset = poseCompose(poseInverse(deviceWorld), m_lastWorld);
-    m_grabbed    = true;
-    m_grabHand   = hand;
-    m_grabPinch  = usePinch;
+    m_grabOffset     = poseCompose(poseInverse(deviceWorld), m_lastWorld);
+    m_grabbed        = true;
+    m_grabHand       = hand;
+    m_grabPinch      = usePinch;
+    m_grabHandActive = handActive; // WP-G6: eligible for the 1€ carry filter
+    m_carryFilter.reset();         // fresh smoothing each grab (no carry-over from a prior grab)
 }
 
 void CXRAnchor::grabPushPull(float deltaMeters) {
