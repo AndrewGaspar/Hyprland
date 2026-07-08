@@ -54,11 +54,11 @@ done
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MONADO_BUILD="${MONADO_BUILD:-$REPO/subprojects/monado/build}"
-HYPRLAND_BIN="$REPO/build-debug/Hyprland"
+HYPRLAND_BIN="${HYPRLAND_BIN:-$REPO/build-debug/Hyprland}"
 LOGDIR="${TMPDIR:-/tmp}/hypxrland-preview-$$"
 mkdir -p "$LOGDIR"
 
-[[ -x $HYPRLAND_BIN ]] || { echo "missing $HYPRLAND_BIN — build first: cmake --build build-debug --target Hyprland"; exit 1; }
+[[ -x $HYPRLAND_BIN ]] || { echo "missing $HYPRLAND_BIN — build first (or set HYPRLAND_BIN, e.g. to build-rel/Hyprland)"; exit 1; }
 
 if [[ $USE_WIVRN -eq 1 ]]; then
     # Real-headset mode: talk to the system WiVRn runtime instead of our vendored Monado.
