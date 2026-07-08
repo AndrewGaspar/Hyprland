@@ -5,6 +5,7 @@
 #include <string>
 #include <atomic>
 #include <expected>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -38,6 +39,12 @@ class CXRSession;
 class CXRGraphics;
 class CXRMonitorLayer;
 class CXRPointerDevice;
+
+// XR monitor layers cross the frame thread via std::shared_ptr (atomic control block), NOT the
+// codebase-standard hyprutils SP whose refcount is a plain int (see the thread-safety rule in
+// XRMonitorLayer.hpp, where this alias is also defined identically for the layer TU). Declared
+// here against the incomplete type so this lightweight header need not pull in the XR headers.
+using PXRLAYER = std::shared_ptr<CXRMonitorLayer>;
 
 // The single main-thread entry point the rest of Hyprland touches for OpenXR.
 // Owns the lifecycle state machine and funnels the three enable/disable entry points
@@ -74,8 +81,8 @@ class COpenXRManager {
     // state (including DISABLED) so monitors created without a session become plain headless
     // outputs whose quads bind lazily on start() (doc 02). WP3 exercises this with a single
     // hard-coded test monitor; the config keyword/dispatcher/hyprctl surfaces are WP4.
-    std::expected<SP<CXRMonitorLayer>, std::string> createXRMonitor(const SXRMonitorParams& params);
-    void                                            destroyXRMonitor(const std::string& name);
+    std::expected<PXRLAYER, std::string> createXRMonitor(const SXRMonitorParams& params);
+    void                                 destroyXRMonitor(const std::string& name);
 
     // --- IPC verb funnel (main thread). ONE implementation, two transports: the xrmonitor
     // dispatcher and the hyprctl openxr subcommands both call these (doc 05 §3/§4). Return
@@ -156,9 +163,9 @@ class COpenXRManager {
     // --- selection + layer cap (main thread) ---
     // Resolve the "the" monitor per doc 05 §3.2: explicit selection > last ray-hovered (WP7) >
     // focused-if-XR. Returns null if none resolves.
-    SP<CXRMonitorLayer> resolveSelected();
-    SP<CXRMonitorLayer> layerByName(const std::string& name);
-    SP<CXRMonitorLayer> layerByMonitorID(MONITORID id);
+    PXRLAYER            resolveSelected();
+    PXRLAYER            layerByName(const std::string& name);
+    PXRLAYER            layerByMonitorID(MONITORID id);
     // Main-thread hover bookkeeping driven by the ray pointer (doc 04 §3/§9): mark `name` (or "")
     // as the owner's currently-hovered XR monitor, updating layer.m_hovered flags and the
     // last-ray-hovered selection candidate.
@@ -214,8 +221,12 @@ class COpenXRManager {
     std::atomic<bool> m_running{false};
 
     // XR monitor layers. m_layers is written on the main thread and snapshotted per frame by
-    // the frame thread, both under m_layersMu (doc 00 handoff table).
-    std::vector<SP<CXRMonitorLayer>> m_layers;
+    // the frame thread, both under m_layersMu (doc 00 handoff table). std::shared_ptr, NOT
+    // hyprutils SP: the snapshot copies cross threads and only shared_ptr's refcount is atomic
+    // (see the thread-safety rule in XRMonitorLayer.hpp). The frame thread additionally drops
+    // its toRemove refs BEFORE acking a removal, so finalizeLayerRemoval always holds the last
+    // ref and ~CXRMonitorLayer (which releases hyprutils WPs/listeners) runs on main.
+    std::vector<PXRLAYER>            m_layers;
     std::mutex                       m_layersMu;
     uint64_t                         m_seqCounter = 0;
 

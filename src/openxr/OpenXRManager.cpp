@@ -518,7 +518,7 @@ void COpenXRManager::setHoveredMonitor(const std::string& name) {
     }
 }
 
-SP<CXRMonitorLayer> COpenXRManager::layerByMonitorID(MONITORID id) {
+PXRLAYER COpenXRManager::layerByMonitorID(MONITORID id) {
     std::scoped_lock lock(m_layersMu);
     for (auto& l : m_layers) {
         if (l->m_pendingRemoval.load(std::memory_order_acquire))
@@ -605,8 +605,8 @@ void COpenXRManager::frameThread() {
         // Snapshot the layer set: bound + non-pending-removal layers become the active set;
         // pending-removal layers are collected for frame-side teardown (removal barrier
         // step 2). Both under m_layersMu (doc 00 handoff table).
-        std::vector<SP<CXRMonitorLayer>> active;
-        std::vector<SP<CXRMonitorLayer>> toRemove;
+        std::vector<PXRLAYER> active;
+        std::vector<PXRLAYER> toRemove;
         {
             std::scoped_lock lock(m_layersMu);
             active.reserve(m_layers.size());
@@ -619,7 +619,11 @@ void COpenXRManager::frameThread() {
         }
 
         // Removal barrier step 2: this layer is no longer submitted/blitted. Destroy its
-        // frame-side resources (once) and ack to main, which erases it + destroys the output.
+        // frame-side resources (once), DROP our refs, then ack to main. Order matters: main
+        // erases the layer on ack, and the last shared_ptr must die on the main thread —
+        // ~CXRMonitorLayer releases hyprutils WPs/listeners, which must not be released
+        // concurrently with main-thread refcount traffic (see XRMonitorLayer.hpp).
+        std::vector<std::string> removedNames;
         for (auto& l : toRemove) {
             if (l->m_removalAcked.exchange(true))
                 continue;
@@ -628,8 +632,11 @@ void COpenXRManager::frameThread() {
                 l->destroyFrameResourcesGL(*m_graphics);
             }
             l->destroySwapchain(); // context NOT current
-            reportLayerRemoved(l->m_monitorName);
+            removedNames.push_back(l->m_monitorName);
         }
+        toRemove.clear(); // drop refs BEFORE the acks — main may finalize (and erase) immediately
+        for (auto& name : removedNames)
+            reportLayerRemoved(name);
 
         // DEVIATION from doc 01's frame-loop pseudocode (which gates the pump on the state
         // already being SYNCHRONIZED/VISIBLE/FOCUSED): the runtime only advances
@@ -681,11 +688,16 @@ void COpenXRManager::frameThread() {
                     createLayerSwapchain(*l, newSize);
             }
 
-            // First bind: create a swapchain sized to the monitor's pixel mode.
+            // First bind: create a swapchain sized to the monitor's pixel mode, as cached by
+            // the main thread at bind/modeChanged (m_pendingSize under m_bufMu). The frame
+            // thread must NOT lock() m_monitor — hyprutils refcounts are not atomic and racing
+            // the main thread's copies corrupts them (see XRMonitorLayer.hpp).
             if (l->m_swapchain == XR_NULL_HANDLE) {
                 Vector2D size;
-                if (auto mon = l->m_monitor.lock())
-                    size = mon->m_pixelSize;
+                {
+                    std::lock_guard<std::mutex> lk(l->m_bufMu);
+                    size = l->m_pendingSize;
+                }
                 if (size.x >= 1 && size.y >= 1)
                     createLayerSwapchain(*l, size);
             }
@@ -710,8 +722,10 @@ void COpenXRManager::frameThread() {
             // that corrupts the heap in-process.
             CXRGraphics::CScopedGLContext ctx(*m_graphics);
 
-            if (XR_FAILED(xrAcquireSwapchainImage(l->m_swapchain, &acqInfo, &imgIdx)))
+            if (XR_FAILED(xrAcquireSwapchainImage(l->m_swapchain, &acqInfo, &imgIdx))) {
+                l->retireBuffer(std::move(buf)); // never let a valid buffer SP die on this thread
                 continue;
+            }
             XrSwapchainImageWaitInfo waitImg = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
             waitImg.timeout                  = XR_INFINITE_DURATION;
             xrWaitSwapchainImage(l->m_swapchain, &waitImg);
@@ -729,6 +743,10 @@ void COpenXRManager::frameThread() {
 
             XrSwapchainImageReleaseInfo relInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             xrReleaseSwapchainImage(l->m_swapchain, &relInfo);
+
+            // Hand the consumed buffer back for main-thread release — its final SP dec must
+            // not happen on this thread (non-atomic refcounts, see XRMonitorLayer.hpp).
+            l->retireBuffer(std::move(buf));
         }
 
         // --- anchor solve (WP5) ---
@@ -884,13 +902,15 @@ void COpenXRManager::frameThread() {
             // quads included), expressed in the aim poses' reference frame (undo the LOCAL
             // fallback floor shift, exactly as the reference-frame submission path above does).
             // `anchor` hands the grab machine (WP8) the live CXRAnchor for this layer, valid only
-            // for the rest of this frame (backed by `active`, a local SP<CXRMonitorLayer> vector).
-            if (auto mon = l->m_monitor.lock()) {
+            // for the rest of this frame (backed by `active`, a local PXRLAYER vector). The
+            // monitor id comes from the layer's main-thread-written cache — no m_monitor.lock()
+            // on this thread (non-atomic refcounts, see XRMonitorLayer.hpp).
+            if (const auto MONID = l->m_monitorId.load(std::memory_order_acquire); MONID >= 0) {
                 OpenXR::SXRPose worldRef = res.worldPose;
                 if (!m_session->m_usingLocalFloor)
                     worldRef.pos.y -= floorOffset;
                 SXRPointerTarget pt;
-                pt.id        = mon->m_id;
+                pt.id        = MONID;
                 pt.worldPose = worldRef;
                 pt.w         = res.widthMeters;
                 pt.h         = res.heightMeters;
@@ -991,7 +1011,7 @@ bool COpenXRManager::createLayerSwapchain(CXRMonitorLayer& layer, const Vector2D
     return true;
 }
 
-std::expected<SP<CXRMonitorLayer>, std::string> COpenXRManager::createXRMonitor(const SXRMonitorParams& params) {
+std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMonitorParams& params) {
     // Runs on the main thread; works in EVERY manager state (doc 02 — that is what makes lazy
     // binding possible).
 
@@ -1011,7 +1031,7 @@ std::expected<SP<CXRMonitorLayer>, std::string> COpenXRManager::createXRMonitor(
     // 2. Construct the layer (still unbound) and register it.
     static auto PSIZE      = CConfigValue<Hyprlang::FLOAT>("openxr:default_size");
     const float sizeMeters = params.m_sizeMeters.value_or((float)*PSIZE);
-    auto        layer      = makeShared<CXRMonitorLayer>(params.m_name, ++m_seqCounter, sizeMeters);
+    auto        layer      = std::make_shared<CXRMonitorLayer>(params.m_name, ++m_seqCounter, sizeMeters);
 
     // Seed the anchoring engine (WP5). widthMeters is the live quad width; height derives from
     // the pixel mode each frame.
@@ -1066,7 +1086,7 @@ std::expected<SP<CXRMonitorLayer>, std::string> COpenXRManager::createXRMonitor(
     // 4. Bind: cache the monitor + wire listeners. The onGone callback runs the removal
     //    barrier when the monitor is externally destroyed (path B).
     layer->bindToMonitor(mon, [this, name = params.m_name]() {
-        SP<CXRMonitorLayer> l;
+        PXRLAYER l;
         {
             std::scoped_lock lock(m_layersMu);
             for (auto& cand : m_layers)
@@ -1117,7 +1137,7 @@ std::expected<SP<CXRMonitorLayer>, std::string> COpenXRManager::createXRMonitor(
 }
 
 void COpenXRManager::destroyXRMonitor(const std::string& name) {
-    SP<CXRMonitorLayer> layer;
+    PXRLAYER layer;
     {
         std::scoped_lock lock(m_layersMu);
         for (auto& l : m_layers)
@@ -1141,7 +1161,7 @@ void COpenXRManager::destroyXRMonitor(const std::string& name) {
 
 void COpenXRManager::finalizeLayerRemoval(const std::string& name) {
     // Main thread. Erase the layer, then destroy its output if it still exists.
-    SP<CXRMonitorLayer> layer;
+    PXRLAYER layer;
     {
         std::scoped_lock lock(m_layersMu);
         for (auto it = m_layers.begin(); it != m_layers.end(); ++it) {
@@ -1154,6 +1174,11 @@ void COpenXRManager::finalizeLayerRemoval(const std::string& name) {
     }
     if (!layer)
         return;
+
+    // Release any queued/retired presented buffers here, on the main thread — their final SP
+    // dec must not happen in ~CXRMonitorLayer if that ever ran off-main (belt-and-braces; the
+    // frame thread has already dropped its ref by the time it acks, see frameThread()).
+    layer->releaseBuffers();
 
     // No frame thread (direct-teardown path): destroy any lingering frame resources. While
     // DISABLED there should be none, but be defensive.
@@ -1232,7 +1257,7 @@ void COpenXRManager::bindExistingLayers() {
                 continue;
             }
             l->bindToMonitor(mon, [this, name = l->m_monitorName]() {
-                SP<CXRMonitorLayer> layer;
+                PXRLAYER layer;
                 {
                     std::scoped_lock lk(m_layersMu);
                     for (auto& cand : m_layers)
@@ -1262,13 +1287,15 @@ void COpenXRManager::teardownLayers() {
     static auto                      PDESTROY = CConfigValue<Hyprlang::INT>("openxr:destroy_monitors_on_stop");
     const bool                       destroy  = *PDESTROY;
 
-    std::vector<SP<CXRMonitorLayer>> layers;
+    std::vector<PXRLAYER> layers;
     {
         std::scoped_lock lock(m_layersMu);
         layers = m_layers;
     }
 
     for (auto& l : layers) {
+        // Release presented-buffer refs on the main thread (no frame thread here — path C).
+        l->releaseBuffers();
         if (destroy && l->m_createdByXR) {
             l->stopMainListeners();
             l->m_destroyListener.reset(); // avoid re-entering the removal path from our own destroy
@@ -1287,7 +1314,7 @@ void COpenXRManager::teardownLayers() {
 
     if (destroy) {
         std::scoped_lock lock(m_layersMu);
-        std::erase_if(m_layers, [](const SP<CXRMonitorLayer>& l) { return l->m_createdByXR; });
+        std::erase_if(m_layers, [](const PXRLAYER& l) { return l->m_createdByXR; });
     }
 }
 
@@ -1375,7 +1402,7 @@ OpenXR::SXRVerbContext COpenXRManager::currentVerbContext() {
     return m_lastVerbCtx;
 }
 
-SP<CXRMonitorLayer> COpenXRManager::layerByName(const std::string& name) {
+PXRLAYER COpenXRManager::layerByName(const std::string& name) {
     std::scoped_lock lock(m_layersMu);
     for (auto& l : m_layers)
         if (l->m_monitorName == name && !l->m_pendingRemoval.load(std::memory_order_acquire))
@@ -1383,7 +1410,7 @@ SP<CXRMonitorLayer> COpenXRManager::layerByName(const std::string& name) {
     return nullptr;
 }
 
-SP<CXRMonitorLayer> COpenXRManager::resolveSelected() {
+PXRLAYER COpenXRManager::resolveSelected() {
     // doc 05 §3.2 resolution order.
     if (!m_selectedMonitor.empty())
         if (auto l = layerByName(m_selectedMonitor))
@@ -1485,13 +1512,13 @@ void COpenXRManager::recomputeQuadActive() {
     {
         std::scoped_lock                 lock(m_layersMu);
 
-        std::vector<SP<CXRMonitorLayer>> active;
+        std::vector<PXRLAYER> active;
         for (auto& l : m_layers)
             if (!l->m_pendingRemoval.load(std::memory_order_acquire))
                 active.push_back(l);
 
         // Oldest first; suspend everything past the cap counting from the newest.
-        std::sort(active.begin(), active.end(), [](const SP<CXRMonitorLayer>& a, const SP<CXRMonitorLayer>& b) { return a->m_seq < b->m_seq; });
+        std::sort(active.begin(), active.end(), [](const PXRLAYER& a, const PXRLAYER& b) { return a->m_seq < b->m_seq; });
 
         const size_t n = active.size();
         for (size_t i = 0; i < n; ++i) {
@@ -1551,7 +1578,7 @@ std::expected<void, std::string> COpenXRManager::cmdSelect(const std::string& ar
 
     if (arg == "next" || arg == "prev") {
         // Cycle in creation order (m_seq).
-        std::vector<SP<CXRMonitorLayer>> ordered;
+        std::vector<PXRLAYER> ordered;
         {
             std::scoped_lock lock(m_layersMu);
             for (auto& l : m_layers)
@@ -1560,7 +1587,7 @@ std::expected<void, std::string> COpenXRManager::cmdSelect(const std::string& ar
         }
         if (ordered.empty())
             return std::unexpected<std::string>("no XR monitors exist");
-        std::sort(ordered.begin(), ordered.end(), [](const SP<CXRMonitorLayer>& a, const SP<CXRMonitorLayer>& b) { return a->m_seq < b->m_seq; });
+        std::sort(ordered.begin(), ordered.end(), [](const PXRLAYER& a, const PXRLAYER& b) { return a->m_seq < b->m_seq; });
 
         size_t cur = 0;
         for (size_t i = 0; i < ordered.size(); ++i)
@@ -1737,7 +1764,7 @@ std::expected<void, std::string> COpenXRManager::cmdAnchor(const std::string& ar
         return std::unexpected<std::string>("anchor: expected <name|active> <local|head|body|device:left|right> [offset:x,y,z]");
 
     const std::string   target = tokens[0];
-    SP<CXRMonitorLayer> layer  = target == "active" ? resolveSelected() : layerByName(target);
+    PXRLAYER layer  = target == "active" ? resolveSelected() : layerByName(target);
     if (!layer)
         return std::unexpected<std::string>(target == "active" ? "no XR monitor selected" : "no XR monitor named '" + target + "'");
 

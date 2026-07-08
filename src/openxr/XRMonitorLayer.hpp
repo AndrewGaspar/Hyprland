@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -28,6 +29,20 @@ namespace Aquamarine {
 // m_layersMu). It ferries a headless output's presented buffers into an XrSwapchain and is
 // submitted as one XrCompositionLayerQuad per frame. Thread ownership is annotated per field
 // and is load-bearing (doc 02 / doc 00 handoff table).
+//
+// THREAD-SAFETY RULE (load-bearing, learned from a live UAF crash): hyprutils
+// CSharedPointer/CWeakPointer refcounts are plain unsigned ints — NOT atomic. Any inc/dec
+// from the frame thread races the main thread's copies of the same object and silently
+// corrupts the count (observed: CMonitor destroyed while still owned by the monitor state
+// vectors). Therefore:
+//   - The frame thread must never copy, destroy, or lock() a hyprutils SP/WP whose impl the
+//     main thread also touches. Monitor facts it needs are cached below as plain values
+//     (m_monitorId, m_pendingSize) written by the main thread.
+//   - Buffer SPs are handed BACK to the main thread for their final release (retireBuffer/
+//     releaseBuffers) — a move never touches the refcount.
+//   - The layer itself crosses threads via std::shared_ptr (atomic control block), and the
+//     manager guarantees the destructor runs on the main thread (the dtor releases hyprutils
+//     WPs/listeners).
 class CXRMonitorLayer {
   public:
     CXRMonitorLayer(const std::string& name, uint64_t seq, float sizeMeters);
@@ -43,8 +58,15 @@ class CXRMonitorLayer {
 
     // ---- frame thread ----
     // Grab the latest presented buffer, if any (nulls m_haveNewFrame). Returns null when no
-    // new frame is pending.
+    // new frame is pending. The returned SP is MOVED out (no refcount op); the caller must
+    // hand it back via retireBuffer() when done — never let it die on the frame thread.
     SP<Aquamarine::IBuffer> takeLatestBuffer();
+    // Hand a consumed buffer back for main-thread release (moved into m_retiredBuffers).
+    void retireBuffer(SP<Aquamarine::IBuffer>&& buf);
+    // ---- main thread ----
+    // Release the queued + retired buffer refs here, on the main thread (called by the
+    // presented listener each frame and by the manager's removal/teardown paths).
+    void releaseBuffers();
     // Delete per-layer GL objects (m_lastEGLImg, m_cpuTex). REQUIRES the EGL context current.
     void destroyFrameResourcesGL(CXRGraphics& gfx);
     // Destroy the XrSwapchain. REQUIRES the context NOT current (interop rule, doc 01).
@@ -74,7 +96,10 @@ class CXRMonitorLayer {
     // ---- main -> frame handoff (doc 00 table) ----
     std::mutex              m_bufMu;
     SP<Aquamarine::IBuffer> m_latestBuffer;          // written under m_bufMu on presented
-    Vector2D                m_pendingSize;           // written under m_bufMu on mode change
+    std::vector<SP<Aquamarine::IBuffer>>
+                            m_retiredBuffers;        // under m_bufMu; frame moves consumed buffers in, main releases (releaseBuffers)
+    Vector2D                m_pendingSize;           // written under m_bufMu on bind + mode change (the monitor's pixel size)
+    std::atomic<int64_t>    m_monitorId{-1};         // MONITORID, cached at bind — the frame thread must not lock() m_monitor
     std::atomic<bool>       m_haveNewFrame{false};   // release-store after buffer write
     std::atomic<bool>       m_swapchainDirty{false}; // set on mode change / (re)bind
     std::atomic<bool>       m_pendingRemoval{false}; // removal barrier flag
@@ -95,5 +120,10 @@ class CXRMonitorLayer {
     bool                  m_hasContent = false;   // at least one successful blit since (re)create
     bool                  m_quadActive = true;    // false while suspended by the layer cap
 };
+
+// Layers deliberately use std::shared_ptr instead of the codebase-standard hyprutils SP:
+// copies genuinely cross the frame thread (the per-frame snapshot), and only shared_ptr's
+// control block is atomic. See the thread-safety rule above.
+using PXRLAYER = std::shared_ptr<CXRMonitorLayer>;
 
 #endif // HAVE_OPENXR
