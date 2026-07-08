@@ -10,11 +10,12 @@ Driver: [`scripts/xr-container.sh`](../scripts/xr-container.sh). Ships
 ## Interactive session (`session`)
 
 ```sh
-scripts/xr-container.sh session                 # windowed Monado (no headset), --gpu amd
-scripts/xr-container.sh session --conf FILE     # source FILE as the base config
-scripts/xr-container.sh session --wivrn         # real headset via the host WiVRn runtime
-scripts/xr-container.sh session --passthrough   # openxr:blend_mode = alpha
-scripts/xr-container.sh exec hyprctl openxr status   # talk to the running session
+scripts/xr-container.sh session                    # windowed Monado (no headset), --gpu amd
+scripts/xr-container.sh session --conf FILE        # source FILE as the base config
+scripts/xr-container.sh session --wivrn            # real headset via host WiVRn (forces --gpu nvidia)
+scripts/xr-container.sh session --passthrough      # openxr:blend_mode = alpha
+scripts/xr-container.sh session --publish-remote   # + expose Monado remote driver on an ephemeral host port
+scripts/xr-container.sh exec hyprctl openxr status # talk to the running session
 ```
 
 Boots `:session` and launches a full Omarchy desktop as a NESTED window on the
@@ -29,13 +30,27 @@ default XR monitors) and launched by `session/session-launch.sh`.
 - **windowed** (default, no headset): a vendored Monado runs in-container; a
   container-local rooted `Xwayland` (on the host compositor) is its X target, so
   the Monado XR view appears as a window on the host — no host XWayland needed.
-  The remote-driver port is published to `127.0.0.1:4242` (unless the host already
-  runs a monado-service) so you can drive it with `monado-gui remote`.
+  The Monado remote-driver port (container `4242`) is **not** published by default.
+  Pass `--publish-remote` to map it to an **ephemeral** free host port (printed in
+  the banner) — or `--publish-remote=PORT` for a fixed one — then drive it with
+  `monado-gui remote 127.0.0.1:<port>`. (A fixed `4242` publish once poisoned a
+  concurrent host suite run, hence opt-in + ephemeral.)
 - **--wivrn**: mounts the host `/usr/lib/wivrn` + manifest + `wivrn/comp_ipc`
   socket (symlinked to `$XDG_RUNTIME_DIR/wivrn/comp_ipc` inside) and points
   `XR_RUNTIME_JSON` at the WiVRn manifest. This container never runs wivrn-server.
-  Cross-GPU note: WiVRn encodes on the host's GPU; run `--gpu` matching it (the
-  NVIDIA CDI path is WP4) or session creation crashes at swapchain setup.
+  `--wivrn` defaults `--gpu` to `nvidia` (WiVRn's encode GPU); a mismatched
+  `--gpu amd` warns and cross-GPU-crashes at swapchain setup (WP3's SEGV).
+
+  **Dual-GPU-laptop caveat (this box):** the *nested* container Hyprland renders
+  its flat window into the **host** compositor, so it must render on the **host's**
+  GPU (the AMD 890M iGPU here) — nesting on NVIDIA fails at `CBackend::create()`
+  (aquamarine can't stand up its nested wayland backend on the NVIDIA node while
+  the host runs on AMD). But WiVRn encodes on NVIDIA. On such a machine no single
+  GPU satisfies both the nested-window path (host GPU) and the XR-encode path
+  (WiVRn GPU); a true single-GPU `--wivrn` run needs the host compositor itself on
+  the encode GPU, or a split-GPU session (nested compositor on the host GPU,
+  `openxr:gpu` on the encode GPU) — future work, see
+  [`06-testing.md` § 9](../docs/openxr/06-testing.md) and the research doc.
 
 Teardown = `podman rm -f` the tracked container, which reaps the whole session
 tree (Hyprland, Monado/Xwayland, waybar/mako/walker). NEVER kill by process name:
@@ -92,8 +107,11 @@ The real exit code comes from a sentinel file (`machinectl shell` always exits
 container is `podman rm -f`'d on every exit path (success, failure, Ctrl-C)
 unless `--keep`.
 
-`--gpu amd` uses `/dev/dri/renderD129`. `--gpu nvidia` needs the host CDI spec
-(see below); it is refused with setup instructions if the spec is absent.
+`--gpu` selects the render node by vendor scan (see [GPU](#gpu)); `--gpu amd` is
+the default. `--gpu nvidia` needs the host CDI spec (see below); it is refused
+with setup instructions if the spec is absent. The suite pins the node it
+resolves **inside** the container, so a CDI-injected NVIDIA node is verified
+present rather than assumed by name.
 
 ## Layout
 
@@ -108,16 +126,60 @@ unless `--keep`.
 
 ## GPU
 
-Single-GPU by construction (dodges the cross-GPU `xrCreateSwapchain` crash).
-`--gpu amd` → `--device /dev/dri/renderD129` (no CDI). `--gpu nvidia` →
-`--device nvidia.com/gpu=all`, which needs the host CDI spec:
+**Single-GPU by construction** — the container renders XR on exactly one GPU, so
+it never hits the cross-GPU `xrCreateSwapchain` crash that a container-AMD-renderer
+vs host-NVIDIA-encoder split produces (WP3's `--wivrn --gpu amd` SEGV).
+
+### Vendor resolution (`--gpu`)
+
+No render-node names are hardcoded (they differ box to box). `--gpu SPEC` is
+resolved by [`scripts/lib/gpu.sh`](../scripts/lib/gpu.sh) `resolve_render_node`,
+which scans `/sys/class/drm/renderD*/device/vendor`:
+
+| SPEC | Meaning |
+| --- | --- |
+| `amd` | first `0x1002` node (default for `test`/`shell`/windowed `session`) |
+| `nvidia` | first `0x10de` node, via CDI (default for `--wivrn`) |
+| `intel` | first `0x8086` node |
+| `/dev/dri/renderDNNN` | that exact node, verbatim |
+
+Precedence: **explicit path** > **env override** (`$HYPXRLAND_{AMD,NVIDIA,INTEL}_NODE`)
+> **vendor scan** > hard error listing the candidate nodes + their vendor ids.
+The resolver runs **twice** — host-side to pick the `podman --device`, and again
+**inside** the container to pin `openxr:gpu`/`AQ_DRM_DEVICES`/`WLR_RENDER_DRM_DEVICE`
+(`XR_GPU_NODE`). The in-container scan matters because a CDI-injected NVIDIA node
+keeps its host name but must be *verified present*, not assumed.
+
+### NVIDIA via CDI
+
+`--gpu nvidia` uses `--device nvidia.com/gpu=all`; the image ships **no NVIDIA
+userspace driver** — CDI injects the host libraries. It needs the host CDI spec:
 
 ```sh
 sudo pacman -S nvidia-container-toolkit
 sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml   # re-run after driver updates
 ```
 
-The image ships **no NVIDIA userspace driver** — CDI injects the host libraries.
+An Arch pacman hook regenerates the spec on driver updates. The tooling also
+checks the spec's baked `host-driver-version` against the loaded
+`/sys/module/nvidia/version` and prints the regenerate command if they drift
+(non-fatal). If the spec is absent, `--gpu nvidia` is refused with these
+instructions (`check-gpu`/`build --check-gpu` fall back to AMD instead).
+
+### Cross-GPU rule of thumb
+
+Whatever runs the OpenXR **runtime/encoder** dictates the GPU. `--wivrn` encodes
+on the host's WiVRn GPU (NVIDIA here), so it forces `--gpu nvidia`; a mismatched
+`--gpu amd` crashes at swapchain setup. The vendored windowed Monado's null
+compositor likewise picks a GPU independently — pin the container to match it.
+
+### Future work
+
+`openxr:gpu` in the compositor still takes only a `/dev/dri/renderD*` path. Teaching
+it vendor keywords (`amd`/`nvidia`/`intel`, resolved via `drmGetDevices2`) would let
+the config express the same portable selection this tooling does — see
+[`docs/openxr/research/06-podman-isolation.md`](../docs/openxr/research/06-podman-isolation.md)
+open questions.
 
 ## Safety
 

@@ -20,7 +20,9 @@
 # written to the sentinel file ($XR_TEST_SENTINEL) — the host wrapper reads that.
 #
 # Config knobs (env, all optional; the wrapper sets them):
-#   XR_GPU_NODE       GPU render node to pin (default /dev/dri/renderD129 = AMD).
+#   XR_GPU_NODE       GPU render node to pin. Normally set by the wrapper (resolved
+#                     in-container). If unset (manual run), it is resolved by a
+#                     vendor scan (scripts/lib/gpu.sh, default vendor = amd).
 #                     Fans out to WLR_RENDER_DRM_DEVICE + HYPRTESTER_XR_GPU.
 #   BUILD_DIR         in-container build tree (default /build).
 #   SRC_DIR           overlay-mounted repo (default /src).
@@ -33,7 +35,15 @@
 
 set -uo pipefail
 
-XR_GPU_NODE="${XR_GPU_NODE:-/dev/dri/renderD129}"
+# Render node: prefer what the wrapper handed in (resolved in-container); else
+# resolve by vendor scan via the shared resolver (default vendor amd).
+if [[ -z ${XR_GPU_NODE:-} ]]; then
+    if [[ -r /src/scripts/lib/gpu.sh ]]; then
+        # shellcheck source=../../scripts/lib/gpu.sh
+        source /src/scripts/lib/gpu.sh
+        XR_GPU_NODE="$(resolve_render_node amd 2>/dev/null || true)"
+    fi
+fi
 BUILD="${BUILD_DIR:-/build}"
 SRC="${SRC_DIR:-/src}"
 MONADO_SERVICE="${MONADO_SERVICE:-$BUILD/monado/src/xrt/targets/service/monado-service}"
