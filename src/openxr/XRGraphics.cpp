@@ -322,8 +322,39 @@ bool CXRGraphics::initBlitGL() {
 }
 
 void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer& layer, XR_GLuint dstTex) {
-    const int dstW = (int)layer.m_swapchainSize.x;
+    const int dstW = (int)layer.m_swapchainSize.x; // FULL swapchain (content + chrome margins)
     const int dstH = (int)layer.m_swapchainSize.y;
+
+    // Chrome margins (WP-G1): the desktop content blits into the INNER content rect; the surrounding
+    // margin is left fully transparent (alpha 0) so it never covers anything under XR passthrough.
+    // m_contentSize/m_contentOffsetPx are px within the full swapchain (top-left origin); the GL
+    // swapchain image has a BOTTOM-left origin (the shader / blit already flip v), so the content
+    // rect's GL-space bottom edge is dstH - top - height. Content-less layers (no chrome computed
+    // yet) fall back to the full swapchain.
+    int contentW = (int)layer.m_contentSize.x;
+    int contentH = (int)layer.m_contentSize.y;
+    if (contentW <= 0 || contentH <= 0) {
+        contentW = dstW;
+        contentH = dstH;
+    }
+    const int contentX  = (int)layer.m_contentOffsetPx.x;                   // from left
+    const int contentGL = dstH - (int)layer.m_contentOffsetPx.y - contentH; // GL bottom-left y
+
+    // Clear the WHOLE swapchain image to premultiplied-transparent (0,0,0,0). Because the quad is
+    // submitted premultiplied (no XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT), bilinear
+    // sampling at the content/margin seam blends content(rgb,1) with (0,0,0,0) staying valid
+    // premultiplied — no dark halo. Content pixels below then overwrite the inner rect at alpha 1.
+    auto clearMargin = [&]() {
+        GLuint fbo = 0;
+        glGenFramebuffers(1, &fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
+        glDisable(GL_SCISSOR_TEST);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glClearColor(0.f, 0.f, 0.f, 0.f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDeleteFramebuffers(1, &fbo);
+    };
 
     // --- 1. DMA-BUF path (primary) ---
     auto dmab = buf->dmabuf();
@@ -366,6 +397,8 @@ void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer
 
         layer.m_lastEGLImg = s_eglCreateImage(m_eglDisplay, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attribs.data());
         if (layer.m_lastEGLImg != nullptr) {
+            clearMargin(); // transparent margin first
+
             glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_extTex);
             s_glImageTarget2D(GL_TEXTURE_EXTERNAL_OES, (GLeglImageOES)layer.m_lastEGLImg);
 
@@ -373,7 +406,9 @@ void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer
             glGenFramebuffers(1, &fbo);
             glBindFramebuffer(GL_FRAMEBUFFER, fbo);
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
-            glViewport(0, 0, (GLsizei)dstW, (GLsizei)dstH);
+            // Draw the content into the INNER content rect only (the viewport confines the
+            // fullscreen triangle); the shader pins content alpha to 1.0. Margin stays transparent.
+            glViewport(contentX, contentGL, (GLsizei)contentW, (GLsizei)contentH);
 
             glUseProgram(m_blitProg);
             glActiveTexture(GL_TEXTURE0);
@@ -404,6 +439,8 @@ void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer
                 layer.m_cpuTexSize = buf->size;
             }
 
+            clearMargin(); // transparent margin first
+
             glBindTexture(GL_TEXTURE_2D, layer.m_cpuTex);
             // DRM_FORMAT_XRGB8888 is BGRX in memory; GL_BGRA_EXT swaps to RGBA correctly.
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)buf->size.x, (GLsizei)buf->size.y, GL_BGRA_EXT, GL_UNSIGNED_BYTE, data);
@@ -417,15 +454,18 @@ void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dstFBO);
             glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
             // Source Y inverted: same top-left -> bottom-left origin flip as the dmabuf shader.
-            glBlitFramebuffer(0, (GLint)buf->size.y, (GLint)buf->size.x, 0, 0, 0, dstW, dstH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
-            // Force dst alpha opaque (same reason as the dmabuf shader's fragColor.a = 1.0): the
-            // XRGB source has undefined alpha which would punch holes under ALPHA_BLEND. dstFBO is
-            // still bound as the DRAW framebuffer here; write ONLY the alpha channel to 1.0 (glClear
-            // is unaffected by viewport, so it covers the whole dst attachment).
+            // Dst is the INNER content rect (transparent margin already cleared around it).
+            glBlitFramebuffer(0, (GLint)buf->size.y, (GLint)buf->size.x, 0, contentX, contentGL, contentX + contentW, contentGL + contentH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+            // Force dst alpha opaque within the CONTENT rect only (same reason as the dmabuf shader's
+            // fragColor.a = 1.0): the XRGB source has undefined alpha which would punch holes under
+            // ALPHA_BLEND. Scissor to the content rect so the transparent margin keeps alpha 0.
+            glEnable(GL_SCISSOR_TEST);
+            glScissor(contentX, contentGL, (GLsizei)contentW, (GLsizei)contentH);
             glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
             glClearColor(0.f, 0.f, 0.f, 1.f);
             glClear(GL_COLOR_BUFFER_BIT);
             glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            glDisable(GL_SCISSOR_TEST);
             glDeleteFramebuffers(1, &srcFBO);
             glDeleteFramebuffers(1, &dstFBO);
             return;
@@ -433,7 +473,20 @@ void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer
     }
 
     // --- 3. Clear fallback (black in production; WIP used cyan as a debug sentinel) ---
-    clearTex(dstTex, layer.m_swapchainSize, 0.0f, 0.0f, 0.0f);
+    // Transparent margin, opaque-black content rect (both blit paths failed).
+    clearMargin();
+    {
+        GLuint fbo = 0;
+        glGenFramebuffers(1, &fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(contentX, contentGL, (GLsizei)contentW, (GLsizei)contentH);
+        glClearColor(0.f, 0.f, 0.f, 1.f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDisable(GL_SCISSOR_TEST);
+        glDeleteFramebuffers(1, &fbo);
+    }
 }
 
 void CXRGraphics::clearTex(XR_GLuint dstTex, const Vector2D& size, float r, float g, float b) {
