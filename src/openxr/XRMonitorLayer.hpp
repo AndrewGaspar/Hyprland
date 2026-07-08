@@ -126,6 +126,39 @@ class CXRMonitorLayer {
     XR_EGLImageKHR        m_lastEGLImg = nullptr; // last dmabuf EGLImage (destroyed on next blit)
     bool                  m_hasContent = false;   // at least one successful blit since (re)create
     bool                  m_quadActive = true;    // false while suspended by the layer cap
+
+    // ---- chrome content snapshot (WP-G2, frame thread only) ----
+    // A persistent RGBA copy of the last fully-composited swapchain image (content @ alpha 1 +
+    // transparent margin), kept so an ANIMATION-ONLY frame (chrome fading with NO new desktop
+    // buffer) can re-blit the content into a freshly-acquired swapchain image before drawing the
+    // chrome over it — every acquired image gets a complete, correct render. Deliberately a GL
+    // texture we own (not the retired IBuffer, whose dmabuf the compositor may recycle, nor
+    // m_lastEGLImg): zero hyprutils refcount traffic, self-contained teardown.
+    XR_GLuint m_contentTex = 0;
+    Vector2D  m_contentTexSize; // size m_contentTex was allocated at (== m_swapchainSize)
+
+    // ---- chrome visual-state contract (WP-G2) — the interface future chrome consumers read ----
+    // hoverRegion/grabbedNow are WRITTEN by the frame loop right AFTER CXRInput::processPointer
+    // (from CXRInput's read-only chromeHoverRegion()/isMonitorGrabbed() accessors, queried by
+    // monitor id) and READ by the chrome draw pass at the TOP of the next frame's blit loop — a
+    // deliberate one-frame latency, all on the frame thread. Atomics per the §5.5 contract (never
+    // a hyprutils refcount op). grabbedNow is true for EITHER grab kind (MOVE from bar/body AND
+    // corner RESIZE, WP-G3): any active manipulation shows the grab color on all chrome elements.
+    // While a hand grabs it casts no ray, so its hover contribution clears; grabbedNow alone holds
+    // the chrome visible for the duration of the manipulation.
+    std::atomic<uint8_t> m_hoverRegion{0 /* OpenXR::XR_REGION_NONE */}; // region the ray last classified on THIS quad (any hand)
+    std::atomic<bool>    m_grabbedNow{false};                          // this quad has an active MOVE or RESIZE grab
+
+    // Fade-envelope state (frame thread only; only the blit loop touches these). Alpha is advanced
+    // every frame from predicted-display-time deltas via OpenXR::chromeFadeAdvance; the *Drawn*
+    // trackers record what was last rendered so a static (no-new-buffer) frame can decide whether a
+    // chrome-only redraw is actually needed.
+    float    m_chromeAlpha       = 0.F; // current fade alpha [0,1]
+    int64_t  m_chromeUpdateNs    = 0;   // predictedDisplayTime of the last fade advance
+    int64_t  m_chromeActiveNs    = 0;   // predictedDisplayTime the quad was last hovered/grabbed
+    float    m_chromeDrawnAlpha  = 0.F; // alpha last rendered into the swapchain (redraw diff)
+    uint8_t  m_chromeDrawnRegion = 0;   // hover region last rendered (redraw diff)
+    bool     m_chromeDrawnGrab   = false;
 };
 
 // Layers deliberately use std::shared_ptr instead of the codebase-standard hyprutils SP:

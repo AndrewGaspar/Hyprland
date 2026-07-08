@@ -345,6 +345,27 @@ void CXRInput::hapticTick(OpenXR::eXRHand hand) {
     xrApplyHapticFeedback(m_session, &hai, reinterpret_cast<const XrHapticBaseHeader*>(&vib));
 }
 
+OpenXR::eXRQuadRegion CXRInput::chromeHoverRegion(MONITORID id) const {
+    // Precedence so a resize/move affordance highlights over a plain body/margin hover.
+    auto rank = [](OpenXR::eXRQuadRegion r) -> int {
+        if (OpenXR::xrRegionIsCorner(r) || r == OpenXR::XR_REGION_BAR)
+            return 2;
+        if (r == OpenXR::XR_REGION_BODY || r == OpenXR::XR_REGION_MARGIN)
+            return 1;
+        return 0;
+    };
+    OpenXR::eXRQuadRegion best = OpenXR::XR_REGION_NONE;
+    for (int h = 0; h < 2; ++h) {
+        if (m_hoverChromeMon[h] == id && rank(m_hoverRegion[h]) > rank(best))
+            best = m_hoverRegion[h];
+    }
+    return best;
+}
+
+bool CXRInput::isMonitorGrabbed(MONITORID id) const {
+    return m_grabbedMon[OpenXR::XR_HAND_LEFT] == id || m_grabbedMon[OpenXR::XR_HAND_RIGHT] == id;
+}
+
 void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint32_t timeMs, const OpenXR::SXRSolveInput& solveIn, const OpenXR::SXRAnchorTuning& tune) {
     if (!m_emit)
         return;
