@@ -161,6 +161,14 @@ namespace OpenXR {
         std::optional<SXRPose> pinchLeft;
         std::optional<SXRPose> pinchRight;
         uint32_t               pxW = 1, pxH = 1; // current monitor mode, for aspect
+        // Optional 1€ carry filter (WP-G6), read per-frame from config by the caller. When
+        // grabFilter is set AND the grab is a hand grab (beginGrab handActive=true), solve() runs
+        // the carried world pose through a 1€ low-pass and submits it in LOCAL_FLOOR instead of the
+        // device-space late-latch. Off (default) / controllers keep the zero-latency device path
+        // unchanged. min cutoff (Hz) + beta are Casiez's two parameters (defaults 1.0 / 0.007).
+        bool                   grabFilter          = false;
+        float                  grabFilterMinCutoff = 1.0F;
+        float                  grabFilterBeta      = 0.007F;
     };
 
     struct SXRSolveResult {
@@ -194,7 +202,11 @@ namespace OpenXR {
         // controllers/grasp, or (WP-G5, usePinch=true) the hand pinch pose. usePinch makes solve()
         // carry the quad against the pinch pose + return a PINCH space selector so the runtime
         // late-latches the pinch action space; the release/endGrab picks the same device pose.
-        void beginGrab(eXRHand hand, const SXRPose& deviceWorld, bool usePinch = false);
+        // `handActive` (WP-G6): the grabbing device is a tracked hand (not a controller). It arms the
+        // optional 1€ carry filter for this grab (see SXRSolveInput::grabFilter) and resets the
+        // filter state so smoothing starts fresh at grab-begin. Controllers pass false (default) and
+        // are never filtered.
+        void beginGrab(eXRHand hand, const SXRPose& deviceWorld, bool usePinch = false, bool handActive = false);
         void grabPushPull(float deltaMeters);
         void grabResize(float deltaMeters);
         // Re-anchor from the quad's world pose at the release frame (grip ∘ offset). Kept for
@@ -278,6 +290,8 @@ namespace OpenXR {
         bool    m_grabbed  = false;
         eXRHand m_grabHand = XR_HAND_LEFT;
         bool    m_grabPinch = false;         // WP-G5: MOVE grab anchored to the pinch pose (hands)
+        bool    m_grabHandActive = false;    // WP-G6: grabbing device is a hand -> 1€ filter eligible
+        SXROneEuroPose m_carryFilter;        // WP-G6: 1€ carry filter state, reset at beginGrab
         SXRPose m_grabOffset;                // in the grabbing hand's device (grip OR pinch) space
         bool    m_deviceOffsetDirty = false; // DEVICE: recompute offset on first valid grip
         // corner resize grab (WP-G3): begin-snapshot of the pinned corner + diagonal in WORLD

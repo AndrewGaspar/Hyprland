@@ -123,12 +123,15 @@ bool COpenXRManager::isOverlay() const {
 std::array<COpenXRManager::SXRHandInputInfo, 2> COpenXRManager::handInputInfos() const {
     // WP-G5: reflect each hand's active device for `hyprctl openxr status`. m_input's per-hand kind
     // is an atomic mirror (main-thread safe to read); hand_grab is read from config here.
-    static auto                     PHANDGRAB = CConfigValue<std::string>("openxr:hand_grab");
+    static auto                     PHANDGRAB   = CConfigValue<std::string>("openxr:hand_grab");
+    static auto                     PGRABFILTER = CConfigValue<Hyprlang::INT>("openxr:grab_filter");
+    const bool                      filterOn    = *PGRABFILTER != 0;
     std::array<SXRHandInputInfo, 2> out;
     for (int h = 0; h < 2; ++h) {
         const bool hands = m_input && m_input->handInputKind((OpenXR::eXRHand)h) == OpenXR::XR_INPUT_HANDS;
         out[h].hands     = hands;
         out[h].gesture   = hands ? OpenXR::xrHandGrabName(OpenXR::xrParseHandGrab(*PHANDGRAB)) : "";
+        out[h].filtered  = hands && filterOn; // WP-G6: hand move-grabs will be 1€-filtered
     }
     return out;
 }
@@ -826,6 +829,14 @@ void COpenXRManager::frameThread() {
         // coordinates; the final quad pose is shifted back before submission.
         static auto     PFLOOR      = CConfigValue<Hyprlang::FLOAT>("openxr:floor_offset");
         const float     floorOffset = (float)*PFLOOR;
+        // WP-G6: 1€ hand-grab carry filter parameters, read per-frame (hot-toggles). Only a hand
+        // MOVE grab with grabFilter set is filtered (see CXRAnchor::solve grab override).
+        static auto     PGRABFILTER   = CConfigValue<Hyprlang::INT>("openxr:grab_filter");
+        static auto     PGRABFILTERMC = CConfigValue<Hyprlang::FLOAT>("openxr:grab_filter_min_cutoff");
+        static auto     PGRABFILTERB  = CConfigValue<Hyprlang::FLOAT>("openxr:grab_filter_beta");
+        const bool      grabFilter    = *PGRABFILTER != 0;
+        const float     grabFilterMc  = (float)*PGRABFILTERMC;
+        const float     grabFilterB   = (float)*PGRABFILTERB;
         OpenXR::SXRPose viewPose;
         bool            viewValid = false;
         XrSpaceLocation loc       = {XR_TYPE_SPACE_LOCATION};
@@ -893,6 +904,9 @@ void COpenXRManager::frameThread() {
                     in.gripRight  = gripRight;
                     in.pinchLeft  = pinchLeft;  // WP-G5: pinch-anchored hand MOVE grabs
                     in.pinchRight = pinchRight;
+                    in.grabFilter          = grabFilter; // WP-G6: 1€ carry filter (hands, opt-in)
+                    in.grabFilterMinCutoff = grabFilterMc;
+                    in.grabFilterBeta      = grabFilterB;
                     // Aspect from the CONTENT pixel mode (not the chrome-expanded swapchain) so
                     // widthMeters/heightMeters stay CONTENT geometry — `size:` and layout
                     // serialization keep meaning content meters (WP-G1).

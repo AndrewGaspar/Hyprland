@@ -747,6 +747,19 @@ std::vector<SP<IValue>> Values::getConfigValues() {
                   "if the grabbed quad's speed at release exceeds this (m/s), re-anchor from the last calm sample instead of the fixed latency window — catches a "
                   "fast fist-open/flick even when it is quicker than grab_release_latency_ms. 0 disables (latency window only)",
                   0.6, {.min = 0.0, .max = 5.0}),
+        MS<Bool>("openxr:grab_filter",
+                 "smooth a hand's move-grab carry with a 1€ low-pass filter (Casiez CHI'12) to remove hand-tracking jitter. Hands only (controllers are never "
+                 "filtered); adds ~1 frame of latency in exchange for steadiness. Off by default — enable and tune min_cutoff/beta live in the headset. Read per-frame "
+                 "(hot-toggles)",
+                 false),
+        MS<Float>("openxr:grab_filter_min_cutoff",
+                  "1€ filter minimum cutoff frequency (Hz) for the hand move-grab carry. Lower = more smoothing when the panel is nearly still (also more lag). Casiez's "
+                  "suggested starting point is 1.0; drop toward 0.1-0.5 if a held-still panel still jitters",
+                  1.0, {.min = 0.01, .max = 10.0}),
+        MS<Float>("openxr:grab_filter_beta",
+                  "1€ filter speed coefficient for the hand move-grab carry. Higher = the cutoff rises faster with motion, so fast moves lag less (but jitter returns "
+                  "sooner). Casiez's suggested starting point is 0.007; raise it (e.g. 0.05-0.5) if moving a panel feels laggy, lower it if fast moves overshoot/jitter",
+                  0.007, {.min = 0.0, .max = 1.0}),
         MS<Float>("openxr:scroll_speed", "multiplier for thumbstick scrolling on XR monitors", 1.0, {.min = 0.0, .max = 100.0}),
         MS<Float>("openxr:chrome_margin",
                   "transparent chrome margin added around each XR monitor's content, in meters. The quad grows by this on the top/left/right (and the bottom, which also "

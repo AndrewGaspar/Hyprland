@@ -32,7 +32,9 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     // WP-G5: per-hand active input device (hands vs controllers) + the hand grab gesture.
     const auto        HANDS = g_pOpenXRManager->handInputInfos();
     auto              handLabel = [](const COpenXRManager::SXRHandInputInfo& hi) -> std::string {
-        return hi.hands ? std::format("hands ({})", hi.gesture) : "controllers";
+        if (!hi.hands)
+            return "controllers";
+        return hi.filtered ? std::format("hands ({}, filtered)", hi.gesture) : std::format("hands ({})", hi.gesture);
     };
 
     if (format == FORMAT_JSON) {
@@ -70,14 +72,15 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "overlay": {},
     "inhibitingIdle": {},
     "input": {{
-        "left": {{ "kind": "{}", "gesture": "{}" }},
-        "right": {{ "kind": "{}", "gesture": "{}" }}
+        "left": {{ "kind": "{}", "gesture": "{}", "filtered": {} }},
+        "right": {{ "kind": "{}", "gesture": "{}", "filtered": {} }}
     }},
     "monitors": [{}{}]
 }}
 )#",
                            STATE, RUNTIME, SYSTEM, BLEND, OVERLAY ? "true" : "false", INHIBITING_IDLE ? "true" : "false", HANDS[0].hands ? "hands" : "controllers", HANDS[0].gesture,
-                           HANDS[1].hands ? "hands" : "controllers", HANDS[1].gesture, MONS.empty() ? "" : "\n", mons);
+                           HANDS[0].filtered ? "true" : "false", HANDS[1].hands ? "hands" : "controllers", HANDS[1].gesture, HANDS[1].filtered ? "true" : "false",
+                           MONS.empty() ? "" : "\n", mons);
     }
 
     std::string out = std::format("state: {}\nruntime: {}\nsystem: {}\nblend mode: {}\noverlay: {}\nidle inhibited: {}\ninput: left {}, right {}\n", STATE, RUNTIME, SYSTEM, BLEND,
