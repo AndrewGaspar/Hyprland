@@ -22,3 +22,8 @@
 	url = https://github.com/KhronosGroup/Vulkan-Headers.git
 	shallow = true
 	ignore = dirty
+[submodule "subprojects/hypxrpaper"]
+	path = subprojects/hypxrpaper
+	url = https://github.com/AndrewGaspar/hypxrpaper.git
+	shallow = true
+	ignore = dirty
