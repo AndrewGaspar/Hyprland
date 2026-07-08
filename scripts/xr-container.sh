@@ -41,8 +41,28 @@
 #       On failure, artifacts (run log + preserved /tmp/hyprtester-xr-* dirs
 #       with hyprland + monado logs) are copied to containers/artifacts/<ts>/.
 #
-#   session
-#       Stub — interactive session lands in WP3.
+#   session [--wivrn] [--conf FILE] [--gpu nvidia|amd] [--passthrough]
+#       Boot :session and launch a full Omarchy desktop as a NESTED window on the
+#       host, with the dev Hyprland's XR extension enabled. waybar/mako/walker/
+#       portals autostart on the container's OWN private buses (no shim; verify
+#       with `busctl --user list` inside). Input is isolated (no /dev/input).
+#         (default, no headset)  a vendored windowed Monado runs in-container; its
+#                                XR view appears as a second window via host XWayland.
+#         --wivrn                talk to the host WiVRn runtime for a REAL headset
+#                                (host must run wivrn-server with the headset up;
+#                                this container never starts wivrn-server).
+#         --conf FILE            source FILE (bind-mounted ro) as the base config
+#                                instead of the image's ~/.config/hypr/hyprland.conf.
+#         --passthrough          openxr:blend_mode = alpha (composite over passthrough).
+#         --gpu nvidia|amd       single-GPU pin (default amd = /dev/dri/renderD129).
+#       Runs interactively (attached logs); teardown on exit = `podman rm -f` its
+#       container, which cleanly kills the whole session tree.
+#
+#   exec <cmd…>
+#       Run <cmd…> inside the RUNNING session container as `dev` in its logind
+#       session (e.g. `xr-container.sh exec hyprctl openxr status`). Convenience
+#       wrapper around `machinectl shell dev@.host … bash -lc`.
+#
 #
 # SAFETY: this box's HOST compositor is also named "Hyprland". This script NEVER
 # kills by process name. Container teardown is `podman rm -f <tracked-name>`
@@ -73,6 +93,15 @@ ARTIFACTS_DIR="$REPO/containers/artifacts"
 
 # Host GPU render nodes (this box): renderD128 = NVIDIA, renderD129 = AMD.
 AMD_RENDER_NODE="${HYPXRLAND_AMD_NODE:-/dev/dri/renderD129}"
+NVIDIA_RENDER_NODE="${HYPXRLAND_NVIDIA_NODE:-/dev/dri/renderD128}"
+CDI_NVIDIA_SPEC_YAML="/etc/cdi/nvidia.yaml"
+CDI_NVIDIA_SPEC_JSON="/etc/cdi/nvidia.json"
+
+# session mounts: host XR bits land under this container-side dir (a plain
+# top-level mount point, NOT under systemd-managed /run, so nothing shadows it).
+HOST_MNT="/hypxrland-host"
+WIVRN_MANIFEST="${WIVRN_RUNTIME_JSON:-/usr/share/openxr/1/openxr_wivrn.json}"
+WIVRN_LIB_DIR="/usr/lib/wivrn"
 CDI_NVIDIA_SPEC_YAML="/etc/cdi/nvidia.yaml"
 CDI_NVIDIA_SPEC_JSON="/etc/cdi/nvidia.json"
 
@@ -469,6 +498,201 @@ cmd_test() {
     die "XR suite FAILED in-container (rc=$rc)"
 }
 
+# --- session -----------------------------------------------------------------
+# resolve_gpu_devargs <gpu> — set REPLY_DEVARGS (array) + REPLY_GPU_NODE for the
+# requested GPU, or die with setup guidance. (Shared by session; mirrors the
+# inline logic in cmd_shell without restructuring it.)
+resolve_gpu_devargs() {
+    local gpu="$1"
+    REPLY_DEVARGS=()
+    case "$gpu" in
+        nvidia)
+            nvidia_cdi_available || { print_nvidia_cdi_setup; die "NVIDIA CDI unavailable; use --gpu amd"; }
+            REPLY_DEVARGS=(--device nvidia.com/gpu=all)
+            REPLY_GPU_NODE="$NVIDIA_RENDER_NODE" ;;
+        amd)
+            REPLY_DEVARGS=(--device "$AMD_RENDER_NODE")
+            REPLY_GPU_NODE="$AMD_RENDER_NODE" ;;
+        *) die "--gpu must be nvidia or amd" ;;
+    esac
+}
+
+cmd_session() {
+    local gpu="amd" use_wivrn=0 passthrough=0 user_conf=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --wivrn)      use_wivrn=1 ;;
+            --passthrough) passthrough=1 ;;
+            --gpu)        [[ $# -ge 2 ]] || die "--gpu needs an argument"; gpu="$2"; shift ;;
+            --gpu=*)      gpu="${1#--gpu=}" ;;
+            --conf)       [[ $# -ge 2 ]] || die "--conf needs a FILE argument"; user_conf="$2"; shift ;;
+            --conf=*)     user_conf="${1#--conf=}" ;;
+            -h|--help)    usage; exit 0 ;;
+            *) die "session: unknown flag $1" ;;
+        esac
+        shift
+    done
+    podman image exists "$IMG_SESSION" || die "session image not built (run: $0 build)"
+
+    resolve_gpu_devargs "$gpu"   # sets REPLY_DEVARGS + REPLY_GPU_NODE
+    local gpu_node="$REPLY_GPU_NODE"
+    local -a devargs=("${REPLY_DEVARGS[@]}")
+
+    # --- host wayland socket (nested output) ---
+    local host_xdg="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    local wl="${WAYLAND_DISPLAY:-wayland-1}"
+    local host_sock
+    [[ $wl == /* ]] && host_sock="$wl" || host_sock="$host_xdg/$wl"
+    [[ -S $host_sock ]] || die "host wayland socket not found: $host_sock (run this from a wayland session)"
+    local ctr_wl="$HOST_MNT/wayland-1"
+
+    ensure_volumes "$VOL_BUILD" "$VOL_CCACHE"
+
+    # --- assemble the podman run + launch env per mode ---
+    local -a mounts=(
+        -v "$REPO:/src:O"
+        -v "$VOL_BUILD:/build"
+        -v "$VOL_CCACHE:$CCACHE_DIR_IN_CTR"
+        -v "$host_sock:$ctr_wl"
+    )
+    [[ -f $host_sock.lock ]] && mounts+=(-v "$host_sock.lock:$ctr_wl.lock:ro")
+
+    # launch_env: passed INLINE to session-launch.sh (a `machinectl shell` login
+    # does NOT inherit `podman run -e` env, so we can't rely on container env).
+    local -a launch_env=(
+        "XR_GPU_NODE=$gpu_node"
+        "HL_WAYLAND_DISPLAY=$ctr_wl"
+        "XR_PASSTHROUGH=$passthrough"
+    )
+    [[ -n $user_conf ]] && {
+        [[ -f $user_conf ]] || die "--conf file not found: $user_conf"
+        local ctr_conf="$HOST_MNT/user.conf"
+        mounts+=(-v "$(cd "$(dirname "$user_conf")" && pwd)/$(basename "$user_conf"):$ctr_conf:ro")
+        launch_env+=("XR_BASE_CONF=$ctr_conf")
+    }
+
+    local -a portargs=()
+    if [[ $use_wivrn -eq 1 ]]; then
+        # --- WiVRn (real headset via host runtime) ---
+        [[ -f $WIVRN_MANIFEST ]]   || die "WiVRn manifest not found: $WIVRN_MANIFEST (is wivrn installed?)"
+        [[ -d $WIVRN_LIB_DIR ]]    || die "WiVRn lib dir not found: $WIVRN_LIB_DIR"
+        local host_wivrn="$host_xdg/wivrn/comp_ipc"
+        if ! pgrep -x wivrn-server >/dev/null; then
+            warn "wivrn-server is NOT running on the host — start it (wivrn-dashboard) and connect the"
+            warn "headset first, or XR session creation will fail. Continuing so you can see the error."
+        fi
+        [[ -S $host_wivrn ]] || warn "host wivrn socket $host_wivrn absent (headset not connected yet?)"
+        mounts+=(
+            -v "$WIVRN_LIB_DIR:$WIVRN_LIB_DIR:ro"
+            -v "$WIVRN_MANIFEST:/usr/share/openxr/1/openxr_wivrn.json:ro"
+        )
+        [[ -S $host_wivrn ]] && mounts+=(-v "$host_wivrn:$HOST_MNT/wivrn-comp_ipc")
+        launch_env+=(
+            "XR_MODE=wivrn"
+            "XR_RUNTIME_JSON=/usr/share/openxr/1/openxr_wivrn.json"
+            "WIVRN_HOST_SOCK=$HOST_MNT/wivrn-comp_ipc"
+        )
+    else
+        # --- windowed Monado (no headset) ---
+        # session-launch.sh runs a CONTAINER-LOCAL rooted Xwayland (connected to the
+        # same host wayland socket) as Monado's X target, so we need NO host X mount
+        # and no host XWayland running — the Monado window appears on the host as the
+        # Xwayland screen window.
+        launch_env+=(
+            "XR_MODE=windowed"
+            "XR_RUNTIME_JSON=/build/monado/openxr_monado-dev.json"
+        )
+        # Publish the monado remote-driver port so you can drive it with monado-gui
+        # from the host — ONLY when the host isn't already using 4242 (one per box).
+        if pgrep -x monado-service >/dev/null; then
+            warn "a host monado-service is running (owns TCP 4242) — NOT publishing the port."
+            warn "monado-gui remote drive from the host is unavailable this run."
+        else
+            portargs=(-p 127.0.0.1:4242:4242)
+        fi
+    fi
+
+    local ctr="hypxrland-session-$$"
+    cleanup_session() { podman rm -f "$ctr" >/dev/null 2>&1 || true; }
+    trap cleanup_session EXIT INT TERM
+
+    log "Booting $IMG_SESSION (session, --gpu $gpu, mode $([[ $use_wivrn -eq 1 ]] && echo wivrn || echo windowed))"
+    podman rm -f "$ctr" >/dev/null 2>&1 || true
+    podman run -d --name "$ctr" --systemd=always --userns=keep-id --user root \
+        --security-opt label=disable \
+        "${devargs[@]}" "${portargs[@]}" "${mounts[@]}" \
+        "$IMG_SESSION" >/dev/null
+    wait_for_systemd "$ctr"
+    # Named volumes come up root-owned; make them writable by dev (uid 1000).
+    podman exec "$ctr" chown -R dev:dev /build "$CCACHE_DIR_IN_CTR" >/dev/null 2>&1 || true
+
+    print_session_banner "$ctr" "$use_wivrn" "${portargs[*]:-}"
+
+    # Build the inline env prefix for the machinectl login (which won't inherit env).
+    local envstr=""; local kv
+    for kv in "${launch_env[@]}"; do envstr+="$kv "; done
+
+    log "Launching Omarchy XR session (Ctrl-C or exit to tear down)"
+    podman exec -it "$ctr" machinectl shell dev@.host /usr/bin/bash -lc \
+        "env $envstr bash /src/containers/session/session-launch.sh" || true
+
+    cleanup_session; trap - EXIT INT TERM
+    log "Session exited; container '$ctr' removed (whole session tree reaped)."
+}
+
+print_session_banner() {
+    local ctr="$1" use_wivrn="$2" ports="$3"
+    cat <<EOF
+
+  ============================ HypXRland session ============================
+  Container: $ctr   (removed on exit)
+EOF
+    if [[ $use_wivrn -eq 1 ]]; then
+        cat <<EOF
+  Mode: WiVRn (real headset via the HOST runtime).
+    Put the headset ON — the XR monitors render there. A nested Omarchy window
+    also appears on this desktop (the flat view + where keyboard/mouse go).
+    If the session never reaches FOCUSED, the headset isn't connected or the
+    host wivrn-server isn't running.
+EOF
+    else
+        cat <<EOF
+  Mode: windowed Monado (no headset). Expect TWO new windows on your desktop:
+    - the nested Omarchy session (themed waybar at the top, wallpaper, …)
+    - the Monado compositor window (the 3D XR view with the floating monitors)
+EOF
+        [[ -n $ports ]] && cat <<EOF
+    Drive the fake HMD/controllers from the host (port published):
+      subprojects/monado/build/src/xrt/targets/gui/monado-gui remote
+      (or the in-container gui: xr-container.sh exec monado-gui remote)
+EOF
+    fi
+    cat <<EOF
+
+  Talk to the nested session from the host:
+    $0 exec hyprctl openxr status
+    $0 exec hyprctl monitors
+    $0 exec hyprctl dispatch exec alacritty     # a terminal in the nested session
+  Private-bus / isolation proof (all run INSIDE the container):
+    $0 exec busctl --user list        # org.freedesktop.Notifications owner = container
+    $0 exec ls /dev/input             # empty: no physical input devices
+    $0 exec hyprctl devices           # only the nested wayland seat
+  ===========================================================================
+EOF
+}
+
+# --- exec: run a command in the RUNNING session container as dev --------------
+cmd_exec() {
+    [[ $# -ge 1 ]] || die "exec: need a command (e.g. $0 exec hyprctl openxr status)"
+    local ctr
+    ctr=$(podman ps --format '{{.Names}}' 2>/dev/null | grep '^hypxrland-session-' | head -1 || true)
+    [[ -n $ctr ]] || die "no running hypxrland-session-* container (start one with: $0 session)"
+    # Quote each arg so the remote bash -lc sees them intact.
+    local q="" a
+    for a in "$@"; do q+="$(printf '%q ' "$a")"; done
+    podman exec -it "$ctr" machinectl shell dev@.host /usr/bin/bash -lc "$q"
+}
+
 # --- main --------------------------------------------------------------------
 usage() { grep -E '^# ' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
@@ -490,7 +714,8 @@ case "$sub" in
         img="$IMG_BASE"
         podman image exists "$IMG_SESSION" && img="$IMG_SESSION"
         check_gpu "$gpu" "$img" ;;
-    session)   die "session: not implemented in WP1 (interactive session lands in WP3)" ;;
+    session)   cmd_session "$@" ;;
+    exec)      cmd_exec "$@" ;;
     test)      cmd_test "$@" ;;
     -h|--help) usage ;;
     *) usage; die "unknown subcommand: $sub" ;;

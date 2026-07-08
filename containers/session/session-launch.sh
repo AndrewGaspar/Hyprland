@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# In-container session launcher. Run as `dev` inside a real logind session
+# (entered by scripts/xr-container.sh `session` via `machinectl shell`). Brings
+# up the dev Hyprland with the XR extension, nesting into the bind-mounted host
+# wayland socket, against either:
+#   windowed  — a vendored windowed Monado (no headset) whose window appears on
+#               the host desktop via the host XWayland socket, OR
+#   wivrn     — the host WiVRn runtime (real headset). This container NEVER runs
+#               wivrn-server; it only talks to the host's over a bind-mounted
+#               socket.
+#
+# The Omarchy autostart chain (waybar/mako/walker/portals via uwsm-app, from the
+# base config's `source`) comes up on THIS container's private system/session
+# buses — the whole point of the container. Nothing is shimmed.
+#
+# Env inputs (set inline by the wrapper's `machinectl shell … bash -lc` command):
+#   XR_MODE            windowed | wivrn                                (required)
+#   XR_GPU_NODE        render node -> AQ_DRM_DEVICES + openxr:gpu      (required)
+#   XR_RUNTIME_JSON    OpenXR runtime manifest                        (required)
+#   HL_WAYLAND_DISPLAY absolute path of the bind-mounted host socket  (required)
+#   XR_BASE_CONF       base config to source (default ~/.config/hypr/hyprland.conf)
+#   XR_OVERLAY         1 -> openxr:overlay = 1
+#   XR_PASSTHROUGH     1 -> openxr:blend_mode = alpha
+#   MONADO_BIN         (windowed) monado-service path (default /build/monado/…)
+#   XR_X_DISPLAY       (windowed) X display for the container-local Xwayland (:9)
+#   WIVRN_HOST_SOCK    (wivrn) bind-mounted host wivrn comp_ipc socket
+#   HYPRLAND_BIN       dev Hyprland (default /build/Hyprland)
+set -uo pipefail
+
+: "${XR_MODE:?}"; : "${XR_GPU_NODE:?}"; : "${XR_RUNTIME_JSON:?}"; : "${HL_WAYLAND_DISPLAY:?}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+# --- nest into the host wayland compositor -----------------------------------
+# WAYLAND_DISPLAY is an ABSOLUTE path (starts with /), so libwayland connects to
+# it directly and skips the XDG_RUNTIME_DIR 0700-owner check entirely.
+export AQ_BACKENDS=wayland
+export WAYLAND_DISPLAY="$HL_WAYLAND_DISPLAY"
+export AQ_DRM_DEVICES="$XR_GPU_NODE"
+export XR_RUNTIME_JSON
+HYPRLAND_BIN="${HYPRLAND_BIN:-/build/Hyprland}"
+[[ -x $HYPRLAND_BIN ]] || { echo "!! dev Hyprland missing at $HYPRLAND_BIN — build it first (bash /src/containers/build-in-ctr.sh)" >&2; exit 6; }
+
+echo "== HypXRland container session =="
+echo "   mode=$XR_MODE  gpu=$XR_GPU_NODE"
+echo "   nesting into host WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+echo "   XR_RUNTIME_JSON=$XR_RUNTIME_JSON"
+
+# --- merged launch config ----------------------------------------------------
+MERGED="$XDG_RUNTIME_DIR/hyprland-xr-merged.conf"
+XR_GPU_NODE="$XR_GPU_NODE" \
+XR_OVERLAY="${XR_OVERLAY:-0}" \
+XR_PASSTHROUGH="${XR_PASSTHROUGH:-0}" \
+XR_BASE_CONF="${XR_BASE_CONF:-$HOME/.config/hypr/hyprland.conf}" \
+    bash /src/containers/session/merge-conf.sh "$MERGED" >/dev/null
+echo "   merged config -> $MERGED"
+
+# --- runtime-specific bring-up ----------------------------------------------
+case "$XR_MODE" in
+    wivrn)
+        # The WiVRn client (Monado IPC) hardcodes $XDG_RUNTIME_DIR/wivrn/comp_ipc.
+        # Symlink it to the bind-mounted host socket — connect() follows the
+        # symlink, and an AF_UNIX socket is reachable cross-namespace by its inode.
+        sock="${WIVRN_HOST_SOCK:-/hypxrland-host/wivrn-comp_ipc}"
+        if [[ -S $sock ]]; then
+            mkdir -p "$XDG_RUNTIME_DIR/wivrn"
+            ln -sf "$sock" "$XDG_RUNTIME_DIR/wivrn/comp_ipc"
+            echo "   wivrn socket -> $XDG_RUNTIME_DIR/wivrn/comp_ipc  ($sock)"
+        else
+            echo "!! WiVRn socket not found at $sock." >&2
+            echo "   Is wivrn-server running on the HOST with the headset connected?" >&2
+            echo "   (Session creation would fail; exiting cleanly.)" >&2
+            exit 3
+        fi
+        if ldd /usr/lib/wivrn/libopenxr_wivrn.so 2>&1 | grep -qi 'not found'; then
+            echo "!! WiVRn client library has unresolved deps:" >&2
+            ldd /usr/lib/wivrn/libopenxr_wivrn.so 2>&1 | grep -i 'not found' >&2
+        fi
+        ;;
+    windowed)
+        MONADO_BIN="${MONADO_BIN:-/build/monado/src/xrt/targets/service/monado-service}"
+        [[ -x $MONADO_BIN ]] || { echo "!! monado-service missing at $MONADO_BIN — run build-in-ctr.sh" >&2; exit 4; }
+        command -v Xwayland >/dev/null || { echo "!! Xwayland missing (install xorg-xwayland)" >&2; exit 7; }
+
+        # Monado's windowed compositor needs an X server (its Wayland window backend
+        # asserts with 0 swapchain images under Hyprland — XRT_COMPOSITOR_FORCE_XCB).
+        # Rather than depend on a host XWayland (lazy; may be down; /tmp bind mounts
+        # are shadowed by the container's systemd tmpfs anyway), run a CONTAINER-LOCAL
+        # rooted Xwayland that connects to the same host wayland socket — its single X
+        # screen appears as one window on the host desktop, and Monado draws into it.
+        local_dpy="${XR_X_DISPLAY:-:9}"
+        echo ">> starting container Xwayland $local_dpy (rooted, on the host compositor)"
+        Xwayland "$local_dpy" -geometry 1600x900 >"$XDG_RUNTIME_DIR/xwayland.log" 2>&1 &
+        XWL_PID=$!
+        for _ in $(seq 1 20); do
+            [[ -S /tmp/.X11-unix/X${local_dpy#:} ]] && break
+            kill -0 "$XWL_PID" 2>/dev/null || { echo "!! Xwayland died:" >&2; tail -20 "$XDG_RUNTIME_DIR/xwayland.log" >&2; exit 7; }
+            sleep 0.3
+        done
+        [[ -S /tmp/.X11-unix/X${local_dpy#:} ]] || { echo "!! Xwayland X socket never appeared" >&2; exit 7; }
+        echo "   Xwayland up (pid $XWL_PID, DISPLAY=$local_dpy); log $XDG_RUNTIME_DIR/xwayland.log"
+
+        echo ">> starting windowed monado-service (remote driver, DISPLAY=$local_dpy)"
+        env P_OVERRIDE_ACTIVE_CONFIG=remote XRT_NO_STDIN=1 XRT_COMPOSITOR_FORCE_XCB=1 \
+            DISPLAY="$local_dpy" \
+            "$MONADO_BIN" >"$XDG_RUNTIME_DIR/monado.log" 2>&1 &
+        MONADO_PID=$!
+        sleep 3
+        if ! kill -0 "$MONADO_PID" 2>/dev/null; then
+            echo "!! monado-service died — last 20 log lines:" >&2
+            tail -20 "$XDG_RUNTIME_DIR/monado.log" >&2
+            exit 5
+        fi
+        echo "   monado-service up (pid $MONADO_PID); log $XDG_RUNTIME_DIR/monado.log"
+        ;;
+    *) echo "unknown XR_MODE: $XR_MODE (want windowed|wivrn)" >&2; exit 2 ;;
+esac
+
+echo ">> exec dev Hyprland (--config $MERGED)"
+# exec: Hyprland becomes the session leader's foreground process, so the wrapper's
+# attached `machinectl shell` terminal shows its logs. Container teardown
+# (podman rm -f) reaps the whole tree, including the backgrounded monado above.
+exec "$HYPRLAND_BIN" --config "$MERGED"
