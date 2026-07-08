@@ -78,24 +78,15 @@ SHIM
 chmod +x "$SHIM_DIR/uwsm-app"
 
 # --------------------------------------------------------------------------
-# 1b. Nested-safe terminal override (DBus single-instance apps)
+# NOTE on DBus single-instance apps (no override needed anymore)
 # --------------------------------------------------------------------------
-# The nested session shares the HOST's DBus session bus (same XDG_RUNTIME_DIR).
-# GApplication single-instance apps therefore route a nested launch to their
-# already-running HOST instance, so the window opens on the HOST session, NOT
-# nested — this is independent of the uwsm-app shim. The terminal is the one we
-# care about for usability, so detect the default terminal (xdg-terminal-exec
-# picks the first valid entry in ~/.config/xdg-terminals.list) and, for known
-# single-instance terminals, emit an override that forces a fresh instance.
-TERM_LIST="$HOME_DIR/.config/xdg-terminals.list"
-FIRST_TERM="$(grep -vE '^[[:space:]]*(#|$)' "$TERM_LIST" 2>/dev/null | head -n1 || true)"
-TERM_OVERRIDE_CMD=""
-case "$FIRST_TERM" in
-    *ghostty*) TERM_OVERRIDE_CMD="ghostty --gtk-single-instance=false" ;;
-    # alacritty / kitty / foot are not DBus singletons: the plain uwsm-app bind
-    # already lands nested, so no override is needed.
-esac
-
+# preview-xr.sh launches the nested Hyprland under `dbus-run-session`, so the
+# nested session has its OWN private DBus session bus. GApplication/DBus
+# single-instance apps (ghostty, walker, mako, the browser, nautilus, obsidian…)
+# therefore find NO existing instance on this fresh bus and start a NEW one inside
+# the nested session — no more delegating to the HOST instance. That means the old
+# per-terminal `--gtk-single-instance=false` override is unnecessary: the stock
+# `uwsm-app -- xdg-terminal-exec` bind (via the shim above) already lands nested.
 # --------------------------------------------------------------------------
 # 2. nested.conf
 # --------------------------------------------------------------------------
@@ -114,16 +105,30 @@ cat > "$NESTED_CONF" <<CONF
 #
 # Mirrors the user's Omarchy desktop (keybinds / look'n'feel / theme) while
 # excluding everything that mutates global session state or starts daemons:
-#   EXCLUDED  default/hypr/autostart.conf   (hypridle, mako, waybar, fcitx5,
-#                                             swaybg, polkit, monitor-watch,
+#   EXCLUDED  default/hypr/autostart.conf   (hypridle, waybar, fcitx5, swaybg,
+#                                             polkit, monitor-watch, mako,
 #                                             systemctl/dbus import-environment,
 #                                             omarchy-first-run/powerprofiles)
 #   EXCLUDED  ~/.config/hypr/autostart.conf  (steam, theme/power daemons)
 #   EXCLUDED  ~/.config/hypr/monitors.conf   (host monitor layout; nested has
 #                                             its own WAYLAND-1 + XR outputs)
-# Per-session cosmetics (waybar, swaybg) are relaunched below via plain
-# exec-once. mako/hypridle/fcitx5/polkit are deliberately NOT started (DBus name
-# conflicts with the host / global-state daemons).
+#
+# PRIVATE DBus session bus: preview-xr.sh launches this nested Hyprland under
+# dbus-run-session, so the whole nested session (and every keybind-launched app,
+# which inherits DBUS_SESSION_BUS_ADDRESS through Hyprland's fork/exec) has its OWN
+# session bus. DBus/GApplication singletons (ghostty, walker, mako, browser,
+# nautilus, obsidian, web-apps) therefore start FRESH nested instead of routing to
+# their already-running HOST instances — the shared-bus delegation bug is gone, and
+# no per-app single-instance override is needed. Side effects (all fine for a
+# preview): nested notifications go to the nested mako (below), not the host;
+# xdg-desktop-portal dbus-activates fresh on this bus (pickers/screencast may be
+# limited); host DBus services (NetworkManager applet, etc.) are absent on the fresh
+# bus. Anything that STILL routes to the host would only do so via a non-DBus channel
+# (e.g. an X11/abstract-socket singleton) — none observed here.
+#
+# Per-session cosmetics (waybar, swaybg) plus mako are relaunched below via plain
+# exec-once (mako is now safe: no org.freedesktop.Notifications clash on the private
+# bus). hypridle/fcitx5/polkit stay OFF (global-state / unwanted in a preview).
 # ==========================================================================
 
 # Route keybind app-launches through the uwsm-app shim so they land in THIS
@@ -156,30 +161,23 @@ source = $USER_HYPR/bindings.conf
 source = $HOME_DIR/.local/state/omarchy/toggles/hypr/*.conf
 CONF
 
-# Terminal override (only for DBus single-instance terminals — see section 1b).
-if [ -n "$TERM_OVERRIDE_CMD" ]; then
-    cat >> "$NESTED_CONF" <<CONF
-
-# ---- Nested-safe terminal ($FIRST_TERM) ----
-# The host runs this terminal as a GApplication single-instance, so a nested
-# launch of it via the default 'uwsm-app -- xdg-terminal-exec' bind would route
-# to the HOST instance (shared DBus session bus) and open there. Force a fresh
-# instance so SUPER+RETURN / SUPER+ALT+RETURN land in THIS nested session.
-unbind = SUPER, RETURN
-bindd = SUPER, RETURN, Terminal, exec, $TERM_OVERRIDE_CMD
-unbind = SUPER ALT, RETURN
-bindd = SUPER ALT, RETURN, Tmux, exec, $TERM_OVERRIDE_CMD -e tmux new
-CONF
-fi
+# Terminal binds are left stock: the private DBus session bus (dbus-run-session in
+# preview-xr.sh) means the default 'uwsm-app -- xdg-terminal-exec' bind opens a fresh
+# nested terminal even for GApplication single-instance terminals like ghostty, so no
+# per-terminal override is emitted anymore.
 
 cat >> "$NESTED_CONF" <<CONF
 
 # ---- Per-session cosmetics (SAFE: plain exec-once, no uwsm/systemd/dbus) ----
-# waybar gives the Omarchy top bar; swaybg the themed wallpaper. NOT launched:
-# mako (org.freedesktop.Notifications would clash with the host), hypridle,
-# fcitx5, polkit agent, or anything systemctl/dbus-*.
+# waybar gives the Omarchy top bar; swaybg the themed wallpaper; mako the nested
+# notification daemon. mako is safe here because the nested session has its OWN
+# private DBus bus (dbus-run-session), so it owns org.freedesktop.Notifications on
+# THAT bus with no clash against the host mako — nested notify-send now surfaces in
+# the nested session. NOT launched: hypridle, fcitx5, polkit agent, or anything
+# systemctl/dbus-* (global-state / unwanted in a preview).
 exec-once = waybar
 exec-once = swaybg -i $HOME_DIR/.config/omarchy/current/background -m fill
+exec-once = mako
 
 # ==========================================================================
 # HypXRland XR essentials (equivalent of scripts/preview-xr.conf).
