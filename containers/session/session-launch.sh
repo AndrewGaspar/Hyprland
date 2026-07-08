@@ -42,6 +42,12 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 # uwsm-app-routed launches.
 export PATH="$HOME/.local/share/omarchy/bin:$PATH"
 
+# The image's theme install runs with OMARCHY_THEME_SKIP_BACKGROUND=1 (no
+# compositor at build time), deferring the wallpaper selection to us: create
+# ~/.config/omarchy/current/background (symlink into the theme's backgrounds/)
+# if it doesn't exist yet, or swaybg renders a black desktop.
+[ -e "$HOME/.config/omarchy/current/background" ] || omarchy-theme-bg-next >/dev/null 2>&1 || true
+
 # --- nest into the host wayland compositor -----------------------------------
 # WAYLAND_DISPLAY is an ABSOLUTE path (starts with /), so libwayland connects to
 # it directly and skips the XDG_RUNTIME_DIR 0700-owner check entirely.
