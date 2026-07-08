@@ -1134,6 +1134,13 @@ std::string CConfigManager::parseKeyword(const std::string& COMMAND, const std::
     // full `/reload`. Same targeted fix, mirroring the inhibit_idle special-case.
     if (COMMAND == "openxr:enabled" && g_pOpenXRManager)
         g_pOpenXRManager->onConfigReload();
+
+    // openxr:chrome_* geometry (enabled/margin/bar_height/bar_width_frac/corner_size) is frozen
+    // into each layer's swapchain at creation; onConfigReload() diffs the tuple and marks
+    // swapchains dirty (WP-G2). Same legacy-keyword gap as above: without this, a bare
+    // `hyprctl keyword openxr:chrome_margin ...` would not apply until a full /reload.
+    if (COMMAND.starts_with("openxr:chrome_") && g_pOpenXRManager)
+        g_pOpenXRManager->onConfigReload();
 #endif
 
     // Update window border colors
