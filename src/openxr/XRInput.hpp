@@ -219,6 +219,14 @@ class CXRInput {
     std::array<MONITORID, 2>   m_grabbedMon{-1, -1}; // monitor id each hand currently grabs
     std::array<std::string, 2> m_grabbedMonName;     // its name, captured at grab-begin (event payload)
 
+    // ---- release-latching (WP-G4, research 04-grabbable-borders.md §5.4) ----
+    // Per-hand ring of the carried quad's world pose, pushed every grabbed frame. On the release
+    // edge the reanchor uses a pose from ~openxr:grab_release_latency_ms before the edge (and/or
+    // the last calm sample) instead of the perturbed release-frame pose. POD, frame-thread-only —
+    // zero hyprutils refcount ops (XRMonitorLayer.hpp rule). Gesture-agnostic: it hooks the grab
+    // machine's release edge whatever gesture (squeeze / grasp / future pinch) drove it.
+    std::array<OpenXR::SXRGrabRing, 2> m_grabRing;
+
     int                        m_owner      = -1;  // hand that owns the single pointer (-1 = none)
     MONITORID                  m_emittedMon = -1;  // last MOTION_ABS monitor emitted (coalescing, -1 = hover clear)
     Vector2D                   m_emittedUV;        // last MOTION_ABS uv emitted
