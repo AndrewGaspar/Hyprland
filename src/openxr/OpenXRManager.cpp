@@ -1676,6 +1676,11 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
         info.quatZ                       = reportPose.rot.z;
         info.quatW                       = reportPose.rot.w;
         info.grabbed                     = l->m_anchor.grabbed(); // WP8 drives the grab machine
+        switch (l->m_anchor.grabKind()) {                         // WP-G3: move vs resize
+            case OpenXR::XR_GRABKIND_MOVE: info.grabKind = "move"; break;
+            case OpenXR::XR_GRABKIND_RESIZE: info.grabKind = "resize"; break;
+            default: info.grabKind = "none"; break;
+        }
         info.hovered                     = l->m_hovered;          // WP7
         if (l->m_reqResolution) {
             info.w = (int)l->m_reqResolution->x;
