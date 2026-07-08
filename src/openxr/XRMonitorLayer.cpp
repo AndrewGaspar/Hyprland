@@ -17,6 +17,15 @@ CXRMonitorLayer::CXRMonitorLayer(const std::string& name, uint64_t seq, float si
 void CXRMonitorLayer::bindToMonitor(PHLMONITOR mon, std::function<void()> onGone) {
     m_monitor = mon;
 
+    // Cache the facts the frame thread needs as plain values — it must never lock() m_monitor
+    // (non-atomic hyprutils refcounts; see the thread-safety rule in the header).
+    m_monitorId.store(mon->m_id, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(m_bufMu);
+        m_pendingSize = mon->m_pixelSize;
+    }
+    m_swapchainDirty.store(true, std::memory_order_release);
+
     // presented: fires on the main thread after each committed frame — stash the buffer for
     // the frame thread (the WIP's proven handoff pattern, moved per-layer).
     m_presentedListener = mon->m_events.presented.listen([this]() {
@@ -26,9 +35,13 @@ void CXRMonitorLayer::bindToMonitor(PHLMONITOR mon, std::function<void()> onGone
         auto buf = pmon->m_output->state->state().buffer;
         if (!buf)
             return;
-        std::lock_guard<std::mutex> lk(m_bufMu);
-        m_latestBuffer = buf; // SP keeps the buffer alive across threads
-        m_haveNewFrame.store(true, std::memory_order_release);
+        std::vector<SP<Aquamarine::IBuffer>> retired;
+        {
+            std::lock_guard<std::mutex> lk(m_bufMu);
+            retired.swap(m_retiredBuffers); // release frame-consumed buffers here, on main
+            m_latestBuffer = buf;           // SP keeps the buffer alive across threads
+            m_haveNewFrame.store(true, std::memory_order_release);
+        }
     });
 
     // modeChanged: record the new pixel size for the frame thread to recreate the swapchain.
@@ -68,6 +81,29 @@ SP<Aquamarine::IBuffer> CXRMonitorLayer::takeLatestBuffer() {
     m_latestBuffer.reset();
     m_haveNewFrame.store(false, std::memory_order_relaxed);
     return buf;
+}
+
+void CXRMonitorLayer::retireBuffer(SP<Aquamarine::IBuffer>&& buf) {
+    // Frame thread. The final release of a buffer SP must happen on the main thread — the main
+    // thread holds refs to the same buffer (output state, renderer) and hyprutils refcounts are
+    // not atomic. A move never touches the count.
+    if (!buf)
+        return;
+    std::lock_guard<std::mutex> lk(m_bufMu);
+    m_retiredBuffers.emplace_back(std::move(buf));
+}
+
+void CXRMonitorLayer::releaseBuffers() {
+    // Main thread. Pull the refs out under the lock, release them outside it.
+    SP<Aquamarine::IBuffer>              latest;
+    std::vector<SP<Aquamarine::IBuffer>> retired;
+    {
+        std::lock_guard<std::mutex> lk(m_bufMu);
+        latest = std::move(m_latestBuffer);
+        m_latestBuffer.reset();
+        retired.swap(m_retiredBuffers);
+        m_haveNewFrame.store(false, std::memory_order_relaxed);
+    }
 }
 
 void CXRMonitorLayer::destroyFrameResourcesGL(CXRGraphics& gfx) {

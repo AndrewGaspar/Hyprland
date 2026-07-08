@@ -85,7 +85,7 @@ constexpr float XR_GRAB_RESIZE_SPEED   = 1.0F; // m/s of width at full stick.x
 // the sampled aim poses (device/grip-locked quads pass their world-composed pose). `anchor` is
 // the live CXRAnchor for the grab machine (§6, WP8) to call beginGrab/grabPushPull/grabResize/
 // endGrab on; it is a raw, frame-thread-only pointer valid strictly for the duration of the
-// frame that produced this target vector (backed by the frame loop's own SP<CXRMonitorLayer>
+// frame that produced this target vector (backed by the frame loop's own PXRLAYER
 // snapshot) — never cached across frames.
 struct SXRPointerTarget {
     MONITORID          id = -1;
