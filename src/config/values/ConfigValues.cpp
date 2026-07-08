@@ -728,6 +728,11 @@ std::vector<SP<IValue>> Values::getConfigValues() {
                  "let a squeeze/grip on a monitor's CONTENT body move it (the controller convenience). true keeps grab-anywhere for controllers; false confines moving "
                  "to the bottom move-bar and resizing to the corner handles. The bar and corners always grab regardless. Read per-frame (hot-toggles)",
                  true),
+        MS<String>("openxr:hand_grab",
+                   "hand-tracking grab gesture (XR_EXT_hand_interaction): pinch (thumb-index, default; anchors to the stable pinch pose so opening the pinch to release "
+                   "doesn't lurch the window) | grasp (fist curl; anchors to the wrist) | both (either). Hands always grab from the move-bar/corners only (never the body, "
+                   "regardless of grab_anywhere); controllers are unaffected. Read per-frame (hot-toggles)",
+                   "pinch"),
         MS<Int>("openxr:grab_release_latency_ms",
                 "on grab release, re-anchor from the quad pose sampled this many ms BEFORE the release edge, to reject the release-motion lurch (the grip/hand "
                 "swing on the release frame). 0 = use the release frame. ~100 clears the perturbation; raise it if releases still lurch, lower it if a quick "

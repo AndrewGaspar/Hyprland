@@ -120,6 +120,19 @@ bool COpenXRManager::isOverlay() const {
     return m_session && m_session->m_isOverlay;
 }
 
+std::array<COpenXRManager::SXRHandInputInfo, 2> COpenXRManager::handInputInfos() const {
+    // WP-G5: reflect each hand's active device for `hyprctl openxr status`. m_input's per-hand kind
+    // is an atomic mirror (main-thread safe to read); hand_grab is read from config here.
+    static auto                     PHANDGRAB = CConfigValue<std::string>("openxr:hand_grab");
+    std::array<SXRHandInputInfo, 2> out;
+    for (int h = 0; h < 2; ++h) {
+        const bool hands = m_input && m_input->handInputKind((OpenXR::eXRHand)h) == OpenXR::XR_INPUT_HANDS;
+        out[h].hands     = hands;
+        out[h].gesture   = hands ? OpenXR::xrHandGrabName(OpenXR::xrParseHandGrab(*PHANDGRAB)) : "";
+    }
+    return out;
+}
+
 bool COpenXRManager::shouldInhibitIdle() {
     // doc 05 §6.1. FOCUSED (and only FOCUSED) inhibits: the headset is on and this session has
     // input focus. VISIBLE (e.g. runtime dashboard in front) intentionally does not inhibit.
@@ -577,6 +590,13 @@ void COpenXRManager::frameThread() {
     while (m_running.load()) {
         m_session->pollEvents();
 
+        // WP-G5: forward an interaction-profile change to the input system so it re-reads each
+        // hand's active device (hands vs controllers) on the next sample().
+        if (m_input && m_session->m_interactionProfileChanged) {
+            m_session->m_interactionProfileChanged = false;
+            m_input->notifyInteractionProfileChanged();
+        }
+
         // Recenter (doc 03 §6): re-express every anchor across a reference-space change.
         if (m_session->m_recenterPending) {
             const OpenXR::SXRPose M      = m_session->m_recenterPose;
@@ -830,6 +850,10 @@ void COpenXRManager::frameThread() {
         // same way as the view; the device-lock late-latch path (below) composes that shift back
         // out algebraically, so the grip ActionSpace is still submitted unshifted.
         std::optional<OpenXR::SXRPose> gripLeft, gripRight;
+        // WP-G5: hand pinch poses, floor-shifted identically to the grips (same LOCAL-fallback
+        // handling) so a pinch-anchored hand grab carries in the same reference frame as everything
+        // else. Empty for controller/remote-driver sessions (no pinch pose bound).
+        std::optional<OpenXR::SXRPose> pinchLeft, pinchRight;
         if (m_input) {
             if (auto g = m_input->grip(OpenXR::XR_HAND_LEFT)) {
                 if (!m_session->m_usingLocalFloor)
@@ -840,6 +864,16 @@ void COpenXRManager::frameThread() {
                 if (!m_session->m_usingLocalFloor)
                     g->pos.y += floorOffset;
                 gripRight = g;
+            }
+            if (auto p = m_input->pinch(OpenXR::XR_HAND_LEFT)) {
+                if (!m_session->m_usingLocalFloor)
+                    p->pos.y += floorOffset;
+                pinchLeft = p;
+            }
+            if (auto p = m_input->pinch(OpenXR::XR_HAND_RIGHT)) {
+                if (!m_session->m_usingLocalFloor)
+                    p->pos.y += floorOffset;
+                pinchRight = p;
             }
         }
 
@@ -853,10 +887,12 @@ void COpenXRManager::frameThread() {
                 const bool needsView = l->m_anchor.state().mode != OpenXR::XR_ANCHOR_LOCAL;
                 if (viewValid || !needsView) {
                     OpenXR::SXRSolveInput in;
-                    in.view      = viewPose;
-                    in.dt        = dt;
-                    in.gripLeft  = gripLeft;
-                    in.gripRight = gripRight;
+                    in.view       = viewPose;
+                    in.dt         = dt;
+                    in.gripLeft   = gripLeft;
+                    in.gripRight  = gripRight;
+                    in.pinchLeft  = pinchLeft;  // WP-G5: pinch-anchored hand MOVE grabs
+                    in.pinchRight = pinchRight;
                     // Aspect from the CONTENT pixel mode (not the chrome-expanded swapchain) so
                     // widthMeters/heightMeters stay CONTENT geometry — `size:` and layout
                     // serialization keep meaning content meters (WP-G1).
@@ -926,15 +962,20 @@ void COpenXRManager::frameThread() {
             // at display time (doc 03 §3.4), so the quad tracks 1:1 with zero added latency. Any
             // other selector (incl. a grip selector with no valid grip space) submits the world
             // pose in the reference space, with the LOCAL-fallback floor shift removed.
-            XrSpace gripSpace = XR_NULL_HANDLE;
-            if (m_input && (res.space == OpenXR::XR_SPACE_GRIP_LEFT || res.space == OpenXR::XR_SPACE_GRIP_RIGHT))
-                gripSpace = m_input->gripSpace(res.space == OpenXR::XR_SPACE_GRIP_LEFT ? OpenXR::XR_HAND_LEFT : OpenXR::XR_HAND_RIGHT);
+            XrSpace deviceSpace = XR_NULL_HANDLE;
+            if (m_input) {
+                if (res.space == OpenXR::XR_SPACE_GRIP_LEFT || res.space == OpenXR::XR_SPACE_GRIP_RIGHT)
+                    deviceSpace = m_input->gripSpace(res.space == OpenXR::XR_SPACE_GRIP_LEFT ? OpenXR::XR_HAND_LEFT : OpenXR::XR_HAND_RIGHT);
+                else if (res.space == OpenXR::XR_SPACE_PINCH_LEFT || res.space == OpenXR::XR_SPACE_PINCH_RIGHT)
+                    // WP-G5: a pinch-anchored hand MOVE grab late-latches the pinch pose action space.
+                    deviceSpace = m_input->pinchSpace(res.space == OpenXR::XR_SPACE_PINCH_LEFT ? OpenXR::XR_HAND_LEFT : OpenXR::XR_HAND_RIGHT);
+            }
 
             XrSpace         quadSpace = m_session->m_refSpace;
             OpenXR::SXRPose quadPose;
-            if (gripSpace != XR_NULL_HANDLE) {
-                quadSpace = gripSpace;
-                quadPose  = res.pose; // grip-space offset; the grip ActionSpace is unshifted
+            if (deviceSpace != XR_NULL_HANDLE) {
+                quadSpace = deviceSpace;
+                quadPose  = res.pose; // device-space offset; the grip/pinch ActionSpace is unshifted
             } else {
                 quadPose = res.space == OpenXR::XR_SPACE_LOCAL_FLOOR ? res.pose : res.worldPose;
                 if (!m_session->m_usingLocalFloor)
@@ -998,10 +1039,12 @@ void COpenXRManager::frameThread() {
         // (move/anchor/scale/...) touching the same CXRAnchor.
         if (m_input) {
             OpenXR::SXRSolveInput pointerSolveIn;
-            pointerSolveIn.view      = viewPose;
-            pointerSolveIn.dt        = dt;
-            pointerSolveIn.gripLeft  = gripLeft;
-            pointerSolveIn.gripRight = gripRight;
+            pointerSolveIn.view       = viewPose;
+            pointerSolveIn.dt         = dt;
+            pointerSolveIn.gripLeft   = gripLeft;
+            pointerSolveIn.gripRight  = gripRight;
+            pointerSolveIn.pinchLeft  = pinchLeft; // WP-G5: pinch grab begin/carry/latch device pose
+            pointerSolveIn.pinchRight = pinchRight;
             std::scoped_lock lock(m_layersMu);
             m_input->processPointer(pointerTargets, (uint32_t)Time::millis(Time::steadyNow()), pointerSolveIn, tune);
 
