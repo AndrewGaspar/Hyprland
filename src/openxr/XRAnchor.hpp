@@ -38,10 +38,15 @@ namespace OpenXR {
     };
 
     // Which XrSpace the quad layer must reference; mapped to real handles by CXRMonitorLayer.
+    // GRIP_* is the controller/wrist grip action space; PINCH_* is the hand pinch pose action space
+    // (WP-G5) — a hand MOVE grab anchors to the steadier thumb-index contact point, so the runtime
+    // late-latches the pinch pose (not the wrist) at display time.
     enum eXRSpaceSelector : uint8_t {
         XR_SPACE_LOCAL_FLOOR = 0,
         XR_SPACE_GRIP_LEFT,
         XR_SPACE_GRIP_RIGHT,
+        XR_SPACE_PINCH_LEFT,
+        XR_SPACE_PINCH_RIGHT,
     };
 
     // ---- constants (doc 03 §8) ----
@@ -149,6 +154,12 @@ namespace OpenXR {
         float                  dt = 0.F; // seconds since last solve (clamped to [0, 0.1])
         std::optional<SXRPose> gripLeft; // grip poses in LOCAL_FLOOR; nullopt = tracking invalid
         std::optional<SXRPose> gripRight;
+        // Hand pinch poses in LOCAL_FLOOR (WP-G5); nullopt unless the ext/hand_interaction_ext
+        // pinch pose is bound + valid this frame. Used ONLY by a pinch-anchored hand MOVE grab
+        // (solve() grab override) — every other path ignores them, so a controller/remote-driver
+        // session simply leaves them empty with no behavior change.
+        std::optional<SXRPose> pinchLeft;
+        std::optional<SXRPose> pinchRight;
         uint32_t               pxW = 1, pxH = 1; // current monitor mode, for aspect
     };
 
@@ -179,7 +190,11 @@ namespace OpenXR {
         SXRSolveResult solve(const SXRSolveInput& in, const SXRAnchorTuning& tune);
 
         // ---- grab pose math (§4) — the grab state MACHINE is WP8 ----
-        void beginGrab(eXRHand hand, const SXRPose& gripWorld);
+        // `deviceWorld` is the grabbing hand's device pose in LOCAL_FLOOR: the wrist grip pose for
+        // controllers/grasp, or (WP-G5, usePinch=true) the hand pinch pose. usePinch makes solve()
+        // carry the quad against the pinch pose + return a PINCH space selector so the runtime
+        // late-latches the pinch action space; the release/endGrab picks the same device pose.
+        void beginGrab(eXRHand hand, const SXRPose& deviceWorld, bool usePinch = false);
         void grabPushPull(float deltaMeters);
         void grabResize(float deltaMeters);
         // Re-anchor from the quad's world pose at the release frame (grip ∘ offset). Kept for
@@ -262,7 +277,8 @@ namespace OpenXR {
         // grab
         bool    m_grabbed  = false;
         eXRHand m_grabHand = XR_HAND_LEFT;
-        SXRPose m_grabOffset;                // in grabbing hand's grip space
+        bool    m_grabPinch = false;         // WP-G5: MOVE grab anchored to the pinch pose (hands)
+        SXRPose m_grabOffset;                // in the grabbing hand's device (grip OR pinch) space
         bool    m_deviceOffsetDirty = false; // DEVICE: recompute offset on first valid grip
         // corner resize grab (WP-G3): begin-snapshot of the pinned corner + diagonal in WORLD
         // (LOCAL_FLOOR), so every frame derives width from the grip's projection onto that fixed

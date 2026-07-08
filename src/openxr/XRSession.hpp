@@ -93,6 +93,9 @@ class CXRSession {
     bool           m_sessionBegan  = false;
     bool           m_exitRequested = false; // set on EXITING / LOSS_PENDING / instance loss
     bool           m_instanceLost  = false; // set on LOSS_PENDING / XrEventDataInstanceLossPending
+    // WP-G5: set by pollEvents on XrEventDataInteractionProfileChanged; the frame loop forwards it
+    // to CXRInput (re-read xrGetCurrentInteractionProfile) then clears it. Frame-thread only.
+    bool           m_interactionProfileChanged = false;
 
     uint32_t       m_maxLayerCount   = 16; // XrSystemGraphicsProperties::maxLayerCount (spec floor 16)
     int64_t        m_swapchainFormat = 0;  // chosen once after session creation

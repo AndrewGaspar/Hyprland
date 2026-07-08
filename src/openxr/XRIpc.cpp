@@ -29,6 +29,12 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     // end-to-end without polling wall-clock idle timers).
     const bool         INHIBITING_IDLE = g_pOpenXRManager->shouldInhibitIdle();
 
+    // WP-G5: per-hand active input device (hands vs controllers) + the hand grab gesture.
+    const auto        HANDS = g_pOpenXRManager->handInputInfos();
+    auto              handLabel = [](const COpenXRManager::SXRHandInputInfo& hi) -> std::string {
+        return hi.hands ? std::format("hands ({})", hi.gesture) : "controllers";
+    };
+
     if (format == FORMAT_JSON) {
         std::string mons;
         for (size_t i = 0; i < MONS.size(); ++i) {
@@ -63,14 +69,19 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "blendMode": "{}",
     "overlay": {},
     "inhibitingIdle": {},
+    "input": {{
+        "left": {{ "kind": "{}", "gesture": "{}" }},
+        "right": {{ "kind": "{}", "gesture": "{}" }}
+    }},
     "monitors": [{}{}]
 }}
 )#",
-                           STATE, RUNTIME, SYSTEM, BLEND, OVERLAY ? "true" : "false", INHIBITING_IDLE ? "true" : "false", MONS.empty() ? "" : "\n", mons);
+                           STATE, RUNTIME, SYSTEM, BLEND, OVERLAY ? "true" : "false", INHIBITING_IDLE ? "true" : "false", HANDS[0].hands ? "hands" : "controllers", HANDS[0].gesture,
+                           HANDS[1].hands ? "hands" : "controllers", HANDS[1].gesture, MONS.empty() ? "" : "\n", mons);
     }
 
-    std::string out =
-        std::format("state: {}\nruntime: {}\nsystem: {}\nblend mode: {}\noverlay: {}\nidle inhibited: {}\n", STATE, RUNTIME, SYSTEM, BLEND, OVERLAY ? "yes" : "no", INHIBITING_IDLE ? "yes" : "no");
+    std::string out = std::format("state: {}\nruntime: {}\nsystem: {}\nblend mode: {}\noverlay: {}\nidle inhibited: {}\ninput: left {}, right {}\n", STATE, RUNTIME, SYSTEM, BLEND,
+                                  OVERLAY ? "yes" : "no", INHIBITING_IDLE ? "yes" : "no", handLabel(HANDS[0]), handLabel(HANDS[1]));
     for (const auto& m : MONS) {
         out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} ({}) hovered: {}\n", m.name, m.id, m.w, m.h,
                            m.refresh, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.grabbed ? "yes" : "no", m.grabKind, m.hovered ? "yes" : "no");

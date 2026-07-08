@@ -116,6 +116,7 @@ void CXRAnchor::initFromState(const SXRAnchorState& state) {
     m_bodyHeightCaptured = false;
     m_deviceOffsetDirty  = false;
     m_grabbed            = false;
+    m_grabPinch          = false;
     m_resizing           = false;
     // m_lastWorld / m_hasLastWorld intentionally preserved: switching representation of an
     // existing on-screen quad should not lose where it currently is.
@@ -160,27 +161,34 @@ SXRSolveResult CXRAnchor::solve(const SXRSolveInput& in, const SXRAnchorTuning& 
     res.widthMeters  = m_state.widthMeters;
     res.heightMeters = m_state.widthMeters * (float)in.pxH / (float)(in.pxW ? in.pxW : 1);
 
-    // Grab override (§4.2): behave as device-locked to the grabbing hand.
+    // Grab override (§4.2): behave as device-locked to the grabbing hand. The device is the wrist
+    // grip pose for controllers/grasp, or (WP-G5) the hand pinch pose — the offset was captured
+    // against whichever pose beginGrab received, so the same device pose + a matching space
+    // selector (GRIP_* vs PINCH_*) must be used here for the runtime late-latch to compose right.
     if (m_grabbed) {
-        res.space                          = m_grabHand == XR_HAND_LEFT ? XR_SPACE_GRIP_LEFT : XR_SPACE_GRIP_RIGHT;
-        const std::optional<SXRPose>& grip = m_grabHand == XR_HAND_LEFT ? in.gripLeft : in.gripRight;
+        const bool left = m_grabHand == XR_HAND_LEFT;
+        if (m_grabPinch)
+            res.space = left ? XR_SPACE_PINCH_LEFT : XR_SPACE_PINCH_RIGHT;
+        else
+            res.space = left ? XR_SPACE_GRIP_LEFT : XR_SPACE_GRIP_RIGHT;
+        const std::optional<SXRPose>& dev = m_grabPinch ? (left ? in.pinchLeft : in.pinchRight) : (left ? in.gripLeft : in.gripRight);
 
         // §4.2 amendment: user-facing modes keep re-evaluating orientation continuously while
         // carried instead of staying rigid to the wrist until release. Position remains a
-        // grip-space offset (late-latched by the runtime, zero added latency); only the
+        // device-space offset (late-latched by the runtime, zero added latency); only the
         // offset's rotation is refreshed from this frame's poses — head faces the viewer,
         // body faces yaw-only. local/device grabs stay fully rigid: carrying like an object
         // (tilt it with the wrist) is the expected metaphor there.
-        if (grip && (m_state.mode == XR_ANCHOR_HEAD || m_state.mode == XR_ANCHOR_BODY)) {
-            const Vec3 worldPos = poseCompose(*grip, m_grabOffset).pos;
+        if (dev && (m_state.mode == XR_ANCHOR_HEAD || m_state.mode == XR_ANCHOR_BODY)) {
+            const Vec3 worldPos = poseCompose(*dev, m_grabOffset).pos;
             Quat       face     = lookAtNoRoll(worldPos, in.view.pos, m_lastWorld.rot);
             if (m_state.mode == XR_ANCHOR_BODY)
                 face = qFromYaw(qYawOf(face, m_lastYaw));
-            m_grabOffset.rot = qMul(qInverse(grip->rot), face);
+            m_grabOffset.rot = qMul(qInverse(dev->rot), face);
         }
 
         res.pose       = m_grabOffset;
-        res.worldPose  = grip ? poseCompose(*grip, m_grabOffset) : m_lastWorld;
+        res.worldPose  = dev ? poseCompose(*dev, m_grabOffset) : m_lastWorld;
         m_lastWorld    = res.worldPose;
         m_hasLastWorld = true;
         return res;
@@ -313,11 +321,13 @@ SXRSolveResult CXRAnchor::solve(const SXRSolveInput& in, const SXRAnchorTuning& 
 
 // ---- grab pose math (§4) ----
 
-void CXRAnchor::beginGrab(eXRHand hand, const SXRPose& gripWorld) {
-    // Capture the quad's current displayed world pose relative to the grabbing hand (§4.1).
-    m_grabOffset = poseCompose(poseInverse(gripWorld), m_lastWorld);
+void CXRAnchor::beginGrab(eXRHand hand, const SXRPose& deviceWorld, bool usePinch) {
+    // Capture the quad's current displayed world pose relative to the grabbing hand's device
+    // pose (§4.1). `deviceWorld` is the grip pose (controllers/grasp) or the pinch pose (WP-G5).
+    m_grabOffset = poseCompose(poseInverse(deviceWorld), m_lastWorld);
     m_grabbed    = true;
     m_grabHand   = hand;
+    m_grabPinch  = usePinch;
 }
 
 void CXRAnchor::grabPushPull(float deltaMeters) {
@@ -402,14 +412,17 @@ void CXRAnchor::endResize(const SXRPose& gripWorldLatched, const SXRSolveInput& 
 }
 
 void CXRAnchor::endGrab(const SXRSolveInput& in, const SXRAnchorTuning& tune) {
-    // Release-frame pose (unlatched): grip ∘ offset this frame == m_lastWorld from the solve.
-    const std::optional<SXRPose>& grip = m_grabHand == XR_HAND_LEFT ? in.gripLeft : in.gripRight;
-    const SXRPose                 W    = grip ? poseCompose(*grip, m_grabOffset) : m_lastWorld;
+    // Release-frame pose (unlatched): device ∘ offset this frame == m_lastWorld from the solve.
+    // The device pose is the pinch pose for a pinch-anchored grab (WP-G5), else the grip pose.
+    const bool                    left = m_grabHand == XR_HAND_LEFT;
+    const std::optional<SXRPose>& dev  = m_grabPinch ? (left ? in.pinchLeft : in.pinchRight) : (left ? in.gripLeft : in.gripRight);
+    const SXRPose                 W    = dev ? poseCompose(*dev, m_grabOffset) : m_lastWorld;
     endGrab(W, in, tune);
 }
 
 void CXRAnchor::endGrab(const SXRPose& releaseWorld, const SXRSolveInput& in, const SXRAnchorTuning& tune) {
-    m_grabbed = false;
+    m_grabbed   = false;
+    m_grabPinch = false;
 
     SXRVerbContext ctx;
     ctx.view      = in.view;

@@ -117,6 +117,14 @@ bool CXRInput::init(CXRSession& session, bool hasHandInteraction) {
         !makeAction(m_hapticAction, "haptic", "Haptic", XR_ACTION_TYPE_VIBRATION_OUTPUT))
         return false;
 
+    // WP-G5: the hand pinch value + stable pinch pose (only bound to ext/hand_interaction_ext).
+    // Created only when the extension is enabled — no controller profile references them.
+    if (m_hasHandInteraction) {
+        if (!makeAction(m_pinchValueAction, "pinch_value", "Pinch value", XR_ACTION_TYPE_FLOAT_INPUT) ||
+            !makeAction(m_pinchPoseAction, "pinch_pose", "Pinch pose", XR_ACTION_TYPE_POSE_INPUT))
+            return false;
+    }
+
     // 3. Suggested bindings for every supported profile.
     if (!suggestBindings())
         Log::logger->log(Log::WARN, "[OPENXR] no interaction profile bindings were accepted by the runtime");
@@ -185,13 +193,20 @@ bool CXRInput::suggestBindings() {
         any |= suggestProfile(m_instance, "/interaction_profiles/oculus/touch_controller", b);
     }
 
-    // ext/hand_interaction_ext — only when XR_EXT_hand_interaction was enabled (doc 04 §1.4).
+    // ext/hand_interaction_ext — only when XR_EXT_hand_interaction was enabled (doc 04 §1.4, WP-G5).
+    // pinch_ext/value is bound to BOTH select (a body pinch = a click, §5.2) and the dedicated
+    // pinch_value action (the hand grab gesture, region-gated to the bar/corners); grasp_ext/value
+    // stays on grab (the fist, used when openxr:hand_grab is grasp/both). pinch_ext/pose is the
+    // stable MOVE-grab anchor. aim drives the ray; grip is kept for grasp anchoring + the ref-space
+    // solve. Binding one source (pinch value) to two actions is legal and intentional.
     if (m_hasHandInteraction) {
         std::vector<XrActionSuggestedBinding> b = {
-            bind(m_aimAction, "/user/hand/left/input/aim/pose"),           bind(m_aimAction, "/user/hand/right/input/aim/pose"),
-            bind(m_gripAction, "/user/hand/left/input/grip/pose"),         bind(m_gripAction, "/user/hand/right/input/grip/pose"),
-            bind(m_selectAction, "/user/hand/left/input/pinch_ext/value"), bind(m_selectAction, "/user/hand/right/input/pinch_ext/value"),
-            bind(m_grabAction, "/user/hand/left/input/grasp_ext/value"),   bind(m_grabAction, "/user/hand/right/input/grasp_ext/value"),
+            bind(m_aimAction, "/user/hand/left/input/aim/pose"),               bind(m_aimAction, "/user/hand/right/input/aim/pose"),
+            bind(m_gripAction, "/user/hand/left/input/grip/pose"),             bind(m_gripAction, "/user/hand/right/input/grip/pose"),
+            bind(m_selectAction, "/user/hand/left/input/pinch_ext/value"),     bind(m_selectAction, "/user/hand/right/input/pinch_ext/value"),
+            bind(m_pinchValueAction, "/user/hand/left/input/pinch_ext/value"), bind(m_pinchValueAction, "/user/hand/right/input/pinch_ext/value"),
+            bind(m_pinchPoseAction, "/user/hand/left/input/pinch_ext/pose"),   bind(m_pinchPoseAction, "/user/hand/right/input/pinch_ext/pose"),
+            bind(m_grabAction, "/user/hand/left/input/grasp_ext/value"),       bind(m_grabAction, "/user/hand/right/input/grasp_ext/value"),
         };
         any |= suggestProfile(m_instance, "/interaction_profiles/ext/hand_interaction_ext", b);
     }
@@ -214,8 +229,19 @@ bool CXRInput::createActionSpaces() {
         return true;
     };
 
-    return makeSpace(m_aimAction, XR_HAND_LEFT, m_aimSpace[XR_HAND_LEFT]) && makeSpace(m_aimAction, XR_HAND_RIGHT, m_aimSpace[XR_HAND_RIGHT]) &&
-        makeSpace(m_gripAction, XR_HAND_LEFT, m_gripSpace[XR_HAND_LEFT]) && makeSpace(m_gripAction, XR_HAND_RIGHT, m_gripSpace[XR_HAND_RIGHT]);
+    if (!(makeSpace(m_aimAction, XR_HAND_LEFT, m_aimSpace[XR_HAND_LEFT]) && makeSpace(m_aimAction, XR_HAND_RIGHT, m_aimSpace[XR_HAND_RIGHT]) &&
+          makeSpace(m_gripAction, XR_HAND_LEFT, m_gripSpace[XR_HAND_LEFT]) && makeSpace(m_gripAction, XR_HAND_RIGHT, m_gripSpace[XR_HAND_RIGHT])))
+        return false;
+
+    // WP-G5: pinch pose spaces (hands only). A creation failure here is non-fatal — hands simply
+    // fall back to the grip pose for anchoring (pinchSpace stays XR_NULL_HANDLE); the aim/grip
+    // spaces above are what the core pointer/anchor paths need.
+    if (m_hasHandInteraction) {
+        if (!makeSpace(m_pinchPoseAction, XR_HAND_LEFT, m_pinchSpace[XR_HAND_LEFT]) || !makeSpace(m_pinchPoseAction, XR_HAND_RIGHT, m_pinchSpace[XR_HAND_RIGHT]))
+            Log::logger->log(Log::WARN, "[OPENXR] pinch pose action spaces unavailable; hand grabs will anchor to the grip pose");
+    }
+
+    return true;
 }
 
 void CXRInput::destroy() {
@@ -229,12 +255,18 @@ void CXRInput::destroy() {
             xrDestroySpace(s);
             s = XR_NULL_HANDLE;
         }
+    for (auto& s : m_pinchSpace)
+        if (s != XR_NULL_HANDLE) {
+            xrDestroySpace(s);
+            s = XR_NULL_HANDLE;
+        }
     if (m_actionSet != XR_NULL_HANDLE) {
         xrDestroyActionSet(m_actionSet); // also destroys child actions
         m_actionSet = XR_NULL_HANDLE;
     }
     m_aimAction = m_gripAction = m_selectAction = m_grabAction = m_scrollAction = m_menuAction = m_hapticAction = XR_NULL_HANDLE;
-    m_attached                                                                                                  = false;
+    m_pinchValueAction = m_pinchPoseAction = XR_NULL_HANDLE;
+    m_attached                             = false;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -252,9 +284,25 @@ void CXRInput::logInteractionProfileOnce() {
     }
 }
 
+void CXRInput::refreshHandProfiles() {
+    for (auto hand : {XR_HAND_LEFT, XR_HAND_RIGHT}) {
+        OpenXR::eXRInputKind kind = OpenXR::XR_INPUT_CONTROLLER;
+        XrInteractionProfileState st = {XR_TYPE_INTERACTION_PROFILE_STATE};
+        if (XR_SUCCEEDED(xrGetCurrentInteractionProfile(m_session, m_handPath[hand], &st)) && st.interactionProfile != XR_NULL_PATH)
+            kind = OpenXR::xrInputKindForProfile(fromPath(m_instance, st.interactionProfile));
+        m_handActive[hand] = kind == OpenXR::XR_INPUT_HANDS;
+        m_handInputKindAtomic[hand].store((uint8_t)kind, std::memory_order_release);
+    }
+}
+
 void CXRInput::sample(XrTime predictedDisplayTime, XrSpace refSpace) {
     if (!m_attached)
         return;
+
+    // WP-G5: refresh the per-hand active-device cache when the runtime signalled an interaction
+    // profile change (or on the first sample). Cheap + rare — never per-frame in steady state.
+    if (m_profileDirty.exchange(false, std::memory_order_acq_rel))
+        refreshHandProfiles();
 
     XrActiveActionSet active = {m_actionSet, XR_NULL_PATH};
     XrActionsSyncInfo si     = {XR_TYPE_ACTIONS_SYNC_INFO};
@@ -293,6 +341,7 @@ void CXRInput::sample(XrTime predictedDisplayTime, XrSpace refSpace) {
         };
         h.aim  = locate(m_aimSpace[hand]);
         h.grip = locate(m_gripSpace[hand]);
+        h.pinch = locate(m_pinchSpace[hand]); // WP-G5: XR_NULL_HANDLE space -> nullopt
 
         // Analog / boolean state (each getter yields {value/currentState, isActive}).
         XrActionStateGetInfo gi = {XR_TYPE_ACTION_STATE_GET_INFO};
@@ -309,6 +358,14 @@ void CXRInput::sample(XrTime predictedDisplayTime, XrSpace refSpace) {
         XrActionStateFloat gf = {XR_TYPE_ACTION_STATE_FLOAT};
         if (XR_SUCCEEDED(xrGetActionStateFloat(m_session, &gi, &gf)) && gf.isActive)
             h.grab = gf.currentState;
+
+        // WP-G5: pinch strength (hands only; the action is unbound for controller profiles).
+        if (m_pinchValueAction != XR_NULL_HANDLE) {
+            gi.action             = m_pinchValueAction;
+            XrActionStateFloat pf = {XR_TYPE_ACTION_STATE_FLOAT};
+            if (XR_SUCCEEDED(xrGetActionStateFloat(m_session, &gi, &pf)) && pf.isActive)
+                h.pinchValue = pf.currentState;
+        }
 
         gi.action                = m_scrollAction;
         XrActionStateVector2f vf = {XR_TYPE_ACTION_STATE_VECTOR2F};
@@ -378,7 +435,9 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
     static auto PRELLATENCY = CConfigValue<Hyprlang::INT>("openxr:grab_release_latency_ms");
     static auto PRELVELREJ  = CConfigValue<Hyprlang::FLOAT>("openxr:grab_release_velocity_reject");
     static auto PGRABANY    = CConfigValue<Hyprlang::INT>("openxr:grab_anywhere");
+    static auto PHANDGRAB    = CConfigValue<std::string>("openxr:hand_grab");
     const bool  grabAnywhere = *PGRABANY != 0;
+    const OpenXR::eXRHandGrab handGrabMode = OpenXR::xrParseHandGrab(*PHANDGRAB); // hot-toggles (read per-frame)
     const float onT         = (float)*PSELON;
     const float offT        = (float)*PSELOFF;
     const float grabOnT     = (float)*PGRABON;
@@ -483,22 +542,35 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
     //    vanishing mid-grab means its monitor was destroyed -> force release, no re-anchor).
     for (auto hand : {XR_HAND_LEFT, XR_HAND_RIGHT}) {
         const std::optional<OpenXR::SXRPose>& worldGrip = hand == XR_HAND_LEFT ? solveIn.gripLeft : solveIn.gripRight;
+        // WP-G5: hands vs controller device selection. When hands are active the grab gesture value
+        // comes from pinch/grasp per openxr:hand_grab (a controller keeps the plain squeeze), and a
+        // pinch-driven grab anchors to the stable pinch pose (floor-shifted, from the frame loop) —
+        // falling back to grip when no pinch pose is available. `grabDevPose` follows the current
+        // grab's already-decided device (m_grabDevicePinch), used for per-frame carry/resize/latch.
+        const bool                            handIsHands = handActive(hand);
+        const float                           pinchVal    = m_hands[hand].pinchValue;
+        const float                           graspVal    = m_hands[hand].grab;
+        const float                           grabVal     = handIsHands ? OpenXR::xrHandGrabValue(handGrabMode, pinchVal, graspVal) : graspVal;
+        const std::optional<OpenXR::SXRPose>& pinchPose   = hand == XR_HAND_LEFT ? solveIn.pinchLeft : solveIn.pinchRight;
+        const bool                            wantPinch   = handIsHands && OpenXR::xrHandGrabUsesPinch(handGrabMode, pinchVal, graspVal) && pinchPose.has_value();
+        const std::optional<OpenXR::SXRPose>& newDevPose  = wantPinch ? pinchPose : worldGrip;
+        const std::optional<OpenXR::SXRPose>& grabDevPose = m_grabDevicePinch[hand] ? pinchPose : worldGrip;
 
-        if (m_grabTrig[hand].update(m_hands[hand].grab, grabOnT, grabOffT)) {
+        if (m_grabTrig[hand].update(grabVal, grabOnT, grabOffT)) {
             if (m_grabTrig[hand].state) {
                 // Rising edge: the grab gesture is gated by the chrome region it landed on (WP-G3).
                 // The BAR moves; a CORNER resizes (from that corner); the BODY moves only with
                 // openxr:grab_anywhere (the controller-grip convenience); the transparent MARGIN
-                // never grabs. grabActionForRegion() is the single decision point (handActive=false
-                // until WP-G5 forces hands to the chrome). Prefer the region the hover step already
-                // classified this frame; otherwise redo the intersection with the 5-degree entry
-                // cone (doc 04 §6) and take the nearest hit whose region yields a grab action.
+                // never grabs. grabActionForRegion() is the single decision point — WP-G5 passes
+                // handIsHands so a hand is forced to the bar/corners (never body). Prefer the region
+                // the hover step already classified this frame; otherwise redo the intersection with
+                // the 5-degree entry cone (doc 04 §6) and take the nearest grab-yielding hit.
                 const SXRPointerTarget* target = nullptr;
                 OpenXR::eXRGrabAction   action = OpenXR::XR_GRAB_ACTION_NONE;
                 OpenXR::eXRQuadRegion   region = OpenXR::XR_REGION_NONE;
 
                 if (m_hoverChromeMon[hand] >= 0) {
-                    const OpenXR::eXRGrabAction a = OpenXR::grabActionForRegion(m_hoverRegion[hand], grabAnywhere, /*handActive*/ false);
+                    const OpenXR::eXRGrabAction a = OpenXR::grabActionForRegion(m_hoverRegion[hand], grabAnywhere, handIsHands);
                     if (a != OpenXR::XR_GRAB_ACTION_NONE) {
                         for (const auto& t : targets)
                             if (t.id == m_hoverChromeMon[hand]) {
@@ -523,7 +595,7 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                         if (!hit.hit || hit.t >= bestT)
                             continue;
                         const OpenXR::eXRQuadRegion  reg = OpenXR::classifyQuadHit(hit.u, hit.v, t.chrome);
-                        const OpenXR::eXRGrabAction  a   = OpenXR::grabActionForRegion(reg, grabAnywhere, /*handActive*/ false);
+                        const OpenXR::eXRGrabAction  a   = OpenXR::grabActionForRegion(reg, grabAnywhere, handIsHands);
                         if (a == OpenXR::XR_GRAB_ACTION_NONE)
                             continue;
                         bestT  = hit.t;
@@ -533,17 +605,21 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                     }
                 }
 
-                if (target && target->anchor && !target->anchor->grabbed() && worldGrip && action != OpenXR::XR_GRAB_ACTION_NONE) {
+                if (target && target->anchor && !target->anchor->grabbed() && newDevPose && action != OpenXR::XR_GRAB_ACTION_NONE) {
+                    // WP-G5: anchor a hand grab to the pinch pose (wantPinch), a controller/grasp
+                    // grab to the grip pose. m_grabDevicePinch remembers the choice so every carry/
+                    // resize/latch frame feeds the SAME device pose.
+                    m_grabDevicePinch[hand] = wantPinch;
                     if (OpenXR::xrGrabActionIsResize(action)) {
                         // Content aspect (h/w) from the target's full-quad meters * chrome content
                         // fractions — held fixed for the resize (matches the solve's pixel aspect).
                         const float contentW = target->w * target->chrome.contentFracW();
                         const float contentH = target->h * target->chrome.contentFracH();
                         const float aspect   = contentW > 0.f ? contentH / contentW : 1.f;
-                        target->anchor->beginResize(hand, region, *worldGrip, aspect);
+                        target->anchor->beginResize(hand, region, *newDevPose, aspect);
                         m_grabKind[hand] = OpenXR::XR_GRABKIND_RESIZE;
                     } else {
-                        target->anchor->beginGrab(hand, *worldGrip);
+                        target->anchor->beginGrab(hand, *newDevPose, wantPinch);
                         m_grabKind[hand] = OpenXR::XR_GRABKIND_MOVE;
                     }
                     m_grabbing[hand]       = true;
@@ -572,15 +648,15 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                     }
                 if (target && target->anchor) {
                     if (m_grabKind[hand] == OpenXR::XR_GRABKIND_RESIZE) {
-                        // The ring holds GRIP poses for a resize; the latched/velocity-rejected grip
-                        // gives the FINAL size + pinned-corner position, rejecting the release jerk.
-                        const std::optional<OpenXR::SXRPose>& grip = hand == XR_HAND_LEFT ? solveIn.gripLeft : solveIn.gripRight;
+                        // The ring holds the resize DEVICE poses (grip for controllers, pinch for a
+                        // hand resize — WP-G5); the latched/velocity-rejected sample gives the FINAL
+                        // size + pinned-corner position, rejecting the release jerk.
                         if (m_grabRing[hand].size() > 0) {
-                            const OpenXR::SXRPose latchedGrip = OpenXR::pickReleasePose(m_grabRing[hand], timeMs, relLatencyMs, relVelReject);
-                            target->anchor->endResize(latchedGrip, solveIn, tune);
-                        } else if (grip)
-                            target->anchor->endResize(*grip, solveIn, tune);
-                        // else: no grip and no history -> leave the last resized size in place.
+                            const OpenXR::SXRPose latched = OpenXR::pickReleasePose(m_grabRing[hand], timeMs, relLatencyMs, relVelReject);
+                            target->anchor->endResize(latched, solveIn, tune);
+                        } else if (grabDevPose)
+                            target->anchor->endResize(*grabDevPose, solveIn, tune);
+                        // else: no device pose and no history -> leave the last resized size in place.
                     } else if (m_grabRing[hand].size() > 0) {
                         const OpenXR::SXRPose releaseWorld = OpenXR::pickReleasePose(m_grabRing[hand], timeMs, relLatencyMs, relVelReject);
                         target->anchor->endGrab(releaseWorld, solveIn, tune);
@@ -614,13 +690,13 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                 m_grabbedMonName[hand].clear();
                 m_grabKind[hand]   = OpenXR::XR_GRABKIND_NONE;
             } else if (m_grabKind[hand] == OpenXR::XR_GRABKIND_RESIZE) {
-                // Corner resize: drive the size from THIS frame's grip world pose and record the grip
-                // for the release latch. No stick verbs — the hand's motion is the resize. (Runs
-                // under m_layersMu, same discipline as the stick-resize path — both mutate widthMeters.)
-                const std::optional<OpenXR::SXRPose>& grip = hand == XR_HAND_LEFT ? solveIn.gripLeft : solveIn.gripRight;
-                if (grip) {
-                    target->anchor->grabResizeCorner(*grip, solveIn, tune);
-                    m_grabRing[hand].push(*grip, timeMs);
+                // Corner resize: drive the size from THIS frame's device world pose (grip, or the
+                // pinch pose for a hand resize — WP-G5) and record it for the release latch. No stick
+                // verbs — the hand's motion is the resize. (Runs under m_layersMu, same discipline as
+                // the stick-resize path — both mutate widthMeters.)
+                if (grabDevPose) {
+                    target->anchor->grabResizeCorner(*grabDevPose, solveIn, tune);
+                    m_grabRing[hand].push(*grabDevPose, timeMs);
                 }
             } else {
                 const Vector2D stick = m_hands[hand].stick;

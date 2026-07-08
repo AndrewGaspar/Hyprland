@@ -117,6 +117,16 @@ class COpenXRManager {
     };
     std::vector<SXRMonitorInfo> monitorInfos();
 
+    // WP-G5: per-hand active input device for `hyprctl openxr status`. Reads CXRInput's atomic
+    // interaction-profile mirror (main-thread safe) + the openxr:hand_grab mode. `hands` is true
+    // when that hand is on the ext/hand_interaction_ext profile; `gesture` is the hand_grab mode
+    // string then (else empty). Both default to controller when no session/input exists.
+    struct SXRHandInputInfo {
+        bool        hands   = false;
+        std::string gesture = ""; // "pinch" | "grasp" | "both" when hands, else ""
+    };
+    std::array<SXRHandInputInfo, 2> handInputInfos() const;
+
     // `hyprctl openxr layout`: paste-ready `xrmonitor = ...` lines for every live XR monitor.
     std::string layoutDump();
 
