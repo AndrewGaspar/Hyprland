@@ -806,8 +806,11 @@ void COpenXRManager::frameThread() {
                     in.dt        = dt;
                     in.gripLeft  = gripLeft;
                     in.gripRight = gripRight;
-                    in.pxW       = (uint32_t)std::max(1.0, l->m_swapchainSize.x);
-                    in.pxH       = (uint32_t)std::max(1.0, l->m_swapchainSize.y);
+                    // Aspect from the CONTENT pixel mode (not the chrome-expanded swapchain) so
+                    // widthMeters/heightMeters stay CONTENT geometry — `size:` and layout
+                    // serialization keep meaning content meters (WP-G1).
+                    in.pxW       = (uint32_t)std::max(1.0, l->m_contentSize.x);
+                    in.pxH       = (uint32_t)std::max(1.0, l->m_contentSize.y);
                     results[i]   = l->m_anchor.solve(in, tune);
                     solved[i]    = true;
                 } else if (l->m_anchor.hasLastWorld()) {
@@ -816,7 +819,7 @@ void COpenXRManager::frameThread() {
                     results[i].pose         = l->m_anchor.lastWorld();
                     results[i].worldPose    = results[i].pose;
                     results[i].widthMeters  = l->m_anchor.state().widthMeters;
-                    results[i].heightMeters = results[i].widthMeters * (float)l->m_swapchainSize.y / (float)std::max(1.0, l->m_swapchainSize.x);
+                    results[i].heightMeters = results[i].widthMeters * (float)l->m_contentSize.y / (float)std::max(1.0, l->m_contentSize.x);
                     solved[i]               = true;
                 }
             }
@@ -887,6 +890,16 @@ void COpenXRManager::frameThread() {
                     quadPose.pos.y -= floorOffset; // back to the LOCAL reference frame
             }
 
+            // Chrome margins (WP-G1): the SOLVE poses the CONTENT center (`res` = content meters),
+            // but the submitted quad is content + transparent margins. Grow to the full quad meters
+            // (contentMeters / contentFrac) and shift the submit pose from the content center to the
+            // quad geometric center so the content stays exactly where the anchor placed it — the
+            // asymmetric bottom margin (which holds the move-bar) would otherwise drift layouts.
+            const OpenXR::SXRChromeGeometry& chrome = l->m_chrome;
+            const float                      quadW  = res.widthMeters / (chrome.contentFracW() > 0.f ? chrome.contentFracW() : 1.f);
+            const float                      quadH  = res.heightMeters / (chrome.contentFracH() > 0.f ? chrome.contentFracH() : 1.f);
+            const OpenXR::SXRPose            quadCenterPose = OpenXR::contentPoseToQuadCenter(quadPose, chrome, quadW, quadH);
+
             XrCompositionLayerQuad quad   = {XR_TYPE_COMPOSITION_LAYER_QUAD};
             quad.layerFlags               = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
             quad.space                    = quadSpace;
@@ -894,28 +907,31 @@ void COpenXRManager::frameThread() {
             quad.subImage.swapchain       = l->m_swapchain;
             quad.subImage.imageRect       = {{0, 0}, {w, h}};
             quad.subImage.imageArrayIndex = 0;
-            quad.pose                     = xrFromPose(quadPose);
-            quad.size                     = {res.widthMeters, res.heightMeters};
+            quad.pose                     = xrFromPose(quadCenterPose);
+            quad.size                     = {quadW, quadH};
             quads.push_back(quad);
 
-            // Ray-pointer target: hit-test against the world-composed pose (device/grip-locked
-            // quads included), expressed in the aim poses' reference frame (undo the LOCAL
-            // fallback floor shift, exactly as the reference-frame submission path above does).
-            // `anchor` hands the grab machine (WP8) the live CXRAnchor for this layer, valid only
-            // for the rest of this frame (backed by `active`, a local PXRLAYER vector). The
-            // monitor id comes from the layer's main-thread-written cache — no m_monitor.lock()
-            // on this thread (non-atomic refcounts, see XRMonitorLayer.hpp).
+            // Ray-pointer target: hit-test against the FULL quad (content + margins) so chrome hits
+            // (bar / corners) are classifiable — worldPose is the quad-center world pose in the aim
+            // poses' reference frame (undo the LOCAL fallback floor shift, as the ref-frame submit
+            // path above does; the chrome offset then goes from content to quad center). `chrome`
+            // travels along so processPointer classifies each hit and remaps BODY hits to content
+            // uv. `anchor` hands the grab machine (WP8) the live CXRAnchor, valid only for the rest
+            // of this frame (backed by `active`, a local PXRLAYER vector). The monitor id comes from
+            // the layer's main-thread-written cache — no m_monitor.lock() here (non-atomic
+            // refcounts, see XRMonitorLayer.hpp).
             if (const auto MONID = l->m_monitorId.load(std::memory_order_acquire); MONID >= 0) {
                 OpenXR::SXRPose worldRef = res.worldPose;
                 if (!m_session->m_usingLocalFloor)
                     worldRef.pos.y -= floorOffset;
                 SXRPointerTarget pt;
                 pt.id        = MONID;
-                pt.worldPose = worldRef;
-                pt.w         = res.widthMeters;
-                pt.h         = res.heightMeters;
+                pt.worldPose = OpenXR::contentPoseToQuadCenter(worldRef, chrome, quadW, quadH);
+                pt.w         = quadW;
+                pt.h         = quadH;
                 pt.name      = l->m_monitorName;
                 pt.anchor    = &l->m_anchor;
+                pt.chrome    = chrome;
                 pointerTargets.push_back(std::move(pt));
             }
         }
@@ -964,12 +980,33 @@ bool COpenXRManager::createLayerSwapchain(CXRMonitorLayer& layer, const Vector2D
     if (layer.m_swapchain != XR_NULL_HANDLE)
         layer.destroySwapchain();
 
+    // Chrome margins (WP-G1): expand the swapchain by a transparent margin around the content so
+    // chrome (bottom move-bar + corner handles) has a place that never covers a desktop pixel.
+    // `size` is the monitor's pixel mode = the inner content rect. Derive the normalized layout
+    // from CONTENT meters + config, then the full px size from the same fractions — both stored on
+    // the layer so the blit (px insets) and the quad-submit/classifier (fractions) share one
+    // source. The anchor widthMeters read here is a benign unlocked frame-thread read (cosmetic
+    // margin sizing only; content geometry is unaffected), same tolerance as the config reads.
+    static auto PMARGIN                    = CConfigValue<Hyprlang::FLOAT>("openxr:chrome_margin");
+    static auto PBARH                      = CConfigValue<Hyprlang::FLOAT>("openxr:chrome_bar_height");
+    static auto PBARWF                     = CConfigValue<Hyprlang::FLOAT>("openxr:chrome_bar_width_frac");
+    static auto PCORNER                    = CConfigValue<Hyprlang::FLOAT>("openxr:chrome_corner_size");
+    const float                     cW     = std::max(0.001f, layer.m_anchor.state().widthMeters);
+    const float                     cH     = cW * (float)std::max(1.0, size.y) / (float)std::max(1.0, size.x);
+    const OpenXR::SXRChromeGeometry chrome = OpenXR::makeChromeGeometry(cW, cH, (float)*PMARGIN, (float)*PBARH, (float)*PBARWF, (float)*PCORNER);
+
+    // Full swapchain px = content px expanded by the same fractions (px/fraction stay consistent).
+    const double   fw = chrome.contentFracW() > 0.0 ? (double)chrome.contentFracW() : 1.0;
+    const double   fh = chrome.contentFracH() > 0.0 ? (double)chrome.contentFracH() : 1.0;
+    const Vector2D fullSize{std::max(size.x, std::round(size.x / fw)), std::max(size.y, std::round(size.y / fh))};
+    const Vector2D contentOffset{std::round(chrome.contentU0 * fullSize.x), std::round(chrome.contentV0 * fullSize.y)};
+
     XrSwapchainCreateInfo info = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     info.usageFlags            = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
     info.format                = m_session->m_swapchainFormat;
     info.sampleCount           = 1;
-    info.width                 = (uint32_t)size.x;
-    info.height                = (uint32_t)size.y;
+    info.width                 = (uint32_t)fullSize.x;
+    info.height                = (uint32_t)fullSize.y;
     info.faceCount             = 1;
     info.arraySize             = 1;
     info.mipCount              = 1;
@@ -980,7 +1017,7 @@ bool COpenXRManager::createLayerSwapchain(CXRMonitorLayer& layer, const Vector2D
 
     XrResult r = xrCreateSwapchain(m_session->m_session, &info, &layer.m_swapchain);
     if (XR_FAILED(r)) {
-        Log::logger->log(Log::ERR, "[OPENXR] xrCreateSwapchain for '{}' ({}x{}) failed: {}", layer.m_monitorName, (int)size.x, (int)size.y, (int)r);
+        Log::logger->log(Log::ERR, "[OPENXR] xrCreateSwapchain for '{}' ({}x{}) failed: {}", layer.m_monitorName, (int)fullSize.x, (int)fullSize.y, (int)r);
         layer.m_swapchain = XR_NULL_HANDLE;
         return false;
     }
@@ -994,8 +1031,11 @@ bool COpenXRManager::createLayerSwapchain(CXRMonitorLayer& layer, const Vector2D
     for (auto& img : imgs)
         layer.m_swapchainImages.push_back(img.image);
 
-    layer.m_swapchainSize = size;
-    layer.m_hasContent    = false;
+    layer.m_swapchainSize   = fullSize;
+    layer.m_contentSize     = size;
+    layer.m_contentOffsetPx = contentOffset;
+    layer.m_chrome          = chrome;
+    layer.m_hasContent      = false;
 
     // Reset the per-layer CPU staging tex so it reallocs to the new mode on the next blit.
     {
@@ -1006,7 +1046,8 @@ bool COpenXRManager::createLayerSwapchain(CXRMonitorLayer& layer, const Vector2D
     layer.m_cpuTex     = 0;
     layer.m_cpuTexSize = Vector2D{};
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] swapchain created for XR monitor '{}': {}x{}, {} images, format 0x{:x}", layer.m_monitorName, (int)size.x, (int)size.y, imgCount,
+    Log::logger->log(Log::DEBUG, "[OPENXR] swapchain created for XR monitor '{}': {}x{} (content {}x{} @ +{},+{}), {} images, format 0x{:x}", layer.m_monitorName,
+                     (int)fullSize.x, (int)fullSize.y, (int)size.x, (int)size.y, (int)contentOffset.x, (int)contentOffset.y, imgCount,
                      (unsigned long long)m_session->m_swapchainFormat);
     return true;
 }
