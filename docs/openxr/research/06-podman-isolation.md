@@ -287,6 +287,11 @@ forces work.
   the simplest reliable option (no CDI, no driver lockstep)?
 - Confirm the **Monado null compositor picks the GPU that's actually visible** in the container (if only `renderD128`
   is exposed, it must pick NVIDIA) — expected, but verify against the cross-GPU-crash history.
+- **Future work — vendor keywords in `openxr:gpu`.** The container tooling resolves `--gpu amd|nvidia|intel` by a
+  vendor scan of `/sys/class/drm` (`scripts/lib/gpu.sh`); the compositor's `openxr:gpu` config still takes only a
+  literal `/dev/dri/renderD*` path. Teaching `openxr:gpu` to accept the same vendor keywords (resolved with
+  `drmGetDevices2` at config-parse time) would let a hyprland.conf express portable GPU selection directly, instead of
+  the wrapper computing a box-specific node and injecting it. Not implemented in WP4.
 
 ---
 

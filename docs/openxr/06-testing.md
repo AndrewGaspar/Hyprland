@@ -545,6 +545,86 @@ cd hyprtester
 
 ---
 
+## 9. Containerized dev/test environment
+
+A rootless-podman Arch+systemd container (`containers/`, driven by
+`scripts/xr-container.sh`) runs the whole XR stack in **full session/input/GPU
+isolation** — no host DBus, no `/dev/input`, one GPU by construction. It boots
+real PID-1 systemd, installs a curated Omarchy desktop, and builds the dev
+Hyprland + hyprtester + vendored Monado into a volume (`/build`) so the host tree
+is never touched. See [`containers/README.md`](../../containers/README.md) for the
+image/build details; this section is the testing-oriented view.
+
+### Topologies
+
+| Invocation | XR runtime | Nesting host | Host mounts | Use |
+| --- | --- | --- | --- | --- |
+| `test` | vendored Monado **null**, in-container | headless **labwc** (in-container) | **none** (hermetic) | CI-style suite run |
+| `session` (windowed) | vendored **windowed** Monado, in-container | host wayland socket (nested window) | wayland socket only | interactive dev, no headset |
+| `session --wivrn` | **host WiVRn** runtime | host wayland socket | wayland socket + `/usr/lib/wivrn` + manifest + `wivrn/comp_ipc` | real Quest 3 |
+
+### The three invocations
+
+```sh
+scripts/xr-container.sh test --gpu amd            # hermetic hyprtester --xr, AMD
+scripts/xr-container.sh test --gpu nvidia         # …on NVIDIA via CDI
+scripts/xr-container.sh session                   # windowed Monado desktop (no headset)
+scripts/xr-container.sh session --wivrn           # real headset (forces --gpu nvidia here)
+scripts/xr-container.sh check-gpu --gpu nvidia    # eglinfo/vulkaninfo smoke test
+```
+
+GPU selection is by **vendor scan** (`scripts/lib/gpu.sh`), not hardcoded node
+names — `--gpu amd|nvidia|intel` or an explicit `/dev/dri/renderD*`. The node is
+resolved host-side (for `--device`) and again **inside** the container (for the
+`openxr:gpu` pin), so a CDI-injected NVIDIA node is verified present rather than
+assumed. See [`containers/README.md` § GPU](../../containers/README.md#gpu).
+
+### Validation matrix (observed on the dual-GPU dev laptop: AMD 890M iGPU + RTX 5070)
+
+| Path | `--gpu amd` | `--gpu nvidia` (CDI) |
+| --- | --- | --- |
+| `check-gpu` | AMD ICD (radv/radeonsi) | NVIDIA ICD (RTX 5070 EGL + Vulkan) — CDI end-to-end |
+| `test` (hermetic suite) | **green** (18/18, ×2) | 1 deterministic fail (`xr_mirror`) + flaky input SKIPs |
+| `session --wivrn` | nested backend up → cross-GPU swapchain SEGV (WP3) | nested `CBackend::create()` fails on NVIDIA (see below) |
+
+**NVIDIA hermetic finding.** On NVIDIA the nested-into-labwc topology hits an
+aquamarine GBM limitation — `GBM: Failed to allocate a GBM buffer: bo null …
+format XR24` on the NVIDIA node — so `xr_mirror` (which stands up a `HEADLESS-2`
+mirror output) fails deterministically, and the input tests flake (nested
+compositor buffer pressure). This is an NVIDIA-driver/aquamarine GBM constraint in
+the nested-wlroots-style topology, **not** compositor application logic. **AMD is
+the reliable hermetic GPU** (18/18 twice); use `--gpu nvidia` for `check-gpu`
+(proving the CDI ICDs) but prefer AMD for the suite on this class of machine.
+
+**`session --wivrn` finding (dual-GPU laptop).** The money-shot single-GPU NVIDIA
+`--wivrn` run is **blocked by topology, not by WP4**: the nested container Hyprland
+renders its flat window into the host compositor and so must render on the *host's*
+GPU (AMD 890M here) — nesting on NVIDIA fails at `CBackend::create()`. With `--gpu
+amd` the nested backend comes up and reaches WiVRn (as in WP3) but SEGVs at the
+cross-GPU swapchain. No single GPU satisfies both the nested-window path (host GPU)
+and WiVRn's encode path (NVIDIA). The tractable fixes are (a) the host compositor
+itself on the encode GPU (single-GPU by construction), or (b) a **split-GPU**
+session — nested compositor on the host GPU, `openxr:gpu` on the encode GPU — which
+needs cross-GPU XR-blit validation and a headset. **Marked pending.** The NVIDIA
+CDI plumbing itself is proven by `check-gpu` (full RTX 5070 EGL + Vulkan inside the
+container).
+
+### Hermetic vs host suite, and the 4242 story
+
+- **Hermetic (`test`)** is the preferred way to run the suite: it uses its **own
+  network namespace** and vendored Monado, touching no host sockets, so it can run
+  alongside a live host session safely. This is the container's reason to exist.
+- **The host suite** (running `hyprtester --xr` natively, §8) and the container's
+  **windowed `session`** both involve a Monado **remote driver on TCP 4242** —
+  and there is only **one** 4242 per box. A container that *publishes*
+  `127.0.0.1:4242` will collide with a host Monado and poison a concurrent host
+  suite run. Therefore windowed `session` **does not publish 4242 by default**;
+  opt in with `--publish-remote` (ephemeral free host port, printed in the banner)
+  or `--publish-remote=PORT`. Rule of thumb: **serialize** anything that binds
+  4242 — a host suite run and a port-publishing container session must not overlap.
+
+---
+
 ## Context files to read before implementing
 
 - `docs/openxr/00-overview.md` — lifecycle states (the strings `waitForXrState` matches), build gating
