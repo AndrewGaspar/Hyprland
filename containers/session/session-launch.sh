@@ -15,7 +15,11 @@
 #
 # Env inputs (set inline by the wrapper's `machinectl shell … bash -lc` command):
 #   XR_MODE            windowed | wivrn                                (required)
-#   XR_GPU_NODE        render node -> AQ_DRM_DEVICES + openxr:gpu      (required)
+#   XR_GPU_NODE        render node -> openxr:gpu (XR encode side)      (required)
+#   NESTED_GPU_NODE    render node -> AQ_DRM_DEVICES (nested compositor
+#                      / host-compositor side); default = XR_GPU_NODE
+#                      (single-GPU). Split-GPU --wivrn sets this to the
+#                      host GPU while XR_GPU_NODE is the encode GPU.
 #   XR_RUNTIME_JSON    OpenXR runtime manifest                        (required)
 #   HL_WAYLAND_DISPLAY absolute path of the bind-mounted host socket  (required)
 #   XR_BASE_CONF       base config to source (default ~/.config/hypr/hyprland.conf)
@@ -35,13 +39,17 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 # it directly and skips the XDG_RUNTIME_DIR 0700-owner check entirely.
 export AQ_BACKENDS=wayland
 export WAYLAND_DISPLAY="$HL_WAYLAND_DISPLAY"
-export AQ_DRM_DEVICES="$XR_GPU_NODE"
+# Nested compositor renders on the host-compositor GPU (NESTED_GPU_NODE); the XR
+# encode side (openxr:gpu, set in the merged config) uses XR_GPU_NODE. On a
+# single-GPU run NESTED_GPU_NODE is unset and both collapse to XR_GPU_NODE.
+NESTED_GPU_NODE="${NESTED_GPU_NODE:-$XR_GPU_NODE}"
+export AQ_DRM_DEVICES="$NESTED_GPU_NODE"
 export XR_RUNTIME_JSON
 HYPRLAND_BIN="${HYPRLAND_BIN:-/build/Hyprland}"
 [[ -x $HYPRLAND_BIN ]] || { echo "!! dev Hyprland missing at $HYPRLAND_BIN — build it first (bash /src/containers/build-in-ctr.sh)" >&2; exit 6; }
 
 echo "== HypXRland container session =="
-echo "   mode=$XR_MODE  gpu=$XR_GPU_NODE"
+echo "   mode=$XR_MODE  nested-gpu(AQ)=$NESTED_GPU_NODE  xr-gpu(openxr)=$XR_GPU_NODE"
 echo "   nesting into host WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
 echo "   XR_RUNTIME_JSON=$XR_RUNTIME_JSON"
 
