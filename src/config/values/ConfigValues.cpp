@@ -724,6 +724,15 @@ std::vector<SP<IValue>> Values::getConfigValues() {
         MS<Float>("openxr:pointer_trigger_threshold_release", "trigger analog value that releases the pointer button (hysteresis)", 0.4, {.min = 0.0, .max = 1.0}),
         MS<Float>("openxr:grab_threshold", "squeeze analog value that starts a grab", 0.7, {.min = 0.0, .max = 1.0}),
         MS<Float>("openxr:grab_threshold_release", "squeeze analog value that ends a grab (hysteresis)", 0.4, {.min = 0.0, .max = 1.0}),
+        MS<Int>("openxr:grab_release_latency_ms",
+                "on grab release, re-anchor from the quad pose sampled this many ms BEFORE the release edge, to reject the release-motion lurch (the grip/hand "
+                "swing on the release frame). 0 = use the release frame. ~100 clears the perturbation; raise it if releases still lurch, lower it if a quick "
+                "flick-and-let-go feels like it snaps back too far",
+                100, {.min = 0, .max = 500}),
+        MS<Float>("openxr:grab_release_velocity_reject",
+                  "if the grabbed quad's speed at release exceeds this (m/s), re-anchor from the last calm sample instead of the fixed latency window — catches a "
+                  "fast fist-open/flick even when it is quicker than grab_release_latency_ms. 0 disables (latency window only)",
+                  0.6, {.min = 0.0, .max = 5.0}),
         MS<Float>("openxr:scroll_speed", "multiplier for thumbstick scrolling on XR monitors", 1.0, {.min = 0.0, .max = 100.0}),
         MS<Bool>("openxr:inhibit_idle", "inhibit idle (hypridle etc.) while the XR session is focused", true),
         MS<Bool>("openxr:destroy_monitors_on_stop",
