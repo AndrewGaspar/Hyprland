@@ -27,8 +27,22 @@
 #   check-gpu [--gpu nvidia|amd]
 #       Standalone GPU smoke test (same as build --check-gpu).
 #
-#   session / test
-#       Stubs — implemented in WP2 (test) and WP3 (session).
+#   test [--gpu nvidia|amd] [--build] [--keep] [TEST_NAMES...]
+#       Hermetic in-container `hyprtester --xr` (WP2). Boots :session with NO
+#       host wayland/X/wivrn mounts, brings up a headless labwc as the nesting
+#       host inside, runs the XR suite nested into it, and reports the real
+#       exit code (sentinel file — machinectl shell always exits 0). Everything
+#       (Hyprland + vendored monado null-compositor) runs inside the container.
+#       --build   force an in-container build (build-in-ctr.sh) before testing;
+#                 otherwise auto-builds only if /build has no binaries.
+#       --keep    leave the container running afterwards (for debugging).
+#       TEST_NAMES  optional subset of xr test names to run (else the whole
+#                 group), passed straight through to hyprtester.
+#       On failure, artifacts (run log + preserved /tmp/hyprtester-xr-* dirs
+#       with hyprland + monado logs) are copied to containers/artifacts/<ts>/.
+#
+#   session
+#       Stub — interactive session lands in WP3.
 #
 # SAFETY: this box's HOST compositor is also named "Hyprland". This script NEVER
 # kills by process name. Container teardown is `podman rm -f <tracked-name>`
@@ -53,6 +67,9 @@ CONTAINERFILE="$REPO/containers/Containerfile.base"
 INSTALL_SCRIPT="$REPO/containers/omarchy-install-ctr.sh"
 INSTALL_IN_CTR="/tmp/omarchy-install-ctr.sh"
 CCACHE_DIR_IN_CTR="/home/dev/.cache/ccache"
+BUILD_IN_CTR_SCRIPT="$REPO/containers/build-in-ctr.sh"
+RUN_XR_TESTS_SCRIPT="$REPO/containers/test/run-xr-tests.sh"
+ARTIFACTS_DIR="$REPO/containers/artifacts"
 
 # Host GPU render nodes (this box): renderD128 = NVIDIA, renderD129 = AMD.
 AMD_RENDER_NODE="${HYPXRLAND_AMD_NODE:-/dev/dri/renderD129}"
@@ -331,6 +348,127 @@ cmd_shell() {
     log "Shell exited; container removed."
 }
 
+# --- test (WP2): hermetic in-container `hyprtester --xr` ----------------------
+# Boots :session (no host wayland/X/wivrn mounts — hermetic by construction),
+# ensures /build is populated (auto-builds if not), runs containers/test/
+# run-xr-tests.sh as dev via machinectl (labwc headless nest -> hyprtester --xr),
+# reads the real exit code from a sentinel, copies artifacts out on failure, and
+# removes the container on ALL exit paths.
+cmd_test() {
+    local gpu="amd" keep=0 do_build=0
+    local -a testnames=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --gpu)     [[ $# -ge 2 ]] || die "--gpu needs an argument (nvidia|amd)"; gpu="$2"; shift ;;
+            --gpu=*)   gpu="${1#--gpu=}" ;;
+            --keep)    keep=1 ;;
+            --build)   do_build=1 ;;
+            -h|--help) usage; exit 0 ;;
+            -*)        die "test: unknown flag $1" ;;
+            *)         testnames+=("$1") ;;   # hyprtester test-name filter (subset)
+        esac
+        shift
+    done
+    podman image exists "$IMG_SESSION" || die "session image not built (run: $0 build)"
+    [[ -f $RUN_XR_TESTS_SCRIPT ]] || die "missing $RUN_XR_TESTS_SCRIPT"
+
+    # GPU device args + the render node the suite pins (single-GPU by construction).
+    local gpu_node
+    local -a devargs=()
+    case "$gpu" in
+        nvidia)
+            nvidia_cdi_available || { print_nvidia_cdi_setup; die "NVIDIA CDI unavailable on this host; use --gpu amd"; }
+            devargs=(--device nvidia.com/gpu=all)
+            # CDI injects the driver; renderD128 is this box's NVIDIA node.
+            gpu_node="${HYPXRLAND_NVIDIA_NODE:-/dev/dri/renderD128}" ;;
+        amd)
+            devargs=(--device "$AMD_RENDER_NODE")
+            gpu_node="$AMD_RENDER_NODE" ;;
+        *) die "test: --gpu must be nvidia or amd" ;;
+    esac
+
+    ensure_volumes "$VOL_BUILD" "$VOL_CCACHE"
+    local ctr="hypxrland-test-$$"
+    local removed=0
+    cleanup_test() { [[ $removed -eq 1 || $keep -eq 1 ]] || { podman rm -f "$ctr" >/dev/null 2>&1 || true; }; }
+    trap cleanup_test EXIT INT TERM
+
+    # HERMETIC: mounts are ONLY the overlay source, the build+ccache volumes and
+    # the GPU device — NO host wayland/X11/wivrn sockets. (Proven in the report by
+    # echoing this invocation.) --systemd=always gives real logind for machinectl.
+    log "Booting $IMG_SESSION (test, --gpu $gpu, node $gpu_node)"
+    podman rm -f "$ctr" >/dev/null 2>&1 || true
+    podman run -d --name "$ctr" --systemd=always --userns=keep-id --user root \
+        --security-opt label=disable \
+        "${devargs[@]}" \
+        -v "$REPO:/src:O" \
+        -v "$VOL_BUILD:/build" \
+        -v "$VOL_CCACHE:$CCACHE_DIR_IN_CTR" \
+        "$IMG_SESSION" >/dev/null
+    wait_for_systemd "$ctr"
+    podman exec "$ctr" chown -R dev:dev /build "$CCACHE_DIR_IN_CTR" >/dev/null 2>&1 || true
+
+    # Ensure /build is populated. Auto-build if the binaries are missing, or if
+    # --build was passed (force a fresh build-in-ctr run).
+    local have_bins=1
+    podman exec "$ctr" test -x /build/hyprtester/hyprtester -a -x /build/Hyprland || have_bins=0
+    if [[ $do_build -eq 1 || $have_bins -eq 0 ]]; then
+        [[ $have_bins -eq 0 ]] && log "/build has no hyprtester/Hyprland yet — building in-container (build-in-ctr.sh)"
+        [[ $do_build -eq 1 ]] && log "--build requested — (re)building in-container (build-in-ctr.sh)"
+        podman exec "$ctr" machinectl shell dev@.host /usr/bin/bash -lc \
+            'bash /src/containers/build-in-ctr.sh' \
+            || die "in-container build failed"
+    else
+        log "/build already populated (Hyprland + hyprtester present) — skipping build (use --build to force)"
+    fi
+
+    # Run the suite. machinectl shell always exits 0 -> real rc from the sentinel.
+    local sentinel="/tmp/hypxrland-xr-tests.exit"
+    log "Running hermetic XR suite in-container (labwc nest -> hyprtester --xr)"
+    podman exec "$ctr" rm -f "$sentinel" >/dev/null 2>&1 || true
+    podman exec "$ctr" machinectl shell dev@.host /usr/bin/bash -lc \
+        "XR_GPU_NODE='$gpu_node' bash /src/containers/test/run-xr-tests.sh ${testnames[*]:-}" || true
+
+    local rc
+    rc=$(podman exec "$ctr" cat "$sentinel" 2>/dev/null || echo missing)
+    log "XR suite sentinel exit code: $rc"
+
+    if [[ "$rc" != 0 ]]; then
+        # Preserve artifacts: the combined run log + every preserved
+        # /tmp/hyprtester-xr-* dir (the harness keeps these on failure, incl.
+        # hyprland logs + monado.log).
+        local ts stamp
+        ts=$(date +%Y%m%d-%H%M%S)
+        stamp="$ARTIFACTS_DIR/$ts"
+        mkdir -p "$stamp"
+        warn "XR suite failed (rc=$rc) — collecting artifacts into $stamp"
+        podman cp "$ctr:/tmp/hypxrland-xr-tests.log" "$stamp/xr-tests.log" >/dev/null 2>&1 || true
+        # copy each preserved run dir
+        local dirs
+        dirs=$(podman exec "$ctr" bash -lc 'ls -d /tmp/hyprtester-xr-* 2>/dev/null' || true)
+        local d
+        for d in $dirs; do
+            podman cp "$ctr:$d" "$stamp/$(basename "$d")" >/dev/null 2>&1 || true
+        done
+        echo "   Artifacts: $stamp"
+        ls -la "$stamp" 2>/dev/null | sed 's/^/     /' || true
+    fi
+
+    if [[ $keep -eq 1 ]]; then
+        warn "--keep: leaving container $ctr running (remove with: podman rm -f $ctr)"
+    else
+        podman rm -f "$ctr" >/dev/null 2>&1 || true
+        removed=1
+    fi
+    trap - EXIT INT TERM
+
+    if [[ "$rc" == 0 ]]; then
+        log "XR suite PASSED in-container (hermetic, --gpu $gpu)"
+        return 0
+    fi
+    die "XR suite FAILED in-container (rc=$rc)"
+}
+
 # --- main --------------------------------------------------------------------
 usage() { grep -E '^# ' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
@@ -353,7 +491,7 @@ case "$sub" in
         podman image exists "$IMG_SESSION" && img="$IMG_SESSION"
         check_gpu "$gpu" "$img" ;;
     session)   die "session: not implemented in WP1 (interactive session lands in WP3)" ;;
-    test)      die "test: not implemented in WP1 (hermetic --xr suite lands in WP2)" ;;
+    test)      cmd_test "$@" ;;
     -h|--help) usage ;;
     *) usage; die "unknown subcommand: $sub" ;;
 esac
