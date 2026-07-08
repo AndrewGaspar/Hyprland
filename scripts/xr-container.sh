@@ -41,7 +41,8 @@
 #       On failure, artifacts (run log + preserved /tmp/hyprtester-xr-* dirs
 #       with hyprland + monado logs) are copied to containers/artifacts/<ts>/.
 #
-#   session [--wivrn] [--conf FILE] [--gpu amd|nvidia|intel|/dev/dri/renderD*]
+#   session [--wivrn] [--conf FILE] [--gpu split|amd|nvidia|intel|/dev/dri/renderD*]
+#           [--nested-gpu SPEC] [--xr-gpu SPEC]
 #           [--passthrough] [--publish-remote[=PORT]]
 #       Boot :session and launch a full Omarchy desktop as a NESTED window on the
 #       host, with the dev Hyprland's XR extension enabled. waybar/mako/walker/
@@ -55,9 +56,19 @@
 #         --conf FILE            source FILE (bind-mounted ro) as the base config
 #                                instead of the image's ~/.config/hypr/hyprland.conf.
 #         --passthrough          openxr:blend_mode = alpha (composite over passthrough).
-#         --gpu SPEC             single-GPU pin, resolved by vendor scan (default:
-#                                nvidia with --wivrn, else amd). SPEC is a vendor
-#                                keyword (amd|nvidia|intel) or a /dev/dri/renderD* path.
+#         --gpu SPEC             GPU selection (default: split with --wivrn, else amd).
+#                                SPEC = split | amd|nvidia|intel | /dev/dri/renderD*.
+#             split              expose BOTH GPUs and assign roles separately: the
+#                                nested compositor renders on the host-compositor GPU
+#                                (AQ_DRM_DEVICES) and XR encodes on a different GPU
+#                                (openxr:gpu). This is the ONLY reliable --wivrn mode
+#                                on a dual-GPU box; degrades to single-GPU when the
+#                                machine has only one GPU. A single-GPU --gpu pin with
+#                                --wivrn is kept for experiments (warns; known-broken).
+#         --nested-gpu SPEC      (split) override the host-compositor/AQ node
+#                                (default: 'host' = first non-NVIDIA present node).
+#         --xr-gpu SPEC          (split) override the XR/encode node (default: nvidia).
+#                                Passing either --nested-gpu/--xr-gpu implies --gpu split.
 #         --publish-remote[=PORT] publish the in-container Monado remote-driver port
 #                                (container 4242) to the host on an EPHEMERAL free
 #                                port (or PORT). OFF by default — a fixed 4242 publish
@@ -241,6 +252,73 @@ gpu_devargs() {
             REPLY_DEVARGS=(--device "$n") ;;
         *) die "--gpu must be amd|nvidia|intel|/dev/dri/renderD* (got '$gpu')" ;;
     esac
+}
+
+# resolve_split_gpu <nested_spec> <xr_spec> — split-GPU device plumbing for the
+# --wivrn session. On a dual-GPU box the nested compositor must render on the
+# HOST compositor's GPU (aquamarine nests on it) while WiVRn encodes on a
+# DIFFERENT GPU (NVIDIA here); no single GPU satisfies both, so we expose BOTH and
+# assign roles separately. Sets:
+#   SPLIT_DEVARGS       podman --device args (union of both GPUs, deduped)
+#   SPLIT_NESTED_SPEC   effective nested (host-compositor) spec  -> NESTED_GPU_NODE
+#   SPLIT_XR_SPEC       effective XR/encode spec                 -> XR_GPU_NODE
+# Both specs are re-resolved to concrete nodes INSIDE the container after boot
+# (gpu_node_in_ctr) so a CDI-injected NVIDIA node is verified present by name.
+# Single-GPU degradation: a box with only one GPU (no distinct NVIDIA + non-NVIDIA
+# pair) collapses to that one node for BOTH roles (a genuine single-GPU --wivrn,
+# which is fine when the host compositor already runs on the encode GPU). Dies
+# with guidance only when a side is explicitly requested but truly unavailable.
+resolve_split_gpu() {
+    local nested_spec="$1" xr_spec="$2"
+    SPLIT_DEVARGS=()
+    SPLIT_NESTED_SPEC="$nested_spec"
+    SPLIT_XR_SPEC="$xr_spec"
+
+    local have_nvidia=0 have_other=0
+    resolve_render_node nvidia >/dev/null 2>&1 && have_nvidia=1
+    { resolve_render_node amd >/dev/null 2>&1 || resolve_render_node intel >/dev/null 2>&1; } && have_other=1
+
+    # --- single-GPU degradation (no distinct NVIDIA + non-NVIDIA pair) ---
+    if [[ $have_nvidia -eq 0 || $have_other -eq 0 ]]; then
+        local node
+        node=$(resolve_render_node "$nested_spec") \
+            || die "split: no usable GPU node for '$nested_spec' (see above)"
+        warn "split: only one GPU present ($node) — degrading to single-GPU for BOTH nested + XR roles."
+        warn "       (fine if the host compositor already runs on the encode GPU; otherwise WiVRn may cross-GPU-crash.)"
+        SPLIT_NESTED_SPEC="$nested_spec"
+        SPLIT_XR_SPEC="$nested_spec"
+        if [[ $have_nvidia -eq 1 && $have_other -eq 0 ]]; then
+            nvidia_cdi_available || { print_nvidia_cdi_setup; die "split: the lone GPU is NVIDIA and needs a CDI spec (see above)"; }
+            check_nvidia_cdi_freshness
+            SPLIT_DEVARGS=(--device nvidia.com/gpu=all)
+        else
+            SPLIT_DEVARGS=(--device "$node")
+        fi
+        return 0
+    fi
+
+    # --- true dual-GPU split ---
+    # Nested (host-compositor) side: a real DRM node bind-mounted as a --device
+    # (never CDI-only — aquamarine opens it directly to nest).
+    local nested_node
+    nested_node=$(resolve_render_node "$nested_spec") \
+        || die "split: could not resolve nested GPU '$nested_spec' (host-compositor side) — see above"
+    SPLIT_DEVARGS+=(--device "$nested_node")
+
+    # XR / encode side.
+    if [[ "${xr_spec,,}" == nvidia ]]; then
+        nvidia_cdi_available || {
+            print_nvidia_cdi_setup
+            die "split: the XR/encode side wants NVIDIA but its CDI spec is absent (see above); install it, or pass --xr-gpu <amd|intel|/dev/dri/renderDNNN>."
+        }
+        check_nvidia_cdi_freshness
+        SPLIT_DEVARGS+=(--device nvidia.com/gpu=all)
+    else
+        local xr_node
+        xr_node=$(resolve_render_node "$xr_spec") \
+            || die "split: could not resolve XR GPU '$xr_spec' — see above"
+        [[ "$xr_node" != "$nested_node" ]] && SPLIT_DEVARGS+=(--device "$xr_node")
+    fi
 }
 
 # gpu_node_in_ctr <ctr> <gpu> — resolve the render node INSIDE a running
@@ -570,12 +648,17 @@ find_free_tcp_port() {
 cmd_session() {
     local gpu="" use_wivrn=0 passthrough=0 user_conf=""
     local publish_remote=0 remote_port=""
+    local nested_gpu="" xr_gpu=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --wivrn)      use_wivrn=1 ;;
             --passthrough) passthrough=1 ;;
             --gpu)        [[ $# -ge 2 ]] || die "--gpu needs an argument"; gpu="$2"; shift ;;
             --gpu=*)      gpu="${1#--gpu=}" ;;
+            --nested-gpu) [[ $# -ge 2 ]] || die "--nested-gpu needs an argument"; nested_gpu="$2"; shift ;;
+            --nested-gpu=*) nested_gpu="${1#--nested-gpu=}" ;;
+            --xr-gpu)     [[ $# -ge 2 ]] || die "--xr-gpu needs an argument"; xr_gpu="$2"; shift ;;
+            --xr-gpu=*)   xr_gpu="${1#--xr-gpu=}" ;;
             --conf)       [[ $# -ge 2 ]] || die "--conf needs a FILE argument"; user_conf="$2"; shift ;;
             --conf=*)     user_conf="${1#--conf=}" ;;
             --publish-remote)   publish_remote=1 ;;                       # ephemeral host port
@@ -587,19 +670,40 @@ cmd_session() {
     done
     podman image exists "$IMG_SESSION" || die "session image not built (run: $0 build)"
 
-    # Default GPU: --wivrn must render on the host's ENCODE GPU (NVIDIA on this
-    # box) or it cross-GPU-crashes at swapchain setup — force NVIDIA when the GPU
-    # is unspecified. Windowed default stays AMD (no CDI dependency for the common
-    # no-headset case). An explicit --gpu always wins.
-    if [[ -z $gpu ]]; then
-        [[ $use_wivrn -eq 1 ]] && gpu=nvidia || gpu=amd
-    elif [[ $use_wivrn -eq 1 && ${gpu,,} != nvidia && $gpu != /* ]]; then
-        warn "--wivrn encodes on the host GPU; --gpu $gpu may cross-GPU-crash at swapchain setup."
+    # --nested-gpu/--xr-gpu are split-only role overrides -> they imply --gpu split.
+    if [[ -n $nested_gpu || -n $xr_gpu ]]; then
+        [[ -z $gpu || $gpu == split ]] || die "--nested-gpu/--xr-gpu apply only to --gpu split (got --gpu $gpu)"
+        gpu=split
     fi
 
-    gpu_devargs "$gpu"; gpu="$REPLY_GPU"
-    local -a devargs=("${REPLY_DEVARGS[@]}")
-    local gpu_node=""   # resolved in-container after boot
+    # Default GPU mode. --wivrn is single-GPU-broken on a dual-GPU box (the nested
+    # window must render on the HOST compositor's GPU while WiVRn encodes on a
+    # DIFFERENT one) — so --wivrn defaults to `split`, which exposes both GPUs and
+    # assigns them separately. Windowed default stays single-GPU AMD (no headset,
+    # no CDI dependency, and the in-container Monado picks its own device). An
+    # explicit --gpu always wins.
+    if [[ -z $gpu ]]; then
+        [[ $use_wivrn -eq 1 ]] && gpu=split || gpu=amd
+    fi
+    if [[ $use_wivrn -eq 1 && $gpu != split ]]; then
+        warn "--wivrn with a single-GPU pin (--gpu $gpu) is known-broken on dual-GPU boxes:"
+        warn "  --gpu amd -> nested backend up but cross-GPU swapchain SEGV; --gpu nvidia -> nested"
+        warn "  CBackend::create() fails. Use --gpu split (default) unless your host compositor"
+        warn "  already runs on the encode GPU."
+    fi
+
+    local -a devargs=()
+    local gpu_node=""   # resolved in-container after boot (single-GPU path)
+    if [[ $gpu == split ]]; then
+        # nested = host-compositor GPU (default heuristic 'host'); xr = encode GPU
+        # (default nvidia). resolve_split_gpu builds the combined --device set and
+        # may degrade both roles to one node on a single-GPU machine.
+        resolve_split_gpu "${nested_gpu:-host}" "${xr_gpu:-nvidia}"
+        devargs=("${SPLIT_DEVARGS[@]}")
+    else
+        gpu_devargs "$gpu"; gpu="$REPLY_GPU"
+        devargs=("${REPLY_DEVARGS[@]}")
+    fi
 
     # --- host wayland socket (nested output) ---
     local host_xdg="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -684,7 +788,7 @@ cmd_session() {
     cleanup_session() { podman rm -f "$ctr" >/dev/null 2>&1 || true; }
     trap cleanup_session EXIT INT TERM
 
-    log "Booting $IMG_SESSION (session, --gpu $gpu, mode $([[ $use_wivrn -eq 1 ]] && echo wivrn || echo windowed))"
+    log "Booting $IMG_SESSION (session, --gpu $gpu, mode $([[ $use_wivrn -eq 1 ]] && echo wivrn || echo windowed), devices: ${devargs[*]})"
     podman rm -f "$ctr" >/dev/null 2>&1 || true
     podman run -d --name "$ctr" --systemd=always --userns=keep-id --user root \
         --security-opt label=disable \
@@ -694,12 +798,20 @@ cmd_session() {
     # Named volumes come up root-owned; make them writable by dev (uid 1000).
     podman exec "$ctr" chown -R dev:dev /build "$CCACHE_DIR_IN_CTR" >/dev/null 2>&1 || true
 
-    # Resolve the render node in-container (verifies the injected/mounted GPU node).
-    gpu_node=$(gpu_node_in_ctr "$ctr" "$gpu")
-    log "In-container render node for --gpu $gpu: $gpu_node"
-    launch_env+=("XR_GPU_NODE=$gpu_node")
+    # Resolve the render node(s) in-container (verifies the injected/mounted nodes).
+    local nested_node="" xr_node=""
+    if [[ $gpu == split ]]; then
+        nested_node=$(gpu_node_in_ctr "$ctr" "$SPLIT_NESTED_SPEC")
+        xr_node=$(gpu_node_in_ctr "$ctr" "$SPLIT_XR_SPEC")
+        log "In-container split GPU nodes: nested(AQ)=$nested_node  XR(openxr:gpu)=$xr_node"
+        launch_env+=("NESTED_GPU_NODE=$nested_node" "XR_GPU_NODE=$xr_node")
+    else
+        gpu_node=$(gpu_node_in_ctr "$ctr" "$gpu")
+        log "In-container render node for --gpu $gpu: $gpu_node"
+        launch_env+=("XR_GPU_NODE=$gpu_node")
+    fi
 
-    print_session_banner "$ctr" "$use_wivrn" "$remote_port"
+    print_session_banner "$ctr" "$use_wivrn" "$remote_port" "$gpu" "$nested_node" "$xr_node"
 
     # Build the inline env prefix for the machinectl login (which won't inherit env).
     local envstr=""; local kv
@@ -714,12 +826,18 @@ cmd_session() {
 }
 
 print_session_banner() {
-    local ctr="$1" use_wivrn="$2" remote_port="$3"
+    local ctr="$1" use_wivrn="$2" remote_port="$3" gpu="${4:-}" nested_node="${5:-}" xr_node="${6:-}"
     cat <<EOF
 
   ============================ HypXRland session ============================
   Container: $ctr   (removed on exit)
 EOF
+    if [[ $gpu == split ]]; then
+        cat <<EOF
+  GPU: split — nested compositor (AQ_DRM_DEVICES) on $nested_node,
+                XR encode (openxr:gpu) on $xr_node.
+EOF
+    fi
     if [[ $use_wivrn -eq 1 ]]; then
         cat <<EOF
   Mode: WiVRn (real headset via the HOST runtime).
