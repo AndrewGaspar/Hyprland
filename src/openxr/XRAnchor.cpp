@@ -116,6 +116,7 @@ void CXRAnchor::initFromState(const SXRAnchorState& state) {
     m_bodyHeightCaptured = false;
     m_deviceOffsetDirty  = false;
     m_grabbed            = false;
+    m_resizing           = false;
     // m_lastWorld / m_hasLastWorld intentionally preserved: switching representation of an
     // existing on-screen quad should not lose where it currently is.
 }
@@ -328,6 +329,76 @@ void CXRAnchor::grabPushPull(float deltaMeters) {
 
 void CXRAnchor::grabResize(float deltaMeters) {
     m_state.widthMeters = std::clamp(m_state.widthMeters + deltaMeters, XR_WIDTH_MIN, XR_WIDTH_MAX);
+}
+
+// ---- corner resize grab (WP-G3) ----
+
+void CXRAnchor::beginResize(eXRHand hand, eXRQuadRegion corner, const SXRPose& gripWorld, float aspectHW) {
+    if (!m_hasLastWorld)
+        return; // nothing displayed to resize from; caller gates on hasLastWorld()
+
+    m_grabHand     = hand;
+    m_resizeAspect = aspectHW > 0.F ? aspectHW : 1.F;
+
+    const SXRPose& P  = m_lastWorld; // displayed CONTENT center pose (this frame's solve)
+    const float    w0 = m_state.widthMeters;
+    const float    h0 = w0 * m_resizeAspect;
+
+    float sx = 1.F, sy = 1.F;
+    xrCornerSigns(corner, sx, sy);
+    const Vec3 right = qRotate(P.rot, Vec3{1.F, 0.F, 0.F});
+    const Vec3 up    = qRotate(P.rot, Vec3{0.F, 1.F, 0.F});
+
+    // Grabbed corner and its diagonally-opposite (pinned) corner, in world.
+    const Vec3 grabbedCorner = P.pos + right * (sx * w0 * 0.5F) + up * (sy * h0 * 0.5F);
+    const Vec3 pin           = P.pos - right * (sx * w0 * 0.5F) - up * (sy * h0 * 0.5F);
+    const Vec3 diag          = grabbedCorner - pin;
+    const float L0           = diag.length();
+
+    m_resizeSx       = sx;
+    m_resizeSy       = sy;
+    m_resizePin      = pin;
+    m_resizeDiagUnit = L0 > 1e-5F ? diag / L0 : right;
+    m_resizeL0       = L0 > 1e-5F ? L0 : 1e-5F;
+    m_resizeW0       = w0;
+    m_resizeGrip0    = gripWorld;
+    m_resizeRot      = P.rot;
+    m_resizing       = true;
+}
+
+void CXRAnchor::grabResizeCorner(const SXRPose& gripWorld, const SXRSolveInput& in, const SXRAnchorTuning& tune) {
+    if (!m_resizing)
+        return;
+
+    // Project the hand's motion since grab-start onto the fixed content diagonal: outward (away from
+    // the pinned corner) grows, inward shrinks. Width scales with the diagonal; aspect is fixed.
+    const float proj = (gripWorld.pos - m_resizeGrip0.pos).dot(m_resizeDiagUnit);
+    float       wNew = m_resizeW0 * ((m_resizeL0 + proj) / m_resizeL0);
+    wNew             = std::clamp(wNew, XR_WIDTH_MIN, XR_WIDTH_MAX);
+    const float Lnew = m_resizeL0 * (wNew / m_resizeW0); // clamp-consistent diagonal
+
+    // Opposite corner stays at m_resizePin; the content center is the diagonal midpoint.
+    const Vec3 centerNew = m_resizePin + m_resizeDiagUnit * (Lnew * 0.5F);
+
+    m_state.widthMeters = wNew;
+
+    SXRVerbContext ctx;
+    ctx.view      = in.view;
+    ctx.viewValid = true;
+    ctx.gripLeft  = in.gripLeft;
+    ctx.gripRight = in.gripRight;
+    // Re-express the resized content pose into the persistent mode. For LOCAL this pins the opposite
+    // corner exactly in world; for head/body/device it re-seeds the anchor offset (and the spring)
+    // at the resized pose so the leash follows the size change instead of fighting it (doc note in
+    // XRAnchor.hpp). Orientation is held at the grab-start value for a stable diagonal.
+    reanchorFromWorld(SXRPose{centerNew, m_resizeRot}, ctx, tune);
+}
+
+void CXRAnchor::endResize(const SXRPose& gripWorldLatched, const SXRSolveInput& in, const SXRAnchorTuning& tune) {
+    // Final size/position from the LATCHED grip (WP-G4 ring) — rejects the release-frame jerk on the
+    // size just as the move path rejects it on the pose. Then drop out of resize back to normal solve.
+    grabResizeCorner(gripWorldLatched, in, tune);
+    m_resizing = false;
 }
 
 void CXRAnchor::endGrab(const SXRSolveInput& in, const SXRAnchorTuning& tune) {

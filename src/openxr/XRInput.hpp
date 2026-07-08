@@ -224,6 +224,11 @@ class CXRInput {
     std::array<SXRSchmitt, 2>  m_grabTrig;           // per-hand grab (squeeze) hysteresis
     std::array<MONITORID, 2>   m_grabbedMon{-1, -1}; // monitor id each hand currently grabs
     std::array<std::string, 2> m_grabbedMonName;     // its name, captured at grab-begin (event payload)
+    // WP-G3: what the grab is doing per hand — a bar/body MOVE (rigid grip carry + release latch) or
+    // a CORNER resize (scale about the pinned opposite corner). Decides the per-frame drive (stick
+    // push-pull/resize for MOVE vs grabResizeCorner for RESIZE) and the release path (endGrab vs
+    // endResize). The ring holds carried QUAD poses for MOVE, GRIP poses for RESIZE (both latched).
+    std::array<OpenXR::eXRGrabKind, 2> m_grabKind{OpenXR::XR_GRABKIND_NONE, OpenXR::XR_GRABKIND_NONE};
 
     // ---- release-latching (WP-G4, research 04-grabbable-borders.md §5.4) ----
     // Per-hand ring of the carried quad's world pose, pushed every grabbed frame. On the release

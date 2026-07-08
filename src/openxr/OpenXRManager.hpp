@@ -109,8 +109,9 @@ class COpenXRManager {
         std::string anchorMode = "local";
         float       posX = 0.f, posY = 0.f, posZ = 0.f;
         float       quatX = 0.f, quatY = 0.f, quatZ = 0.f, quatW = 1.f;
-        bool        grabbed = false;
-        bool        hovered = false;
+        bool        grabbed  = false;
+        std::string grabKind = "none"; // WP-G3: "none" | "move" | "resize" (which grab owns it)
+        bool        hovered  = false;
     };
     std::vector<SXRMonitorInfo> monitorInfos();
 

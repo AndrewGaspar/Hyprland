@@ -300,6 +300,49 @@ namespace OpenXR {
         return r == XR_REGION_CORNER_TL || r == XR_REGION_CORNER_TR || r == XR_REGION_CORNER_BL || r == XR_REGION_CORNER_BR;
     }
 
+    // ---- grab-region gating (docs/openxr/research/04-grabbable-borders.md §5.2, WP-G3) ----
+    //
+    // Pure decision helper: given the chrome region a grab gesture landed on, what does it do?
+    // BAR always MOVEs; each CORNER always RESIZEs (from that corner); BODY MOVEs only when
+    // openxr:grab_anywhere is set (the controller-grip-anywhere convenience) AND hands are not the
+    // active device; MARGIN / NONE never grab. gtest-covered truth table (tests/xr/grab_gating.cpp).
+    //
+    // `handActive` is the WP-G5 slot: when hands are the active device the fist/pinch is forced to
+    // the bar/corners (no whole-content grab, per the vendor UX in §2-§3), so BODY never grabs
+    // regardless of grab_anywhere. WP-G3 always passes false — flipping G5 on is a one-argument
+    // change with no rework here.
+    enum eXRGrabAction : uint8_t {
+        XR_GRAB_ACTION_NONE = 0,
+        XR_GRAB_ACTION_MOVE,
+        XR_GRAB_ACTION_RESIZE_TL,
+        XR_GRAB_ACTION_RESIZE_TR,
+        XR_GRAB_ACTION_RESIZE_BL,
+        XR_GRAB_ACTION_RESIZE_BR,
+    };
+
+    inline bool xrGrabActionIsResize(eXRGrabAction a) {
+        return a == XR_GRAB_ACTION_RESIZE_TL || a == XR_GRAB_ACTION_RESIZE_TR || a == XR_GRAB_ACTION_RESIZE_BL || a == XR_GRAB_ACTION_RESIZE_BR;
+    }
+
+    inline eXRGrabAction grabActionForRegion(eXRQuadRegion region, bool grabAnywhere, bool handActive) {
+        switch (region) {
+            case XR_REGION_BAR: return XR_GRAB_ACTION_MOVE;
+            case XR_REGION_CORNER_TL: return XR_GRAB_ACTION_RESIZE_TL;
+            case XR_REGION_CORNER_TR: return XR_GRAB_ACTION_RESIZE_TR;
+            case XR_REGION_CORNER_BL: return XR_GRAB_ACTION_RESIZE_BL;
+            case XR_REGION_CORNER_BR: return XR_GRAB_ACTION_RESIZE_BR;
+            case XR_REGION_BODY: return (grabAnywhere && !handActive) ? XR_GRAB_ACTION_MOVE : XR_GRAB_ACTION_NONE;
+            default: return XR_GRAB_ACTION_NONE; // XR_REGION_MARGIN / XR_REGION_NONE
+        }
+    }
+
+    // Corner signs in the CONTENT's world frame: sx = +1 right edge / -1 left edge; sy = +1 top
+    // edge (+world-up) / -1 bottom edge. (u grows right, v grows DOWN, so top corners are +up.)
+    inline void xrCornerSigns(eXRQuadRegion corner, float& sx, float& sy) {
+        sx = (corner == XR_REGION_CORNER_TR || corner == XR_REGION_CORNER_BR) ? 1.F : -1.F;
+        sy = (corner == XR_REGION_CORNER_TL || corner == XR_REGION_CORNER_TR) ? 1.F : -1.F;
+    }
+
     inline const char* xrRegionName(eXRQuadRegion r) {
         switch (r) {
             case XR_REGION_BODY: return "body";

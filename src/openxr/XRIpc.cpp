@@ -45,10 +45,11 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
                 }}
             }},
             "grabbed": {},
+            "grabKind": "{}",
             "hovered": {}
         }})#",
                                 m.name, m.id, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.quatX, m.quatY, m.quatZ, m.quatW, m.grabbed ? "true" : "false",
-                                m.hovered ? "true" : "false");
+                                m.grabKind, m.hovered ? "true" : "false");
             if (i + 1 < MONS.size())
                 mons += ",\n";
             else
@@ -71,8 +72,8 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     std::string out =
         std::format("state: {}\nruntime: {}\nsystem: {}\nblend mode: {}\noverlay: {}\nidle inhibited: {}\n", STATE, RUNTIME, SYSTEM, BLEND, OVERLAY ? "yes" : "no", INHIBITING_IDLE ? "yes" : "no");
     for (const auto& m : MONS) {
-        out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} hovered: {}\n", m.name, m.id, m.w, m.h, m.refresh,
-                           m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.grabbed ? "yes" : "no", m.hovered ? "yes" : "no");
+        out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} ({}) hovered: {}\n", m.name, m.id, m.w, m.h,
+                           m.refresh, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.grabbed ? "yes" : "no", m.grabKind, m.hovered ? "yes" : "no");
     }
     return out;
 }
