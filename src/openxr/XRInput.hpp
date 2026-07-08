@@ -168,6 +168,17 @@ class CXRInput {
         return m_gripSpace[h];
     }
 
+    // Frame-thread READ-ONLY exports for the WP-G2 chrome draw pass. These only surface state that
+    // processPointer already resolved (m_hoverRegion/m_hoverChromeMon/m_grabbedMon) — they do NOT
+    // touch the pointer/grab machine, so they respect the WP-G3 ownership boundary. Read on the
+    // frame thread right after processPointer.
+    //   chromeHoverRegion(id): the region a hand's ray currently classifies on monitor `id`
+    //     (XR_REGION_NONE if neither hand hovers it). If both hands hover it, the higher-precedence
+    //     region wins (corner/bar over body/margin) so a resize/move affordance highlights.
+    //   isMonitorGrabbed(id):  whether either hand currently grabs monitor `id`.
+    OpenXR::eXRQuadRegion chromeHoverRegion(MONITORID id) const;
+    bool                  isMonitorGrabbed(MONITORID id) const;
+
     // Frame thread (set on the main thread before the frame thread starts). Producer sink for
     // frame->main events (queue push + eventfd wake, owned by COpenXRManager).
     void setEmitter(std::function<void(XRQueueItem)> emit) {

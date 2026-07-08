@@ -367,6 +367,13 @@ namespace OpenXR {
         bool  hasContentRect() const {
             return contentU1 > contentU0 && contentV1 > contentV0;
         }
+        // Whether any drawable chrome element exists (a move-bar with area, or corner handles).
+        // WP-G2 uses this to gate the chrome draw pass + auto-hide entirely: with chrome disabled
+        // (margin 0 + bar 0) the geometry is a full-quad content rect and this returns false, so
+        // the draw pass is skipped and there is zero visual change (the disable mechanism, doc §8).
+        bool  hasChrome() const {
+            return (barU1 > barU0 && barV1 > barV0) || (cornerU > 0.F && cornerV > 0.F);
+        }
         float contentFracW() const {
             return contentU1 - contentU0;
         }
@@ -474,5 +481,36 @@ namespace OpenXR {
         const float yLocal = (0.5F - g.contentCenterV()) * quadH;
         const Vec3  off    = qRotate(contentPose.rot, Vec3{xLocal, yLocal, 0.F});
         return SXRPose{contentPose.pos - off, contentPose.rot};
+    }
+
+    // ---- chrome auto-hide fade envelope (docs/openxr/research/04-grabbable-borders.md §8, WP-G2) ----
+    //
+    // Pure, unconditional (gtest-covered in tests/xr/chrome_fade.cpp): advance a layer's chrome
+    // fade alpha one frame toward its visibility target, so the move-bar/corner handles fade IN
+    // when the ray hovers the quad (or it is grabbed) and fade OUT `hideDelay` seconds after the
+    // last such interaction. Driven on the FRAME thread from xrWaitFrame predicted-display-time
+    // deltas (no wall clock — see the frame loop), which is why it takes explicit dt/since-active
+    // seconds rather than reading a clock.
+    //
+    //   cur            current alpha in [0,1]
+    //   activeNow      the ray hovers ANY region of this quad this frame, or it is grabbed
+    //   dtSec          seconds since the previous advance (predicted-time delta, clamped by caller)
+    //   sinceActiveSec seconds since `activeNow` was last true (0 when activeNow)
+    //   fadeSec        full fade duration in seconds (openxr:chrome_fade_ms)
+    //   hideDelaySec   idle grace before fading out (openxr:chrome_hide_delay_ms)
+    //
+    // The visibility target is 1 while active or within the hide-delay grace, else 0; alpha ramps
+    // toward it at a constant dt/fadeSec rate (linear fade). Returns the new alpha in [0,1].
+    inline float chromeFadeAdvance(float cur, bool activeNow, float dtSec, float sinceActiveSec, float fadeSec, float hideDelaySec) {
+        const bool  visible = activeNow || sinceActiveSec < hideDelaySec;
+        const float target  = visible ? 1.F : 0.F;
+        if (fadeSec <= 0.F)
+            return target; // no fade duration -> snap
+        if (dtSec <= 0.F)
+            return std::clamp(cur, 0.F, 1.F); // no time elapsed -> hold
+        const float step = dtSec / fadeSec;
+        if (target > cur)
+            return std::min(target, cur + step);
+        return std::max(target, cur - step);
     }
 }

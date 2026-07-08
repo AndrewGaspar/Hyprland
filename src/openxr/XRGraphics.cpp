@@ -8,6 +8,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <vector>
 #include <fcntl.h>
 #include <unistd.h>
@@ -18,6 +19,7 @@
 #include "../Compositor.hpp"
 #include "../render/OpenGL.hpp"
 #include "../debug/log/Logger.hpp"
+#include "../config/ConfigValue.hpp"
 #include "XRMonitorLayer.hpp"
 #include <aquamarine/buffer/Buffer.hpp>
 
@@ -502,11 +504,145 @@ void CXRGraphics::clearTex(XR_GLuint dstTex, const Vector2D& size, float r, floa
     glDeleteFramebuffers(1, &fbo);
 }
 
-void CXRGraphics::destroyLayerGL(XR_EGLImageKHR img, XR_GLuint cpuTex) {
+// ---- WP-G2: chrome snapshot + move-bar/corner-handle draw pass ----
+
+void CXRGraphics::snapshotSwapchain(CXRMonitorLayer& layer, XR_GLuint srcTex) {
+    const Vector2D size = layer.m_swapchainSize;
+    if (size.x < 1 || size.y < 1)
+        return;
+
+    // (Re)allocate the persistent snapshot at the full swapchain size.
+    if (layer.m_contentTex == 0 || layer.m_contentTexSize != size) {
+        if (layer.m_contentTex == 0)
+            glGenTextures(1, &layer.m_contentTex);
+        glBindTexture(GL_TEXTURE_2D, layer.m_contentTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)size.x, (GLsizei)size.y, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        layer.m_contentTexSize = size;
+    }
+
+    // Copy srcTex (the swapchain image we just wrote content into) -> snapshot, 1:1 (no flip; both
+    // share the swapchain's bottom-left origin). Preserves the content-alpha-1 / margin-alpha-0 layout.
+    GLuint srcFBO = 0, dstFBO = 0;
+    glGenFramebuffers(1, &srcFBO);
+    glGenFramebuffers(1, &dstFBO);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, srcFBO);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, srcTex, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dstFBO);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, layer.m_contentTex, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glBlitFramebuffer(0, 0, (GLint)size.x, (GLint)size.y, 0, 0, (GLint)size.x, (GLint)size.y, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glDeleteFramebuffers(1, &srcFBO);
+    glDeleteFramebuffers(1, &dstFBO);
+}
+
+bool CXRGraphics::restoreSnapshot(CXRMonitorLayer& layer, XR_GLuint dstTex) {
+    const Vector2D size = layer.m_swapchainSize;
+    if (layer.m_contentTex == 0 || layer.m_contentTexSize != size || size.x < 1 || size.y < 1)
+        return false;
+
+    GLuint srcFBO = 0, dstFBO = 0;
+    glGenFramebuffers(1, &srcFBO);
+    glGenFramebuffers(1, &dstFBO);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, srcFBO);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, layer.m_contentTex, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dstFBO);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glBlitFramebuffer(0, 0, (GLint)size.x, (GLint)size.y, 0, 0, (GLint)size.x, (GLint)size.y, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glDeleteFramebuffers(1, &srcFBO);
+    glDeleteFramebuffers(1, &dstFBO);
+    return true;
+}
+
+void CXRGraphics::drawChrome(CXRMonitorLayer& layer, XR_GLuint dstTex, float alpha, uint8_t hoverRegion, bool grabbed) {
+    const OpenXR::SXRChromeGeometry& g = layer.m_chrome;
+    if (alpha <= 0.f || !g.hasChrome())
+        return;
+
+    const int W = (int)layer.m_swapchainSize.x;
+    const int H = (int)layer.m_swapchainSize.y;
+    if (W <= 0 || H <= 0)
+        return;
+
+    // Chrome colors (ARGB ints, hot-reloadable per-frame cached reads — benign frame-thread race,
+    // same tolerance as the other openxr:* config reads in this path).
+    static auto PIDLE  = CConfigValue<Config::INTEGER>("openxr:chrome_col_idle");
+    static auto PHOVER = CConfigValue<Config::INTEGER>("openxr:chrome_col_hover");
+    static auto PGRAB  = CConfigValue<Config::INTEGER>("openxr:chrome_col_grab");
+
+    GLuint fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glEnable(GL_SCISSOR_TEST);
+
+    // Fill a uv rect (top-left origin, v down) with a PREMULTIPLIED chrome color scaled by the fade
+    // alpha. The swapchain image has a bottom-left origin, so flip v -> GL y. glClear on a scissor
+    // rect is a hard overwrite (plain filled rect — v1 shape; L-brackets deferred), which is exactly
+    // what we want in the transparent margin. rgb is stored premultiplied by (colorAlpha*fade) so the
+    // TEXTURE_SOURCE_ALPHA composite is correct with no edge halo.
+    auto fillRect = [&](float u0, float v0, float u1, float v1, uint32_t argb) {
+        if (u1 <= u0 || v1 <= v0)
+            return;
+        const float ca = ((argb >> 24) & 0xff) / 255.f;
+        const float cr = ((argb >> 16) & 0xff) / 255.f;
+        const float cg = ((argb >> 8) & 0xff) / 255.f;
+        const float cb = (argb & 0xff) / 255.f;
+        const float ea = ca * alpha; // effective (fade-scaled) alpha
+        const int   x0 = (int)std::lround(u0 * W);
+        const int   x1 = (int)std::lround(u1 * W);
+        const int   glY0 = (int)std::lround((1.f - v1) * H); // v1 is the lower (in-screen) edge -> smaller GL y
+        const int   glY1 = (int)std::lround((1.f - v0) * H);
+        if (x1 <= x0 || glY1 <= glY0)
+            return;
+        glScissor(x0, glY0, x1 - x0, glY1 - glY0);
+        glClearColor(cr * ea, cg * ea, cb * ea, ea); // premultiplied
+        glClear(GL_COLOR_BUFFER_BIT);
+    };
+
+    // Per-element color: grabbed overrides everything; else the hovered element gets the hover
+    // color and the rest stay idle. hoverRegion is the ray's region on THIS quad (bar / a specific
+    // corner / body / margin). Body/margin hover still shows the whole chrome (idle) as an invite.
+    const uint32_t idle  = (uint32_t)(int64_t)*PIDLE;
+    const uint32_t hover = (uint32_t)(int64_t)*PHOVER;
+    const uint32_t grab  = (uint32_t)(int64_t)*PGRAB;
+    auto colFor = [&](OpenXR::eXRQuadRegion elem) -> uint32_t {
+        if (grabbed)
+            return grab;
+        return ((OpenXR::eXRQuadRegion)hoverRegion == elem) ? hover : idle;
+    };
+
+    // Move-bar.
+    fillRect(g.barU0, g.barV0, g.barU1, g.barV1, colFor(OpenXR::XR_REGION_BAR));
+
+    // Corner handles: filled squares in the margin just OUTSIDE each content corner (matches
+    // OpenXR::classifyQuadHit's corner bands exactly).
+    if (g.cornerU > 0.f && g.cornerV > 0.f) {
+        fillRect(g.contentU0 - g.cornerU, g.contentV0 - g.cornerV, g.contentU0, g.contentV0, colFor(OpenXR::XR_REGION_CORNER_TL));
+        fillRect(g.contentU1, g.contentV0 - g.cornerV, g.contentU1 + g.cornerU, g.contentV0, colFor(OpenXR::XR_REGION_CORNER_TR));
+        fillRect(g.contentU0 - g.cornerU, g.contentV1, g.contentU0, g.contentV1 + g.cornerV, colFor(OpenXR::XR_REGION_CORNER_BL));
+        fillRect(g.contentU1, g.contentV1, g.contentU1 + g.cornerU, g.contentV1 + g.cornerV, colFor(OpenXR::XR_REGION_CORNER_BR));
+    }
+
+    glDisable(GL_SCISSOR_TEST);
+    glDeleteFramebuffers(1, &fbo);
+}
+
+void CXRGraphics::destroyLayerGL(XR_EGLImageKHR img, XR_GLuint cpuTex, XR_GLuint contentTex) {
     if (img != nullptr && s_eglDestroyImage)
         s_eglDestroyImage(m_eglDisplay, img);
     if (cpuTex) {
         GLuint t = cpuTex;
+        glDeleteTextures(1, &t);
+    }
+    if (contentTex) {
+        GLuint t = contentTex;
         glDeleteTextures(1, &t);
     }
 }

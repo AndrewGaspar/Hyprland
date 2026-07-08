@@ -55,8 +55,26 @@ class CXRGraphics {
     void blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer& layer, XR_GLuint dstTex);
     // Frame thread, inside a CScopedGLContext. Clear an image to a solid color.
     void clearTex(XR_GLuint dstTex, const Vector2D& size, float r, float g, float b);
-    // Delete a layer's per-layer GL objects (EGLImage + staging tex). Context must be current.
-    void destroyLayerGL(XR_EGLImageKHR img, XR_GLuint cpuTex);
+    // Delete a layer's per-layer GL objects (EGLImage + CPU staging tex + chrome snapshot tex).
+    // Context must be current.
+    void destroyLayerGL(XR_EGLImageKHR img, XR_GLuint cpuTex, XR_GLuint contentTex);
+
+    // ---- WP-G2: chrome snapshot + move-bar/corner-handle draw pass (frame thread, in a
+    // CScopedGLContext). See docs/openxr/research/04-grabbable-borders.md §5.5/§8. ----
+    // Copy a freshly-blitted swapchain image (srcTex, sized to layer.m_swapchainSize) into the
+    // layer's persistent content snapshot texture (allocated/resized here). Called after each
+    // real content blit so a later animation-only frame can restore it.
+    void snapshotSwapchain(CXRMonitorLayer& layer, XR_GLuint srcTex);
+    // Restore the content snapshot into a newly-acquired swapchain image (dstTex) for an
+    // animation-only frame (chrome fading with no new desktop buffer). Returns false if no
+    // snapshot exists yet (caller then skips the chrome-only redraw).
+    bool restoreSnapshot(CXRMonitorLayer& layer, XR_GLuint dstTex);
+    // Draw the auto-hiding chrome (bottom move-bar + four corner resize handles) into the margin
+    // of dstTex, over already-present content. `alpha` is the fade envelope [0,1]; `hoverRegion`
+    // (OpenXR::eXRQuadRegion) highlights the hovered element; `grabbed` overrides all elements to
+    // the grab color. Colors come from openxr:chrome_col_* and are written PREMULTIPLIED (the quad
+    // composites TEXTURE_SOURCE_ALPHA). Only touches margin pixels — never the content rect.
+    void drawChrome(CXRMonitorLayer& layer, XR_GLuint dstTex, float alpha, uint8_t hoverRegion, bool grabbed);
 
     // RAII guard: ctor eglMakeCurrent(m_xrContext), dtor eglMakeCurrent(EGL_NO_CONTEXT).
     // The ONLY sanctioned way GL work is issued — see doc 01 "EGL context ownership".

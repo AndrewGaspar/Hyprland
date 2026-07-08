@@ -707,9 +707,40 @@ void COpenXRManager::frameThread() {
 
             auto buf = l->takeLatestBuffer();
 
-            // Skip the blit when no new buffer arrived: a quad re-presents the most recently
-            // released swapchain image every runtime frame (doc 01).
-            if (!buf && l->m_hasContent)
+            // ---- WP-G2 chrome auto-hide fade (frame thread; predicted-display-time deltas, no
+            // wall clock). hoverRegion/grabbedNow were written by LAST frame's processPointer
+            // plumbing (end of this loop iteration) — a deliberate one-frame latency. activeNow
+            // drives the envelope: fade in while the ray hovers/grabs this quad, out after the
+            // hide delay. Advanced every frame regardless of whether we redraw. ----
+            static auto   PFADEMS    = CConfigValue<Hyprlang::INT>("openxr:chrome_fade_ms");
+            static auto   PHIDEMS    = CConfigValue<Hyprlang::INT>("openxr:chrome_hide_delay_ms");
+            const uint8_t hoverReg   = l->m_hoverRegion.load(std::memory_order_acquire);
+            const bool    grabbedNow = l->m_grabbedNow.load(std::memory_order_acquire);
+            const bool    activeNow  = grabbedNow || hoverReg != OpenXR::XR_REGION_NONE;
+            const bool    chromeOn   = l->m_chrome.hasChrome();
+
+            const int64_t nowNs = fs.predictedDisplayTime;
+            if (activeNow)
+                l->m_chromeActiveNs = nowNs;
+            float dtSec = 0.f;
+            if (l->m_chromeUpdateNs != 0 && nowNs > l->m_chromeUpdateNs)
+                dtSec = std::min(0.1f, (float)(nowNs - l->m_chromeUpdateNs) / 1e9f);
+            l->m_chromeUpdateNs = nowNs;
+            // m_chromeActiveNs == 0 means "never hovered/grabbed yet" -> treat as long-past so the
+            // chrome starts (and stays) hidden until the first real interaction.
+            const float sinceActiveSec = l->m_chromeActiveNs == 0 ? 1e9f : (float)(nowNs - l->m_chromeActiveNs) / 1e9f;
+            const float newAlpha =
+                chromeOn ? OpenXR::chromeFadeAdvance(l->m_chromeAlpha, activeNow, dtSec, sinceActiveSec, (float)*PFADEMS / 1000.f, (float)*PHIDEMS / 1000.f) : 0.f;
+            l->m_chromeAlpha = newAlpha;
+
+            // A chrome-only (no new desktop buffer) redraw is needed ONLY when the on-screen chrome
+            // would actually differ (alpha/region/grab changed) and something is or was visible.
+            // This is what keeps a static desktop with hidden chrome at zero GPU cost — the quad
+            // re-presents the most recently released image every runtime frame (doc 01).
+            const bool chromeVisualChanged = newAlpha != l->m_chromeDrawnAlpha || hoverReg != l->m_chromeDrawnRegion || grabbedNow != l->m_chromeDrawnGrab;
+            const bool wantAnimTick        = chromeOn && l->m_hasContent && chromeVisualChanged && (newAlpha > 0.f || l->m_chromeDrawnAlpha > 0.f);
+
+            if (!buf && !wantAnimTick && l->m_hasContent)
                 continue;
 
             XrSwapchainImageAcquireInfo acqInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
@@ -731,14 +762,34 @@ void COpenXRManager::frameThread() {
             xrWaitSwapchainImage(l->m_swapchain, &waitImg);
 
             if (imgIdx < l->m_swapchainImages.size()) {
+                const XR_GLuint dst = l->m_swapchainImages[imgIdx];
                 if (buf) {
-                    m_graphics->blitBuffer(buf, *l, l->m_swapchainImages[imgIdx]);
+                    m_graphics->blitBuffer(buf, *l, dst);
                     if (!l->m_hasContent)
                         Log::logger->log(Log::DEBUG, "[OPENXR] first blit landed for XR monitor '{}' ({}x{})", l->m_monitorName, (int)l->m_swapchainSize.x,
                                          (int)l->m_swapchainSize.y);
                     l->m_hasContent = true;
+                    // Snapshot the fresh content (WITHOUT chrome) so an animation-only frame can
+                    // restore it into a different acquired image (WP-G2). Only when chrome is
+                    // enabled — the extra copy is pure overhead otherwise (zero-cost disabled path).
+                    if (chromeOn)
+                        m_graphics->snapshotSwapchain(*l, dst);
+                } else if (l->m_hasContent) {
+                    // Animation-only frame: no new desktop buffer, chrome fading — restore the last
+                    // content into this (possibly different) image, then draw chrome over it.
+                    m_graphics->restoreSnapshot(*l, dst);
                 } else
-                    m_graphics->clearTex(l->m_swapchainImages[imgIdx], l->m_swapchainSize, 0.0f, 0.0f, 0.0f);
+                    m_graphics->clearTex(dst, l->m_swapchainSize, 0.0f, 0.0f, 0.0f);
+
+                // Chrome pass (WP-G2): draw the move-bar + corner handles into the transparent
+                // margin over the content. No-op when disabled or fully faded out; drawChrome never
+                // touches the content rect.
+                if (chromeOn && l->m_hasContent) {
+                    m_graphics->drawChrome(*l, dst, newAlpha, hoverReg, grabbedNow);
+                    l->m_chromeDrawnAlpha  = newAlpha;
+                    l->m_chromeDrawnRegion = hoverReg;
+                    l->m_chromeDrawnGrab   = grabbedNow;
+                }
             }
 
             XrSwapchainImageReleaseInfo relInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -953,6 +1004,17 @@ void COpenXRManager::frameThread() {
             pointerSolveIn.gripRight = gripRight;
             std::scoped_lock lock(m_layersMu);
             m_input->processPointer(pointerTargets, (uint32_t)Time::millis(Time::steadyNow()), pointerSolveIn, tune);
+
+            // WP-G2 chrome visual-state plumbing: publish each active quad's current ray-hover
+            // region + grab flag onto the layer for the NEXT frame's chrome draw pass (frame
+            // thread → frame thread, plain atomics — no processPointer/grab-machine change; the
+            // input path only EXPOSES its per-hand region/grab state via read-only accessors).
+            for (auto& l : active) {
+                const MONITORID mid = l->m_monitorId.load(std::memory_order_acquire);
+                const auto reg = mid >= 0 ? m_input->chromeHoverRegion(mid) : OpenXR::XR_REGION_NONE;
+                l->m_hoverRegion.store((uint8_t)reg, std::memory_order_release);
+                l->m_grabbedNow.store(mid >= 0 && m_input->isMonitorGrabbed(mid), std::memory_order_release);
+            }
         }
 
         // xrEndFrame with zero layers is valid (nothing composited yet) — doc 01.
@@ -987,13 +1049,20 @@ bool COpenXRManager::createLayerSwapchain(CXRMonitorLayer& layer, const Vector2D
     // the layer so the blit (px insets) and the quad-submit/classifier (fractions) share one
     // source. The anchor widthMeters read here is a benign unlocked frame-thread read (cosmetic
     // margin sizing only; content geometry is unaffected), same tolerance as the config reads.
-    static auto PMARGIN                    = CConfigValue<Hyprlang::FLOAT>("openxr:chrome_margin");
-    static auto PBARH                      = CConfigValue<Hyprlang::FLOAT>("openxr:chrome_bar_height");
-    static auto PBARWF                     = CConfigValue<Hyprlang::FLOAT>("openxr:chrome_bar_width_frac");
-    static auto PCORNER                    = CConfigValue<Hyprlang::FLOAT>("openxr:chrome_corner_size");
+    static auto PENABLED                   = CConfigValue<Hyprlang::INT>("openxr:chrome_enabled");
+    static auto PMARGIN                     = CConfigValue<Hyprlang::FLOAT>("openxr:chrome_margin");
+    static auto PBARH                       = CConfigValue<Hyprlang::FLOAT>("openxr:chrome_bar_height");
+    static auto PBARWF                      = CConfigValue<Hyprlang::FLOAT>("openxr:chrome_bar_width_frac");
+    static auto PCORNER                     = CConfigValue<Hyprlang::FLOAT>("openxr:chrome_corner_size");
+    // Master toggle: chrome_enabled=0 collapses ALL margins to 0 -> makeChromeGeometry yields a
+    // full-quad content rect (hasChrome()==false), so the swapchain is content-only and the draw
+    // pass no-ops — zero visual change vs. pre-WP-G1 (the documented disable mechanism, doc §8).
+    const bool                      chromeOn = *PENABLED;
+    const float                     margin   = chromeOn ? (float)*PMARGIN : 0.f;
+    const float                     barH     = chromeOn ? (float)*PBARH : 0.f;
     const float                     cW     = std::max(0.001f, layer.m_anchor.state().widthMeters);
     const float                     cH     = cW * (float)std::max(1.0, size.y) / (float)std::max(1.0, size.x);
-    const OpenXR::SXRChromeGeometry chrome = OpenXR::makeChromeGeometry(cW, cH, (float)*PMARGIN, (float)*PBARH, (float)*PBARWF, (float)*PCORNER);
+    const OpenXR::SXRChromeGeometry chrome = OpenXR::makeChromeGeometry(cW, cH, margin, barH, (float)*PBARWF, (float)*PCORNER);
 
     // Full swapchain px = content px expanded by the same fractions (px/fraction stay consistent).
     const double   fw = chrome.contentFracW() > 0.0 ? (double)chrome.contentFracW() : 1.0;
@@ -1037,14 +1106,24 @@ bool COpenXRManager::createLayerSwapchain(CXRMonitorLayer& layer, const Vector2D
     layer.m_chrome          = chrome;
     layer.m_hasContent      = false;
 
-    // Reset the per-layer CPU staging tex so it reallocs to the new mode on the next blit.
+    // Reset the per-layer CPU staging tex + chrome snapshot so they realloc to the new mode.
     {
         CXRGraphics::CScopedGLContext ctx(*m_graphics);
-        m_graphics->destroyLayerGL(layer.m_lastEGLImg, layer.m_cpuTex);
+        m_graphics->destroyLayerGL(layer.m_lastEGLImg, layer.m_cpuTex, layer.m_contentTex);
     }
-    layer.m_lastEGLImg = nullptr;
-    layer.m_cpuTex     = 0;
-    layer.m_cpuTexSize = Vector2D{};
+    layer.m_lastEGLImg     = nullptr;
+    layer.m_cpuTex         = 0;
+    layer.m_cpuTexSize     = Vector2D{};
+    layer.m_contentTex     = 0;
+    layer.m_contentTexSize = Vector2D{};
+    // Chrome fade must start hidden after a (re)create so a resized/rebound quad does not flash
+    // its chrome; the draw-diff trackers reset too so the first real frame draws cleanly.
+    layer.m_chromeAlpha       = 0.f;
+    layer.m_chromeDrawnAlpha  = 0.f;
+    layer.m_chromeDrawnRegion = 0;
+    layer.m_chromeDrawnGrab   = false;
+    layer.m_chromeUpdateNs    = 0;
+    layer.m_chromeActiveNs    = 0;
 
     Log::logger->log(Log::DEBUG, "[OPENXR] swapchain created for XR monitor '{}': {}x{} (content {}x{} @ +{},+{}), {} images, format 0x{:x}", layer.m_monitorName,
                      (int)fullSize.x, (int)fullSize.y, (int)size.x, (int)size.y, (int)contentOffset.x, (int)contentOffset.y, imgCount,
@@ -1367,6 +1446,27 @@ void COpenXRManager::reportLayerRemoved(const std::string& name) {
     enqueue(ev);
 }
 
+void COpenXRManager::markSwapchainsDirtyIfChromeChanged() {
+    static auto PENABLED = CConfigValue<Hyprlang::INT>("openxr:chrome_enabled");
+    static auto PMARGIN  = CConfigValue<Hyprlang::FLOAT>("openxr:chrome_margin");
+    static auto PBARH    = CConfigValue<Hyprlang::FLOAT>("openxr:chrome_bar_height");
+    static auto PBARWF   = CConfigValue<Hyprlang::FLOAT>("openxr:chrome_bar_width_frac");
+    static auto PCORNER  = CConfigValue<Hyprlang::FLOAT>("openxr:chrome_corner_size");
+
+    const std::array<double, 5> cur{(double)*PENABLED, (double)*PMARGIN, (double)*PBARH, (double)*PBARWF, (double)*PCORNER};
+    const bool                  changed = !m_lastChromeGeom.has_value() || *m_lastChromeGeom != cur;
+    m_lastChromeGeom                     = cur;
+    if (!changed)
+        return;
+
+    // Force the frame thread to recreate every layer's swapchain, which recomputes m_contentSize/
+    // m_contentOffsetPx/m_chrome from the new values (createLayerSwapchain). Without this the
+    // margin px + chrome fractions stay frozen at their creation-time values.
+    std::scoped_lock lock(m_layersMu);
+    for (auto& l : m_layers)
+        l->m_swapchainDirty.store(true, std::memory_order_release);
+}
+
 void COpenXRManager::onConfigReload() {
     static auto PENABLED = CConfigValue<Hyprlang::INT>("openxr:enabled");
     const bool  enabled  = *PENABLED;
@@ -1385,6 +1485,10 @@ void COpenXRManager::onConfigReload() {
             ensurePointerDevice();
         else
             removePointerDevice();
+
+        // WP-G2: pick up hot-edited chrome geometry (margin/bar/corner/enabled) by recreating
+        // swapchains when they changed. Colors + fade/hide timings are read per-frame (no recreate).
+        markSwapchainsDirtyIfChromeChanged();
     }
 
     // Re-run so that toggling openxr:inhibit_idle takes effect immediately (WP9 hook).

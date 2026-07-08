@@ -1,12 +1,14 @@
 #pragma once
 #ifdef HAVE_OPENXR
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <atomic>
 #include <expected>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -121,6 +123,13 @@ class COpenXRManager {
     // Reconcile the declared (`xrmonitor` keyword) set against live layers (doc 05 §2.5). Runs
     // from onConfigReload() and from init() so declared monitors materialize even while disabled.
     void reconcileDeclaredMonitors();
+
+    // WP-G2: on a config reload, if the chrome GEOMETRY vars (enabled/margin/bar_height/
+    // bar_width_frac/corner_size) changed, mark every layer's swapchain dirty so the frame thread
+    // recreates it — the chrome margin px + m_chrome fractions are frozen at swapchain creation, so
+    // this is what makes chrome_* hot-reloadable (the WP-G1 follow-up). Colors + fade/hide timings
+    // are read per-frame and need no recreate. Main thread; takes m_layersMu.
+    void markSwapchainsDirtyIfChromeChanged();
 
     // Re-check `openxr:enabled` (and other hot-live vars) against the current lifecycle state
     // and start()/stop() accordingly. Normally reached via the config.reloaded/props_refreshed
@@ -249,6 +258,11 @@ class COpenXRManager {
     CXRQueue            m_queue;
     std::atomic<bool>   m_queueOverflowed{false}; // logged-once guard for a lost non-droppable item
     std::atomic<bool>   m_frameRequestedTeardown{false};
+
+    // Last-seen chrome geometry config tuple (enabled, margin, bar_height, bar_width_frac,
+    // corner_size), to detect a hot-reload change (WP-G2 chrome hot-reload fix). Empty until first
+    // compared.
+    std::optional<std::array<double, 5>> m_lastChromeGeom;
 
     CHyprSignalListener m_configReloadListener;
     CHyprSignalListener m_propsRefreshedListener;
