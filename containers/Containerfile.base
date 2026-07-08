@@ -1,0 +1,181 @@
+# HypXRland container BASE image — Arch + PID-1 systemd + the Hyprland build
+# environment + an Omarchy 3.8.2 checkout, ready for the boot-install-commit
+# that layers the desktop on top (see scripts/xr-container.sh `build`).
+#
+# Why PID-1 systemd (not a shim)? So the container has a real system D-Bus,
+# systemd-logind and a genuine per-user `systemd --user` session entered via
+# `machinectl shell` — exactly how a bare-metal Arch/Omarchy user runs. This is
+# the Omedora lesson (omedora/testing.md §6): don't shim, boot init.
+#
+# This Dockerfile builds ONLY the base: base system + build toolchain + the
+# Hyprland/monado build deps + labwc (WP2's headless nesting host) + an Omarchy
+# tree. The Omarchy *desktop packages* and config are NOT installed here — a
+# `podman build` RUN has no PID-1 systemd, so `machinectl shell`, the session
+# bus and running-service restarts don't work. They are installed by
+# containers/omarchy-install-ctr.sh inside a live boot and committed on top
+# (image tags hypxrland-ctr:{base,pkgs,session}).
+#
+# IMPORTANT: this image ships NO NVIDIA userspace driver. On an NVIDIA host the
+# driver libraries + EGL/Vulkan ICDs are injected at run time via CDI
+# (`--device nvidia.com/gpu=all`); a baked-in driver would shadow the host's and
+# mismatch the host kernel module. AMD uses the in-tree Mesa (userspace is
+# version-tolerant against the host amdgpu kernel driver).
+
+FROM archlinux:latest
+
+# --- the Omarchy custom pacman repo ------------------------------------------
+# Omarchy's walker/elephant/omarchy-walker/swayosd/uwsm-adjacent packages (the
+# AUR-origin desktop bits) live in the prebuilt `[omarchy]` repo, not in Arch
+# core/extra. Add it (TrustAll, no keyring needed) so the desktop payload
+# resolves with plain `pacman -S` in the pkgs stage — far cheaper than building
+# every AUR package with yay. We keep Arch's own core/extra/multilib mirrors
+# (current, matches the rolling host closely) rather than switching wholesale to
+# Omarchy's snapshot mirror: we build our binaries fresh in-container, so we want
+# current libs, and [omarchy] packages resolve fine against them (Arch deps are
+# lower-bound `>=`, and the desktop bits are forward-compatible).
+RUN printf '\n[omarchy]\nSigLevel = Optional TrustAll\nServer = https://pkgs.omarchy.org/stable/$arch\n' \
+        >>/etc/pacman.conf && \
+    sed -i 's/^#\(ParallelDownloads\).*/\1 = 8/' /etc/pacman.conf
+
+# --- base system + systemd ---------------------------------------------------
+# systemd/systemd-sysvcompat → PID-1 init + /sbin/init; dbus-broker → the most
+# container-friendly system bus; polkit → the auth prompts the session wants.
+RUN pacman -Syu --noconfirm --needed \
+        systemd systemd-sysvcompat dbus-broker polkit \
+        base-devel git cmake ninja ccache sudo \
+        pkgconf which findutils diffutils procps-ng inetutils \
+    && yes | pacman -Scc >/dev/null 2>&1 || true
+
+# --- Hyprland build dependencies ---------------------------------------------
+# Derived from CMakeLists.txt (pkg_check_modules / find_package) + the host's
+# `hyprland` runtime deps. Grouped by the CMake check that needs them:
+#   compositor libs : aquamarine hyprutils hyprlang hyprgraphics hyprcursor
+#                     hyprwayland-scanner hyprland-protocols
+#   graphics/EGL/GL : mesa libglvnd (libEGL/libGLESv2/libgbm), glslang
+#   wayland/xkb     : wayland wayland-protocols libxkbcommon
+#   2D/text/color   : cairo pango pixman libdrm lcms2
+#   input/misc      : libinput util-linux(libuuid) glib2(gio) re2 muparser
+#                     lua(>=5.5) libxcursor
+#   config/plugins  : hyprlang tomlplusplus glaze
+#   XWayland (XWAYLAND_DEPENDENCIES): libxcb xcb-util-wm(icccm) xcb-util-errors
+#                     xorg-xwayland
+#   OpenXR (HAVE_OPENXR): openxr
+#   tests (WITH_TESTS): gtest
+# udis86 is satisfied by the vendored subproject fallback (subprojects/udis86),
+# so no package is needed for it.
+RUN pacman -S --noconfirm --needed \
+        aquamarine hyprutils hyprlang hyprgraphics hyprcursor \
+        hyprwayland-scanner hyprland-protocols \
+        wayland wayland-protocols libxkbcommon \
+        mesa libglvnd glslang \
+        cairo pango pixman libdrm lcms2 \
+        libinput util-linux glib2 re2 muparser lua \
+        libxcursor libxcb xcb-util-wm xcb-util-errors xorg-xwayland \
+        tomlplusplus glaze openxr gtest \
+        python \
+    && yes | pacman -Scc >/dev/null 2>&1 || true
+
+# --- vendored-Monado build dependencies --------------------------------------
+# scripts/build-monado.sh builds monado-service (null compositor + remote
+# driver) + the monado GUI. Its own configure-failure message lists these; the
+# Vulkan/Eigen headers come from the vendored submodules, but the ICD loader,
+# shader compiler and SDL (gui) are real system deps.
+RUN pacman -S --noconfirm --needed \
+        vulkan-icd-loader vulkan-headers shaderc glslang \
+        libxcb wayland wayland-protocols libdrm sdl2 \
+    && yes | pacman -Scc >/dev/null 2>&1 || true
+
+# --- GPU userspace (AMD) + graphics diagnostics ------------------------------
+# vulkan-radeon → AMD Vulkan ICD for the --gpu amd path (NVIDIA's ICD is CDI-
+# injected). vulkan-tools/mesa-utils/wayland-utils give vulkaninfo/eglinfo/
+# wayland-info for `--check-gpu` and WP2 diagnostics. NO nvidia-utils here.
+RUN pacman -S --noconfirm --needed \
+        vulkan-radeon vulkan-tools mesa-utils wayland-utils \
+    && yes | pacman -Scc >/dev/null 2>&1 || true
+
+# --- labwc: WP2's headless nesting host --------------------------------------
+# labwc is the lightest Wayland compositor that advertises the protocols
+# Aquamarine's nested backend needs (xdg_wm_base v6 + zwp_linux_dmabuf_v1), so
+# the hyprtester --xr nested fallback can nest into it instead of the host
+# socket. TEST-ONLY scaffolding — not part of the desktop.
+# labwc ships a cap_sys_nice file capability; under rootless podman that cap is
+# not in the user-ns bounding set, so `systemd-run --user labwc` fails at exec
+# (203/EXEC "Operation not permitted"). Strip it — labwc runs fine without RT
+# priority in a container.
+RUN pacman -S --noconfirm --needed labwc \
+    && setcap -r /usr/bin/labwc || true \
+    && yes | pacman -Scc >/dev/null 2>&1 || true
+
+# --- container-friendly systemd ----------------------------------------------
+# The Arch base image ships /etc/machine-id containing the literal string
+# "uninitialized", which puts systemd in first-boot mode; rootless PID-1 can't
+# commit a real id, sd_id128_get_machine() returns -ENOPKG and dbus-broker dies
+# at launch ("launcher_run_child ... Package not installed") — verified live.
+# Bake a real machine-id at build time so the system bus comes up. (Committed
+# pkgs/session images share it; irrelevant for this single-purpose rig.)
+RUN rm -f /etc/machine-id && systemd-machine-id-setup && test -s /etc/machine-id
+
+# podman --systemd=always mounts the cgroup/tmpfs scaffolding and masks most
+# problematic units, but a few still try (and fail) to touch host-owned state.
+# Mask the reliable offenders so `systemctl is-system-running` settles at
+# running/degraded quickly. systemd-resolved can't keep CAP_SYS_ADMIN in a
+# rootless user-ns (spawn loop); podman provides /etc/resolv.conf anyway.
+# systemd-firstboot wants a console/stdin the container doesn't have.
+RUN systemctl mask \
+        systemd-remount-fs.service \
+        systemd-machine-id-commit.service \
+        systemd-resolved.service \
+        systemd-firstboot.service \
+        dev-hugepages.mount \
+        sys-kernel-config.mount \
+        sys-kernel-debug.mount \
+    || true
+
+# dbus-broker (system bus) + logind up at boot.
+RUN systemctl enable dbus-broker.service systemd-logind.service || true
+
+# When `user@1000.service` is started by lingering at boot (before any PAM
+# login), PID 1 doesn't inject XDG_RUNTIME_DIR into the `systemd --user`
+# manager, so it dies with exit 49 ("$XDG_RUNTIME_DIR is not set"). Pin it via a
+# drop-in so the user manager comes up at boot. (pam_systemd sets it too once a
+# `machinectl shell` login happens — this covers the pre-login linger start.)
+RUN mkdir -p /etc/systemd/system/user@.service.d && \
+    printf '[Service]\nEnvironment=XDG_RUNTIME_DIR=/run/user/%%i\n' \
+        >/etc/systemd/system/user@.service.d/10-xdg-runtime-dir.conf
+
+# --- the `dev` user ----------------------------------------------------------
+# uid 1000 (matches the host user under --userns=keep-id so it owns the mounted
+# XDG_RUNTIME_DIR sockets), wheel + NOPASSWD sudo (the omarchy install expects
+# passwordless sudo), a known password (hypxrland) so PAM prompts (hyprlock) in
+# the session accept it.
+RUN useradd --create-home --uid 1000 --shell /bin/bash --groups wheel dev && \
+    printf '%%wheel ALL=(ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/wheel-nopasswd && \
+    chmod 0440 /etc/sudoers.d/wheel-nopasswd && \
+    echo 'dev:hypxrland' | chpasswd
+
+# Enable lingering so `systemd --user` for dev starts at boot (not just on first
+# login). The marker file is exactly what `loginctl enable-linger dev` writes
+# and needs no logind at build time.
+RUN install -d -m 0755 /var/lib/systemd/linger && \
+    touch /var/lib/systemd/linger/dev
+
+# --- the Omarchy tree --------------------------------------------------------
+# A WEB checkout pinned at tag v3.8.2 (NOT the host's local ~/.local/share/
+# omarchy) — reproducible and decoupled from host state. The curated install
+# (containers/omarchy-install-ctr.sh) sources the safe subset of this clone.
+# NOTE: `install -d -o dev` only chowns the leaf, not intermediate parents, so
+# chown .local explicitly or the install can't create ~/.local/state later.
+RUN install -d -o dev -g dev /home/dev/.local/share && \
+    chown dev:dev /home/dev/.local && \
+    git clone --depth 1 --branch v3.8.2 \
+        https://github.com/basecamp/omarchy \
+        /home/dev/.local/share/omarchy && \
+    chown -R dev:dev /home/dev/.local/share/omarchy
+
+# The curated install tees to this log; pre-create it dev-owned so writes need
+# no sudo.
+RUN install -m 0664 -o dev -g dev /dev/null /var/log/omarchy-install.log
+
+# Boot systemd. The committed pkgs/session images inherit this CMD + STOPSIGNAL.
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
