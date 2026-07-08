@@ -16,10 +16,13 @@
 #
 # Ctrl-C here stops everything. Kills ONLY the PIDs it spawned.
 #
-# Usage: preview-xr.sh [--wivrn] [--env <spec>]
+# Usage: preview-xr.sh [--wivrn] [--passthrough] [--env <spec>]
 #   --wivrn                 use the system WiVRn runtime (real headset!) instead of
 #                           launching the vendored windowed monado-service. Requires
 #                           wivrn-server running with the headset connected.
+#   --passthrough           set openxr:blend_mode = alpha so monitors composite over
+#                           the real world (needs a runtime/HMD with passthrough,
+#                           e.g. Quest 3 via --wivrn; Monado null only does opaque).
 #   --env pano              gradient-sky panorama background (hypxrpaper, no args)
 #   --env forest            bundled 'forest-clearing' 3D scene (--scene forest-clearing)
 #   --env <path>            *.hdr/*.png/*.jpg -> equirect panorama; else -> --scene <path>
@@ -30,10 +33,13 @@ set -euo pipefail
 
 ENV_SPEC=""
 USE_WIVRN=0
+PASSTHROUGH=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --wivrn)
             USE_WIVRN=1; shift ;;
+        --passthrough)
+            PASSTHROUGH=1; shift ;;
         --env)
             [[ $# -ge 2 ]] || { echo "--env requires an argument (pano | forest | <path>)"; exit 2; }
             ENV_SPEC="$2"; shift 2 ;;
@@ -42,7 +48,7 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             grep -E '^# ' "${BASH_SOURCE[0]}" | sed 's/^# //'; exit 0 ;;
         *)
-            echo "unknown argument: $1"; echo "usage: preview-xr.sh [--wivrn] [--env <spec>]"; exit 2 ;;
+            echo "unknown argument: $1"; echo "usage: preview-xr.sh [--wivrn] [--passthrough] [--env <spec>]"; exit 2 ;;
     esac
 done
 
@@ -83,8 +89,14 @@ CONF="$LOGDIR/preview-merged.conf"
     # Overlay mode ONLY when an ambient background is requested: HypXRland then composites its
     # monitors on top of the hypxrpaper primary session instead of owning the whole view.
     [[ -n $ENV_SPEC ]] && echo "openxr:overlay = 1"
+    [[ $PASSTHROUGH -eq 1 ]] && echo "openxr:blend_mode = alpha"
     true
 } > "$CONF"
+
+if [[ $PASSTHROUGH -eq 1 && -n $ENV_SPEC ]]; then
+    echo "note: --passthrough + --env: the ambient background is an opaque primary session," \
+         "so it will cover the real-world view; passthrough only shows through where nothing renders."
+fi
 
 # Resolve the GPU render node the merged config pins Hyprland to (dual-GPU boxes), so we can hand
 # hypxrpaper the SAME node via --gpu — a cross-GPU primary would crash Monado at swapchain time.
