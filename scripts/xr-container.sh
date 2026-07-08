@@ -42,7 +42,7 @@
 #       with hyprland + monado logs) are copied to containers/artifacts/<ts>/.
 #
 #   session [--wivrn] [--conf FILE] [--gpu split|amd|nvidia|intel|/dev/dri/renderD*]
-#           [--nested-gpu SPEC] [--xr-gpu SPEC]
+#           [--nested-gpu SPEC] [--xr-gpu SPEC] [--env pano|forest|<path>]
 #           [--passthrough] [--publish-remote[=PORT]]
 #       Boot :session and launch a full Omarchy desktop as a NESTED window on the
 #       host, with the dev Hyprland's XR extension enabled. waybar/mako/walker/
@@ -56,6 +56,13 @@
 #         --conf FILE            source FILE (bind-mounted ro) as the base config
 #                                instead of the image's ~/.config/hypr/hyprland.conf.
 #         --passthrough          openxr:blend_mode = alpha (composite over passthrough).
+#         --env pano|forest|<path>
+#                                Ambient background: launch hypxrpaper as the PRIMARY
+#                                OpenXR session (gradient sky / bundled 'forest-clearing'
+#                                3D scene / a panorama or scene <path> reachable inside
+#                                the container) and run HypXRland as an XR_EXTX_overlay on
+#                                top (forces openxr:overlay = 1). Mirrors preview-xr.sh
+#                                --env. Needs hypxrpaper built into /build (build-in-ctr.sh).
 #         --gpu SPEC             GPU selection (default: split with --wivrn, else amd).
 #                                SPEC = split | amd|nvidia|intel | /dev/dri/renderD*.
 #             split              expose BOTH GPUs and assign roles separately: the
@@ -646,13 +653,15 @@ find_free_tcp_port() {
 }
 
 cmd_session() {
-    local gpu="" use_wivrn=0 passthrough=0 user_conf=""
+    local gpu="" use_wivrn=0 passthrough=0 user_conf="" env_spec=""
     local publish_remote=0 remote_port=""
     local nested_gpu="" xr_gpu=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --wivrn)      use_wivrn=1 ;;
             --passthrough) passthrough=1 ;;
+            --env)        [[ $# -ge 2 ]] || die "--env needs an argument (pano|forest|<path>)"; env_spec="$2"; shift ;;
+            --env=*)      env_spec="${1#--env=}" ;;
             --gpu)        [[ $# -ge 2 ]] || die "--gpu needs an argument"; gpu="$2"; shift ;;
             --gpu=*)      gpu="${1#--gpu=}" ;;
             --nested-gpu) [[ $# -ge 2 ]] || die "--nested-gpu needs an argument"; nested_gpu="$2"; shift ;;
@@ -731,6 +740,12 @@ cmd_session() {
         "HL_WAYLAND_DISPLAY=$ctr_wl"
         "XR_PASSTHROUGH=$passthrough"
     )
+    # --env: hypxrpaper draws an ambient background as the PRIMARY session and
+    # HypXRland composites its monitors on top as an XR_EXTX_overlay (session-launch.sh
+    # forces openxr:overlay=1 when XR_ENV is set). 'pano'/'forest' need no host files;
+    # a custom <path> must be reachable INSIDE the container (e.g. under /src, or add a
+    # bind mount) — the bundled scenes come from the /src submodule checkout.
+    [[ -n $env_spec ]] && launch_env+=("XR_ENV=$env_spec")
     [[ -n $user_conf ]] && {
         [[ -f $user_conf ]] || die "--conf file not found: $user_conf"
         local ctr_conf="$HOST_MNT/user.conf"

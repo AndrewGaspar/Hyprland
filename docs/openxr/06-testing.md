@@ -569,6 +569,7 @@ image/build details; this section is the testing-oriented view.
 scripts/xr-container.sh test --gpu amd            # hermetic hyprtester --xr, AMD
 scripts/xr-container.sh test --gpu nvidia         # …on NVIDIA via CDI
 scripts/xr-container.sh session                   # windowed Monado desktop (no headset)
+scripts/xr-container.sh session --env forest      # + hypxrpaper ambient background (overlay mode)
 scripts/xr-container.sh session --wivrn           # real headset (default --gpu split)
 scripts/xr-container.sh check-gpu --gpu nvidia    # eglinfo/vulkaninfo smoke test
 ```

@@ -36,7 +36,8 @@
 #   --env pano              gradient-sky panorama background (hypxrpaper, no args)
 #   --env forest            bundled 'forest-clearing' 3D scene (--scene forest-clearing)
 #   --env <path>            *.hdr/*.png/*.jpg -> equirect panorama; else -> --scene <path>
-# When --env is given, hypxrpaper is discovered via $HYPXRPAPER_BIN, then
+# When --env is given, hypxrpaper is discovered via $HYPXRPAPER_BIN, then the
+# vendored submodule build (subprojects/hypxrpaper/build/hypxrpaper), then
 # `hypxrpaper` on PATH, and openxr:overlay is enabled in the generated config.
 
 set -euo pipefail
@@ -202,9 +203,21 @@ fi
 
 # Optional ambient background: hypxrpaper as the PRIMARY OpenXR session, under HypXRland's overlay.
 if [[ -n $ENV_SPEC ]]; then
-    PAPER_BIN="${HYPXRPAPER_BIN:-$(command -v hypxrpaper || true)}"
+    # Discovery order: explicit $HYPXRPAPER_BIN, then the vendored submodule's in-tree
+    # build (subprojects/hypxrpaper/build — where `cmake -B build` lands it), then a
+    # 'hypxrpaper' on $PATH (a system/host install).
+    PAPER_BIN="${HYPXRPAPER_BIN:-}"
+    if [[ -z $PAPER_BIN ]]; then
+        if [[ -x $REPO/subprojects/hypxrpaper/build/hypxrpaper ]]; then
+            PAPER_BIN="$REPO/subprojects/hypxrpaper/build/hypxrpaper"
+        else
+            PAPER_BIN="$(command -v hypxrpaper || true)"
+        fi
+    fi
     [[ -n $PAPER_BIN && -x $PAPER_BIN ]] || {
-        echo "hypxrpaper not found — set \$HYPXRPAPER_BIN to its path or put 'hypxrpaper' on \$PATH"
+        echo "hypxrpaper not found — build the submodule (cmake -B subprojects/hypxrpaper/build" \
+             "subprojects/hypxrpaper && cmake --build subprojects/hypxrpaper/build), set" \
+             "\$HYPXRPAPER_BIN, or put 'hypxrpaper' on \$PATH"
         exit 1
     }
 

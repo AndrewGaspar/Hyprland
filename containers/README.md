@@ -15,6 +15,8 @@ scripts/xr-container.sh session --conf FILE        # source FILE as the base con
 scripts/xr-container.sh session --wivrn            # real headset via host WiVRn (default --gpu split)
 scripts/xr-container.sh session --wivrn --nested-gpu amd --xr-gpu nvidia  # explicit split roles
 scripts/xr-container.sh session --passthrough      # openxr:blend_mode = alpha
+scripts/xr-container.sh session --env pano         # ambient gradient-sky background (hypxrpaper)
+scripts/xr-container.sh session --env forest       # bundled 'forest-clearing' 3D scene
 scripts/xr-container.sh session --publish-remote   # + expose Monado remote driver on an ephemeral host port
 scripts/xr-container.sh exec hyprctl openxr status # talk to the running session
 ```
@@ -60,6 +62,20 @@ default XR monitors) and launched by `session/session-launch.sh`.
   roles (a legitimate single-GPU `--wivrn` when the host compositor already runs
   on the encode GPU). Passing either `--nested-gpu` or `--xr-gpu` implies
   `--gpu split`. See [`06-testing.md` § 9](../docs/openxr/06-testing.md).
+
+- **--env `pano`|`forest`|`<path>`**: an ambient XR background. Launches the
+  vendored [`hypxrpaper`](https://github.com/AndrewGaspar/hypxrpaper) (submodule at
+  `subprojects/hypxrpaper`, built into `/build/hypxrpaper` by `build-in-ctr.sh`) as
+  the **primary** OpenXR session — a procedural gradient sky (`pano`), the bundled
+  `forest-clearing` 3D scene (`forest`), or a panorama/scene `<path>` — and runs
+  HypXRland as an `XR_EXTX_overlay` on top (forces `openxr:overlay = 1`). The
+  primary comes up first (on the same runtime + XR/encode GPU), then Hyprland joins
+  as the overlay; the monitors float over the scene instead of a black void
+  (`exec hyprctl openxr status` → `overlay: yes`, state `focused`). Bundled-scene
+  assets are read from the read-only `/src` submodule checkout via
+  `HYPXRPAPER_ASSET_DIR` (no copy into `/build`); a custom `<path>` must be reachable
+  inside the container (under `/src`, or add a bind mount). This mirrors
+  `scripts/preview-xr.sh --env`.
 
 Teardown = `podman rm -f` the tracked container, which reaps the whole session
 tree (Hyprland, Monado/Xwayland, waybar/mako/walker). NEVER kill by process name:

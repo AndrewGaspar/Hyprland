@@ -23,8 +23,13 @@
 #   XR_RUNTIME_JSON    OpenXR runtime manifest                        (required)
 #   HL_WAYLAND_DISPLAY absolute path of the bind-mounted host socket  (required)
 #   XR_BASE_CONF       base config to source (default ~/.config/hypr/hyprland.conf)
-#   XR_OVERLAY         1 -> openxr:overlay = 1
+#   XR_OVERLAY         1 -> openxr:overlay = 1 (auto-forced to 1 when XR_ENV is set)
 #   XR_PASSTHROUGH     1 -> openxr:blend_mode = alpha
+#   XR_ENV             ambient-background spec (pano | forest | <path>); when set,
+#                      hypxrpaper is launched as the PRIMARY OpenXR session and
+#                      HypXRland runs as an XR_EXTX_overlay on top of it (the
+#                      preview-xr.sh --env model, adapted for the container).
+#   HYPXRPAPER_BIN     (XR_ENV) hypxrpaper path (default /build/hypxrpaper/hypxrpaper)
 #   MONADO_BIN         (windowed) monado-service path (default /build/monado/…)
 #   XR_X_DISPLAY       (windowed) X display for the container-local Xwayland (:9)
 #   WIVRN_HOST_SOCK    (wivrn) bind-mounted host wivrn comp_ipc socket
@@ -68,9 +73,14 @@ echo "   nesting into host WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
 echo "   XR_RUNTIME_JSON=$XR_RUNTIME_JSON"
 
 # --- merged launch config ----------------------------------------------------
+# An ambient background (XR_ENV) means HypXRland composites its monitors ON TOP of
+# the hypxrpaper primary session, so it MUST be an overlay — force openxr:overlay=1.
+XR_ENV="${XR_ENV:-}"
+XR_OVERLAY="${XR_OVERLAY:-0}"
+[[ -n $XR_ENV ]] && XR_OVERLAY=1
 MERGED="$XDG_RUNTIME_DIR/hyprland-xr-merged.conf"
 XR_GPU_NODE="$XR_GPU_NODE" \
-XR_OVERLAY="${XR_OVERLAY:-0}" \
+XR_OVERLAY="$XR_OVERLAY" \
 XR_PASSTHROUGH="${XR_PASSTHROUGH:-0}" \
 XR_BASE_CONF="${XR_BASE_CONF:-$HOME/.config/hypr/hyprland.conf}" \
     bash /src/containers/session/merge-conf.sh "$MERGED" >/dev/null
@@ -136,6 +146,46 @@ case "$XR_MODE" in
         ;;
     *) echo "unknown XR_MODE: $XR_MODE (want windowed|wivrn)" >&2; exit 2 ;;
 esac
+
+# --- optional ambient background (hypxrpaper as the PRIMARY session) ----------
+# Launched AFTER the runtime is up (windowed monado / wivrn socket ready) and
+# BEFORE Hyprland, so the primary session exists when HypXRland's overlay joins.
+# It runs on the SAME runtime (XR_RUNTIME_JSON, exported above) and the XR/encode
+# GPU (XR_GPU_NODE — in split mode that's the runtime-compositor GPU, which is
+# where a primary session must render; a cross-GPU primary crashes the runtime).
+# Backgrounded and PID-tracked here; `podman rm -f` reaps it with the whole tree
+# (same as the windowed monado above), so no explicit teardown is needed.
+if [[ -n $XR_ENV ]]; then
+    PAPER_BIN="${HYPXRPAPER_BIN:-/build/hypxrpaper/hypxrpaper}"
+    [[ -x $PAPER_BIN ]] || { echo "!! hypxrpaper missing at $PAPER_BIN — run build-in-ctr.sh (or set HYPXRPAPER_BIN)" >&2; exit 8; }
+
+    # Bundled scenes (e.g. forest-clearing) live in the read-only /src checkout.
+    # An out-of-tree /build binary's exe-relative search can't find them, so point
+    # hypxrpaper's asset search at the submodule's assets dir explicitly.
+    export HYPXRPAPER_ASSET_DIR="${HYPXRPAPER_ASSET_DIR:-/src/subprojects/hypxrpaper/assets}"
+
+    # Map the --env spec to hypxrpaper args (mirrors scripts/preview-xr.sh).
+    PAPER_ARGS=()
+    case "$XR_ENV" in
+        pano)   ;;                                   # no args = built-in gradient sky
+        forest) PAPER_ARGS=(--scene forest-clearing) ;;
+        *.hdr|*.HDR|*.png|*.PNG|*.jpg|*.JPG|*.jpeg|*.JPEG)
+                PAPER_ARGS=("$XR_ENV") ;;            # equirectangular panorama (positional)
+        *)      PAPER_ARGS=(--scene "$XR_ENV") ;;    # a .glb/.gltf/scene.json or bundled scene name
+    esac
+    [[ -n $XR_GPU_NODE ]] && PAPER_ARGS+=(--gpu "$XR_GPU_NODE")
+
+    echo ">> starting hypxrpaper ambient background (--env $XR_ENV; assets=$HYPXRPAPER_ASSET_DIR)"
+    "$PAPER_BIN" "${PAPER_ARGS[@]}" >"$XDG_RUNTIME_DIR/hypxrpaper.log" 2>&1 &
+    PAPER_PID=$!
+    sleep 2
+    if ! kill -0 "$PAPER_PID" 2>/dev/null; then
+        echo "!! hypxrpaper died — last 20 log lines:" >&2
+        tail -20 "$XDG_RUNTIME_DIR/hypxrpaper.log" >&2
+        exit 9
+    fi
+    echo "   hypxrpaper up (pid $PAPER_PID); log $XDG_RUNTIME_DIR/hypxrpaper.log"
+fi
 
 echo ">> exec dev Hyprland (--config $MERGED)"
 # exec: Hyprland becomes the session leader's foreground process, so the wrapper's
