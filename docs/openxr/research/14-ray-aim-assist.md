@@ -264,7 +264,7 @@ filter. `SXROneEuroPose` / `oneEuroStepPose` already exist (`XRMath.hpp:314`) an
 gtest-verified. Add a per-hand `SXROneEuroPose m_aimFilter[2]` in `CXRInput`, filter
 `m_hands[hand].aim` in `sample()` (or at the top of the ray cast) with `dt` from the solve,
 behind `openxr:aim_filter` + `aim_filter_min_cutoff` / `aim_filter_beta`.
-- **Applies to controllers AND hands** (unlike `grab_filter`, hands-only).
+- **Applies to controllers AND hands** — as does `grab_filter` since 2026-07-09 (`grab_filter_scope=all`, now the default); an `aim_filter_scope` would mirror it.
 - **Pinch-onset damping:** when `select`/`pinchValue` is rising past a low threshold, transiently
   *lower* the min-cutoff (more smoothing) for a few frames so the press/pinch doesn't yank the
   aim off-target the instant the user commits — this is the documented Meta behavior. Cheap:

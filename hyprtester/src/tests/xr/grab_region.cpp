@@ -17,10 +17,13 @@
 #include <thread>
 
 // grab_region.cpp — WP-G3 region-gated grab + corner resize, scripted via the Monado remote
-// driver (no headset). The chrome layout is deterministic from the openxr:chrome_* defaults
-// (margin 0.04, bar 0.05 @ 0.6 width, corner 0.06), so a controller aiming a -Z ray from a chosen
-// (x,y) offset lands the ray at (x,y) on the quad plane and hits a known region. Tests assert the
-// gating decision (grabKind: none/move/resize) and, for resize, that the opposite corner is pinned.
+// driver (no headset). The chrome layout is deterministic from the chrome_* geometry, so a
+// controller aiming a -Z ray from a chosen (x,y) offset lands the ray at (x,y) on the quad plane
+// and hits a known region. Because the shipped chrome_* defaults were re-tuned (2026-07-09, larger
+// margins/bar), the geometry-sensitive tests PIN the values their aim math assumes via keywords
+// (margin 0.04, bar 0.05 @ 0.6 width, corner 0.06) rather than relying on ambient defaults, and the
+// guard restores the shipped defaults. Tests assert the gating decision (grabKind: none/move/resize)
+// and, for resize, that the opposite corner is pinned.
 
 namespace {
     using namespace MonadoWire;
@@ -35,8 +38,11 @@ namespace {
             if (restoreGrabAnywhere)
                 getFromSocket("/keyword openxr:grab_anywhere 1"); // back to default for later tests
             if (restoreChrome) {
-                getFromSocket("/keyword openxr:chrome_margin 0.04");
-                getFromSocket("/keyword openxr:chrome_corner_size 0.06");
+                // Restore the SHIPPED defaults (live-tuned 2026-07-09), not the values a test pinned.
+                getFromSocket("/keyword openxr:chrome_margin 0.10");
+                getFromSocket("/keyword openxr:chrome_bar_height 0.08");
+                getFromSocket("/keyword openxr:chrome_bar_width_frac 0.8");
+                getFromSocket("/keyword openxr:chrome_corner_size 0.09");
             }
             if (!monitorName.empty())
                 getFromSocket("/openxr destroy " + monitorName);
@@ -177,7 +183,15 @@ TEST_CASE(xr_grab_gating_body_vs_bar) {
 
     const std::string mon = XR::monitorName(20);
     SGuard            guard{this->failed, name(), ""};
-    if (!setup(this, mon, guard))
+    // Pin the chrome geometry this test's bar/body aim offsets were calibrated against (the pre-2026-
+    // 07-09 defaults), so the re-tuned shipped defaults don't move the bar band out from under it.
+    guard.restoreChrome = true;
+    if (!setup(this, mon, guard, [] {
+            getFromSocket("/keyword openxr:chrome_margin 0.04");
+            getFromSocket("/keyword openxr:chrome_bar_height 0.05");
+            getFromSocket("/keyword openxr:chrome_bar_width_frac 0.6");
+            getFromSocket("/keyword openxr:chrome_corner_size 0.06");
+        }))
         return;
 
     ASSERT(getFromSocket("/keyword openxr:grab_anywhere 0"), std::string("ok"));
