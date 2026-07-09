@@ -832,9 +832,12 @@ void COpenXRManager::frameThread() {
         // WP-G6: 1€ hand-grab carry filter parameters, read per-frame (hot-toggles). Only a hand
         // MOVE grab with grabFilter set is filtered (see CXRAnchor::solve grab override).
         static auto     PGRABFILTER   = CConfigValue<Hyprlang::INT>("openxr:grab_filter");
+        static auto     PGRABFILTERSC = CConfigValue<std::string>("openxr:grab_filter_scope");
         static auto     PGRABFILTERMC = CConfigValue<Hyprlang::FLOAT>("openxr:grab_filter_min_cutoff");
         static auto     PGRABFILTERB  = CConfigValue<Hyprlang::FLOAT>("openxr:grab_filter_beta");
         const bool      grabFilter    = *PGRABFILTER != 0;
+        // scope=all (default) filters controllers too; anything else (e.g. "hands") = hands only.
+        const bool      grabFilterAll = *PGRABFILTERSC != "hands";
         const float     grabFilterMc  = (float)*PGRABFILTERMC;
         const float     grabFilterB   = (float)*PGRABFILTERB;
         OpenXR::SXRPose viewPose;
@@ -904,7 +907,8 @@ void COpenXRManager::frameThread() {
                     in.gripRight  = gripRight;
                     in.pinchLeft  = pinchLeft;  // WP-G5: pinch-anchored hand MOVE grabs
                     in.pinchRight = pinchRight;
-                    in.grabFilter          = grabFilter; // WP-G6: 1€ carry filter (hands, opt-in)
+                    in.grabFilter          = grabFilter; // WP-G6: 1€ carry filter (on by default)
+                    in.grabFilterScopeAll  = grabFilterAll; // filter controllers too (scope=all)
                     in.grabFilterMinCutoff = grabFilterMc;
                     in.grabFilterBeta      = grabFilterB;
                     // Aspect from the CONTENT pixel mode (not the chrome-expanded swapchain) so

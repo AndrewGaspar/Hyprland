@@ -124,39 +124,126 @@ TEST(GrabRing, LastCalmWindowBound) {
     EXPECT_GE(cp.pos.x, r.at(0).world.pos.x - 0.05f * 4.f);
 }
 
-// ---- pickReleasePose truth table -----------------------------------------------------------
+// ---- release-window / carry statistics (the relative-rejection primitives) -----------------
 
-TEST(GrabRing, PickReleaseTruthTable) {
-    // Build: 8 calm frames (x -> 0.007) then a 0.2 m jerk on the final frame.
+TEST(GrabRing, ReleasePeakAndCarryTypical) {
+    // 30 calm frames at ~0.18 m/s (dx 0.002 @ 11ms), then a 0.3 m jerk (~27 m/s) on the next frame.
     SXRGrabRing r;
-    uint32_t    t     = pushSteady(r, 0.f, 0.001f, 8, 0);
-    const float calmX = r.at(0).world.pos.x;
+    uint32_t    t = pushSteady(r, 0.f, 0.002f, 30, 0);
     t += 11;
-    r.push(poseAt(calmX + 0.2f), t);
+    const float calmX = 0.002f * 29.f;
+    r.push(poseAt(calmX + 0.3f), t);
     const uint32_t now = t;
 
-    // (1) velReject disabled (0): pure latency rewind. latency 0 -> newest (the jerk).
-    expectVecNear(pickReleasePose(r, now, 0, 0.f).pos, Vec3{calmX + 0.2f, 0.f, 0.f});
-    // (2) velReject disabled but latency 22ms rewinds ~2 frames past the 11ms jerk -> pre-jerk.
-    EXPECT_LT(pickReleasePose(r, now, 22, 0.f).pos.x, calmX + 0.1f);
-    // (3) velReject on and exceeded (newest speed ~18 m/s > 0.6): lastCalm -> pre-jerk pose,
-    //     regardless of latency (latency 0 would otherwise pick the jerk).
-    EXPECT_NEAR(pickReleasePose(r, now, 0, 0.6f).pos.x, calmX, 1e-3f);
-    // (4) velReject on but threshold too high to trip (100 m/s): falls back to latency (0 -> jerk).
-    expectVecNear(pickReleasePose(r, now, 0, 100.f).pos, Vec3{calmX + 0.2f, 0.f, 0.f});
+    // Peak over the 80 ms release window is the jerk; the typical carry pace (older than 80 ms;
+    // lower-trimmed mean = mean of the faster half) is ~0.18 for a uniform calm carry.
+    EXPECT_GT(r.releasePeakSpeed(now, XR_GRAB_RELEASE_WINDOW_MS), 20.f);
+    EXPECT_NEAR(r.carryTypicalSpeed(now, XR_GRAB_RELEASE_WINDOW_MS, XR_GRAB_MAX_REWIND_MS), 0.1818f, 0.02f);
+
+    // A uniformly fast carry: peak ≈ typical carry (both ~2.7 m/s), so the ratio is ~1.
+    SXRGrabRing f;
+    pushSteady(f, 0.f, 0.03f, 40, 0);
+    const uint32_t fnow = 39 * 11;
+    const float    peak = f.releasePeakSpeed(fnow, XR_GRAB_RELEASE_WINDOW_MS);
+    const float    typ  = f.carryTypicalSpeed(fnow, XR_GRAB_RELEASE_WINDOW_MS, XR_GRAB_MAX_REWIND_MS);
+    EXPECT_NEAR(peak, 2.727f, 0.1f);
+    EXPECT_NEAR(typ, 2.727f, 0.1f);
+    EXPECT_LT(peak / typ, 1.5f); // nowhere near a K=3 outlier
+
+    // Rest-then-flick: stationary just-grabbed samples must NOT drag the typical pace to ~0 (the
+    // median failure mode that motivated the trimmed mean). 18 still frames then 12 flick frames
+    // at ~2.7 m/s: the faster-half mean blends the flick with a few zeros but stays comfortably
+    // within a factor K=3 of the flick pace.
+    SXRGrabRing rf;
+    uint32_t    tt = pushSteady(rf, 0.f, 0.f, 18, 0); // at rest right after the grab
+    tt             = pushSteady(rf, 0.03f, 0.03f, 12, tt + 11);
+    const float rfPeak = rf.releasePeakSpeed(tt, XR_GRAB_RELEASE_WINDOW_MS);
+    const float rfTyp  = rf.carryTypicalSpeed(tt, XR_GRAB_RELEASE_WINDOW_MS, XR_GRAB_MAX_REWIND_MS);
+    EXPECT_GT(rfTyp, 0.5f);         // NOT ~0 (a median over 18 zeros + a few flick frames would be 0)
+    EXPECT_LT(rfPeak / rfTyp, 3.f); // not an outlier at the default K
+}
+
+// ---- pickReleasePose truth table (RELATIVE velocity rejection) ------------------------------
+//
+// velRejectRatio is now a RATIO K; the denominator is the lower-trimmed mean (faster-half mean) of
+// the carry speeds, floored at XR_GRAB_CARRY_SPEED_FLOOR. Truth table:
+//   carry                 release        ratio vs K=3   outlier?  result
+//   calm  (0.18)          jerk  (27)     ~150           yes       lastCalm -> pre-jerk
+//   still (0, floored)    jerk  (27)     ~540           yes       lastCalm -> pre-jerk
+//   fast  (2.7)           fast  (2.7)    ~1             no        sampleBack (latency) — kept
+//   rest then fast flick  fast  (2.7)    <3             no        sampleBack (latency) — kept
+//   calm  (0.18)          calm  (0.18)   ~1             no        sampleBack (latency)
+//   any                   any            K=0 (disabled) —         sampleBack (latency)
+
+TEST(GrabRing, PickReleaseRelativeOutlier) {
+    // Calm carry (0.18 m/s) then a 0.3 m jerk -> a clear outlier that must rewind past the jerk.
+    SXRGrabRing r;
+    uint32_t    t     = pushSteady(r, 0.f, 0.002f, 30, 0);
+    const float calmX = r.at(0).world.pos.x;
+    t += 11;
+    r.push(poseAt(calmX + 0.3f), t);
+    const uint32_t now = t;
+
+    // (1) K disabled (0): pure latency rewind. latency 0 -> newest (the jerk).
+    expectVecNear(pickReleasePose(r, now, 0, 0.f).pos, Vec3{calmX + 0.3f, 0.f, 0.f});
+    // (2) K disabled, latency 33 ms rewinds a few frames past the 11 ms jerk -> pre-jerk region.
+    EXPECT_LT(pickReleasePose(r, now, 33, 0.f).pos.x, calmX + 0.1f);
+    // (3) K=3 and the jerk is a ~150x outlier: lastCalm -> pre-jerk pose, regardless of latency.
+    EXPECT_NEAR(pickReleasePose(r, now, 0, 3.f).pos.x, calmX, 1e-2f);
+    EXPECT_LT(pickReleasePose(r, now, 0, 3.f).pos.x, calmX + 0.1f); // NOT the jerk
+    // (4) K enormous (1000): the jerk is no longer a relative outlier -> latency path (0 -> jerk).
+    expectVecNear(pickReleasePose(r, now, 0, 1000.f).pos, Vec3{calmX + 0.3f, 0.f, 0.f});
 
     // Empty ring -> identity (caller falls back to release-frame endGrab).
     SXRGrabRing empty;
-    expectVecNear(pickReleasePose(empty, 100, 50, 0.6f).pos, Vec3{0.f, 0.f, 0.f});
+    expectVecNear(pickReleasePose(empty, 100, 50, 3.f).pos, Vec3{0.f, 0.f, 0.f});
 }
 
-TEST(GrabRing, CalmCarryNoRewindOnVelReject) {
-    // A wholly calm carry: velReject must NOT trip; result equals the latency sample.
+TEST(GrabRing, PickReleaseStillPanelFistOpen) {
+    // A perfectly still carry (0 m/s) then a jerk: typical carry speed is 0, floored to 0.05, so the jerk
+    // is still an outlier and rewinds to the last still (pre-jerk) sample.
     SXRGrabRing r;
-    uint32_t    t   = pushSteady(r, 0.f, 0.001f, 20, 0);
-    const uint32_t now = t;
-    SXRPose latched = pickReleasePose(r, now, 100, 0.6f);
-    SXRPose ref     = r.sampleBack(now, 100);
+    pushSteady(r, 0.5f, 0.f, 30, 0); // held still at x=0.5
+    uint32_t t = 29 * 11 + 11;
+    r.push(poseAt(0.5f + 0.3f), t); // 0.3 m jerk
+    const SXRPose got = pickReleasePose(r, t, 0, 3.f);
+    EXPECT_NEAR(got.pos.x, 0.5f, 1e-3f); // pre-jerk still pose, not 0.8
+}
+
+TEST(GrabRing, PickReleaseUniformFastNoRewind) {
+    // A deliberate fast flick carried and released at a uniform ~2.7 m/s. The release window speed
+    // matches the carry pace (ratio ~1), so it must NOT rewind — it takes the latency path and lands
+    // near where the hand let go, NOT walked back toward the grab start.
+    SXRGrabRing r;
+    pushSteady(r, 0.f, 0.03f, 40, 0);
+    const uint32_t now     = 39 * 11;
+    const SXRPose  got     = pickReleasePose(r, now, 100, 3.f);
+    const SXRPose  latency = r.sampleBack(now, 100);
+    expectVecNear(got.pos, latency.pos);           // took the latency path
+    EXPECT_GT(got.pos.x, 0.03f * 40.f * 0.6f);     // landed near the end, not rewound to the start
+}
+
+TEST(GrabRing, PickReleaseRestThenFlickNoRewind) {
+    // Grab at rest, then one continuous fast flick released while still moving — the realistic
+    // "deliberate fast move" (nobody carries at constant speed from t=0). The stationary samples
+    // stay in the 500 ms carry window; a plain-median denominator would be ~0 and misfire a rewind
+    // back toward the grab point. The trimmed-mean denominator keeps the flick.
+    SXRGrabRing r;
+    uint32_t    t = pushSteady(r, 0.f, 0.f, 18, 0);          // ~200 ms at rest after the grab
+    t             = pushSteady(r, 0.03f, 0.03f, 12, t + 11); // ~130 ms flick at ~2.7 m/s
+    const SXRPose got     = pickReleasePose(r, t, 100, 3.f);
+    const SXRPose latency = r.sampleBack(t, 100);
+    expectVecNear(got.pos, latency.pos); // took the latency path (no outlier rewind)
+    EXPECT_GT(got.pos.x, 0.05f);         // landed into the flick, not back at the rest pose (x=0)
+}
+
+TEST(GrabRing, PickReleaseCalmReleaseNoRewind) {
+    // A wholly calm carry + calm release: K must NOT trip; result equals the latency sample.
+    SXRGrabRing r;
+    pushSteady(r, 0.f, 0.002f, 40, 0);
+    const uint32_t now     = 39 * 11;
+    const SXRPose  latched = pickReleasePose(r, now, 100, 3.f);
+    const SXRPose  ref     = r.sampleBack(now, 100);
     expectVecNear(latched.pos, ref.pos);
 }
 
@@ -238,21 +325,22 @@ TEST(GrabEndOverload, LatchedLocalReleaseLandsPreJerk) {
     anchor.beginGrab(XR_HAND_LEFT, grip);
     anchor.solve(in, tune);
 
-    // Simulate the carry ring: 8 calm frames near the current world pose, then a jerk.
+    // Simulate the carry ring: 20 calm frames (~0.45 m/s) near the current world pose, then a jerk.
+    // The span exceeds the 80 ms release window so the carry statistic is well-formed.
     const SXRPose base = anchor.lastWorld();
     SXRGrabRing   ring;
     uint32_t      t = 0;
-    for (int i = 0; i < 8; ++i) {
-        ring.push(SXRPose{Vec3{base.pos.x + 0.001f * i, base.pos.y, base.pos.z}, base.rot}, t);
+    for (int i = 0; i < 20; ++i) {
+        ring.push(SXRPose{Vec3{base.pos.x + 0.005f * i, base.pos.y, base.pos.z}, base.rot}, t);
         t += 11;
     }
     const SXRPose preJerk = ring.at(0).world;
     t += 11;
     ring.push(SXRPose{Vec3{preJerk.pos.x + 0.2f, base.pos.y, base.pos.z}, base.rot}, t); // jerk
 
-    const SXRPose releaseWorld = pickReleasePose(ring, t, 0, 0.6f); // velReject trips -> pre-jerk
+    const SXRPose releaseWorld = pickReleasePose(ring, t, 0, 3.f); // relative outlier trips -> pre-jerk
     anchor.endGrab(releaseWorld, in, tune);
 
-    EXPECT_NEAR(anchor.state().anchorPose.pos.x, preJerk.pos.x, 1e-4f);      // latched
+    EXPECT_NEAR(anchor.state().anchorPose.pos.x, preJerk.pos.x, 1e-3f);      // latched
     EXPECT_GT(std::fabs(anchor.state().anchorPose.pos.x - (preJerk.pos.x + 0.2f)), 0.1f); // not jerked
 }
