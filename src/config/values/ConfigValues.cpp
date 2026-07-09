@@ -737,12 +737,13 @@ std::vector<SP<IValue>> Values::getConfigValues() {
                    "hand-tracking grab gesture (XR_EXT_hand_interaction): pinch (thumb-index, default; anchors to the stable pinch pose so opening the pinch to release "
                    "doesn't lurch the window) | grasp (fist curl; anchors to the wrist) | both (either). Hands always grab from the move-bar/corners only (never the body, "
                    "regardless of grab_anywhere); controllers are unaffected. Read per-frame (hot-toggles)",
-                   "pinch"),
+                   "both"),
         MS<String>("openxr:hand_grab_anywhere",
                    "which hand-tracking grab GESTURE may move a monitor from its CONTENT body (the hand analog of grab_anywhere, keyed on the gesture that triggered THIS "
                    "grab, not the hand_grab mode): none (hands only grab the move-bar/corners) | grasp (default; a fist grabs anywhere, a pinch stays chrome-only and keeps "
                    "its click) | pinch | both. CAVEAT for pinch/both: a body pinch will BOTH click (pointer press) and grab. Bar/corners always grab regardless; controllers "
-                   "use grab_anywhere instead. Read per-frame (hot-toggles)",
+                   "use grab_anywhere instead. Read per-frame (hot-toggles). Pairs with hand_grab=both (default) so a fist grabs anywhere while a pinch stays chrome-only "
+                   "+ keeps its click — the live-validated scheme",
                    "grasp"),
         MS<Int>("openxr:grab_release_latency_ms",
                 "on grab release, re-anchor from the quad pose sampled this many ms BEFORE the release edge, to reject the release-motion lurch (the grip/hand "
@@ -750,32 +751,39 @@ std::vector<SP<IValue>> Values::getConfigValues() {
                 "flick-and-let-go feels like it snaps back too far",
                 100, {.min = 0, .max = 500}),
         MS<Float>("openxr:grab_release_velocity_reject",
-                  "if the grabbed quad's speed at release exceeds this (m/s), re-anchor from the last calm sample instead of the fixed latency window — catches a "
-                  "fast fist-open/flick even when it is quicker than grab_release_latency_ms. 0 disables (latency window only)",
-                  0.6, {.min = 0.0, .max = 5.0}),
+                  "release-jerk rejection as a RATIO (not m/s): if the quad's peak speed in the ~80ms release window exceeds this multiple of its typical carry speed "
+                  "(trimmed mean of the faster half of the preceding ~500ms of samples, so a flick started from rest is judged by its flick pace), re-anchor from the last "
+                  "carry-paced sample instead of the fixed latency window — catches a fast fist-open/flick at the release edge. Because it is relative, a uniformly fast "
+                  "flick (release speed ≈ carry speed) is NOT rewound, unlike the old absolute threshold. 0 disables (latency window only)",
+                  3.0, {.min = 0.0, .max = 50.0}),
         MS<Bool>("openxr:grab_filter",
-                 "smooth a hand's move-grab carry with a 1€ low-pass filter (Casiez CHI'12) to remove hand-tracking jitter. Hands only (controllers are never "
-                 "filtered); adds ~1 frame of latency in exchange for steadiness. Off by default — enable and tune min_cutoff/beta live in the headset. Read per-frame "
-                 "(hot-toggles)",
-                 false),
+                 "smooth a move-grab carry with a 1€ low-pass filter (Casiez CHI'12) to remove tracking jitter; adds ~1 frame of latency in exchange for steadiness. On by "
+                 "default (live-validated on Quest 3). See grab_filter_scope for hands-vs-controllers and min_cutoff/beta to tune. Read per-frame (hot-toggles)",
+                 true),
+        MS<String>("openxr:grab_filter_scope",
+                   "which devices the 1€ move-grab carry filter (grab_filter) applies to: all (default; hands AND controllers — controllers reported carry jitter too) | "
+                   "hands (hands only, controllers keep the zero-latency device-space late-latch). Filtering a device drops its runtime late-latch (submits the smoothed "
+                   "pose in LOCAL_FLOOR, +~1 frame latency), so scope=all trades a frame of controller latency for steadiness. Read per-frame (hot-toggles)",
+                   "all"),
         MS<Float>("openxr:grab_filter_min_cutoff",
                   "1€ filter minimum cutoff frequency (Hz) for the hand move-grab carry. Lower = more smoothing when the panel is nearly still (also more lag). Casiez's "
                   "suggested starting point is 1.0; drop toward 0.1-0.5 if a held-still panel still jitters",
                   1.0, {.min = 0.01, .max = 10.0}),
         MS<Float>("openxr:grab_filter_beta",
                   "1€ filter speed coefficient for the hand move-grab carry. Higher = the cutoff rises faster with motion, so fast moves lag less (but jitter returns "
-                  "sooner). Casiez's suggested starting point is 0.007; raise it (e.g. 0.05-0.5) if moving a panel feels laggy, lower it if fast moves overshoot/jitter",
-                  0.007, {.min = 0.0, .max = 1.0}),
+                  "sooner). Casiez's suggested starting point is 0.007; default 0.025 (live-tuned on Quest 3). Raise it (e.g. 0.05-0.5) if moving a panel feels laggy, lower "
+                  "it if fast moves overshoot/jitter",
+                  0.025, {.min = 0.0, .max = 1.0}),
         MS<Float>("openxr:scroll_speed", "multiplier for thumbstick scrolling on XR monitors", 1.0, {.min = 0.0, .max = 100.0}),
         MS<Float>("openxr:chrome_margin",
                   "transparent chrome margin added around each XR monitor's content, in meters. The quad grows by this on the top/left/right (and the bottom, which also "
                   "holds the move-bar); the desktop still blits into the inner content rect so no pixel is covered. size: stays CONTENT meters. 0 disables chrome",
-                  0.04, {.min = 0.0, .max = 1.0}),
+                  0.10, {.min = 0.0, .max = 1.0}),
         MS<Float>("openxr:chrome_bar_height", "height of the XR monitor move-bar, in meters, added below the content inside the bottom margin (WP-G2 draws it, WP-G3 grabs it)",
-                  0.05, {.min = 0.0, .max = 1.0}),
-        MS<Float>("openxr:chrome_bar_width_frac", "XR monitor move-bar width as a fraction of the content width (centered horizontally under the content)", 0.6,
+                  0.08, {.min = 0.0, .max = 1.0}),
+        MS<Float>("openxr:chrome_bar_width_frac", "XR monitor move-bar width as a fraction of the content width (centered horizontally under the content)", 0.8,
                   {.min = 0.0, .max = 1.0}),
-        MS<Float>("openxr:chrome_corner_size", "size of each XR monitor corner resize handle, in meters (square, clamped to the chrome margin so it never covers content)", 0.06,
+        MS<Float>("openxr:chrome_corner_size", "size of each XR monitor corner resize handle, in meters (square, clamped to the chrome margin so it never covers content)", 0.09,
                   {.min = 0.0, .max = 1.0}),
         MS<Bool>("openxr:chrome_enabled",
                  "master toggle for XR monitor chrome (auto-hiding move-bar + corner resize handles). When 0 the margins collapse to 0 and no chrome is drawn — identical to "
