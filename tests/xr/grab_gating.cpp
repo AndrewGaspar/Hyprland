@@ -32,19 +32,75 @@ TEST(XRGrabGating, CornersAlwaysResizeFromThatCorner) {
         EXPECT_TRUE(xrGrabActionIsResize(grabActionForRegion(r, false, false)));
 }
 
-TEST(XRGrabGating, BodyMovesOnlyWithGrabAnywhereAndNoHands) {
+TEST(XRGrabGating, ControllerBodyMovesOnlyWithGrabAnywhere) {
+    // Controller (handActive=false): grab_anywhere decides; handBodyGrab is ignored.
     EXPECT_EQ(grabActionForRegion(XR_REGION_BODY, true, false), XR_GRAB_ACTION_MOVE);   // controller convenience
     EXPECT_EQ(grabActionForRegion(XR_REGION_BODY, false, false), XR_GRAB_ACTION_NONE);  // deliberate-borders
-    EXPECT_EQ(grabActionForRegion(XR_REGION_BODY, true, true), XR_GRAB_ACTION_NONE);    // hands forced to chrome (WP-G5)
+    EXPECT_EQ(grabActionForRegion(XR_REGION_BODY, true, false, true), XR_GRAB_ACTION_MOVE);
+    EXPECT_EQ(grabActionForRegion(XR_REGION_BODY, false, false, true), XR_GRAB_ACTION_NONE); // handBodyGrab irrelevant to controllers
+}
+
+TEST(XRGrabGating, HandBodyGrabGovernedByHandBodyGrabFlagNotGrabAnywhere) {
+    // Hand (handActive=true): grab_anywhere never applies; handBodyGrab decides. Default arg (omitted)
+    // preserves the original WP-G5 "hands never body-grab" behavior.
+    EXPECT_EQ(grabActionForRegion(XR_REGION_BODY, true, true), XR_GRAB_ACTION_NONE);   // default handBodyGrab=false
     EXPECT_EQ(grabActionForRegion(XR_REGION_BODY, false, true), XR_GRAB_ACTION_NONE);
+    EXPECT_EQ(grabActionForRegion(XR_REGION_BODY, false, true, true), XR_GRAB_ACTION_MOVE);  // permitted gesture -> body move
+    EXPECT_EQ(grabActionForRegion(XR_REGION_BODY, true, true, false), XR_GRAB_ACTION_NONE);  // grab_anywhere doesn't help hands
+    EXPECT_EQ(grabActionForRegion(XR_REGION_BODY, true, true, true), XR_GRAB_ACTION_MOVE);
 }
 
 TEST(XRGrabGating, MarginAndNoneNeverGrab) {
     for (bool ga : {false, true})
-        for (bool ha : {false, true}) {
-            EXPECT_EQ(grabActionForRegion(XR_REGION_MARGIN, ga, ha), XR_GRAB_ACTION_NONE);
-            EXPECT_EQ(grabActionForRegion(XR_REGION_NONE, ga, ha), XR_GRAB_ACTION_NONE);
-        }
+        for (bool ha : {false, true})
+            for (bool hbg : {false, true}) {
+                EXPECT_EQ(grabActionForRegion(XR_REGION_MARGIN, ga, ha, hbg), XR_GRAB_ACTION_NONE);
+                EXPECT_EQ(grabActionForRegion(XR_REGION_NONE, ga, ha, hbg), XR_GRAB_ACTION_NONE);
+            }
+}
+
+// ---- openxr:hand_grab_anywhere parse + gesture gating (xrHandBodyGrabAllowed) ----
+
+TEST(XRHandGrabAnywhere, Parse) {
+    EXPECT_EQ(xrParseHandGrabAnywhere("none"), XR_HANDGRAB_ANY_NONE);
+    EXPECT_EQ(xrParseHandGrabAnywhere("grasp"), XR_HANDGRAB_ANY_GRASP);
+    EXPECT_EQ(xrParseHandGrabAnywhere("pinch"), XR_HANDGRAB_ANY_PINCH);
+    EXPECT_EQ(xrParseHandGrabAnywhere("both"), XR_HANDGRAB_ANY_BOTH);
+    // Default (unknown / empty) is grasp — the shipped default.
+    EXPECT_EQ(xrParseHandGrabAnywhere(""), XR_HANDGRAB_ANY_GRASP);
+    EXPECT_EQ(xrParseHandGrabAnywhere("nonsense"), XR_HANDGRAB_ANY_GRASP);
+    // Name round-trips.
+    for (auto m : {XR_HANDGRAB_ANY_NONE, XR_HANDGRAB_ANY_GRASP, XR_HANDGRAB_ANY_PINCH, XR_HANDGRAB_ANY_BOTH})
+        EXPECT_EQ(xrParseHandGrabAnywhere(xrHandGrabAnywhereName(m)), m);
+}
+
+TEST(XRHandGrabAnywhere, BodyGrabTruthTableByTriggeringGesture) {
+    // Rows: config x gesture-that-triggered (true=pinch, false=grasp/fist). The GESTURE decides, not
+    // the hand_grab mode — so with hand_grab=both, a fist-triggered grab reads gestureIsPinch=false.
+    //                                                   grasp-trigger        pinch-trigger
+    EXPECT_FALSE(xrHandBodyGrabAllowed(XR_HANDGRAB_ANY_NONE, false));  // none: never
+    EXPECT_FALSE(xrHandBodyGrabAllowed(XR_HANDGRAB_ANY_NONE, true));
+    EXPECT_TRUE(xrHandBodyGrabAllowed(XR_HANDGRAB_ANY_GRASP, false));  // grasp: fist only
+    EXPECT_FALSE(xrHandBodyGrabAllowed(XR_HANDGRAB_ANY_GRASP, true));  //   pinch-trigger rejected
+    EXPECT_FALSE(xrHandBodyGrabAllowed(XR_HANDGRAB_ANY_PINCH, false)); // pinch: pinch only
+    EXPECT_TRUE(xrHandBodyGrabAllowed(XR_HANDGRAB_ANY_PINCH, true));
+    EXPECT_TRUE(xrHandBodyGrabAllowed(XR_HANDGRAB_ANY_BOTH, false));   // both: either
+    EXPECT_TRUE(xrHandBodyGrabAllowed(XR_HANDGRAB_ANY_BOTH, true));
+}
+
+TEST(XRHandGrabAnywhere, GestureIdentityFromHandGrabModeAndStrengths) {
+    // The caller derives gestureIsPinch from xrHandGrabUsesPinch(mode, pinchVal, graspVal). Verify the
+    // key subtlety: hand_grab=both + config=grasp rejects a pinch-triggered body grab but honors a
+    // fist-triggered one, all from the same config.
+    const auto cfg = XR_HANDGRAB_ANY_GRASP;
+    // hand_grab=grasp: always a fist trigger -> body grab allowed under config=grasp.
+    EXPECT_TRUE(xrHandBodyGrabAllowed(cfg, xrHandGrabUsesPinch(XR_HANDGRAB_GRASP, /*pinch*/ 0.9f, /*grasp*/ 0.9f)));
+    // hand_grab=pinch: always a pinch trigger -> rejected under config=grasp.
+    EXPECT_FALSE(xrHandBodyGrabAllowed(cfg, xrHandGrabUsesPinch(XR_HANDGRAB_PINCH, 0.9f, 0.9f)));
+    // hand_grab=both, fist stronger -> grasp trigger -> allowed under config=grasp.
+    EXPECT_TRUE(xrHandBodyGrabAllowed(cfg, xrHandGrabUsesPinch(XR_HANDGRAB_BOTH, /*pinch*/ 0.2f, /*grasp*/ 0.9f)));
+    // hand_grab=both, pinch stronger -> pinch trigger -> rejected under config=grasp.
+    EXPECT_FALSE(xrHandBodyGrabAllowed(cfg, xrHandGrabUsesPinch(XR_HANDGRAB_BOTH, /*pinch*/ 0.9f, /*grasp*/ 0.2f)));
 }
 
 TEST(XRGrabGating, CornerSigns) {

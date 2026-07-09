@@ -436,8 +436,10 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
     static auto PRELVELREJ  = CConfigValue<Hyprlang::FLOAT>("openxr:grab_release_velocity_reject");
     static auto PGRABANY    = CConfigValue<Hyprlang::INT>("openxr:grab_anywhere");
     static auto PHANDGRAB    = CConfigValue<std::string>("openxr:hand_grab");
+    static auto PHANDGRABANY  = CConfigValue<std::string>("openxr:hand_grab_anywhere");
     const bool  grabAnywhere = *PGRABANY != 0;
     const OpenXR::eXRHandGrab handGrabMode = OpenXR::xrParseHandGrab(*PHANDGRAB); // hot-toggles (read per-frame)
+    const OpenXR::eXRHandGrabAnywhere handGrabAnyMode = OpenXR::xrParseHandGrabAnywhere(*PHANDGRABANY); // hot-toggles (read per-frame)
     const float onT         = (float)*PSELON;
     const float offT        = (float)*PSELOFF;
     const float grabOnT     = (float)*PGRABON;
@@ -552,8 +554,12 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
         const float                           graspVal    = m_hands[hand].grab;
         const float                           grabVal     = handIsHands ? OpenXR::xrHandGrabValue(handGrabMode, pinchVal, graspVal) : graspVal;
         const std::optional<OpenXR::SXRPose>& pinchPose   = hand == XR_HAND_LEFT ? solveIn.pinchLeft : solveIn.pinchRight;
-        const bool                            wantPinch   = handIsHands && OpenXR::xrHandGrabUsesPinch(handGrabMode, pinchVal, graspVal) && pinchPose.has_value();
+        const bool                            gestureIsPinch = OpenXR::xrHandGrabUsesPinch(handGrabMode, pinchVal, graspVal);
+        const bool                            wantPinch   = handIsHands && gestureIsPinch && pinchPose.has_value();
         const std::optional<OpenXR::SXRPose>& newDevPose  = wantPinch ? pinchPose : worldGrip;
+        // WP body-grab (openxr:hand_grab_anywhere): may THIS hand grab from a monitor's BODY? Keyed on
+        // the gesture that triggers the grab this frame (gestureIsPinch), NOT the hand_grab mode.
+        const bool                            handBodyGrab = handIsHands && OpenXR::xrHandBodyGrabAllowed(handGrabAnyMode, gestureIsPinch);
         const std::optional<OpenXR::SXRPose>& grabDevPose = m_grabDevicePinch[hand] ? pinchPose : worldGrip;
 
         if (m_grabTrig[hand].update(grabVal, grabOnT, grabOffT)) {
@@ -561,16 +567,16 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                 // Rising edge: the grab gesture is gated by the chrome region it landed on (WP-G3).
                 // The BAR moves; a CORNER resizes (from that corner); the BODY moves only with
                 // openxr:grab_anywhere (the controller-grip convenience); the transparent MARGIN
-                // never grabs. grabActionForRegion() is the single decision point — WP-G5 passes
-                // handIsHands so a hand is forced to the bar/corners (never body). Prefer the region
-                // the hover step already classified this frame; otherwise redo the intersection with
+                // never grabs. grabActionForRegion() is the single decision point — a hand may body-
+                // grab only when openxr:hand_grab_anywhere permits this grab's gesture (handBodyGrab).
+                // Prefer the region the hover step already classified this frame; otherwise redo with
                 // the 5-degree entry cone (doc 04 §6) and take the nearest grab-yielding hit.
                 const SXRPointerTarget* target = nullptr;
                 OpenXR::eXRGrabAction   action = OpenXR::XR_GRAB_ACTION_NONE;
                 OpenXR::eXRQuadRegion   region = OpenXR::XR_REGION_NONE;
 
                 if (m_hoverChromeMon[hand] >= 0) {
-                    const OpenXR::eXRGrabAction a = OpenXR::grabActionForRegion(m_hoverRegion[hand], grabAnywhere, handIsHands);
+                    const OpenXR::eXRGrabAction a = OpenXR::grabActionForRegion(m_hoverRegion[hand], grabAnywhere, handIsHands, handBodyGrab);
                     if (a != OpenXR::XR_GRAB_ACTION_NONE) {
                         for (const auto& t : targets)
                             if (t.id == m_hoverChromeMon[hand]) {
@@ -595,7 +601,7 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                         if (!hit.hit || hit.t >= bestT)
                             continue;
                         const OpenXR::eXRQuadRegion  reg = OpenXR::classifyQuadHit(hit.u, hit.v, t.chrome);
-                        const OpenXR::eXRGrabAction  a   = OpenXR::grabActionForRegion(reg, grabAnywhere, handIsHands);
+                        const OpenXR::eXRGrabAction  a   = OpenXR::grabActionForRegion(reg, grabAnywhere, handIsHands, handBodyGrab);
                         if (a == OpenXR::XR_GRAB_ACTION_NONE)
                             continue;
                         bestT  = hit.t;
