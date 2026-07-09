@@ -738,6 +738,12 @@ std::vector<SP<IValue>> Values::getConfigValues() {
                    "doesn't lurch the window) | grasp (fist curl; anchors to the wrist) | both (either). Hands always grab from the move-bar/corners only (never the body, "
                    "regardless of grab_anywhere); controllers are unaffected. Read per-frame (hot-toggles)",
                    "pinch"),
+        MS<String>("openxr:hand_grab_anywhere",
+                   "which hand-tracking grab GESTURE may move a monitor from its CONTENT body (the hand analog of grab_anywhere, keyed on the gesture that triggered THIS "
+                   "grab, not the hand_grab mode): none (hands only grab the move-bar/corners) | grasp (default; a fist grabs anywhere, a pinch stays chrome-only and keeps "
+                   "its click) | pinch | both. CAVEAT for pinch/both: a body pinch will BOTH click (pointer press) and grab. Bar/corners always grab regardless; controllers "
+                   "use grab_anywhere instead. Read per-frame (hot-toggles)",
+                   "grasp"),
         MS<Int>("openxr:grab_release_latency_ms",
                 "on grab release, re-anchor from the quad pose sampled this many ms BEFORE the release edge, to reject the release-motion lurch (the grip/hand "
                 "swing on the release frame). 0 = use the release frame. ~100 clears the perturbation; raise it if releases still lurch, lower it if a quick "
