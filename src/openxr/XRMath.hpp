@@ -406,14 +406,16 @@ namespace OpenXR {
     // ---- grab-region gating (docs/openxr/research/04-grabbable-borders.md §5.2, WP-G3) ----
     //
     // Pure decision helper: given the chrome region a grab gesture landed on, what does it do?
-    // BAR always MOVEs; each CORNER always RESIZEs (from that corner); BODY MOVEs only when
-    // openxr:grab_anywhere is set (the controller-grip-anywhere convenience) AND hands are not the
-    // active device; MARGIN / NONE never grab. gtest-covered truth table (tests/xr/grab_gating.cpp).
+    // BAR always MOVEs; each CORNER always RESIZEs (from that corner); MARGIN / NONE never grab;
+    // BODY grabs conditionally. gtest-covered truth table (tests/xr/grab_gating.cpp).
     //
-    // `handActive` is the WP-G5 slot: when hands are the active device the fist/pinch is forced to
-    // the bar/corners (no whole-content grab, per the vendor UX in §2-§3), so BODY never grabs
-    // regardless of grab_anywhere. WP-G3 always passes false — flipping G5 on is a one-argument
-    // change with no rework here.
+    // BODY grab gating:
+    //   • controller (handActive==false): MOVEs iff openxr:grab_anywhere (the grip-anywhere
+    //     convenience). `handBodyGrab` is ignored.
+    //   • hand      (handActive==true):  MOVEs iff `handBodyGrab` — the caller has already checked
+    //     openxr:hand_grab_anywhere against THIS grab's active gesture (see xrHandBodyGrabAllowed).
+    //     grab_anywhere does not apply to hands. Default caller value false ⇒ WP-G5's original
+    //     "hands never body-grab" behavior.
     enum eXRGrabAction : uint8_t {
         XR_GRAB_ACTION_NONE = 0,
         XR_GRAB_ACTION_MOVE,
@@ -427,14 +429,17 @@ namespace OpenXR {
         return a == XR_GRAB_ACTION_RESIZE_TL || a == XR_GRAB_ACTION_RESIZE_TR || a == XR_GRAB_ACTION_RESIZE_BL || a == XR_GRAB_ACTION_RESIZE_BR;
     }
 
-    inline eXRGrabAction grabActionForRegion(eXRQuadRegion region, bool grabAnywhere, bool handActive) {
+    inline eXRGrabAction grabActionForRegion(eXRQuadRegion region, bool grabAnywhere, bool handActive, bool handBodyGrab = false) {
         switch (region) {
             case XR_REGION_BAR: return XR_GRAB_ACTION_MOVE;
             case XR_REGION_CORNER_TL: return XR_GRAB_ACTION_RESIZE_TL;
             case XR_REGION_CORNER_TR: return XR_GRAB_ACTION_RESIZE_TR;
             case XR_REGION_CORNER_BL: return XR_GRAB_ACTION_RESIZE_BL;
             case XR_REGION_CORNER_BR: return XR_GRAB_ACTION_RESIZE_BR;
-            case XR_REGION_BODY: return (grabAnywhere && !handActive) ? XR_GRAB_ACTION_MOVE : XR_GRAB_ACTION_NONE;
+            case XR_REGION_BODY:
+                if (handActive)
+                    return handBodyGrab ? XR_GRAB_ACTION_MOVE : XR_GRAB_ACTION_NONE;
+                return grabAnywhere ? XR_GRAB_ACTION_MOVE : XR_GRAB_ACTION_NONE;
             default: return XR_GRAB_ACTION_NONE; // XR_REGION_MARGIN / XR_REGION_NONE
         }
     }
@@ -530,6 +535,55 @@ namespace OpenXR {
             case XR_HANDGRAB_BOTH: return pinchVal >= graspVal;
             default: return true; // XR_HANDGRAB_PINCH
         }
+    }
+
+    // ---- hand body-grab gating (openxr:hand_grab_anywhere) ----
+    //
+    // Which hand grab GESTURE (if any) may move a monitor from its CONTENT body — the hand analog of
+    // openxr:grab_anywhere, but keyed on the gesture that actually crossed the grab Schmitt this grab
+    // (not the openxr:hand_grab MODE). The gesture identity is xrHandGrabUsesPinch(mode, ...): true ⇒
+    // this grab is a PINCH, false ⇒ a GRASP (fist). So with hand_grab=both, a fist-triggered body grab
+    // is honored under GRASP/BOTH but a pinch-triggered one is not — the trigger, not the mode, decides.
+    //   NONE  → hands never body-grab (original WP-G5 behavior; the bar/corners still grab).
+    //   GRASP → only a fist body-grabs; a pinch stays chrome-only (and keeps its click). DEFAULT.
+    //   PINCH → only a pinch body-grabs. CAVEAT: a body pinch will BOTH click (pointer press) AND grab.
+    //   BOTH  → either gesture body-grabs (same pinch click+grab caveat).
+    enum eXRHandGrabAnywhere : uint8_t {
+        XR_HANDGRAB_ANY_NONE = 0,
+        XR_HANDGRAB_ANY_GRASP,
+        XR_HANDGRAB_ANY_PINCH,
+        XR_HANDGRAB_ANY_BOTH,
+    };
+
+    inline eXRHandGrabAnywhere xrParseHandGrabAnywhere(const std::string& s) {
+        if (s == "none")
+            return XR_HANDGRAB_ANY_NONE;
+        if (s == "pinch")
+            return XR_HANDGRAB_ANY_PINCH;
+        if (s == "both")
+            return XR_HANDGRAB_ANY_BOTH;
+        return XR_HANDGRAB_ANY_GRASP; // default + explicit "grasp"
+    }
+
+    inline const char* xrHandGrabAnywhereName(eXRHandGrabAnywhere m) {
+        switch (m) {
+            case XR_HANDGRAB_ANY_NONE: return "none";
+            case XR_HANDGRAB_ANY_PINCH: return "pinch";
+            case XR_HANDGRAB_ANY_BOTH: return "both";
+            default: return "grasp";
+        }
+    }
+
+    // Whether a hand grab whose triggering gesture was a pinch (gestureIsPinch==true) or a grasp
+    // (false) is permitted to move a monitor from its BODY, under the hand_grab_anywhere config.
+    inline bool xrHandBodyGrabAllowed(eXRHandGrabAnywhere cfg, bool gestureIsPinch) {
+        switch (cfg) {
+            case XR_HANDGRAB_ANY_NONE: return false;
+            case XR_HANDGRAB_ANY_GRASP: return !gestureIsPinch;
+            case XR_HANDGRAB_ANY_PINCH: return gestureIsPinch;
+            case XR_HANDGRAB_ANY_BOTH: return true;
+        }
+        return false;
     }
 
     struct SXRChromeGeometry {
