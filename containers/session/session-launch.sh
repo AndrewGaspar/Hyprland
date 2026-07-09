@@ -33,6 +33,12 @@
 #   MONADO_BIN         (windowed) monado-service path (default /build/monado/…)
 #   XR_X_DISPLAY       (windowed) X display for the container-local Xwayland (:9)
 #   WIVRN_HOST_SOCK    (wivrn) bind-mounted host wivrn comp_ipc socket
+#   HL_PIPEWIRE_SOCK   host PipeWire socket bind-mounted under /hypxrland-host
+#                      (native-PipeWire clients); unset => no native share
+#   HL_PULSE_SOCK      host PulseAudio native socket bind-mounted under
+#                      /hypxrland-host (Pulse-shim clients: chromium, pactl);
+#                      unset => no pulse share. Both unset (host --no-audio or no
+#                      host PipeWire) => the session runs with no audio.
 #   HYPRLAND_BIN       dev Hyprland (default /build/Hyprland)
 set -uo pipefail
 
@@ -52,6 +58,45 @@ export PATH="$HOME/.local/share/omarchy/bin:$PATH"
 # ~/.config/omarchy/current/background (symlink into the theme's backgrounds/)
 # if it doesn't exist yet, or swaybg renders a black desktop.
 [ -e "$HOME/.config/omarchy/current/background" ] || omarchy-theme-bg-next >/dev/null 2>&1 || true
+
+# --- host audio (PipeWire / PulseAudio) --------------------------------------
+# The host audio daemon is shared in via read-only socket bind mounts under
+# /hypxrland-host (xr-container.sh cmd_session). We run NO audio daemon in the
+# container; instead we symlink the host sockets onto the DEFAULT client
+# discovery paths in $XDG_RUNTIME_DIR, so every client resolves them with no env
+# plumbing (incl. anything the systemd user manager launches — same $XDG_RUNTIME_DIR):
+#   pipewire-0    -> native-PipeWire clients (pw-cli, native apps)
+#   pulse/native  -> PulseAudio-shim clients (chromium, pactl, paplay/parecord)
+# connect() follows the symlink and reaches the host daemon cross-namespace by the
+# socket inode (proven: pactl/pw-cli info work over a :ro mount). The image ships
+# pipewire.service/.socket (but NEITHER is enabled, and there is no pipewire-pulse/
+# wireplumber daemon pkg) — mask them defensively so a stray socket-activation
+# can't bind $XDG_RUNTIME_DIR/pipewire-0 over our symlink. Both socket vars unset
+# (host --no-audio or no host PipeWire) => this block no-ops and apps run silent.
+HL_PIPEWIRE_SOCK="${HL_PIPEWIRE_SOCK:-}"
+HL_PULSE_SOCK="${HL_PULSE_SOCK:-}"
+if [[ -n $HL_PIPEWIRE_SOCK || -n $HL_PULSE_SOCK ]]; then
+    systemctl --user mask --now \
+        pipewire.socket pipewire.service pipewire-pulse.socket \
+        pipewire-pulse.service wireplumber.service >/dev/null 2>&1 || true
+    audio_linked=()
+    if [[ -n $HL_PIPEWIRE_SOCK && -S $HL_PIPEWIRE_SOCK ]]; then
+        ln -sf "$HL_PIPEWIRE_SOCK" "$XDG_RUNTIME_DIR/pipewire-0"
+        audio_linked+=("pipewire-0")
+    fi
+    if [[ -n $HL_PULSE_SOCK && -S $HL_PULSE_SOCK ]]; then
+        mkdir -p "$XDG_RUNTIME_DIR/pulse"
+        ln -sf "$HL_PULSE_SOCK" "$XDG_RUNTIME_DIR/pulse/native"
+        audio_linked+=("pulse/native")
+    fi
+    if ((${#audio_linked[@]})); then
+        echo "   audio: host PipeWire shared read-only (in-container daemons masked; linked ${audio_linked[*]})"
+    else
+        echo "   audio: sockets requested but absent under /hypxrland-host — session runs silent (non-fatal)" >&2
+    fi
+else
+    echo "   audio: not shared (--no-audio or host has no PipeWire) — session runs silent"
+fi
 
 # --- nest into the host wayland compositor -----------------------------------
 # WAYLAND_DISPLAY is an ABSOLUTE path (starts with /), so libwayland connects to
