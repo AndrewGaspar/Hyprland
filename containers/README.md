@@ -17,6 +17,7 @@ scripts/xr-container.sh session --wivrn --nested-gpu amd --xr-gpu nvidia  # expl
 scripts/xr-container.sh session --passthrough      # openxr:blend_mode = alpha
 scripts/xr-container.sh session --env pano         # ambient gradient-sky background (hypxrpaper)
 scripts/xr-container.sh session --env forest       # bundled 'forest-clearing' 3D scene
+scripts/xr-container.sh session --no-audio         # do NOT share the host PipeWire/Pulse audio
 scripts/xr-container.sh session --publish-remote   # + expose Monado remote driver on an ephemeral host port
 scripts/xr-container.sh exec hyprctl openxr status # talk to the running session
 ```
@@ -76,6 +77,41 @@ default XR monitors) and launched by `session/session-launch.sh`.
   `HYPXRPAPER_ASSET_DIR` (no copy into `/build`); a custom `<path>` must be reachable
   inside the container (under `/src`, or add a bind mount). This mirrors
   `scripts/preview-xr.sh --env`.
+
+### Audio (host PipeWire, shared read-only)
+
+By default `session` shares the **host** audio daemon into the container so
+in-container apps (chromium, media players, …) play and capture through it — **no
+audio daemon runs in the container**. The host's PipeWire client sockets are
+bind-mounted **read-only** under `/hypxrland-host` (the container's
+`/run/user/1000` is a systemd tmpfs and can't be mounted into directly — the same
+reason the wayland/wivrn sockets land there), and `session-launch.sh` symlinks
+them onto the default in-container discovery paths:
+
+| Host socket | Container symlink | Serves |
+| --- | --- | --- |
+| `$XDG_RUNTIME_DIR/pipewire-0` | `$XDG_RUNTIME_DIR/pipewire-0` | native-PipeWire clients (`pw-cli`, native apps) |
+| `$XDG_RUNTIME_DIR/pulse/native` | `$XDG_RUNTIME_DIR/pulse/native` | PulseAudio-shim clients (**chromium**, `pactl`, `paplay`/`parecord`) |
+
+A **read-only** bind is sufficient — an `AF_UNIX` `connect()` is not a filesystem
+write (verified: `pactl`/`pw-cli` info and playback/capture all work over the
+`:ro` mount). Symlinks onto the default paths (rather than `PULSE_SERVER` /
+`PIPEWIRE_RUNTIME_DIR` env) mean **every** client resolves audio with no env
+plumbing, including anything the systemd user manager launches. The image ships
+`pipewire.service`/`.socket` but **neither is enabled** (and there is no
+`pipewire-pulse`/`wireplumber` daemon package), so nothing competes with the host
+daemon; `session-launch.sh` still `systemctl --user mask`s them defensively so a
+stray socket-activation can't bind `$XDG_RUNTIME_DIR/pipewire-0` over the symlink.
+
+- `--no-audio` omits the mounts entirely; in-container apps degrade to silent
+  (`pactl` returns "Connection refused", chromium still launches fine).
+- A host with **no** running PipeWire is auto-skipped with a notice (audio is
+  optional, never fatal).
+- **WiVRn note:** with a headset connected, the headset speakers and microphone
+  appear as **ordinary host PipeWire devices** (`wivrn.sink` / `wivrn.source`), so
+  they are shared into the container through this same mechanism automatically —
+  no headset-specific audio plumbing. Pick them with `pactl set-default-sink` /
+  `set-default-source` (or in the app) inside the session.
 
 Teardown = `podman rm -f` the tracked container, which reaps the whole session
 tree (Hyprland, Monado/Xwayland, waybar/mako/walker). NEVER kill by process name:
