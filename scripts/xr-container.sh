@@ -43,7 +43,7 @@
 #
 #   session [--wivrn] [--conf FILE] [--gpu split|amd|nvidia|intel|/dev/dri/renderD*]
 #           [--nested-gpu SPEC] [--xr-gpu SPEC] [--env pano|forest|<path>]
-#           [--passthrough] [--publish-remote[=PORT]]
+#           [--passthrough] [--publish-remote[=PORT]] [--no-audio]
 #       Boot :session and launch a full Omarchy desktop as a NESTED window on the
 #       host, with the dev Hyprland's XR extension enabled. waybar/mako/walker/
 #       portals autostart on the container's OWN private buses (no shim; verify
@@ -80,6 +80,13 @@
 #                                (container 4242) to the host on an EPHEMERAL free
 #                                port (or PORT). OFF by default — a fixed 4242 publish
 #                                once poisoned a concurrent host suite run.
+#         --no-audio             do NOT share the host PipeWire/PulseAudio sockets.
+#                                By default the host audio daemon is shared read-only
+#                                (pipewire-0 + pulse/native) so in-container apps
+#                                (chromium, etc.) play/capture through it; no audio
+#                                daemon runs in the container. --no-audio omits the
+#                                mounts (apps degrade to silent). Absent host audio is
+#                                auto-skipped with a notice regardless.
 #       Runs interactively (attached logs); teardown on exit = `podman rm -f` its
 #       container, which cleanly kills the whole session tree.
 #
@@ -654,11 +661,12 @@ find_free_tcp_port() {
 
 cmd_session() {
     local gpu="" use_wivrn=0 passthrough=0 user_conf="" env_spec=""
-    local publish_remote=0 remote_port=""
+    local publish_remote=0 remote_port="" use_audio=1
     local nested_gpu="" xr_gpu=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --wivrn)      use_wivrn=1 ;;
+            --no-audio)   use_audio=0 ;;
             --passthrough) passthrough=1 ;;
             --env)        [[ $# -ge 2 ]] || die "--env needs an argument (pano|forest|<path>)"; env_spec="$2"; shift ;;
             --env=*)      env_spec="${1#--env=}" ;;
@@ -752,6 +760,42 @@ cmd_session() {
         mounts+=(-v "$(cd "$(dirname "$user_conf")" && pwd)/$(basename "$user_conf"):$ctr_conf:ro")
         launch_env+=("XR_BASE_CONF=$ctr_conf")
     }
+
+    # --- host audio (PipeWire / PulseAudio) — optional, --no-audio to skip -----
+    # Share the HOST audio daemon by bind-mounting its client sockets read-only
+    # under $HOST_MNT (the container's /run/user/1000 is a systemd tmpfs and can't
+    # be mounted into directly — same reason the wayland/wivrn sockets land here);
+    # session-launch.sh symlinks them onto the default in-container discovery paths.
+    # NO audio daemon runs in the container — the host's serves everything. Two
+    # sockets for maximal app coverage: pipewire-0 (native-PipeWire clients) and
+    # pulse/native (PulseAudio-shim clients — chromium, pactl, paplay/parecord). A
+    # read-only bind is sufficient: an AF_UNIX connect() is not a filesystem write
+    # (verified — pactl/pw-cli work over the :ro mount). Audio is optional: a host
+    # without a running PipeWire just gets a notice and the session runs silent
+    # (apps degrade gracefully). WiVRn note: with a headset connected, the headset
+    # speakers/mic appear as ordinary host PipeWire devices, so they work in here
+    # automatically through this same share — no headset-specific plumbing.
+    if [[ $use_audio -eq 1 ]]; then
+        local host_pw="$host_xdg/pipewire-0" host_pulse="$host_xdg/pulse/native"
+        local audio_any=0
+        if [[ -S $host_pw ]]; then
+            mounts+=(-v "$host_pw:$HOST_MNT/pipewire-0:ro")
+            launch_env+=("HL_PIPEWIRE_SOCK=$HOST_MNT/pipewire-0")
+            audio_any=1
+        fi
+        if [[ -S $host_pulse ]]; then
+            mounts+=(-v "$host_pulse:$HOST_MNT/pulse-native:ro")
+            launch_env+=("HL_PULSE_SOCK=$HOST_MNT/pulse-native")
+            audio_any=1
+        fi
+        if [[ $audio_any -eq 1 ]]; then
+            log "Audio: sharing host audio read-only (pipewire-0=$([[ -S $host_pw ]] && echo yes || echo no)  pulse/native=$([[ -S $host_pulse ]] && echo yes || echo no))"
+        else
+            warn "Audio: host has no PipeWire/Pulse socket ($host_pw / $host_pulse) — session runs silent (non-fatal; pass --no-audio to silence this)."
+        fi
+    else
+        log "Audio: --no-audio — host audio NOT shared into the session."
+    fi
 
     local -a portargs=()
     if [[ $use_wivrn -eq 1 ]]; then
