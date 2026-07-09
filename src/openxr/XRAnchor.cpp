@@ -3,6 +3,7 @@
 // Pure math — compiled unconditionally, no OpenXR headers (see the header). See
 // docs/openxr/03-anchoring.md §3–§6 for every formula below.
 
+#include <algorithm>
 #include <cmath>
 
 using namespace OpenXR;
@@ -71,11 +72,57 @@ SXRPose SXRGrabRing::lastCalm(float linThresh, uint32_t nowMs, uint32_t maxBackM
     return fallback; // the whole in-window span was above threshold -> maximally rewound
 }
 
-SXRPose OpenXR::pickReleasePose(const SXRGrabRing& ring, uint32_t nowMs, uint32_t latencyMs, float velReject) {
+float SXRGrabRing::releasePeakSpeed(uint32_t nowMs, uint32_t windowMs) const {
+    const uint32_t floorMs = nowMs > windowMs ? nowMs - windowMs : 0;
+    float          peak    = 0.F;
+    for (uint32_t b = 0; b < size(); ++b) {
+        const SXRGrabSample& s = at(b);
+        if (s.timeMs <= floorMs)
+            break; // older than the release window -> carry, not release
+        if (s.linSpeed > peak)
+            peak = s.linSpeed;
+    }
+    return peak;
+}
+
+float SXRGrabRing::carryTypicalSpeed(uint32_t nowMs, uint32_t windowMs, uint32_t maxBackMs) const {
+    const uint32_t hiMs = nowMs > windowMs ? nowMs - windowMs : 0;   // newest carry edge (exclude release window)
+    const uint32_t loMs = nowMs > maxBackMs ? nowMs - maxBackMs : 0; // oldest carry edge (rewind cap)
+    std::array<float, CAP> speeds{};
+    uint32_t               n = 0;
+    for (uint32_t b = 0; b < size(); ++b) {
+        const SXRGrabSample& s = at(b);
+        if (s.timeMs > hiMs)
+            continue; // still inside the release window
+        if (s.timeMs < loMs)
+            break; // past the rewind cap
+        speeds[n++] = s.linSpeed;
+    }
+    if (n == 0)
+        return 0.F;
+    // Lower-trimmed mean: average of the faster ceil(n/2) samples. Robust both ways — stationary
+    // just-grabbed samples (a rest-then-flick carry) can't drag it toward 0 like a median would,
+    // and a single-frame tracking spike can't dominate it like a max would.
+    std::sort(speeds.begin(), speeds.begin() + n); // ascending
+    const uint32_t k   = (n + 1) / 2;              // faster half, ceil
+    float          sum = 0.F;
+    for (uint32_t i = n - k; i < n; ++i)
+        sum += speeds[i];
+    return sum / (float)k;
+}
+
+SXRPose OpenXR::pickReleasePose(const SXRGrabRing& ring, uint32_t nowMs, uint32_t latencyMs, float velRejectRatio) {
     if (ring.size() == 0)
         return SXRPose{};
-    if (velReject > 0.F && ring.size() >= 2 && ring.at(0).linSpeed > velReject)
-        return ring.lastCalm(velReject, nowMs, XR_GRAB_MAX_REWIND_MS);
+    if (velRejectRatio > 0.F && ring.size() >= 2) {
+        const float peak  = ring.releasePeakSpeed(nowMs, XR_GRAB_RELEASE_WINDOW_MS);
+        const float carry = ring.carryTypicalSpeed(nowMs, XR_GRAB_RELEASE_WINDOW_MS, XR_GRAB_MAX_REWIND_MS);
+        const float denom = std::max(carry, XR_GRAB_CARRY_SPEED_FLOOR);
+        // Outlier iff the release is both absolutely non-trivial AND relatively much faster than the
+        // typical carry. A uniformly fast carry keeps peak ≈ carry (ratio ≈ 1) -> not an outlier.
+        if (peak > XR_GRAB_CARRY_SPEED_FLOOR && peak > velRejectRatio * denom)
+            return ring.lastCalm(denom * XR_GRAB_CALM_MARGIN, nowMs, XR_GRAB_MAX_REWIND_MS);
+    }
     return ring.sampleBack(nowMs, latencyMs);
 }
 
@@ -196,7 +243,11 @@ SXRSolveResult CXRAnchor::solve(const SXRSolveInput& in, const SXRAnchorTuning& 
         // exact device-space path below. m_lastWorld becomes the filtered pose, so the WP-G4 release
         // ring records what the user actually saw and the release re-anchors to match.
         SXRPose world = dev ? poseCompose(*dev, m_grabOffset) : m_lastWorld;
-        if (in.grabFilter && m_grabHandActive && dev) {
+        // WP-G6 + live-tune 2026-07-09: filter hands always; filter controllers too when
+        // grabFilterScopeAll (openxr:grab_filter_scope=all, the default). The filtered branch drops
+        // the device-space late-latch (submits LOCAL_FLOOR), so enabling controllers here applies
+        // that same ~1-frame-latency trade to them — deliberate, to kill controller carry jitter.
+        if (in.grabFilter && (m_grabHandActive || in.grabFilterScopeAll) && dev) {
             world     = oneEuroStepPose(m_carryFilter, world, dt, in.grabFilterMinCutoff, in.grabFilterBeta);
             res.space = XR_SPACE_LOCAL_FLOOR;
             res.pose  = world;

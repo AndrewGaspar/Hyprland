@@ -18,7 +18,10 @@ namespace {
         const bool& failed;
         std::string testName;
         std::string monitorName;
+        bool        restoreGrabFilter = false;
         ~SArtifactGuard() {
+            if (restoreGrabFilter)
+                getFromSocket("/keyword openxr:grab_filter 1"); // back to the shipped default
             if (!monitorName.empty())
                 getFromSocket("/openxr destroy " + monitorName);
             if (XR::g_ctx.remote) {
@@ -69,6 +72,12 @@ namespace {
             logSkip("no remote client available");
             return false;
         }
+        // Isolate the RELATIVE release latch: with grab_filter on (the shipped default) the 1€ carry
+        // filter — now applied to controllers too (grab_filter_scope=all) — would smooth the scripted
+        // jerk out of the recorded carry ring, so the latch's outlier detection wouldn't be what's
+        // under test. Disable it for these tests; the guard restores the default.
+        getFromSocket("/keyword openxr:grab_filter 0");
+        guard.restoreGrabFilter = true;
         if (getFromSocket("/openxr create " + mon + " 1280x720 anchor:local pos:0,0,-1.5 size:1.5") != "ok") {
             logSkip("monitor create failed");
             return false;
@@ -252,6 +261,56 @@ TEST_CASE(xr_grab_calm_release_noregress) {
     const float d = dist3(*finalPos, *whereLeft);
     NLog::green("xr_grab_calm_release_noregress: settle->release drift {:.3f} m", d);
     ASSERT(d < 0.05f, true); // a clean release stays put (no spurious rewind)
+}
+
+// xr_grab_fast_flick_noregress — the RELATIVE-rejection guarantee (2026-07-09 live tuning): a
+// deliberate, uniformly FAST carry that is released WHILE STILL MOVING at that pace must land where
+// the hand let go, NOT get rewound toward the grab start. The old ABSOLUTE velocity threshold
+// snapped these back (release speed > threshold ⇒ walk to the last "calm" sample, i.e. the start);
+// the relative heuristic sees release speed ≈ carry speed (ratio ≈ 1 << 3) and keeps it. This is the
+// case the absolute threshold got wrong.
+TEST_CASE(xr_grab_fast_flick_noregress) {
+    XR_SKIP_IF_UNAVAILABLE();
+
+    const std::string mon = XR::monitorName(9);
+    SArtifactGuard     guard{this->failed, name(), ""};
+    MonadoWire::xrt_vec3 hoverPos{};
+    if (!beginScriptedGrab(this, mon, guard, hoverPos))
+        return;
+    NLog::green("xr_grab_fast_flick_noregress: grab began");
+
+    auto* remote = XR::g_ctx.remote;
+
+    // Monitor's world x right after the grab (before the flick).
+    const auto before = monitorPos(getFromSocket("j/openxr"), mon);
+    ASSERT(before.has_value(), true);
+
+    // One continuous fast flick: +0.5 m along +X in ~300 ms (~1.7 m/s, uniform), releasing the
+    // squeeze in the last third while STILL moving fast — the release window carries the same pace as
+    // the flick, so it must NOT be treated as an outlier.
+    remote->animate(
+        [&](MonadoWire::r_remote_data& d, float t01) {
+            d.left.pose.position.x = hoverPos.x + 0.5f * t01;
+            d.left.pose.position.y = hoverPos.y;
+            d.left.pose.position.z = hoverPos.z;
+            if (t01 > 0.7f) {
+                d.left.squeeze_value.x = 0.f;
+                d.left.squeeze_force.x = 0.f;
+            }
+        },
+        std::chrono::milliseconds(300), 60);
+    remote->setSqueeze(CRemoteClient::SIDE_LEFT, 0.f);
+
+    const auto finalPos = awaitReleasedPos(mon);
+    ASSERT(finalPos.has_value(), true);
+    const float moved = (*finalPos)[0] - (*before)[0];
+    NLog::green("xr_grab_fast_flick_noregress: before x {:.3f} -> final x {:.3f} (moved {:.3f} m of ~0.5)", (*before)[0], (*finalPos)[0], moved);
+
+    // Landed near where the flick ended (>55% of the 0.5 m travel), NOT rewound toward the start.
+    // A wrongful absolute-threshold rewind would leave `moved` near 0.
+    ASSERT(moved > 0.28f, true);
+    EXPECT_CONTAINS(getFromSocket("j/openxr"), "\"mode\": \"local\"");
+    NLog::green("xr_grab_fast_flick_noregress: fast flick kept (not rewound)");
 }
 
 #endif // WITH_XR_TESTS

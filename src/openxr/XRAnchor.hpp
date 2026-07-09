@@ -66,14 +66,32 @@ namespace OpenXR {
     // release frame; re-anchoring from that frame's pose bakes the swing into the persistent anchor
     // and the window lurches. The fix is to keep a short per-hand history of the CARRIED world pose
     // and, on release, re-anchor from a pose a little earlier than the release edge — before the
-    // perturbation — and/or from the last "calm" (below-velocity-threshold) sample.
+    // perturbation — and/or from the last "calm" sample.
+    //
+    // RELATIVE velocity rejection (live-tuned 2026-07-09): an ABSOLUTE speed threshold rewound
+    // deliberate fast moves — a genuine fast flick was mistaken for a release jerk and snapped back.
+    // The release perturbation is instead detected as an OUTLIER *relative to the preceding carry*:
+    // rejection triggers only when the peak speed inside the release window exceeds K × the typical
+    // carry speed measured over the samples BEFORE that window. "Typical" is a LOWER-TRIMMED MEAN —
+    // the mean of the FASTER half of the carry samples — not a plain median: a flick that starts
+    // from rest keeps stationary just-grabbed samples in the ring, which would drag a median toward
+    // 0 and misclassify the flick as an outlier; the faster-half mean tracks the pace the hand
+    // actually reached while still averaging out single-frame tracking spikes. A uniformly fast
+    // carry has release-window speed ≈ carry speed (ratio ≈ 1 << K) and is NOT rewound; a calm
+    // carry with a jerk at the release edge has a huge ratio and IS rewound past the jerk. K is the
+    // re-purposed openxr:grab_release_velocity_reject value (a RATIO now, not m/s; default 3.0,
+    // 0 = off).
     //
     // Everything here is POD math (SXRPose = Vec3 + Quat) with ZERO hyprutils SP/WP refcount ops,
     // satisfying the frame-thread rule in XRMonitorLayer.hpp by construction. The per-hand ring
     // instances live in CXRInput (frame thread); the struct lives here (unconditional) so the pure
     // interpolation / velocity-rejection math is gtest-covered like the rest of the anchor engine.
 
-    constexpr uint32_t XR_GRAB_MAX_REWIND_MS = 500; // cap on how far velocity-rejection may rewind
+    constexpr uint32_t XR_GRAB_MAX_REWIND_MS     = 500;   // cap on how far velocity-rejection may rewind
+    constexpr uint32_t XR_GRAB_RELEASE_WINDOW_MS = 80;    // recent span treated as "the release" for the outlier test
+    constexpr float    XR_GRAB_CARRY_SPEED_FLOOR = 0.05F; // m/s: ratio-denominator floor + absolute gate so a
+                                                          // near-still carry doesn't make sub-mm noise an "outlier"
+    constexpr float    XR_GRAB_CALM_MARGIN       = 1.5F;  // a sample ≤ this × carry pace counts as pre-jerk "calm"
 
     struct SXRGrabSample {
         SXRPose  world;           // carried quad world pose (LOCAL_FLOOR) this frame
@@ -110,13 +128,27 @@ namespace OpenXR {
         // (nowMs - maxBackMs). If the whole in-window span is above threshold, returns the
         // furthest-back in-window sample (maximally rewound). Identity if empty.
         SXRPose lastCalm(float linThresh, uint32_t nowMs, uint32_t maxBackMs) const;
+
+        // Peak linSpeed among samples newer than (nowMs - windowMs) — "how fast is the release".
+        // 0 if the ring is empty or nothing falls in the window.
+        float releasePeakSpeed(uint32_t nowMs, uint32_t windowMs) const;
+        // Typical pace of the CARRY span — samples in [nowMs-maxBackMs, nowMs-windowMs], i.e.
+        // older than the release window but within the rewind cap — as the LOWER-TRIMMED MEAN: the
+        // mean of the faster ceil(n/2) of those samples' linSpeeds (see the header comment for why
+        // not a median: rest-then-flick carries). 0 if there is no carry sample (a very short
+        // grab); the caller then falls back to the floor.
+        float carryTypicalSpeed(uint32_t nowMs, uint32_t windowMs, uint32_t maxBackMs) const;
     };
 
-    // Pure release-pose selector (gtest truth table). If velReject > 0 and the newest sample is
-    // moving faster than velReject, walk back to the last calm sample (velocity-outlier rejection);
-    // otherwise rewind by latencyMs. Identity if the ring is empty (caller should fall back to the
-    // release-frame endGrab in that case).
-    SXRPose pickReleasePose(const SXRGrabRing& ring, uint32_t nowMs, uint32_t latencyMs, float velReject);
+    // Pure release-pose selector (gtest truth table). velRejectRatio is a RATIO K (not m/s): if
+    // K > 0 and the release-window peak speed is an OUTLIER — greater than K × the typical carry
+    // speed (denominator floored at XR_GRAB_CARRY_SPEED_FLOOR so a near-still carry stays sane) AND
+    // above that same absolute floor — walk back to the last carry-paced ("calm") sample
+    // (velocity-outlier rejection). Otherwise rewind by latencyMs. A uniformly fast carry has
+    // peak ≈ carry (ratio ≈ 1) and takes the latency path, so a fast flick is NOT rewound — even a
+    // flick started from rest, thanks to the trimmed-mean denominator. Identity if the ring is
+    // empty (caller should fall back to the release-frame endGrab in that case).
+    SXRPose pickReleasePose(const SXRGrabRing& ring, uint32_t nowMs, uint32_t latencyMs, float velRejectRatio);
 
     // ---- per-layer persistent state (doc 03 §2.1) ----
     struct SXRAnchorState {
@@ -162,13 +194,19 @@ namespace OpenXR {
         std::optional<SXRPose> pinchRight;
         uint32_t               pxW = 1, pxH = 1; // current monitor mode, for aspect
         // Optional 1€ carry filter (WP-G6), read per-frame from config by the caller. When
-        // grabFilter is set AND the grab is a hand grab (beginGrab handActive=true), solve() runs
-        // the carried world pose through a 1€ low-pass and submits it in LOCAL_FLOOR instead of the
-        // device-space late-latch. Off (default) / controllers keep the zero-latency device path
-        // unchanged. min cutoff (Hz) + beta are Casiez's two parameters (defaults 1.0 / 0.007).
+        // grabFilter is set, solve() runs the carried world pose through a 1€ low-pass and submits
+        // it in LOCAL_FLOOR instead of the device-space late-latch. By default the filter applies to
+        // BOTH hands and controllers (grabFilterScopeAll, openxr:grab_filter_scope=all, live-tuned
+        // 2026-07-09 — controllers reported carry jitter too). With grabFilterScopeAll=false
+        // (scope=hands) only a hand grab (beginGrab handActive=true) is filtered and controllers keep
+        // the zero-latency device-space late-latch. NOTE the trade-off (see solve()): the filtered
+        // path drops the runtime late-latch (adds ~1 frame of latency) — enabling it for controllers
+        // makes that trade apply to them too. min cutoff (Hz) + beta are Casiez's two parameters
+        // (defaults 1.0 / 0.025 — beta raised from Casiez's 0.007 in the live tuning session).
         bool                   grabFilter          = false;
+        bool                   grabFilterScopeAll  = true;
         float                  grabFilterMinCutoff = 1.0F;
-        float                  grabFilterBeta      = 0.007F;
+        float                  grabFilterBeta      = 0.025F;
     };
 
     struct SXRSolveResult {

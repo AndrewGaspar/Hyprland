@@ -398,6 +398,9 @@ from grab state.
 
 ### 5.6 Config surface (all new vars, `openxr:` prefix, ConfigValues.cpp style)
 
+> NOTE (2026-07-09): defaults + `grab_release_velocity_reject` semantics in this table are the
+> original research values — superseded by the shipped live-tuned set in §11.
+
 | var | type | default | meaning |
 |---|---|---|---|
 | `openxr:grab_affordance` | string | `border` | `border`\|`bar`\|`both`\|`none` — affordance drawn + hit for grab |
@@ -642,3 +645,21 @@ a pinch** and adjust the two knobs while watching a held-still panel and a fast 
   lag. Suggested trials: `(min_cutoff, beta)` = `(1.0, 0.007)` → `(0.5, 0.05)` → `(0.3, 0.2)`.
 - If the pinch-pose anchor (WP-G5) alone already feels good, you may not need the filter at all —
   leaving `grab_filter = false` keeps the zero-latency device-space carry.
+
+## 11. Live-tuned defaults shipped (2026-07-09, Quest 3)
+
+After a live headset session the defaults changed to what validated on-device (replaces the
+default columns above): `chrome_margin 0.04→0.10`, `chrome_bar_height 0.05→0.08`,
+`chrome_bar_width_frac 0.6→0.8`, `chrome_corner_size 0.06→0.09` (bigger, easier grab targets);
+`hand_grab pinch→both` paired with `hand_grab_anywhere grasp` (fist grabs anywhere, pinch stays
+chrome-only + keeps its click); `grab_filter false→true` now default-on, extended to controllers
+via the new `grab_filter_scope=hands|all` (default `all` — controllers reported carry jitter; the
+filtered branch's LOCAL_FLOOR/late-latch-drop trade in §10 now applies to controllers too),
+`grab_filter_beta 0.007→0.025`. **`grab_release_velocity_reject` was re-purposed from an ABSOLUTE
+m/s threshold to a RELATIVE RATIO K (default 3.0, 0=off)** — the absolute threshold rewound
+deliberate fast moves; now rejection triggers only when the peak speed in the ~80 ms release window
+exceeds K× the typical carry speed — a lower-trimmed mean (mean of the faster half) of the preceding
+samples, so a flick started from rest is judged by its flick pace, not dragged to ~0 by the
+stationary just-grabbed samples like a median would be (`SXRGrabRing::releasePeakSpeed` /
+`carryTypicalSpeed`, gtest-covered), so a uniformly fast flick (release ≈ carry pace) is kept while a
+calm-carry-then-jerk fist-open is rewound past the jerk.
