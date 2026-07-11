@@ -24,17 +24,21 @@ export CCACHE_DIR="${CCACHE_DIR:-$HOME/.cache/ccache}"
 echo "==> ccache stats (before):"
 ccache -s 2>/dev/null || true
 
-# The image's Arch mirror is Omarchy's FROZEN snapshot, which may ship a
-# wayland-protocols older than the tree requires — the configure then depends on
-# the vendored subprojects/wayland-protocols submodule. /src is an overlay that
+# The image's Arch mirror is Omarchy's FROZEN snapshot, which may ship deps older
+# (wayland-protocols < 1.49) or more broken (hyprutils 0.13.1 virtual-inheritance
+# casts) than the tree requires — configure then depends on the vendored
+# subprojects/{wayland-protocols,hyprutils} submodules. /src is an overlay that
 # snapshots at container CREATE, so a submodule checked out on the host after
 # the container was created is invisible here; fail early with the fix.
-if [[ ! -e $SRC/subprojects/wayland-protocols/stable ]]; then
-    echo "!! subprojects/wayland-protocols not present in /src — on the HOST run:" >&2
-    echo "     git submodule update --init subprojects/wayland-protocols" >&2
-    echo "   then recreate this container (the /src overlay snapshots at create)." >&2
-    echo "   Continuing; configure will fail if the image's wayland-protocols is too old." >&2
-fi
+for sub in wayland-protocols/stable hyprutils/include; do
+    if [[ ! -e $SRC/subprojects/$sub ]]; then
+        echo "!! subprojects/${sub%%/*} not present in /src — on the HOST run:" >&2
+        echo "     git submodule update --init subprojects/${sub%%/*}" >&2
+        echo "   then recreate this container (the /src overlay snapshots at create)." >&2
+        echo "   Continuing; configure will fail (or the build will crash at runtime)" >&2
+        echo "   if the image's system copy is too old." >&2
+    fi
+done
 
 echo "==> Configuring Hyprland (Ninja, Debug, tests + XR tests) into $BUILD"
 cmake -S "$SRC" -B "$BUILD" -G Ninja \
