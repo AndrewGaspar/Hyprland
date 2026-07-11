@@ -78,8 +78,6 @@ else()
   set(BUILDTYPE_LOWER "release")
 endif()
 
-pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
-message(STATUS "Found wayland-protocols at ${WAYLAND_PROTOCOLS_DIR}")
 pkg_get_variable(WAYLAND_SCANNER_PKGDATA_DIR wayland-scanner pkgdatadir)
 message(
   STATUS "Found wayland-scanner pkgdatadir at ${WAYLAND_SCANNER_PKGDATA_DIR}")
@@ -276,13 +274,36 @@ set(WAYLAND_SERVER_MINIMUM_VERSION 1.22.91)
 set(WAYLAND_SERVER_PROTOCOLS_MINIMUM_VERSION 1.49)
 set(LIBINPUT_MINIMUM_VERSION 1.29)
 
-pkg_check_modules(deps
+# wayland-protocols is a build-time-only dependency: we feed its XML files to
+# wayland-scanner. Use the system package when it is new enough, otherwise fall
+# back to the pinned subproject (subprojects/wayland-protocols). Frozen distro
+# mirrors (e.g. Omarchy's Arch mirror) may still ship an older release than we
+# require, so we don't put wayland-protocols in the REQUIRED deps list below.
+pkg_check_modules(wayland_protocols_dep QUIET wayland-protocols)
+if(wayland_protocols_dep_FOUND
+   AND NOT wayland_protocols_dep_VERSION VERSION_LESS
+           ${WAYLAND_SERVER_PROTOCOLS_MINIMUM_VERSION})
+  pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
+  message(STATUS "Found wayland-protocols at ${WAYLAND_PROTOCOLS_DIR}")
+elseif(EXISTS "${CMAKE_SOURCE_DIR}/subprojects/wayland-protocols/stable")
+  set(WAYLAND_PROTOCOLS_DIR "${CMAKE_SOURCE_DIR}/subprojects/wayland-protocols")
+  message(
+    STATUS "system wayland-protocols too old, using vendored subproject")
+  message(STATUS "Found wayland-protocols at ${WAYLAND_PROTOCOLS_DIR}")
+else()
+  message(
+    FATAL_ERROR
+      "wayland-protocols >= ${WAYLAND_SERVER_PROTOCOLS_MINIMUM_VERSION} not found and subprojects/wayland-protocols is missing; run: git submodule update --init subprojects/wayland-protocols"
+  )
+endif()
+
+pkg_check_modules(
+  deps
   REQUIRED
   IMPORTED_TARGET GLOBAL
   xkbcommon>=${XKBCOMMON_MINIMUM_VERSION}
   uuid
   wayland-server>=${WAYLAND_SERVER_MINIMUM_VERSION}
-  wayland-protocols>=${WAYLAND_SERVER_PROTOCOLS_MINIMUM_VERSION}
   cairo
   pango
   pangocairo
