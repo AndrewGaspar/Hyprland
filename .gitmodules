@@ -27,3 +27,8 @@
 	url = https://github.com/AndrewGaspar/hypxrpaper.git
 	shallow = true
 	ignore = dirty
+[submodule "subprojects/wayland-protocols"]
+	path = subprojects/wayland-protocols
+	url = https://gitlab.freedesktop.org/wayland/wayland-protocols.git
+	shallow = true
+	ignore = dirty
