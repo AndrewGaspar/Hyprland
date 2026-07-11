@@ -32,3 +32,8 @@
 	url = https://gitlab.freedesktop.org/wayland/wayland-protocols.git
 	shallow = true
 	ignore = dirty
+[submodule "subprojects/hyprutils"]
+	path = subprojects/hyprutils
+	url = https://github.com/hyprwm/hyprutils
+	shallow = true
+	ignore = dirty
