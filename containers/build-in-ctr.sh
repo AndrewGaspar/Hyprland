@@ -24,6 +24,18 @@ export CCACHE_DIR="${CCACHE_DIR:-$HOME/.cache/ccache}"
 echo "==> ccache stats (before):"
 ccache -s 2>/dev/null || true
 
+# The image's Arch mirror is Omarchy's FROZEN snapshot, which may ship a
+# wayland-protocols older than the tree requires — the configure then depends on
+# the vendored subprojects/wayland-protocols submodule. /src is an overlay that
+# snapshots at container CREATE, so a submodule checked out on the host after
+# the container was created is invisible here; fail early with the fix.
+if [[ ! -e $SRC/subprojects/wayland-protocols/stable ]]; then
+    echo "!! subprojects/wayland-protocols not present in /src — on the HOST run:" >&2
+    echo "     git submodule update --init subprojects/wayland-protocols" >&2
+    echo "   then recreate this container (the /src overlay snapshots at create)." >&2
+    echo "   Continuing; configure will fail if the image's wayland-protocols is too old." >&2
+fi
+
 echo "==> Configuring Hyprland (Ninja, Debug, tests + XR tests) into $BUILD"
 cmake -S "$SRC" -B "$BUILD" -G Ninja \
     -DCMAKE_BUILD_TYPE=Debug \
