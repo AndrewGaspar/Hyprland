@@ -154,6 +154,60 @@ pkg_check_modules(hyprcursor_dep REQUIRED IMPORTED_TARGET hyprcursor>=${HYPRCURS
 pkg_check_modules(hyprutils_dep REQUIRED IMPORTED_TARGET hyprutils>=${HYPRUTILS_MINIMUM_VERSION})
 pkg_check_modules(hyprgraphics_dep REQUIRED IMPORTED_TARGET hyprgraphics>=${HYPRGRAPHICS_MINIMUM_VERSION})
 
+# hyprutils 0.13.1 (the version on Omarchy's frozen mirror, and the CMake minimum)
+# miscompiles CSharedPointer/CWeakPointer casts across *virtual* inheritance: the
+# converting ctors/assignments and dynamicPointerCast copy the raw stored void*
+# without applying the base-subobject pointer adjustment, so a SP<Derived> viewed
+# as SP<VirtualBase> yields a misadjusted pointer -> garbage vptr -> SIGSEGV inside
+# __dynamic_cast. Upstream's view hierarchy uses virtual multiple inheritance
+# (IView/IGeometric/IAlphaModifiable), which trips this on every view.create
+# (e.g. every window/layer/popup map -> deterministic compositor crash).
+# Fixed upstream by hyprutils 41fb809 ("memory: fix virtual inheritance casts",
+# #115), which is what Hyprland's flake pins -- but the release VERSION string is
+# still 0.13.1, so we can't gate on version; detect the fix by probing the header.
+#
+# The fix is confined to the header-only memory/ templates. We can't install a
+# newer hyprutils on the frozen mirror, so we vendor the pinned commit as a
+# submodule and shadow the system headers with a BEFORE -I. It must shadow the
+# WHOLE hyprutils include tree, not just memory/: some system headers (e.g.
+# cli/Logger.hpp) pull memory/ siblings via quoted-relative includes
+# ("../memory/UniquePtr.hpp"), which resolve next to the *including* header and so
+# ignore any -I. Shadowing memory/ alone would then mix system + vendored copies of
+# the same templates -> ODR/redefinition. Shadowing the full tree keeps every
+# hyprutils header (and its relative includes) consistently vendored. Between
+# 0.13.1 and 41fb809 the only non-memory changes are animation: an inline
+# setValueAndWarp tweak (header-only, no .so symbol) and a NEW Spring.hpp
+# (advanceSpring, unreferenced at this Hyprland commit). No existing exported
+# symbol's signature changed, so the vendored headers stay ABI-compatible with the
+# system-linked libhyprutils.so -- nothing extra is compiled or linked. Mirrors the
+# wayland-protocols frozen-mirror fallback.
+set(HYPRUTILS_MEMFIX_HEADER "${CMAKE_SYSROOT}/usr/include/hyprutils/memory/ImplBase.hpp")
+if(NOT EXISTS "${HYPRUTILS_MEMFIX_HEADER}")
+  # non-standard prefix: ask pkg-config where the headers live
+  if(hyprutils_dep_INCLUDEDIR)
+    set(HYPRUTILS_MEMFIX_HEADER "${hyprutils_dep_INCLUDEDIR}/hyprutils/memory/ImplBase.hpp")
+  endif()
+endif()
+set(HYPRUTILS_HAS_MEMFIX FALSE)
+if(EXISTS "${HYPRUTILS_MEMFIX_HEADER}")
+  file(READ "${HYPRUTILS_MEMFIX_HEADER}" _hyprutils_implbase)
+  string(FIND "${_hyprutils_implbase}" "dataPointer" _hyprutils_memfix_pos)
+  if(NOT _hyprutils_memfix_pos EQUAL -1)
+    set(HYPRUTILS_HAS_MEMFIX TRUE)
+  endif()
+endif()
+if(NOT HYPRUTILS_HAS_MEMFIX)
+  set(_hyprutils_vendored_include "${CMAKE_CURRENT_SOURCE_DIR}/subprojects/hyprutils/include")
+  if(NOT EXISTS "${_hyprutils_vendored_include}/hyprutils/memory/ImplBase.hpp")
+    message(FATAL_ERROR "system hyprutils lacks the virtual-inheritance cast fix and the vendored fallback is missing; run: git submodule update --init subprojects/hyprutils")
+  endif()
+  # Plain -I (not -isystem): -isystem ranks below -I and below other system-header
+  # dirs, so the vendored copy would not reliably win. BEFORE -I puts the vendored
+  # include tree first for every hyprutils header.
+  include_directories(BEFORE "${_hyprutils_vendored_include}")
+  message(STATUS "hyprutils: system headers lack the virtual-inheritance cast fix; shadowing with vendored 41fb809 include tree")
+endif()
+
 option(WITH_OPENXR "Build with OpenXR support" ON)
 if(WITH_OPENXR)
   pkg_check_modules(openxr_dep IMPORTED_TARGET openxr)

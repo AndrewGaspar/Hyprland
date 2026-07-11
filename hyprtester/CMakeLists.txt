@@ -11,13 +11,40 @@ find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(hyprtester_deps REQUIRED IMPORTED_TARGET hyprutils>=0.5.0)
 
+# hyprutils <= 0.13.1 miscompiles SP/WP casts across virtual inheritance — see the
+# matching block in the root CMakeLists.txt for the full story. Probe the system
+# headers for the fix marker (Impl_::dataPointer, added by hyprutils 41fb809) and,
+# when absent, shadow the whole hyprutils include tree with the vendored submodule
+# via a BEFORE -I. Duplicated from the root so hyprtester also builds correctly
+# configured standalone; under the root configure the duplicate -I is harmless.
+# HYPRUTILS_SHADOW_INCLUDE is additionally handed to the plugin Makefile below:
+# hyprtestplugin.so is dlopen'd into the compositor and instantiates the same
+# templates, so it must see the same (fixed) headers.
+set(_hyprutils_probe "${CMAKE_SYSROOT}/usr/include/hyprutils/memory/ImplBase.hpp")
+if(NOT EXISTS "${_hyprutils_probe}" AND hyprtester_deps_INCLUDEDIR)
+  set(_hyprutils_probe "${hyprtester_deps_INCLUDEDIR}/hyprutils/memory/ImplBase.hpp")
+endif()
+set(HYPRUTILS_SHADOW_INCLUDE "")
+if(EXISTS "${_hyprutils_probe}")
+  file(READ "${_hyprutils_probe}" _hyprutils_implbase)
+  string(FIND "${_hyprutils_implbase}" "dataPointer" _hyprutils_memfix_pos)
+  if(_hyprutils_memfix_pos EQUAL -1)
+    get_filename_component(HYPRUTILS_SHADOW_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../subprojects/hyprutils/include" ABSOLUTE)
+    if(NOT EXISTS "${HYPRUTILS_SHADOW_INCLUDE}/hyprutils/memory/ImplBase.hpp")
+      message(FATAL_ERROR "system hyprutils lacks the virtual-inheritance cast fix and the vendored fallback is missing; run: git submodule update --init subprojects/hyprutils")
+    endif()
+    include_directories(BEFORE "${HYPRUTILS_SHADOW_INCLUDE}")
+    message(STATUS "hyprtester: shadowing system hyprutils headers with vendored 41fb809 include tree")
+  endif()
+endif()
+
 file(GLOB_RECURSE SRCFILES CONFIGURE_DEPENDS "src/*.cpp")
 
 add_executable(hyprtester ${SRCFILES})
 add_custom_command(
   TARGET hyprtester
   POST_BUILD
-  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/plugin/build.sh "${LUA_INCLUDE_DIRS}"
+  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/plugin/build.sh "${LUA_INCLUDE_DIRS}" "${HYPRUTILS_SHADOW_INCLUDE}"
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/plugin)
 
 target_link_libraries(hyprtester PUBLIC PkgConfig::hyprtester_deps)
