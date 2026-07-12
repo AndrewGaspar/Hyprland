@@ -63,7 +63,8 @@ same thing live).
 | `openxr:grab_threshold_release` | float | `0.4` | Squeeze value that ends a grab (hysteresis). |
 | `openxr:scroll_speed` | float | `1.0` | Thumbstick scroll multiplier on XR monitors. |
 | `openxr:inhibit_idle` | bool | `true` | Inhibit hypridle/idle while the session is `focused`. |
-| `openxr:destroy_monitors_on_stop` | bool | `true` | Destroy XR-created monitors when the session stops; if `false` they persist as plain headless outputs. |
+| `openxr:monitors_follow_session` | bool | `true` | XR monitors behave like **unplugged external monitors** while no OpenXR session exists: disabled from a sessionless login until the session starts (workspaces return by name, like replugging a display), unplugged again when it stops (workspaces evacuate). They linger disabled in `hyprctl monitors all`, like `monitor = NAME, disable`. `false` = always-present. |
+| `openxr:destroy_monitors_on_stop` | bool | `false` | Destroy XR-created monitors when the session stops instead of keeping them (unplugged / plain headless per `monitors_follow_session`). Declared `xrmonitor`s re-materialize on the next session start. |
 | `openxr:overlay` | bool | `false` | Run as an `XR_EXTX_overlay` session so your monitors composite **on top of another VR app** (a game, or `hypxrpaper`) instead of owning the view. Needs a runtime that supports `XR_EXTX_overlay` — Monado and WiVRn do; **SteamVR-Linux does not** (the session is created as a normal exclusive one, with a warning). Read at session start only (`hyprctl openxr disable && hyprctl openxr enable` to re-apply). See §8. |
 | `openxr:overlay_z` | int | `1` | Overlay stacking order (`sessionLayersPlacement`). Higher composites later / on top; the primary app is always beneath. Only meaningful with `openxr:overlay = 1`. Read at session start only. |
 

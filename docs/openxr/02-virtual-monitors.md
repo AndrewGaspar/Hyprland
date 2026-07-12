@@ -249,10 +249,12 @@ layer must tolerate a dead monitor ref between flag and ack (every frame-thread
 access already goes through `.lock()` guards).
 
 **C. Session stop (doc 01 teardown, after the join):** frame thread is gone, so no
-barrier needed. If `openxr:destroy_monitors_on_stop` (default 1): destroy every
+barrier needed. If `openxr:destroy_monitors_on_stop` (default 0): destroy every
 layer with `m_createdByXR` via the no-session path of (A). Else: keep the outputs
-running as plain headless monitors and keep the (now unbound) layer records for the
-next `start()`.
+and the layer records (swapchain unbound) for the next `start()` — and, with
+`openxr:monitors_follow_session` (default 1, research/18), UNPLUG them
+(`setMonitorsPlugged(false)` → `CMonitor::onDisconnect()`, the same evacuation a
+physical unplug runs) so a sessionless desktop has no phantom monitors.
 
 ## Layer-count limit
 
