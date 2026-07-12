@@ -29,6 +29,8 @@
 #include <variant>
 
 #include <sys/eventfd.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 #include <wayland-server-core.h>
 
@@ -58,6 +60,7 @@
 #include <aquamarine/backend/Backend.hpp>
 #include <aquamarine/backend/Headless.hpp>
 #include <aquamarine/buffer/Buffer.hpp>
+#include <aquamarine/allocator/Allocator.hpp>
 
 COpenXRManager::COpenXRManager() = default;
 
@@ -1460,9 +1463,13 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
         g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitoradded", params.m_name});
 
     // 7. If a session is running, the frame thread creates the swapchain on its next pass (it
-    //    already snapshots m_layers per frame, so no extra wakeup is needed).
-    if (m_running.load())
+    //    already snapshots m_layers per frame, so no extra wakeup is needed). Also decide now
+    //    whether this output must allocate LINEAR buffers for cross-GPU import (needs the XR EGL
+    //    node, only known while running; monitors created while stopped get this at bindExistingLayers).
+    if (m_running.load()) {
+        applyCrossGpuLinear(mon);
         layer->m_swapchainDirty.store(true, std::memory_order_release);
+    }
 
     // 8. Layer cap: a new quad may push the oldest past maxLayerCount (doc 02 recency policy).
     recomputeQuadActive();
@@ -1614,6 +1621,60 @@ void COpenXRManager::bindExistingLayers() {
     }
     for (auto& name : gone)
         finalizeLayerRemoval(name);
+
+    // Cross-GPU linear pass: now that the layers are bound (and EGL is up), decide per output
+    // whether its buffers must be linear for the XR GPU to import them.
+    {
+        std::vector<PHLMONITOR> mons;
+        {
+            std::scoped_lock lock(m_layersMu);
+            for (auto& l : m_layers)
+                if (auto mon = l->m_monitor.lock())
+                    mons.push_back(mon);
+        }
+        for (auto& mon : mons)
+            applyCrossGpuLinear(mon);
+    }
+}
+
+void COpenXRManager::applyCrossGpuLinear(const PHLMONITOR& mon) {
+    // Main thread. Only meaningful once the XR EGL context exists (its DRM node is the thing we
+    // compare against). Before a session is up we don't know the runtime GPU, so leave the output
+    // native — bindExistingLayers() re-runs this for every layer at start().
+    if (!mon || !mon->m_output || !m_graphics)
+        return;
+
+    static auto             PFORCE = CConfigValue<std::string>("openxr:force_linear");
+    const auto              mode   = OpenXR::parseForceLinearMode(*PFORCE); // main-thread string read (never near the frame thread)
+    const auto&             xrNode = m_graphics->selectedRenderNode();
+
+    // Resolve the output's buffer-allocator DRM device (same source isMultiGPU() uses).
+    int64_t allocMajor = -1, allocMinor = -1;
+    bool    allocValid = false;
+    if (auto backend = mon->m_output->getBackend()) {
+        if (auto alloc = backend->preferredAllocator(); alloc && alloc->drmFD() >= 0) {
+            struct stat st;
+            if (fstat(alloc->drmFD(), &st) == 0) {
+                allocMajor = (int64_t)major(st.st_rdev);
+                allocMinor = (int64_t)minor(st.st_rdev);
+                allocValid = true;
+            }
+        }
+    }
+
+    const bool force = OpenXR::shouldForceLinear(mode, xrNode.valid, xrNode.major, xrNode.minor, allocValid, allocMajor, allocMinor);
+
+    if (mon->m_forceLinearSwapchain == force)
+        return; // already in the desired state — no reconfigure churn
+
+    mon->m_forceLinearSwapchain = force;
+    // Rebuild the swapchain with the new modifier policy (idempotent — updateSwapchain() no-ops if
+    // nothing else changed, and it now compares multigpu so the flag flip actually takes).
+    mon->m_state.updateSwapchain();
+
+    Log::logger->log(Log::DEBUG,
+                     "[OPENXR] XR monitor '{}' buffers: {} (force_linear={}, XR drm {}:{} {}, allocator drm {}:{} {})", mon->m_name, force ? "LINEAR (cross-GPU import)" : "native tiling",
+                     *PFORCE, xrNode.major, xrNode.minor, xrNode.valid ? "valid" : "unknown", allocMajor, allocMinor, allocValid ? "valid" : "unknown");
 }
 
 void COpenXRManager::teardownLayers() {
@@ -2213,6 +2274,7 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
         if (auto mon = l->m_monitor.lock()) {
             info.id      = mon->m_id;
             info.plugged = mon->m_enabled; // research/18: unplugged (disabled) while sessionless
+            info.linear  = mon->m_forceLinearSwapchain; // cross-GPU linear-buffer state
             if (info.w == 0) {
                 info.w = (int)mon->m_pixelSize.x;
                 info.h = (int)mon->m_pixelSize.y;

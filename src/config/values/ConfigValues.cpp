@@ -716,6 +716,10 @@ std::vector<SP<IValue>> Values::getConfigValues() {
 
         MS<Bool>("openxr:enabled", "enable the OpenXR integration (session starts when a runtime is available)", false),
         MS<String>("openxr:gpu", "DRM render node to use for XR (e.g. /dev/dri/renderD128). Empty = follow Hyprland's primary GPU", ""),
+        MS<String>("openxr:force_linear",
+                   "allocate LINEAR buffers for XR monitors so the XR GPU can import them: auto (only when a cross-GPU split is detected, "
+                   "default) | on | off. Needed when openxr:gpu is a different GPU than the desktop renders on; costs some compositing throughput",
+                   "auto"),
         MS<String>("openxr:blend_mode", "environment blend mode: auto (runtime preferred) | opaque | alpha (passthrough) | additive. Read at session start", "auto"),
         MS<Float>("openxr:floor_offset", "fallback eye height in meters when the runtime lacks LOCAL_FLOOR", 1.5, {.min = 0.0, .max = 3.0}),
         MS<Float>("openxr:default_size", "default width of a new XR monitor quad, in meters", 1.6, {.min = 0.2, .max = 4.0}),
