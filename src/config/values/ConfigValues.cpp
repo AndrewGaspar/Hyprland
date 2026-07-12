@@ -811,13 +811,19 @@ std::vector<SP<IValue>> Values::getConfigValues() {
         MS<Color>("openxr:chrome_col_hover", "XR monitor chrome color for the element (bar or corner) the ray is pointing at", 0xcc66aaff),
         MS<Color>("openxr:chrome_col_grab", "XR monitor chrome color while the quad is grabbed", 0xff66aaff),
         MS<Bool>("openxr:inhibit_idle", "inhibit idle (hypridle etc.) while the XR session is focused", true),
-        MS<Bool>("openxr:monitors_follow_session",
-                 "XR-created virtual monitors behave like UNPLUGGED external monitors while no OpenXR session exists: held disabled (workspaces evacuate to the remaining "
-                 "monitors, exactly like a physical unplug) until a session starts, re-enabled (workspaces return by name) when it does. false restores the old always-present "
-                 "behavior. See also destroy_monitors_on_stop (research/18)",
-                 true),
+        MS<String>("openxr:monitors_follow_session",
+                   "when XR-created virtual monitors behave like UNPLUGGED external monitors (held disabled — workspaces evacuate to the remaining monitors exactly like a "
+                   "physical unplug, then return by name when re-plugged). off = never (the old always-present behavior); session = while no OpenXR session exists; visible "
+                   "(default) = while the session is not VISIBLE/FOCUSED, so a doffed/standby headset (whose runtime keeps a session alive) reads as unplugged. Unplugging on a "
+                   "visibility drop waits out monitor_unplug_grace_ms (anti-flap). Legacy 0/false => off, 1/true => session. See also destroy_monitors_on_stop (research/18)",
+                   "visible"),
+        MS<Int>("openxr:monitor_unplug_grace_ms",
+                "with monitors_follow_session = visible, how long the headset must stay doffed/standby (session not VISIBLE) before the XR monitors unplug and their workspaces "
+                "evacuate, in milliseconds. Absorbs a brief doff-and-don and proximity-sensor churn so a quick glance away never rearranges workspaces. Donning re-plugs "
+                "immediately regardless",
+                20000, {.min = 0, .max = 600000}),
         MS<Bool>("openxr:destroy_monitors_on_stop",
-                 "destroy XR-created virtual monitors when the session stops, instead of keeping them (unplugged when monitors_follow_session is set, plain headless outputs "
+                 "destroy XR-created virtual monitors when the session stops, instead of keeping them (unplugged when monitors_follow_session != off, plain headless outputs "
                  "otherwise). Declared xrmonitors re-materialize on the next session start",
                  false),
         MS<Bool>("openxr:overlay",

@@ -71,8 +71,9 @@ Add one block to `getConfigValues()` under a new `/* openxr: */` section comment
 | `openxr:grab_threshold_release` | `Float` | `0.4` | squeeze analog value that ends a grab (hysteresis) | hot-live |
 | `openxr:scroll_speed` | `Float` | `1.0` | multiplier for thumbstick scrolling on XR monitors | hot-live |
 | `openxr:inhibit_idle` | `Bool` | `true` | inhibit idle (hypridle etc.) while the XR session is focused | hot — triggers an idle recheck (§6) |
-| `openxr:monitors_follow_session` | `Bool` | `true` | XR-created monitors behave like UNPLUGGED external monitors while no session exists (research/18): created/held disabled when sessionless (workspaces evacuate through the ordinary hotplug path), enabled on session start (workspaces return by name). `false` = the old always-present behavior | hot — `setMonitorsPlugged()` re-asserts on reload/keyword |
-| `openxr:destroy_monitors_on_stop` | `Bool` | `false` | destroy XR-created virtual monitors when the session stops, instead of keeping them (unplugged under `monitors_follow_session`, plain headless outputs otherwise). The research/18 option-(a) escape hatch | hot-live (consulted at stop time) |
+| `openxr:monitors_follow_session` | `String` | `visible` | when XR-created monitors behave like UNPLUGGED external monitors (created/held disabled — workspaces evacuate — then re-enabled/returned by name as the headset comes and goes): `off` = never (old always-present behavior); `session` = while no session exists (research/18); `visible` = while the session is not VISIBLE/FOCUSED, so a doffed/standby headset reads as unplugged (report-18 addendum). Legacy `false/0`→off, `true/1`→session | hot — `updateMonitorsPlugged()` re-asserts on reload/keyword |
+| `openxr:monitor_unplug_grace_ms` | `Int` | `20000` | under `monitors_follow_session = visible`, ms the headset must stay doffed/standby (session not VISIBLE) before its monitors unplug and workspaces evacuate — anti-flap for a quick doff-and-don / proximity-sensor churn (report-18 addendum). Donning re-plugs immediately | hot-live (re-read at each arm) |
+| `openxr:destroy_monitors_on_stop` | `Bool` | `false` | destroy XR-created virtual monitors when the session stops, instead of keeping them (unplugged under `monitors_follow_session != off`, plain headless outputs otherwise). The research/18 option-(a) escape hatch | hot-live (consulted at stop time) |
 | `openxr:overlay` | `Bool` | `false` | run as an `XR_EXTX_overlay` session so monitors composite ON TOP of another XR client (a game, or `hypxrpaper`). Requires a runtime that advertises `XR_EXTX_overlay` (Monado/WiVRn); requested-but-unsupported downgrades to a normal exclusive session with a WARN, never failing startup (doc 01) | **start-only** — read at session start; changing it takes effect on the next start |
 | `openxr:overlay_z` | `Int` | `1` | overlay composition placement (`XR_EXTX_overlay` `sessionLayersPlacement`); higher composites later / on top. On Monado this maps straight into the layer `z_order` (primary pinned to `INT64_MIN`), so any value puts our quads above the primary | **start-only** — read at session start |
 
@@ -398,6 +399,7 @@ state: focused
 runtime: Monado(XRT) by Collabora et al.
 system: Simulated HMD
 blend mode: opaque
+monitors follow session: visible
 monitor XR-code (ID 3): 2560x1440@90.00 size 1.80m anchor local pos [0.00, 1.40, -1.50] grabbed: no (none) hovered: yes plugged: yes
 ```
 
@@ -411,6 +413,8 @@ present:
     "systemName": "Simulated HMD",
     "blendMode": "opaque",
     "overlay": false,
+    "monitorsFollowSession": "visible",
+    "monitorUnplugPendingMs": -1,
     "inhibitingIdle": true,
     "monitors": [
         {
@@ -452,11 +456,19 @@ present:
   end-to-end without polling wall-clock idle timers.
 - `id` — the Hyprland `MONITORID` of the backing headless output; `-1` if the output is not
   (yet) mapped.
-- `plugged` (research/18) — whether the backing headless output is currently enabled. With
-  `openxr:monitors_follow_session` (default) XR monitors are unplugged (disabled, workspaces
-  evacuated — like an unplugged external monitor) whenever no session exists, so this is
-  `false` in `disabled`/`unavailable` states and `true` while a session is up. Text form:
-  `plugged: yes|no`.
+- `plugged` (research/18 + report-18 addendum) — whether the backing headless output is currently
+  enabled. `openxr:monitors_follow_session` decides WHEN XR monitors are unplugged (disabled,
+  workspaces evacuated — like an unplugged external monitor): `off` = never; `session` = whenever
+  no session exists; `visible` (**default**) = whenever the session is not `VISIBLE`/`FOCUSED`, so
+  a doffed/standby headset (whose runtime keeps a session alive on the shelf) reads as unplugged.
+  Under `visible`, an unplug on a visibility drop is deferred by `openxr:monitor_unplug_grace_ms`
+  (default 20000) so a quick doff-and-don never evacuates workspaces; donning re-plugs immediately.
+  Text form: `plugged: yes|no`.
+- `monitorsFollowSession` (report-18 addendum) — the active follow mode: `off` | `session` |
+  `visible`. Text form: `monitors follow session: <mode>`.
+- `monitorUnplugPendingMs` (report-18 addendum) — ms remaining before a pending grace-period
+  unplug fires (headset doffed under `visible` mode), or `-1` when no unplug is pending. Text form
+  appends `(unplug in <n>ms)` to the follow-mode line while pending.
 - `anchor.mode` — `local` | `head` | `body` | `device:left` | `device:right`.
 - `anchor.pose` — for `local`: pose in LOCAL_FLOOR. For leashed/device modes: the configured
   offset in the leash frame as `pos` and the relative rotation as `quat`. **WP8 deviation (as

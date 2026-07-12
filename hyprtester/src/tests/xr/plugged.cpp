@@ -25,13 +25,21 @@ using namespace Hyprutils::OS;
 using namespace Hyprutils::Memory;
 #define SP CSharedPointer
 
-// research/18 WP-M4 — plugged-state round-trip. With openxr:monitors_follow_session (default 1)
-// and openxr:destroy_monitors_on_stop (default 0), XR monitors behave like unplugged external
-// monitors while no session exists: `openxr disable` UNPLUGS them (workspaces evacuate to the
-// remaining monitor, layers + anchors persist), `openxr enable` re-plugs them (workspaces return
-// by name). The suite's Hyprland boots WITH the runtime available, so the sessionless state is
-// driven via the disable/enable edge — the same setMonitorsPlugged() path init() takes on a
-// runtime-less boot.
+// research/18 WP-M4 — plugged-state round-trip on the session-EXISTENCE edge. These tests pin
+// openxr:monitors_follow_session = session so the round-trip is deterministic regardless of the
+// null/remote runtime's visibility behavior: `openxr disable` UNPLUGS the XR monitors (workspaces
+// evacuate to the remaining monitor, layers + anchors persist), `openxr enable` re-plugs them
+// (workspaces return by name). The suite's Hyprland boots WITH the runtime available, so the
+// sessionless state is driven via the disable/enable edge — the same setMonitorsPlugged() path
+// init() takes on a runtime-less boot.
+//
+// report-18 addendum: the SHIPPED default is `visible` (a doffed/standby headset reads as
+// unplugged, after openxr:monitor_unplug_grace_ms). That visibility gating + the anti-flap grace
+// cannot be exercised here — the monado null/remote driver cannot script headset don/doff
+// visibility transitions — so they are covered purely by the pure-logic gtests in tests/xr/
+// plugged.cpp (wantXRMonitorsPlugged / parseMonitorFollowMode truth tables). These suite tests
+// therefore pin `session` mode, which shares the exact same apply path (updateMonitorsPlugged ->
+// setMonitorsPlugged -> onConnect/onDisconnect).
 namespace {
     bool gateUp() {
         if (XR::waitForXrState("focused", std::chrono::milliseconds(15000)))
@@ -110,9 +118,11 @@ TEST_CASE(xr_plugged_follow_session) {
         const bool& failed;
         std::string testName;
         ~SGuard() {
-            // Always leave the shared instance with a running session for later tests.
+            // Always leave the shared instance with a running session AND the shipped default mode
+            // for later tests.
             getFromSocket("/openxr enable");
             XR::waitForXrState("focused", std::chrono::milliseconds(15000));
+            getFromSocket("/keyword openxr:monitors_follow_session visible");
             if (failed)
                 XR::dumpXrArtifacts(testName);
         }
@@ -123,6 +133,10 @@ TEST_CASE(xr_plugged_follow_session) {
         XR::logSkip(name(), "session never reached focused/visible (known env instability)");
         return;
     }
+
+    // Pin existence-gating (see the file header) so the disable/enable round-trip below is
+    // deterministic; the session is focused here, so this keeps the monitors plugged.
+    ASSERT(getFromSocket("/keyword openxr:monitors_follow_session session"), std::string("ok"));
 
     // (a) session up => the declared fixture is PLUGGED: in the default j/monitors list, and
     //     status reports plugged: true.
@@ -268,6 +282,7 @@ TEST_CASE(xr_plugged_create_while_sessionless) {
             XR::waitForXrState("focused", std::chrono::milliseconds(15000));
             if (!monitorName.empty())
                 getFromSocket("/openxr destroy " + monitorName);
+            getFromSocket("/keyword openxr:monitors_follow_session visible");
             if (failed)
                 XR::dumpXrArtifacts(testName);
         }
@@ -278,6 +293,10 @@ TEST_CASE(xr_plugged_create_while_sessionless) {
         XR::logSkip(name(), "session never reached focused/visible (known env instability)");
         return;
     }
+
+    // Pin existence-gating (see the file header) so a sessionless create is deterministically
+    // unplugged and a session start plugs it in, independent of the null runtime's visibility.
+    ASSERT(getFromSocket("/keyword openxr:monitors_follow_session session"), std::string("ok"));
 
     ASSERT(getFromSocket("/openxr disable"), std::string("ok"));
     ASSERT(XR::waitForXrState("disabled", std::chrono::milliseconds(10000)), true);
