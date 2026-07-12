@@ -2,6 +2,7 @@
 #ifdef HAVE_OPENXR
 
 #include <EGL/egl.h> // EGLDisplay, EGLContext, EGLConfig, EGL_NO_DISPLAY, EGL_NO_CONTEXT
+#include <cstdint>
 #include <string>
 
 #include "../helpers/memory/Memory.hpp"
@@ -76,14 +77,25 @@ class CXRGraphics {
     // composites TEXTURE_SOURCE_ALPHA). Only touches margin pixels — never the content rect.
     void drawChrome(CXRMonitorLayer& layer, XR_GLuint dstTex, float alpha, uint8_t hoverRegion, bool grabbed);
 
-    // RAII guard: ctor eglMakeCurrent(m_xrContext), dtor eglMakeCurrent(EGL_NO_CONTEXT).
-    // The ONLY sanctioned way GL work is issued — see doc 01 "EGL context ownership".
+    // RAII guard for an XR GL burst. ctor makes the XR context current; dtor RESTORES whatever
+    // EGL binding was current before the burst (WP-L1, research doc 17 §5) instead of blindly
+    // dropping to EGL_NO_CONTEXT. The old unconditional unbind left Hyprland's renderer to lazily
+    // re-bind — survivable on the NVIDIA pin, but on a shared GPU it let the desktop renderer run
+    // against a stale/empty binding, a candidate for the on-toggle host-monitor corruption. The
+    // restore never re-binds the XR context itself (see the dtor) so the interop contract holds
+    // (the runtime binds the XR context itself; a lingering XR context crashes AMD gallium) and
+    // the frame thread can still claim it. The ONLY sanctioned way GL work is issued — see doc 01.
     struct CScopedGLContext {
         explicit CScopedGLContext(CXRGraphics& gfx);
         ~CScopedGLContext();
         CScopedGLContext(const CScopedGLContext&)            = delete;
         CScopedGLContext& operator=(const CScopedGLContext&) = delete;
         CXRGraphics& m_gfx;
+        // Previously-current EGL binding, captured in the ctor, restored in the dtor.
+        EGLDisplay m_savedDisplay = EGL_NO_DISPLAY;
+        EGLSurface m_savedDraw    = EGL_NO_SURFACE;
+        EGLSurface m_savedRead    = EGL_NO_SURFACE;
+        EGLContext m_savedContext = EGL_NO_CONTEXT;
     };
 
     EGLDisplay         m_eglDisplay  = EGL_NO_DISPLAY;
@@ -103,10 +115,27 @@ class CXRGraphics {
     XR_GLuint m_blitVAO  = 0; // dummy VAO for the fullscreen triangle
     XR_GLuint m_extTex   = 0; // GL_TEXTURE_EXTERNAL_OES, rebound per DMA-BUF blit
 
+    // The DRM render node the XR EGL context landed on (wrong-GPU fail-closed guard). Populated by
+    // selectDisplay when we open our own GBM device; `valid` is false on the shared-display
+    // fallback (no dedicated node to compare). major/minor are the node's device numbers, compared
+    // in start() against the runtime's render node (OpenXR::probeRuntimeRenderNode) — a mismatch
+    // means cross-GPU import, which crashes the driver, so start() fails closed.
+    struct SXRRenderNode {
+        std::string path;
+        int64_t     major = -1;
+        int64_t     minor = -1;
+        bool        valid = false;
+    };
+    const SXRRenderNode& selectedRenderNode() const {
+        return m_selectedNode;
+    }
+
   private:
     // Picks m_eglDisplay (+ m_gbmOwned/m_gbmFd when we own it). WIP GPU-selection port,
     // default adapted to "match Hyprland's primary GPU render node".
     bool selectDisplay(const std::string& gpuOverride);
+
+    SXRRenderNode m_selectedNode;
 };
 
 #endif // HAVE_OPENXR
