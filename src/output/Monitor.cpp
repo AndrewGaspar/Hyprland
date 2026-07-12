@@ -2673,14 +2673,19 @@ bool CMonitorState::updateSwapchain() {
         return true;
     }
 
-    if (OPTIONS.format == m_owner->m_drmFormat && OPTIONS.scanout && OPTIONS.length == 3 && OPTIONS.size == MODE->pixelSize)
+    // multigpu forces the allocator to LINEAR — set on XR-bound headless outputs whose buffers are
+    // imported by a different GPU (m_forceLinearSwapchain). Compared here so flipping the flag
+    // actually triggers a reconfigure instead of being swallowed by the no-op early-out.
+    const bool forceLinear = m_owner->m_forceLinearSwapchain;
+    if (OPTIONS.format == m_owner->m_drmFormat && OPTIONS.scanout && OPTIONS.length == 3 && OPTIONS.size == MODE->pixelSize && OPTIONS.multigpu == forceLinear)
         return true;
 
-    auto options    = OPTIONS;
-    options.format  = m_owner->m_drmFormat;
-    options.scanout = true;
-    options.length  = 3;
-    options.size    = MODE->pixelSize;
+    auto options     = OPTIONS;
+    options.format   = m_owner->m_drmFormat;
+    options.scanout  = true;
+    options.length   = 3;
+    options.size     = MODE->pixelSize;
+    options.multigpu = forceLinear;
     return m_owner->m_output->swapchain->reconfigure(options);
 }
 void CMonitorState::applyModeWithSwapchain(const SP<Aquamarine::SOutputMode>& mode) {

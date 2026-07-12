@@ -48,7 +48,9 @@ order), `docs/openxr/research/18-*` (sibling: monitor plugged-state).
    fallback chain then paints the quad **opaque black** (`XRGraphics.cpp:477-491`): session FOCUSED,
    monitors composited, content black. A concrete contributing bug: our import attribs **never pass
    the dmabuf modifier** (`XRGraphics.cpp:371-398`) — NVIDIA's EGL rejects implicit-modifier
-   imports, so even LINEAR buffers (which the headless outputs get, log-verified) fail.
+   imports. (Correction 2026-07-12: the buffers were assumed LINEAR here, but the live fishfood
+   buffers are actually AMD-tiled `0x0200…` — see §4.1 box — so passing modifiers was necessary but
+   not sufficient; the buffers also had to be forced LINEAR via `openxr:force_linear`.)
 
 3. **Host-monitor corruption on toggle (bug a)** has no surviving logs (gated off + instance dir
    rotated), but code analysis yields one high-confidence mechanism: main-thread XR GL bursts run
@@ -301,6 +303,16 @@ DEBUG from aquamarine ]: Created a GBM allocator with drm fd 18
 DEBUG from aquamarine ]: GBM: Allocated a new buffer with size [Vector2D: x: 1920, y: 1080] and format XR24 with modifier 0x0 : LINEAR
 ```
 
+> **Correction (2026-07-12, after B1/WP-L2 shipped).** This LINEAR observation was NOT
+> representative of the failing fishfood session. Once modifiers were actually passed (commit
+> b93279dd), the live log showed the headless XR output's buffers carry **AMD-tiled** modifier
+> `0x0200000104abb04` (vendor 0x02, DCC, 2 planes) — the compositor renders on the AMD iGPU and
+> aquamarine picks its native tiling, not LINEAR. NVIDIA's EGL correctly rejects the foreign
+> vendor tiling with `EGL_BAD_ATTRIBUTE`. So B1 alone is insufficient on this box and B2 (below) is
+> **required**, not a no-op guard. Fixed by `openxr:force_linear` (auto): when the XR EGL node ≠ the
+> buffer allocator node, the XR output's aquamarine swapchain is reconfigured with
+> `SSwapchainOptions::multigpu` (forces `DRM_FORMAT_MOD_LINEAR`), which NVIDIA imports fine.
+
 ### 4.2 The failing import and the black fallback
 
 `CXRGraphics::blitBuffer()` (`XRGraphics.cpp:326-492`), per presented buffer:
@@ -314,9 +326,10 @@ DEBUG from aquamarine ]: GBM: Allocated a new buffer with size [Vector2D: x: 192
    - **Missing modifier attribs (concrete bug, fix WP-L2)**: the list never includes
      `EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT/HI_EXT` even though aquamarine's dmabuf attrs carry the
      modifier. Implicit-modifier import is a Mesa courtesy; **NVIDIA's EGL requires explicit
-     modifiers** and fails exactly with `EGL_BAD_ATTRIBUTE` otherwise — *even for LINEAR buffers*,
-     which is what these are (modifier `0x0` in the log). On AMD-only boxes we never noticed
-     because Mesa accepts implicit imports from its own driver.
+     modifiers** and fails exactly with `EGL_BAD_ATTRIBUTE` otherwise — *even for LINEAR buffers*.
+     On AMD-only boxes we never noticed because Mesa accepts implicit imports from its own driver.
+     (Correction, see §4.1 box: the live fishfood buffers are NOT LINEAR but AMD-tiled `0x0200…`;
+     passing modifiers is still necessary but not sufficient cross-GPU — hence B2/`openxr:force_linear`.)
 2. **CPU data-pointer fallback** (`:428-475`): requires `BUFFER_CAPABILITY_DATAPTR`; GBM-allocated
    buffers don't have it → skipped.
 3. **Clear fallback** (`:477-491`): scissors to the content rect and clears **opaque black**
@@ -352,7 +365,7 @@ flavor must land in UNAVAILABLE, never crash.
 | option | idea | verdict |
 |---|---|---|
 | **B1. Pass explicit modifiers** | Append `EGL_DMA_BUF_PLANE0_MODIFIER_LO/HI_EXT` (and per-plane) from aquamarine's dmabuf attrs when the modifier is not INVALID | **Do first.** Small, correct on all vendors, and is the difference between "NVIDIA rejects everything" and "NVIDIA imports LINEAR". Keep the no-modifier attempt as fallback for drivers without `EXT_image_dma_buf_import_modifiers`. |
-| B2. Force LINEAR allocation for XR outputs when `openxr:gpu` ≠ compositor node | Headless output swapchain hints; LINEAR is the only layout both vendors agree on | Complements B1; the log shows the allocator already picks LINEAR for headless targets today, so likely a no-op guard — assert/log it rather than force it until proven otherwise. |
+| B2. Force LINEAR allocation for XR outputs when `openxr:gpu` ≠ compositor node | Headless output swapchain hints; LINEAR is the only layout both vendors agree on | **SHIPPED (`openxr:force_linear`, 2026-07-12).** NOT a no-op guard: the live buffers are AMD-tiled, not LINEAR, so B1 alone leaves a black quad. `applyCrossGpuLinear` sets `CMonitor::m_forceLinearSwapchain` → `SSwapchainOptions::multigpu` when the XR EGL node differs from the buffer allocator node; `auto`/`on`/`off`. |
 | B3. CPU round-trip fallback via `gbm_bo_map` | When import fails and the buffer is LINEAR, map the dmabuf and drive the existing CPU-staging path (`:428`) | Correctness backstop (a slow desktop beats a black one), bounded cost at 2560x1440@90 is real (~1.3 GB/s memcpy) — gate behind a log-once WARN and consider frame-skipping. |
 | B4. Log-once + status surface | First import failure per layer logs once with the fourcc/modifier/EGL error; per-frame repeats silenced; status shows the content-path state | Part of WP-L6; makes B1-B3 diagnosable in the field. |
 
