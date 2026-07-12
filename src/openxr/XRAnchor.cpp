@@ -167,6 +167,15 @@ void CXRAnchor::initFromState(const SXRAnchorState& state) {
     m_grabHandActive     = false;
     m_carryFilter.reset();
     m_resizing           = false;
+    // adaptive runtime reset (the config in m_state.adaptive is preserved; the phase machine is not).
+    m_adPhase            = XRAD_DOCKED;
+    m_dockSeatCaptured   = false;
+    m_outDwell           = 0.F;
+    m_inDwell            = 0.F;
+    m_adT                = 0.F;
+    m_seedLeashAtTarget  = false;
+    m_adRoamRuntimeSet   = false;
+    m_adLeftSinceDock    = false;
     // m_lastWorld / m_hasLastWorld intentionally preserved: switching representation of an
     // existing on-screen quad should not lose where it currently is.
 }
@@ -259,6 +268,20 @@ SXRSolveResult CXRAnchor::solve(const SXRSolveInput& in, const SXRAnchorTuning& 
         return res;
     }
 
+    // Adaptive anchoring decorator (research/13 §4.1): a LOCAL anchor that adaptively picks up and
+    // follows the head, then re-docks. Runs only when enabled and not grabbed (the grab override
+    // above returned first — a grab always wins over adaptive, §5.1). Short-circuits the mode switch;
+    // it always submits a LOCAL_FLOOR world pose.
+    if (m_state.adaptive.enabled) {
+        const SXRPose W = adaptiveStep(in, tune);
+        res.space       = XR_SPACE_LOCAL_FLOOR;
+        res.pose        = W;
+        res.worldPose   = W;
+        m_lastWorld     = W;
+        m_hasLastWorld  = true;
+        return res;
+    }
+
     switch (m_state.mode) {
         case XR_ANCHOR_LOCAL: {
             res.space     = XR_SPACE_LOCAL_FLOOR;
@@ -267,87 +290,10 @@ SXRSolveResult CXRAnchor::solve(const SXRSolveInput& in, const SXRAnchorTuning& 
             break;
         }
 
-        case XR_ANCHOR_HEAD: {
-            const SXRPose& O = m_state.anchorPose;
-            const SXRPose  T = poseCompose(in.view, O);
-
-            if (!m_springInit) {
-                m_springPos   = m_hasLastWorld ? m_lastWorld.pos : T.pos;
-                m_springVel   = Vec3{};
-                m_smoothedRot = lookAtNoRoll(m_springPos, in.view.pos, m_state.anchorPose.rot);
-                m_chasing     = false;
-                m_springInit  = true;
-            }
-
-            const Vec3& h      = in.view.pos;
-            const Vec3  dCur   = (m_springPos - h);
-            const Vec3  dTgt   = (T.pos - h);
-            float       angDev = 0.F;
-            if (dCur.length() > 1e-4F && dTgt.length() > 1e-4F)
-                angDev = std::acos(std::clamp(dCur.normalized().dot(dTgt.normalized()), -1.F, 1.F));
-            const float posDev = (m_springPos - T.pos).length();
-
-            if (!m_chasing && (angDev > tune.deadzoneAngleRad || posDev > tune.deadzoneDistance))
-                m_chasing = true;
-
-            if (m_chasing) {
-                springStep(m_springPos, m_springVel, T.pos, tune.leashResponse, dt);
-                if ((m_springPos - T.pos).length() < XR_LEASH_SETTLE_POS) {
-                    m_chasing   = false;
-                    m_springVel = Vec3{};
-                }
-            } else
-                m_springVel = Vec3{};
-
-            const Quat  R_target = lookAtNoRoll(m_springPos, in.view.pos, m_smoothedRot);
-            const float alpha    = 1.F - std::exp(-dt / tune.leashResponse);
-            m_smoothedRot        = qSlerp(m_smoothedRot, R_target, alpha);
-
-            res.space     = XR_SPACE_LOCAL_FLOOR;
-            res.pose      = SXRPose{m_springPos, m_smoothedRot};
-            res.worldPose = res.pose;
-            break;
-        }
-
+        case XR_ANCHOR_HEAD:
         case XR_ANCHOR_BODY: {
-            if (!m_bodyHeightCaptured) {
-                m_state.bodyHeight   = in.view.pos.y;
-                m_bodyHeightCaptured = true;
-            }
-            const SXRPose  bodyFrame = computeBodyFrame(in.view, tune, true);
-            const SXRPose& O         = m_state.anchorPose;
-            const SXRPose  T         = poseCompose(bodyFrame, O);
-
-            if (!m_springInit) {
-                m_springPos   = m_hasLastWorld ? m_lastWorld.pos : T.pos;
-                m_springVel   = Vec3{};
-                m_smoothedRot = qFromYaw(qYawOf(qMul(bodyFrame.rot, O.rot), m_lastYaw));
-                m_chasing     = false;
-                m_springInit  = true;
-            }
-
-            const float posDev = (m_springPos - T.pos).length();
-            const float angDev = std::fabs(wrapPi(qYawOf(m_smoothedRot, m_lastYaw) - qYawOf(T.rot, m_lastYaw)));
-
-            if (!m_chasing && (posDev > tune.deadzoneDistance || angDev > tune.deadzoneAngleRad))
-                m_chasing = true;
-
-            if (m_chasing) {
-                springStep(m_springPos, m_springVel, T.pos, tune.leashResponse, dt);
-                if ((m_springPos - T.pos).length() < XR_LEASH_SETTLE_POS) {
-                    m_chasing   = false;
-                    m_springVel = Vec3{};
-                }
-            } else
-                m_springVel = Vec3{};
-
-            const float targetYaw = qYawOf(qMul(bodyFrame.rot, O.rot), m_lastYaw);
-            const Quat  R_target  = qFromYaw(targetYaw);
-            const float alpha     = 1.F - std::exp(-dt / tune.leashResponse);
-            m_smoothedRot         = qSlerp(m_smoothedRot, R_target, alpha);
-
             res.space     = XR_SPACE_LOCAL_FLOOR;
-            res.pose      = SXRPose{m_springPos, m_smoothedRot};
+            res.pose      = solveLeash(m_state.mode, m_state.anchorPose, in, tune, false);
             res.worldPose = res.pose;
             break;
         }
@@ -384,6 +330,273 @@ SXRSolveResult CXRAnchor::solve(const SXRSolveInput& in, const SXRAnchorTuning& 
     return res;
 }
 
+// ---- head/body leash solve (shared by the normal path + adaptive roam, research/13 §4.3) ----
+
+SXRPose CXRAnchor::solveLeash(eXRAnchorMode mode, const SXRPose& O, const SXRSolveInput& in, const SXRAnchorTuning& tune, bool seedAtTarget) {
+    const float dt = std::clamp(in.dt, 0.F, XR_SOLVE_DT_MAX);
+
+    if (mode == XR_ANCHOR_HEAD) {
+        const SXRPose T = poseCompose(in.view, O);
+
+        if (!m_springInit) {
+            m_springPos   = (seedAtTarget || !m_hasLastWorld) ? T.pos : m_lastWorld.pos;
+            m_springVel   = Vec3{};
+            m_smoothedRot = lookAtNoRoll(m_springPos, in.view.pos, O.rot);
+            m_chasing     = false;
+            m_springInit  = true;
+        }
+
+        const Vec3& h      = in.view.pos;
+        const Vec3  dCur   = (m_springPos - h);
+        const Vec3  dTgt   = (T.pos - h);
+        float       angDev = 0.F;
+        if (dCur.length() > 1e-4F && dTgt.length() > 1e-4F)
+            angDev = std::acos(std::clamp(dCur.normalized().dot(dTgt.normalized()), -1.F, 1.F));
+        const float posDev = (m_springPos - T.pos).length();
+
+        if (!m_chasing && (angDev > tune.deadzoneAngleRad || posDev > tune.deadzoneDistance))
+            m_chasing = true;
+
+        if (m_chasing) {
+            springStep(m_springPos, m_springVel, T.pos, tune.leashResponse, dt);
+            if ((m_springPos - T.pos).length() < XR_LEASH_SETTLE_POS) {
+                m_chasing   = false;
+                m_springVel = Vec3{};
+            }
+        } else
+            m_springVel = Vec3{};
+
+        const Quat  R_target = lookAtNoRoll(m_springPos, in.view.pos, m_smoothedRot);
+        const float alpha    = 1.F - std::exp(-dt / tune.leashResponse);
+        m_smoothedRot        = qSlerp(m_smoothedRot, R_target, alpha);
+        return SXRPose{m_springPos, m_smoothedRot};
+    }
+
+    // XR_ANCHOR_BODY
+    if (!m_bodyHeightCaptured) {
+        m_state.bodyHeight   = in.view.pos.y;
+        m_bodyHeightCaptured = true;
+    }
+    const SXRPose bodyFrame = computeBodyFrame(in.view, tune, true);
+    const SXRPose T         = poseCompose(bodyFrame, O);
+
+    if (!m_springInit) {
+        m_springPos   = (seedAtTarget || !m_hasLastWorld) ? T.pos : m_lastWorld.pos;
+        m_springVel   = Vec3{};
+        m_smoothedRot = qFromYaw(qYawOf(qMul(bodyFrame.rot, O.rot), m_lastYaw));
+        m_chasing     = false;
+        m_springInit  = true;
+    }
+
+    const float posDev = (m_springPos - T.pos).length();
+    const float angDev = std::fabs(wrapPi(qYawOf(m_smoothedRot, m_lastYaw) - qYawOf(T.rot, m_lastYaw)));
+
+    if (!m_chasing && (posDev > tune.deadzoneDistance || angDev > tune.deadzoneAngleRad))
+        m_chasing = true;
+
+    if (m_chasing) {
+        springStep(m_springPos, m_springVel, T.pos, tune.leashResponse, dt);
+        if ((m_springPos - T.pos).length() < XR_LEASH_SETTLE_POS) {
+            m_chasing   = false;
+            m_springVel = Vec3{};
+        }
+    } else
+        m_springVel = Vec3{};
+
+    const float targetYaw = qYawOf(qMul(bodyFrame.rot, O.rot), m_lastYaw);
+    const Quat  R_target  = qFromYaw(targetYaw);
+    const float alpha     = 1.F - std::exp(-dt / tune.leashResponse);
+    m_smoothedRot         = qSlerp(m_smoothedRot, R_target, alpha);
+    return SXRPose{m_springPos, m_smoothedRot};
+}
+
+// ---- adaptive anchoring (research/13 §4) ----
+
+SXRPose CXRAnchor::adaptiveRoamOffset(const SXRAnchorTuning& tune) const {
+    if (m_adRoamRuntimeSet)
+        return m_adRoamOffset; // carry-current-offset captured at undock
+    if (m_state.adaptive.hasRoamOffset)
+        return m_state.adaptive.roamOffset;
+    // Default comfortable follow offset: straight ahead at the default distance. For HEAD this is a
+    // view-space offset (y=0 keeps it at eye level); for BODY the y is relative to the captured body
+    // height (≈ head height). solveLeash builds the look-at / yaw orientation, so rot stays identity.
+    return SXRPose{Vec3{0.F, 0.F, -tune.defaultDistance}, Quat{0.F, 0.F, 0.F, 1.F}};
+}
+
+void CXRAnchor::captureCarryOffset(const SXRSolveInput& in, const SXRAnchorTuning& tune) {
+    // Express the current desk world pose as an offset in the roam frame so the follower keeps its
+    // head-relative placement from the desk (research/13 §4.4). Ephemeral (runtime), cleared on redock.
+    const SXRPose W = m_state.anchorPose;
+    if (effectiveRoamMode(tune) == XR_ANCHOR_HEAD)
+        m_adRoamOffset = poseCompose(poseInverse(in.view), W);
+    else {
+        const SXRPose bodyFrame = computeBodyFrame(in.view, tune, false);
+        m_adRoamOffset          = poseCompose(poseInverse(bodyFrame), W);
+        m_adRoamOffset.rot      = qFromYaw(qYawOf(m_adRoamOffset.rot, 0.F));
+    }
+    m_adRoamRuntimeSet = true;
+}
+
+void CXRAnchor::beginUndock(const SXRPose& fromPose) {
+    m_adFrom            = fromPose;
+    m_adT               = 0.F;
+    m_adPhase           = XRAD_UNDOCKING;
+    m_outDwell          = 0.F;
+    m_inDwell           = 0.F;
+    m_springInit         = false; // reseed the roam spring at its target -> no kick on hand-off
+    m_seedLeashAtTarget  = true;
+    m_bodyHeightCaptured = false; // recapture the comfortable roam height now (no-op for head roam)
+}
+
+void CXRAnchor::beginRedock(const SXRPose& fromPose) {
+    m_adFrom   = fromPose;
+    m_adT      = 0.F;
+    m_adPhase  = XRAD_REDOCKING;
+    m_outDwell = 0.F;
+    m_inDwell  = 0.F;
+}
+
+SXRPose CXRAnchor::adaptiveStep(const SXRSolveInput& in, const SXRAnchorTuning& tune) {
+    const float                dt  = std::clamp(in.dt, 0.F, XR_SOLVE_DT_MAX);
+    const SXRAdaptiveConfig&   cfg = m_state.adaptive;
+
+    // Effective geofence radii: per-monitor override (>=0) else the global tuning.
+    const float         rOut      = cfg.leaveRadius >= 0.F ? cfg.leaveRadius : tune.adLeaveRadius;
+    const float         rIn       = cfg.returnRadius >= 0.F ? cfg.returnRadius : tune.adReturnRadius;
+    const eXRAnchorMode roamMode  = effectiveRoamMode(tune);
+    const SXRPose       roamOff   = adaptiveRoamOffset(tune);
+    const bool          effCarry  = cfg.carryOverride ? cfg.carryOffset : tune.adCarryOffset;
+    const SXRPose       dockPose  = m_state.anchorPose; // the persistent desk pose (LOCAL identity)
+
+    // Seat capture: the head position the instant the monitor is DOCKED with a valid view (§3.1).
+    if (!m_dockSeatCaptured && m_adPhase == XRAD_DOCKED) {
+        m_dockHeadPos      = in.view.pos;
+        m_dockSeatCaptured = true;
+    }
+    // Geofence distance from the desk seat (XZ by default so standing up doesn't undock, §3.1).
+    const float d    = m_dockSeatCaptured ? (tune.adUseHeight ? dist3(in.view.pos, m_dockHeadPos) : horizDistXZ(in.view.pos, m_dockHeadPos)) : 0.F;
+    m_adSeatDist     = d;
+    const bool  gate = m_dockSeatCaptured; // don't transition until a seat exists
+
+    // Latch "the user has actually left the desk since docking" once the head crosses R_out. Auto-
+    // redock (and the undock->redock reverse) is gated on this, so a manual/forced undock while still
+    // sitting at the desk stays roaming instead of instantly snapping back (the geofence would
+    // otherwise see d<R_in and re-dock). A real walk-out sets it naturally (d>R_out triggered undock).
+    if (gate && d > rOut)
+        m_adLeftSinceDock = true;
+    const bool wantReturn = gate && m_adLeftSinceDock;
+
+    SXRPose W;
+    switch (m_adPhase) {
+        case XRAD_DOCKED: {
+            W = dockPose;
+            if (gate && dwellStep(d > rOut, m_outDwell, dt, tune.adLeaveDwell)) {
+                if (effCarry)
+                    captureCarryOffset(in, tune);
+                beginUndock(W);
+            }
+            break;
+        }
+        case XRAD_UNDOCKING: {
+            m_adT               = envAdvance(m_adT, dt, tune.adTransition);
+            const SXRPose to    = solveLeash(roamMode, roamOff, in, tune, m_seedLeashAtTarget);
+            m_seedLeashAtTarget = false;
+            W                   = lerpPose(m_adFrom, to, easeApply(tune.adEase, m_adT));
+            // Reverse interrupt: returned inside R_in for T_in — head back to the desk, keep progress.
+            if (wantReturn && dwellStep(d < rIn, m_inDwell, dt, tune.adReturnDwell)) {
+                m_adFrom   = W;
+                m_adT      = 1.F - m_adT;
+                m_adPhase  = XRAD_REDOCKING;
+                m_outDwell = 0.F;
+            } else if (m_adT >= 1.F) {
+                m_adPhase = XRAD_ROAMING;
+                m_inDwell = 0.F;
+            }
+            break;
+        }
+        case XRAD_ROAMING: {
+            W = solveLeash(roamMode, roamOff, in, tune, false);
+            if (wantReturn && dwellStep(d < rIn, m_inDwell, dt, tune.adReturnDwell))
+                beginRedock(W);
+            break;
+        }
+        case XRAD_REDOCKING: {
+            m_adT = envAdvance(m_adT, dt, tune.adTransition);
+            W     = lerpPose(m_adFrom, dockPose, easeApply(tune.adEase, m_adT));
+            // Reverse interrupt: left again past R_out for T_out — peel back off toward roam.
+            if (gate && dwellStep(d > rOut, m_outDwell, dt, tune.adLeaveDwell)) {
+                m_adFrom            = W;
+                m_adT               = 1.F - m_adT;
+                m_adPhase           = XRAD_UNDOCKING;
+                m_inDwell           = 0.F;
+                m_springInit        = false; // reseed the roam spring
+                m_seedLeashAtTarget = true;
+                if (roamMode == XR_ANCHOR_BODY)
+                    m_bodyHeightCaptured = false;
+            } else if (m_adT >= 1.F) {
+                m_adPhase          = XRAD_DOCKED;
+                m_state.anchorPose = dockPose; // reassert the exact desk pose
+                m_outDwell         = 0.F;
+                m_adRoamRuntimeSet = false; // drop any carry offset; recapture on the next undock
+                m_adLeftSinceDock  = false; // re-arm the "left the desk" latch for the next cycle
+            }
+            break;
+        }
+    }
+    return W;
+}
+
+void CXRAnchor::adaptiveSetEnabled(bool en) {
+    m_state.adaptive.enabled = en;
+    m_adPhase                = XRAD_DOCKED;
+    m_adT                    = 0.F;
+    m_outDwell               = 0.F;
+    m_inDwell                = 0.F;
+    m_dockSeatCaptured       = false; // recapture on the next valid-view solve
+    m_adRoamRuntimeSet       = false;
+    m_adLeftSinceDock        = false;
+}
+
+void CXRAnchor::adaptiveForceUndock() {
+    if (!m_state.adaptive.enabled)
+        return;
+    if (m_adPhase == XRAD_ROAMING || m_adPhase == XRAD_UNDOCKING)
+        return;
+    beginUndock(m_hasLastWorld ? m_lastWorld : m_state.anchorPose);
+}
+
+void CXRAnchor::adaptiveForceDock() {
+    if (!m_state.adaptive.enabled)
+        return;
+    if (m_adPhase == XRAD_DOCKED || m_adPhase == XRAD_REDOCKING)
+        return;
+    beginRedock(m_hasLastWorld ? m_lastWorld : m_state.anchorPose);
+}
+
+void CXRAnchor::adaptiveDockHere() {
+    // Redefine the desk pose to the current displayed pose and recapture the seat next frame.
+    if (m_hasLastWorld)
+        m_state.anchorPose = m_lastWorld;
+    m_adPhase          = XRAD_DOCKED;
+    m_adT              = 0.F;
+    m_outDwell         = 0.F;
+    m_inDwell          = 0.F;
+    m_dockSeatCaptured = false;
+    m_adRoamRuntimeSet = false;
+    m_adLeftSinceDock  = false;
+}
+
+void CXRAnchor::adaptiveSetRoamMode(eXRAnchorMode m) {
+    if (m != XR_ANCHOR_HEAD && m != XR_ANCHOR_BODY)
+        return;
+    m_state.adaptive.roamMode    = m;
+    m_state.adaptive.roamModeSet = true;
+    // Reseed the leash for the new mode on the next roam frame (no kick).
+    m_springInit         = false;
+    m_bodyHeightCaptured = false;
+    m_seedLeashAtTarget  = true;
+}
+
 // ---- grab pose math (§4) ----
 
 void CXRAnchor::beginGrab(eXRHand hand, const SXRPose& deviceWorld, bool usePinch, bool handActive) {
@@ -395,6 +608,19 @@ void CXRAnchor::beginGrab(eXRHand hand, const SXRPose& deviceWorld, bool usePinc
     m_grabPinch      = usePinch;
     m_grabHandActive = handActive; // WP-G6: eligible for the 1€ carry filter
     m_carryFilter.reset();         // fresh smoothing each grab (no carry-over from a prior grab)
+
+    // Adaptive: a grab suspends the geofence (the grab override returns before adaptiveStep). If a
+    // transition is mid-flight, settle it to the nearer endpoint now so the release resolves cleanly
+    // into a stable DOCKED/ROAMING representation (research/13 §5.1), and reset the dwell timers.
+    if (m_state.adaptive.enabled) {
+        if (m_adPhase == XRAD_UNDOCKING)
+            m_adPhase = m_adT >= 0.5F ? XRAD_ROAMING : XRAD_DOCKED;
+        else if (m_adPhase == XRAD_REDOCKING)
+            m_adPhase = m_adT >= 0.5F ? XRAD_DOCKED : XRAD_ROAMING;
+        m_adT      = 0.F;
+        m_outDwell = 0.F;
+        m_inDwell  = 0.F;
+    }
 }
 
 void CXRAnchor::grabPushPull(float deltaMeters) {
@@ -499,7 +725,34 @@ void CXRAnchor::endGrab(const SXRPose& releaseWorld, const SXRSolveInput& in, co
     reanchorFromWorld(releaseWorld, ctx, tune);
 }
 
+void CXRAnchor::reanchorRoam(const SXRPose& W, const SXRVerbContext& ctx, const SXRAnchorTuning& tune) {
+    // Re-express a released world pose into the roam frame, updating the (runtime) roam offset and
+    // re-seeding the leash spring so ROAM continues from where the user let go (research/13 §5.1).
+    const eXRAnchorMode roamMode = effectiveRoamMode(tune);
+    if (roamMode == XR_ANCHOR_HEAD) {
+        if (ctx.viewValid)
+            m_adRoamOffset = poseCompose(poseInverse(ctx.view), W);
+        m_smoothedRot = lookAtNoRoll(W.pos, ctx.view.pos, W.rot);
+    } else {
+        const SXRPose bodyFrame = computeBodyFrame(ctx.view, tune, false);
+        m_adRoamOffset          = poseCompose(poseInverse(bodyFrame), W);
+        m_adRoamOffset.rot      = qFromYaw(qYawOf(m_adRoamOffset.rot, 0.F));
+        m_smoothedRot           = qFromYaw(qYawOf(qMul(bodyFrame.rot, m_adRoamOffset.rot), m_lastYaw));
+    }
+    m_adRoamRuntimeSet = true;
+    m_springPos        = W.pos;
+    m_springVel        = Vec3{};
+    m_chasing          = false;
+    m_springInit       = true;
+}
+
 void CXRAnchor::reanchorFromWorld(const SXRPose& W, const SXRVerbContext& ctx, const SXRAnchorTuning& tune) {
+    // Adaptive + roaming: the persistent mode is LOCAL (the desk pose), but a release while roaming
+    // must update the ROAM offset, not the desk pose (§5.1). Everything else keeps LOCAL semantics.
+    if (m_state.adaptive.enabled && (m_adPhase == XRAD_ROAMING || m_adPhase == XRAD_UNDOCKING)) {
+        reanchorRoam(W, ctx, tune);
+        return;
+    }
     switch (m_state.mode) {
         case XR_ANCHOR_LOCAL: {
             m_state.anchorPose = W;
@@ -716,4 +969,12 @@ void CXRAnchor::onReferenceSpaceChanged(const SXRPose& M) {
     m_springPos   = poseCompose(invM, SXRPose{m_springPos, identityQuat()}).pos;
     m_springVel   = qRotate(qInverse(M.rot), m_springVel);
     m_smoothedRot = qMul(qConjugate(M.rot), m_smoothedRot);
+
+    // Adaptive: the desk seat is a LOCAL_FLOOR position; a frozen transition `from` is a LOCAL_FLOOR
+    // pose. Both must move with the recenter so the geofence + envelope stay physically consistent
+    // (research/13 §5.6). The roam offset is view/body-frame relative -> unaffected (like HEAD/BODY).
+    if (m_dockSeatCaptured)
+        m_dockHeadPos = poseCompose(invM, SXRPose{m_dockHeadPos, identityQuat()}).pos;
+    if (m_adPhase == XRAD_UNDOCKING || m_adPhase == XRAD_REDOCKING)
+        m_adFrom = poseCompose(invM, m_adFrom);
 }

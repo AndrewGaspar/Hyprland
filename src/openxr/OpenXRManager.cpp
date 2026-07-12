@@ -466,6 +466,11 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
             if (!e.str.empty() && g_pEventManager)
                 g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitorgrab", e.str + (e.a ? ",1" : ",0")});
             break;
+        case eXRStateEventType::ADAPTIVE:
+            // research/13 §6.4: the terminal dock/undock edge (a = 1 undocked / 0 docked).
+            if (!e.str.empty() && g_pEventManager)
+                g_pEventManager->postEvent(SHyprIPCEvent{e.a ? "xrmonitorundocked" : "xrmonitordocked", e.str});
+            break;
         case eXRStateEventType::TRACKING: Log::logger->log(Log::DEBUG, "[OPENXR] device-lock tracking {} (monitor {})", e.a ? "gained" : "lost", e.str); break;
         case eXRStateEventType::SCHEDULE_FRAMES: {
             // Pacing on behalf of the frame thread (see the frame loop): scheduleFrame() is
@@ -898,7 +903,10 @@ void COpenXRManager::frameThread() {
             m_lastVerbCtx = OpenXR::SXRVerbContext{viewPose, viewValid, gripLeft, gripRight};
             for (size_t i = 0; i < active.size(); ++i) {
                 auto&      l         = active[i];
-                const bool needsView = l->m_anchor.state().mode != OpenXR::XR_ANCHOR_LOCAL;
+                // Adaptive anchoring needs the head pose for the geofence even though its persistent
+                // mode is LOCAL. When the view is invalid (tracking loss) it falls to the hold-at-
+                // lastWorld branch, which freezes the phase machine + envelope (research/13 §4.2).
+                const bool needsView = l->m_anchor.state().mode != OpenXR::XR_ANCHOR_LOCAL || l->m_anchor.adaptiveEnabled();
                 if (viewValid || !needsView) {
                     OpenXR::SXRSolveInput in;
                     in.view       = viewPose;
@@ -918,6 +926,20 @@ void COpenXRManager::frameThread() {
                     in.pxH       = (uint32_t)std::max(1.0, l->m_contentSize.y);
                     results[i]   = l->m_anchor.solve(in, tune);
                     solved[i]    = true;
+
+                    // Adaptive anchoring (research/13 §5): publish the phase for status and emit the
+                    // terminal dock/undock event exactly once on the ROAMING/DOCKED edge (never the
+                    // begin edge, so a reversed/aborted transition emits nothing). Frame thread →
+                    // main via the SPSC queue, mirroring the GRAB event path.
+                    const auto newPhase = (uint8_t)l->m_anchor.adaptivePhase();
+                    const auto oldPhase = l->m_adPhase.exchange(newPhase, std::memory_order_acq_rel);
+                    if (newPhase != oldPhase && (newPhase == (uint8_t)OpenXR::XRAD_ROAMING || newPhase == (uint8_t)OpenXR::XRAD_DOCKED)) {
+                        SXRStateEvent ev;
+                        ev.type = eXRStateEventType::ADAPTIVE;
+                        ev.a    = newPhase == (uint8_t)OpenXR::XRAD_ROAMING ? 1 : 0;
+                        ev.str  = l->m_monitorName;
+                        enqueue(ev);
+                    }
                 } else if (l->m_anchor.hasLastWorld()) {
                     // No head pose this frame: hold the quad at its last composed world pose.
                     results[i].space        = OpenXR::XR_SPACE_LOCAL_FLOOR;
@@ -1593,6 +1615,16 @@ OpenXR::SXRAnchorTuning COpenXRManager::readAnchorTuning() const {
     static auto             PDIST    = CConfigValue<Hyprlang::FLOAT>("openxr:leash_deadzone_distance");
     static auto             PFOLLOW  = CConfigValue<Hyprlang::INT>("openxr:body_leash_follow_height");
     static auto             PDEFDIST = CConfigValue<Hyprlang::FLOAT>("openxr:default_distance");
+    // Adaptive anchoring (research/13 §6.1) — hot-read per frame, same as the leash vars above.
+    static auto             PADLEAVE   = CConfigValue<Hyprlang::FLOAT>("openxr:adaptive_leave_radius");
+    static auto             PADRETURN  = CConfigValue<Hyprlang::FLOAT>("openxr:adaptive_return_radius");
+    static auto             PADLDWELL  = CConfigValue<Hyprlang::INT>("openxr:adaptive_leave_dwell_ms");
+    static auto             PADRDWELL  = CConfigValue<Hyprlang::INT>("openxr:adaptive_return_dwell_ms");
+    static auto             PADTRANS   = CConfigValue<Hyprlang::INT>("openxr:adaptive_transition_ms");
+    static auto             PADEASE    = CConfigValue<Hyprlang::STRING>("openxr:adaptive_transition_ease");
+    static auto             PADROAM    = CConfigValue<Hyprlang::STRING>("openxr:adaptive_roam_mode");
+    static auto             PADHEIGHT  = CConfigValue<Hyprlang::INT>("openxr:adaptive_use_height");
+    static auto             PADCARRY   = CConfigValue<Hyprlang::INT>("openxr:adaptive_carry_offset");
 
     OpenXR::SXRAnchorTuning t;
     t.leashResponse    = (float)*PRESP;
@@ -1600,6 +1632,15 @@ OpenXR::SXRAnchorTuning COpenXRManager::readAnchorTuning() const {
     t.deadzoneDistance = (float)*PDIST;
     t.bodyFollowHeight = *PFOLLOW;
     t.defaultDistance  = (float)*PDEFDIST;
+    t.adLeaveRadius    = (float)*PADLEAVE;
+    t.adReturnRadius   = (float)*PADRETURN;
+    t.adLeaveDwell     = (float)*PADLDWELL / 1000.f;
+    t.adReturnDwell    = (float)*PADRDWELL / 1000.f;
+    t.adTransition     = (float)*PADTRANS / 1000.f;
+    t.adEase           = OpenXR::xrParseEase(std::string{*PADEASE});
+    t.adRoamMode       = std::string{*PADROAM} == "head" ? OpenXR::XR_ANCHOR_HEAD : OpenXR::XR_ANCHOR_BODY;
+    t.adUseHeight      = *PADHEIGHT;
+    t.adCarryOffset    = *PADCARRY;
     return t;
 }
 
@@ -1832,7 +1873,11 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
         // value. Not explicitly specified by doc 05 (written before grab existed); this is the
         // more useful behavior for any status-polling consumer, noted for WP13 to fold into the
         // doc.
-        const OpenXR::SXRPose reportPose = l->m_anchor.grabbed() && l->m_anchor.hasLastWorld() ? l->m_anchor.lastWorld() : st.anchorPose;
+        // Adaptive: while roaming/transitioning the live world pose (lastWorld) is the follow pose,
+        // not the desk pose — report it so a status consumer sees where the monitor actually is
+        // (research/13 §6.4); a docked adaptive monitor reports its desk pose like any local one.
+        const bool            reportLive = l->m_anchor.hasLastWorld() && (l->m_anchor.grabbed() || (l->m_anchor.adaptiveEnabled() && l->m_anchor.adaptivePhase() != OpenXR::XRAD_DOCKED));
+        const OpenXR::SXRPose reportPose = reportLive ? l->m_anchor.lastWorld() : st.anchorPose;
         info.posX                        = reportPose.pos.x;
         info.posY                        = reportPose.pos.y;
         info.posZ                        = reportPose.pos.z;
@@ -1847,6 +1892,12 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
             default: info.grabKind = "none"; break;
         }
         info.hovered                     = l->m_hovered;          // WP7
+        // Adaptive anchoring (research/13 §6.4).
+        info.adaptiveEnabled  = l->m_anchor.adaptiveEnabled();
+        info.adaptivePhase    = OpenXR::xrAdaptivePhaseName(l->m_anchor.adaptivePhase());
+        info.adaptiveRoamMode = l->m_anchor.adaptiveRoamMode() == OpenXR::XR_ANCHOR_HEAD ? "head" : "body";
+        info.adaptiveSeatDist = l->m_anchor.adaptiveSeatDist();
+        info.adaptiveT        = l->m_anchor.adaptiveTransitionT();
         if (l->m_reqResolution) {
             info.w = (int)l->m_reqResolution->x;
             info.h = (int)l->m_reqResolution->y;
@@ -1904,8 +1955,11 @@ std::string COpenXRManager::layoutDump() {
                 hz = *l->m_reqRefresh;
 
             const auto& st = l->m_anchor.state();
-            // Live substitution for LOCAL only (see comment above).
-            const bool            useLive  = st.mode == OpenXR::XR_ANCHOR_LOCAL && l->m_anchor.hasLastWorld();
+            // Live substitution for LOCAL only (see comment above). EXCEPTION: an adaptive monitor
+            // serializes its SAVED dock pose (m_state.anchorPose), never the live roam pose, so a
+            // save-while-roaming round-trips to the desk pose — the persistent identity (research/13
+            // §6.4). lastWorld while roaming is the follow pose, which must NOT be persisted.
+            const bool            useLive  = st.mode == OpenXR::XR_ANCHOR_LOCAL && !st.adaptive.enabled && l->m_anchor.hasLastWorld();
             const OpenXR::SXRPose livePose = useLive ? l->m_anchor.lastWorld() : st.anchorPose;
 
             lines.push_back(OpenXR::serializeXRMonitorLine(l->m_monitorName, Vector2D{(double)w, (double)h}, hz > 0.f ? std::optional<float>(hz) : std::nullopt, st, livePose,
@@ -2123,6 +2177,81 @@ std::expected<void, std::string> COpenXRManager::cmdCenter() {
     std::scoped_lock lock(m_layersMu);
     if (!layer->m_anchor.applyCenter(ctx, (float)*PDEFDIST))
         return std::unexpected<std::string>("center: head tracking unavailable");
+    return {};
+}
+
+// ---- adaptive anchoring verbs (research/13 §6.3) --------------------------------------------
+
+std::expected<void, std::string> COpenXRManager::cmdAdaptive(const std::string& args) {
+    const auto tokens = splitWs(args);
+    if (tokens.size() != 1)
+        return std::unexpected<std::string>("adaptive: expected on|off|toggle");
+    auto layer = resolveSelected();
+    if (!layer)
+        return std::unexpected<std::string>("no XR monitor selected");
+
+    std::scoped_lock lock(m_layersMu);
+    // Adaptive decorates an anchor:local desk pose (the persistent identity); it is nonsensical on a
+    // leash/device-anchored monitor.
+    if (layer->m_anchor.state().mode != OpenXR::XR_ANCHOR_LOCAL)
+        return std::unexpected<std::string>("adaptive: only valid on an anchor:local monitor");
+
+    const std::string& a = tokens[0];
+    bool               en;
+    if (a == "on")
+        en = true;
+    else if (a == "off")
+        en = false;
+    else if (a == "toggle")
+        en = !layer->m_anchor.adaptiveEnabled();
+    else
+        return std::unexpected<std::string>("adaptive: expected on|off|toggle");
+
+    layer->m_anchor.adaptiveSetEnabled(en);
+    return {};
+}
+
+std::expected<void, std::string> COpenXRManager::cmdDock(const std::string& args) {
+    const auto tokens = splitWs(args);
+    const bool here   = tokens.size() == 1 && (tokens[0] == "here" || tokens[0] == "-here");
+    if (!tokens.empty() && !here)
+        return std::unexpected<std::string>("dock: expected no arg or 'here'");
+    auto layer = resolveSelected();
+    if (!layer)
+        return std::unexpected<std::string>("no XR monitor selected");
+
+    std::scoped_lock lock(m_layersMu);
+    if (!layer->m_anchor.adaptiveEnabled())
+        return std::unexpected<std::string>("dock: adaptive anchoring is not enabled on this monitor");
+    if (here)
+        layer->m_anchor.adaptiveDockHere();
+    else
+        layer->m_anchor.adaptiveForceDock();
+    return {};
+}
+
+std::expected<void, std::string> COpenXRManager::cmdUndock() {
+    auto layer = resolveSelected();
+    if (!layer)
+        return std::unexpected<std::string>("no XR monitor selected");
+
+    std::scoped_lock lock(m_layersMu);
+    if (!layer->m_anchor.adaptiveEnabled())
+        return std::unexpected<std::string>("undock: adaptive anchoring is not enabled on this monitor");
+    layer->m_anchor.adaptiveForceUndock();
+    return {};
+}
+
+std::expected<void, std::string> COpenXRManager::cmdRoam(const std::string& args) {
+    const auto tokens = splitWs(args);
+    if (tokens.size() != 1 || (tokens[0] != "head" && tokens[0] != "body"))
+        return std::unexpected<std::string>("roam: expected head|body");
+    auto layer = resolveSelected();
+    if (!layer)
+        return std::unexpected<std::string>("no XR monitor selected");
+
+    std::scoped_lock lock(m_layersMu);
+    layer->m_anchor.adaptiveSetRoamMode(tokens[0] == "head" ? OpenXR::XR_ANCHOR_HEAD : OpenXR::XR_ANCHOR_BODY);
     return {};
 }
 

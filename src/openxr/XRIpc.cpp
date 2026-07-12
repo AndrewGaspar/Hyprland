@@ -54,10 +54,18 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
             }},
             "grabbed": {},
             "grabKind": "{}",
-            "hovered": {}
+            "hovered": {},
+            "adaptive": {{
+                "enabled": {},
+                "phase": "{}",
+                "roamMode": "{}",
+                "seatDistM": {:.3f},
+                "transitionT": {:.3f}
+            }}
         }})#",
                                 m.name, m.id, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.quatX, m.quatY, m.quatZ, m.quatW, m.grabbed ? "true" : "false",
-                                m.grabKind, m.hovered ? "true" : "false");
+                                m.grabKind, m.hovered ? "true" : "false", m.adaptiveEnabled ? "true" : "false", m.adaptivePhase, m.adaptiveRoamMode, m.adaptiveSeatDist,
+                                m.adaptiveT);
             if (i + 1 < MONS.size())
                 mons += ",\n";
             else
@@ -86,8 +94,11 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     std::string out = std::format("state: {}\nruntime: {}\nsystem: {}\nblend mode: {}\noverlay: {}\nidle inhibited: {}\ninput: left {}, right {}\n", STATE, RUNTIME, SYSTEM, BLEND,
                                   OVERLAY ? "yes" : "no", INHIBITING_IDLE ? "yes" : "no", handLabel(HANDS[0]), handLabel(HANDS[1]));
     for (const auto& m : MONS) {
-        out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} ({}) hovered: {}\n", m.name, m.id, m.w, m.h,
+        out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} ({}) hovered: {}", m.name, m.id, m.w, m.h,
                            m.refresh, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.grabbed ? "yes" : "no", m.grabKind, m.hovered ? "yes" : "no");
+        if (m.adaptiveEnabled)
+            out += std::format(" adaptive: {} (roam {}, seat {:.2f}m)", m.adaptivePhase, m.adaptiveRoamMode, m.adaptiveSeatDist);
+        out += "\n";
     }
     return out;
 }
@@ -159,7 +170,26 @@ static std::string openxrRequest(eHyprCtlOutputFormat format, std::string reques
         return r ? "ok" : r.error();
     }
 
-    return std::format("unknown openxr subcommand '{}'. Valid: status, enable, disable, create, destroy, select, anchor, move, rotate, scale, distance, center, layout",
+    // Adaptive anchoring verbs (research/13 §6.3).
+    if (SUBCOMMAND == "adaptive") {
+        auto r = g_pOpenXRManager->cmdAdaptive(ARGS);
+        return r ? "ok" : r.error();
+    }
+    if (SUBCOMMAND == "dock") {
+        auto r = g_pOpenXRManager->cmdDock(ARGS);
+        return r ? "ok" : r.error();
+    }
+    if (SUBCOMMAND == "undock") {
+        auto r = g_pOpenXRManager->cmdUndock();
+        return r ? "ok" : r.error();
+    }
+    if (SUBCOMMAND == "roam") {
+        auto r = g_pOpenXRManager->cmdRoam(ARGS);
+        return r ? "ok" : r.error();
+    }
+
+    return std::format("unknown openxr subcommand '{}'. Valid: status, enable, disable, create, destroy, select, anchor, move, rotate, scale, distance, center, adaptive, dock, "
+                       "undock, roam, layout",
                        SUBCOMMAND);
 }
 

@@ -149,6 +149,12 @@ class CXRMonitorLayer {
     std::atomic<uint8_t> m_hoverRegion{0 /* OpenXR::XR_REGION_NONE */}; // region the ray last classified on THIS quad (any hand)
     std::atomic<bool>    m_grabbedNow{false};                          // this quad has an active MOVE or RESIZE grab
 
+    // Adaptive anchoring (research/13 §5): the last adaptive phase PUBLISHED by the frame thread —
+    // both the "previous" value the frame thread edge-detects against (to emit the terminal
+    // dock/undock events exactly once) and a status-readable mirror. Written frame-thread after the
+    // solve, read main-thread (status JSON) under m_layersMu. Plain atomic — never a refcount op.
+    std::atomic<uint8_t> m_adPhase{0 /* OpenXR::XRAD_DOCKED */};
+
     // Fade-envelope state (frame thread only; only the blit loop touches these). Alpha is advanced
     // every frame from predicted-display-time deltas via OpenXR::chromeFadeAdvance; the *Drawn*
     // trackers record what was last rendered so a static (no-new-buffer) frame can decide whether a
