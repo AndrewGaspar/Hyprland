@@ -101,6 +101,12 @@ namespace Monitor {
         uint32_t                    m_drmFormat     = DRM_FORMAT_INVALID;
         uint32_t                    m_prevDrmFormat = DRM_FORMAT_INVALID;
 
+        // Force this output's render swapchain to allocate LINEAR (multi-GPU-shareable) buffers.
+        // Set by the OpenXR integration on a headless XR output when the XR runtime's GPU differs
+        // from the buffer allocator's GPU (cross-GPU import needs linear). Honored in
+        // CMonitorState::updateSwapchain via SSwapchainOptions::multigpu. Default false = native tiling.
+        bool                        m_forceLinearSwapchain = false;
+
         CMonitorZoomController      m_zoomController;
 
         bool                        m_dpmsStatus       = true;
