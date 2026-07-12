@@ -41,6 +41,14 @@ namespace OpenXR {
     // falls back to the preferred mode with requestedUnsupported=true. An empty supported list
     // (spec-illegal, but defended) yields XR_BLEND_OPAQUE.
     SXRBlendModePick pickBlendMode(const std::vector<eXRBlendMode>& supported, const std::string& config);
+
+    // Plugged-state policy (research/18 — XR monitors behave like unplugged external monitors
+    // while no session exists). Pure and unconditional so hyprland_gtests can exercise it
+    // (tests/xr/plugged.cpp). `followSession` is openxr:monitors_follow_session; `sessionUp` is
+    // the manager's session-EXISTENCE edge (start()..stop(), NOT visible/focused — mid-session
+    // proximity-sensor idle<->visible churn must never evacuate workspaces). Returns whether
+    // XR-created monitors should currently be enabled ("plugged").
+    bool wantXRMonitorsPlugged(bool followSession, bool sessionUp);
 }
 
 namespace OpenXR {

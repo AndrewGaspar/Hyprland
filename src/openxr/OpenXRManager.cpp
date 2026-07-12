@@ -74,7 +74,9 @@ void COpenXRManager::init() {
 
     // Materialize any monitors declared in the config as plain headless outputs (doc 02 lazy
     // binding). Their quads bind when a session later starts. Done before start() so start()'s
-    // bindExistingLayers() picks them up.
+    // bindExistingLayers() picks them up. With openxr:monitors_follow_session (default) they are
+    // created UNPLUGGED (disabled) and only plug in when a session actually starts (research/18)
+    // — no phantom monitors on a sessionless desktop login.
     reconcileDeclaredMonitors();
 
     // Honor openxr:enabled at startup.
@@ -287,6 +289,11 @@ void COpenXRManager::start() {
     setState(XR_STATE_RUNNING_IDLE);
     Log::logger->log(Log::DEBUG, "[OPENXR] session up (runtime: {}, system: {}), frame thread started", m_runtimeName, m_systemName);
 
+    // Plug the XR monitors now that a session EXISTS (research/18 WP-M2): monitors held disabled
+    // while sessionless re-enable through the hotplug path (workspaces return by name). Done
+    // before the reconcile below so declared-set diffs (mode changes) apply to enabled outputs.
+    setMonitorsPlugged(true);
+
     // Monitors now come only from the config keyword / dispatcher / hyprctl (WP4). Any monitors
     // declared/created while disabled were already materialized as headless outputs and bound
     // above (bindExistingLayers); create any declared-but-missing ones now that a session is up.
@@ -366,6 +373,13 @@ void COpenXRManager::stop() {
 
     // 6. Monitor disposition per openxr:destroy_monitors_on_stop.
     teardownLayers();
+
+    // 7. Unplug the surviving XR monitors — the session no longer exists (research/18 WP-M2).
+    //    Workspaces evacuate to the remaining monitors through the ordinary hotplug path; the
+    //    layers (anchor state, adaptive phase, declared spec) persist for the next start().
+    //    Runs on the session-EXISTENCE edge only — mid-session IDLE<->VISIBLE churn (proximity
+    //    sensor) never reaches stop(). No-op for layers teardownLayers just destroyed/erased.
+    setMonitorsPlugged(false);
 
     m_graphics.reset();
     m_session.reset();
@@ -1327,6 +1341,19 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
             Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}' keeps its explicit monitor= resolution", params.m_name);
     }
 
+    // 5b. Plugged-state gate (research/18 WP-M1/M3): with monitors_follow_session (default), a
+    //     monitor created while NO session exists starts life UNPLUGGED — created (stable id,
+    //     mode applied above) then immediately disabled through the ordinary hotplug path, so a
+    //     sessionless desktop never places workspaces on a display that isn't really there. It
+    //     plugs in at the next session start (setMonitorsPlugged(true) in start()).
+    {
+        static auto PFOLLOW = CConfigValue<Hyprlang::INT>("openxr:monitors_follow_session");
+        if (!OpenXR::wantXRMonitorsPlugged(*PFOLLOW != 0, m_running.load()) && mon->m_enabled) {
+            Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}' created unplugged (no session)", params.m_name);
+            mon->onDisconnect();
+        }
+    }
+
     // 6. Notify (doc 05 event surface).
     if (g_pEventManager)
         g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitoradded", params.m_name});
@@ -1525,6 +1552,50 @@ void COpenXRManager::teardownLayers() {
     }
 }
 
+void COpenXRManager::setMonitorsPlugged(bool sessionUp) {
+    // research/18 WP-M1/M2 (option b — create-but-disabled): XR-created headless outputs behave
+    // like UNPLUGGED external monitors while no OpenXR session exists. This is the single
+    // plugged-state edge; start()/stop()/onConfigReload() (and future research/17 lifecycle
+    // re-probes) all funnel here. Main thread only — onConnect/onDisconnect are hotplug entry
+    // points and CMonitor refs are hyprutils SPs (see the thread rule in XRMonitorLayer.hpp).
+    static auto PFOLLOW = CConfigValue<Hyprlang::INT>("openxr:monitors_follow_session");
+    const bool  want    = OpenXR::wantXRMonitorsPlugged(*PFOLLOW != 0, sessionUp);
+
+    // Snapshot under the lock; drive the transitions without it (onConnect/onDisconnect re-enter
+    // large parts of the compositor: workspace moves, focus, events).
+    std::vector<PXRLAYER> layers;
+    {
+        std::scoped_lock lock(m_layersMu);
+        layers = m_layers;
+    }
+
+    for (auto& l : layers) {
+        // Adopted pre-existing outputs (m_createdByXR == false) are the user's real monitors —
+        // never unplug those; pending-removal layers are mid-barrier and owned by that path.
+        if (!l->m_createdByXR || l->m_pendingRemoval.load(std::memory_order_acquire))
+            continue;
+        auto mon = l->m_monitor.lock();
+        if (!mon || !mon->m_output)
+            continue;
+        if (mon->m_enabled == want)
+            continue;
+
+        Log::logger->log(Log::DEBUG, "[OPENXR] {} XR monitor '{}' (session {})", want ? "plugging" : "unplugging", l->m_monitorName, sessionUp ? "up" : "down");
+
+        // The same two functions the rule manager dispatches for a runtime `monitor=...,disable`
+        // flip (MonitorRuleManager::ensureMonitorStatus): onDisconnect() evacuates workspaces to a
+        // backup monitor and remembers them by THIS monitor's name; onConnect(true) runs the full
+        // name-keyed return (m_lastMonitor tags + remembered-workspace map + workspace-binding
+        // rules). onConnect consults the monitor rule itself, so an explicit `monitor=NAME,disable`
+        // in the user config still wins over a plug attempt. NEVER destroy the output here — that
+        // is the aquamarine headless framecb UAF hot path (destroyOutputDeferred).
+        if (want)
+            mon->onConnect(true);
+        else
+            mon->onDisconnect();
+    }
+}
+
 void COpenXRManager::reportLayerRemoved(const std::string& name) {
     // Frame thread: enqueue the ack and wake the main thread (removal barrier step 2->3).
     SXRStateEvent ev;
@@ -1582,6 +1653,13 @@ void COpenXRManager::onConfigReload() {
         // swapchains when they changed. Colors + fade/hide timings are read per-frame (no recreate).
         markSwapchainsDirtyIfChromeChanged();
     }
+
+    // Re-assert the plugged state (research/18): idempotent, so the normal reload path is a
+    // no-op, but this (a) applies a toggled openxr:monitors_follow_session live, and (b) heals
+    // the rare reload where a changed `monitor=` rule made the rule manager re-enable a monitor
+    // we hold unplugged (ensureMonitorStatus runs before config.reloaded is emitted, so this
+    // listener always has the last word).
+    setMonitorsPlugged(m_running.load());
 
     // Re-run so that toggling openxr:inhibit_idle takes effect immediately (WP9 hook).
     if (g_pInputManager)
@@ -1938,7 +2016,8 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
         if (l->m_reqRefresh)
             info.refresh = *l->m_reqRefresh;
         if (auto mon = l->m_monitor.lock()) {
-            info.id = mon->m_id;
+            info.id      = mon->m_id;
+            info.plugged = mon->m_enabled; // research/18: unplugged (disabled) while sessionless
             if (info.w == 0) {
                 info.w = (int)mon->m_pixelSize.x;
                 info.h = (int)mon->m_pixelSize.y;

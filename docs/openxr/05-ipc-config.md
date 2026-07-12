@@ -71,7 +71,8 @@ Add one block to `getConfigValues()` under a new `/* openxr: */` section comment
 | `openxr:grab_threshold_release` | `Float` | `0.4` | squeeze analog value that ends a grab (hysteresis) | hot-live |
 | `openxr:scroll_speed` | `Float` | `1.0` | multiplier for thumbstick scrolling on XR monitors | hot-live |
 | `openxr:inhibit_idle` | `Bool` | `true` | inhibit idle (hypridle etc.) while the XR session is focused | hot — triggers an idle recheck (§6) |
-| `openxr:destroy_monitors_on_stop` | `Bool` | `true` | destroy XR-created virtual monitors when the session stops. If false they persist as plain headless outputs | hot-live (consulted at stop time) |
+| `openxr:monitors_follow_session` | `Bool` | `true` | XR-created monitors behave like UNPLUGGED external monitors while no session exists (research/18): created/held disabled when sessionless (workspaces evacuate through the ordinary hotplug path), enabled on session start (workspaces return by name). `false` = the old always-present behavior | hot — `setMonitorsPlugged()` re-asserts on reload/keyword |
+| `openxr:destroy_monitors_on_stop` | `Bool` | `false` | destroy XR-created virtual monitors when the session stops, instead of keeping them (unplugged under `monitors_follow_session`, plain headless outputs otherwise). The research/18 option-(a) escape hatch | hot-live (consulted at stop time) |
 | `openxr:overlay` | `Bool` | `false` | run as an `XR_EXTX_overlay` session so monitors composite ON TOP of another XR client (a game, or `hypxrpaper`). Requires a runtime that advertises `XR_EXTX_overlay` (Monado/WiVRn); requested-but-unsupported downgrades to a normal exclusive session with a WARN, never failing startup (doc 01) | **start-only** — read at session start; changing it takes effect on the next start |
 | `openxr:overlay_z` | `Int` | `1` | overlay composition placement (`XR_EXTX_overlay` `sessionLayersPlacement`); higher composites later / on top. On Monado this maps straight into the layer `z_order` (primary pinned to `INT64_MIN`), so any value puts our quads above the primary | **start-only** — read at session start |
 
@@ -397,7 +398,7 @@ state: focused
 runtime: Monado(XRT) by Collabora et al.
 system: Simulated HMD
 blend mode: opaque
-monitor XR-code (ID 3): 2560x1440@90.00 size 1.80m anchor local pos [0.00, 1.40, -1.50] grabbed: no hovered: yes
+monitor XR-code (ID 3): 2560x1440@90.00 size 1.80m anchor local pos [0.00, 1.40, -1.50] grabbed: no (none) hovered: yes plugged: yes
 ```
 
 JSON (`hyprctl -j openxr` / `hyprctl -j openxr status`) — full schema, all keys always
@@ -424,7 +425,8 @@ present:
                 }
             },
             "grabbed": false,
-            "hovered": true
+            "hovered": true,
+            "plugged": true
         }
     ]
 }
@@ -450,6 +452,11 @@ present:
   end-to-end without polling wall-clock idle timers.
 - `id` — the Hyprland `MONITORID` of the backing headless output; `-1` if the output is not
   (yet) mapped.
+- `plugged` (research/18) — whether the backing headless output is currently enabled. With
+  `openxr:monitors_follow_session` (default) XR monitors are unplugged (disabled, workspaces
+  evacuated — like an unplugged external monitor) whenever no session exists, so this is
+  `false` in `disabled`/`unavailable` states and `true` while a session is up. Text form:
+  `plugged: yes|no`.
 - `anchor.mode` — `local` | `head` | `body` | `device:left` | `device:right`.
 - `anchor.pose` — for `local`: pose in LOCAL_FLOOR. For leashed/device modes: the configured
   offset in the leash frame as `pos` and the relative rotation as `quat`. **WP8 deviation (as
