@@ -324,6 +324,12 @@ OpenXR::SXRBlendModePick OpenXR::pickBlendMode(const std::vector<eXRBlendMode>& 
     return {preferred, true};
 }
 
+bool OpenXR::wantXRMonitorsPlugged(bool followSession, bool sessionUp) {
+    // research/18: with monitors_follow_session (default), XR monitors are plugged exactly while
+    // a session exists; opting out keeps them always plugged (the pre-feature behavior).
+    return sessionUp || !followSession;
+}
+
 std::string OpenXR::anchorModeToString(eXRAnchorMode mode, eXRHand device) {
     switch (mode) {
         case XR_ANCHOR_LOCAL: return "local";

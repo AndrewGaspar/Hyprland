@@ -816,8 +816,15 @@ std::vector<SP<IValue>> Values::getConfigValues() {
         MS<Color>("openxr:chrome_col_hover", "XR monitor chrome color for the element (bar or corner) the ray is pointing at", 0xcc66aaff),
         MS<Color>("openxr:chrome_col_grab", "XR monitor chrome color while the quad is grabbed", 0xff66aaff),
         MS<Bool>("openxr:inhibit_idle", "inhibit idle (hypridle etc.) while the XR session is focused", true),
+        MS<Bool>("openxr:monitors_follow_session",
+                 "XR-created virtual monitors behave like UNPLUGGED external monitors while no OpenXR session exists: held disabled (workspaces evacuate to the remaining "
+                 "monitors, exactly like a physical unplug) until a session starts, re-enabled (workspaces return by name) when it does. false restores the old always-present "
+                 "behavior. See also destroy_monitors_on_stop (research/18)",
+                 true),
         MS<Bool>("openxr:destroy_monitors_on_stop",
-                 "destroy XR-created virtual monitors when the session stops. If false they persist as plain headless outputs", true),
+                 "destroy XR-created virtual monitors when the session stops, instead of keeping them (unplugged when monitors_follow_session is set, plain headless outputs "
+                 "otherwise). Declared xrmonitors re-materialize on the next session start",
+                 false),
         MS<Bool>("openxr:overlay",
                  "run as an XR_EXTX_overlay session so monitors composite ON TOP of another XR client (a game, or hypxrpaper). Requires a runtime that "
                  "advertises XR_EXTX_overlay (Monado/WiVRn); ignored with a warning otherwise. Read at session start (disable/enable to change)",
