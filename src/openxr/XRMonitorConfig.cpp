@@ -128,6 +128,9 @@ namespace {
         bool                   gotPos = false;
         float                  posX = 0.f, posY = 0.f, posZ = 0.f;
         float                  yawDeg = 0.f, pitchDeg = 0.f;
+        // Adaptive-anchoring tokens (research/13 §6.2). They decorate anchor:local only.
+        bool                   sawAdaptive = false;
+        float                  roamYawDeg  = 0.f;
 
         const std::string&     modeTok = tokens[0];
         if (modeTok == "anchor:local")
@@ -184,6 +187,61 @@ namespace {
                 if (*r <= 0.f)
                     return std::unexpected<std::string>("size must be positive");
                 out.m_sizeMeters = *r;
+            } else if (key == "adaptive") {
+                sawAdaptive = true;
+                if (val == "on" || val == "true" || val == "1")
+                    anchor.adaptive.enabled = true;
+                else if (val == "off" || val == "false" || val == "0")
+                    anchor.adaptive.enabled = false;
+                else
+                    return std::unexpected<std::string>("adaptive must be on/off, got '" + val + "'");
+            } else if (key == "roam") {
+                sawAdaptive                  = true;
+                anchor.adaptive.roamModeSet  = true;
+                if (val == "head")
+                    anchor.adaptive.roamMode = OpenXR::XR_ANCHOR_HEAD;
+                else if (val == "body")
+                    anchor.adaptive.roamMode = OpenXR::XR_ANCHOR_BODY;
+                else
+                    return std::unexpected<std::string>("roam must be 'head' or 'body', got '" + val + "'");
+            } else if (key == "roam_offset") {
+                sawAdaptive = true;
+                float rx = 0.f, ry = 0.f, rz = 0.f;
+                if (auto r = parseVec3(val, "roam_offset", rx, ry, rz); !r)
+                    return std::unexpected(r.error());
+                anchor.adaptive.roamOffset.pos = OpenXR::Vec3{rx, ry, rz};
+                anchor.adaptive.hasRoamOffset  = true;
+            } else if (key == "roam_yaw") {
+                sawAdaptive = true;
+                auto r      = parseFloat(val, "roam_yaw");
+                if (!r)
+                    return std::unexpected(r.error());
+                roamYawDeg = *r;
+            } else if (key == "leave") {
+                sawAdaptive = true;
+                auto r      = parseFloat(val, "leave");
+                if (!r)
+                    return std::unexpected(r.error());
+                if (*r <= 0.f)
+                    return std::unexpected<std::string>("leave radius must be positive");
+                anchor.adaptive.leaveRadius = *r;
+            } else if (key == "return") {
+                sawAdaptive = true;
+                auto r      = parseFloat(val, "return");
+                if (!r)
+                    return std::unexpected(r.error());
+                if (*r <= 0.f)
+                    return std::unexpected<std::string>("return radius must be positive");
+                anchor.adaptive.returnRadius = *r;
+            } else if (key == "carry") {
+                sawAdaptive                   = true;
+                anchor.adaptive.carryOverride = true;
+                if (val == "on" || val == "true" || val == "1")
+                    anchor.adaptive.carryOffset = true;
+                else if (val == "off" || val == "false" || val == "0")
+                    anchor.adaptive.carryOffset = false;
+                else
+                    return std::unexpected<std::string>("carry must be on/off, got '" + val + "'");
             } else
                 return std::unexpected<std::string>("unknown key '" + key + "' in anchor spec");
         }
@@ -192,6 +250,12 @@ namespace {
             return std::unexpected<std::string>("anchor:local requires 'pos:x,y,z'");
         if (anchor.mode != OpenXR::XR_ANCHOR_LOCAL && !gotPos)
             return std::unexpected<std::string>("this anchor mode requires 'offset:x,y,z'");
+
+        // Adaptive anchoring decorates anchor:local only (the desk pose is the persistent identity).
+        if (sawAdaptive && anchor.mode != OpenXR::XR_ANCHOR_LOCAL)
+            return std::unexpected<std::string>("adaptive/roam tokens are only valid on anchor:local");
+        if (anchor.adaptive.returnRadius >= 0.f && anchor.adaptive.leaveRadius >= 0.f && anchor.adaptive.returnRadius >= anchor.adaptive.leaveRadius)
+            return std::unexpected<std::string>("adaptive 'return' radius must be smaller than 'leave' radius (hysteresis)");
 
         anchor.anchorPose.pos = OpenXR::Vec3{posX, posY, posZ};
 
@@ -204,6 +268,9 @@ namespace {
             case OpenXR::XR_ANCHOR_BODY: anchor.anchorPose.rot = OpenXR::qFromYaw(yawDeg * DEG2RAD); break;
             default: anchor.anchorPose.rot = OpenXR::qMul(OpenXR::qFromYaw(yawDeg * DEG2RAD), OpenXR::qFromPitch(pitchDeg * DEG2RAD)); break;
         }
+
+        // Roam-offset rotation: head is lookAt-driven (identity stored); body is yaw-only.
+        anchor.adaptive.roamOffset.rot = anchor.adaptive.roamMode == OpenXR::XR_ANCHOR_HEAD ? OpenXR::Quat{} : OpenXR::qFromYaw(roamYawDeg * DEG2RAD);
 
         out.m_anchor         = anchor;
         out.m_anchorProvided = true;
@@ -309,6 +376,31 @@ std::string OpenXR::serializeXRMonitorLine(const std::string& name, Vector2D res
         spec += std::format(" yaw:{:.1f}", yawDeg);
     if ((anchor.mode == XR_ANCHOR_LOCAL || anchor.mode == XR_ANCHOR_DEVICE) && std::fabs(pitchDeg) >= 0.05f)
         spec += std::format(" pitch:{:.1f}", pitchDeg);
+
+    // Adaptive anchoring tokens (research/13 §6.4). `pose` here is the SAVED dock pose (the caller
+    // passes m_state.anchorPose for an adaptive monitor regardless of live phase), so a save while
+    // roaming round-trips to the desk pose — the correct persistent identity. Seat + live phase are
+    // ephemeral and not serialized.
+    if (anchor.adaptive.enabled) {
+        spec += " adaptive:on";
+        // Only emit an explicit roam mode when the monitor overrode the global default, so a
+        // save/reload keeps deferring to openxr:adaptive_roam_mode when it wasn't set.
+        if (anchor.adaptive.roamModeSet)
+            spec += std::format(" roam:{}", anchor.adaptive.roamMode == XR_ANCHOR_HEAD ? "head" : "body");
+        if (anchor.adaptive.hasRoamOffset) {
+            const auto& ro = anchor.adaptive.roamOffset.pos;
+            spec += std::format(" roam_offset:{:.3f},{:.3f},{:.3f}", ro.x, ro.y, ro.z);
+            float ry = 0.f, rp = 0.f;
+            quatToYawPitchDeg(anchor.adaptive.roamOffset.rot, ry, rp);
+            spec += std::format(" roam_yaw:{:.1f}", ry);
+        }
+        if (anchor.adaptive.leaveRadius >= 0.f)
+            spec += std::format(" leave:{:.2f}", anchor.adaptive.leaveRadius);
+        if (anchor.adaptive.returnRadius >= 0.f)
+            spec += std::format(" return:{:.2f}", anchor.adaptive.returnRadius);
+        if (anchor.adaptive.carryOverride)
+            spec += std::format(" carry:{}", anchor.adaptive.carryOffset ? "on" : "off");
+    }
 
     return std::format("xrmonitor = {}, {}, {}, size:{:.2f}", name, mode, spec, sizeMeters);
 }
