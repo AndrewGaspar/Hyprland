@@ -13,6 +13,16 @@ const char* OpenXR::xrContentPathName(uint8_t p) {
     }
 }
 
+bool OpenXR::shouldStashPresentedBuffer(bool forceLinear, bool bufIsDmabuf, uint64_t modifier) {
+    // Only guard force-linear dmabuf outputs — everything else (same-GPU, CPU/shm buffers) is fine.
+    if (!forceLinear || !bufIsDmabuf)
+        return true;
+    // A known non-linear tiling under force-linear is a stale pre-reconfigure buffer the foreign XR
+    // GPU cannot import; skip it and wait for the reconfigured LINEAR buffer. LINEAR (0) and INVALID
+    // ("implicit", could be linear) pass through.
+    return modifier == DRM_FORMAT_MOD_LINEAR || modifier == DRM_FORMAT_MOD_INVALID;
+}
+
 std::vector<EGLint> OpenXR::buildDmabufImportAttribs(int width, int height, uint32_t fourcc, const std::vector<SDmabufPlaneImport>& planes, uint64_t modifier, bool withModifiers) {
     // Per-plane attrib-token tables, indexed by plane (0..3). Same layout as
     // src/render/OpenGL.cpp:626-636 (the canonical Hyprland dmabuf import).

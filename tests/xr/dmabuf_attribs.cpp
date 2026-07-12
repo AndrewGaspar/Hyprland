@@ -120,3 +120,38 @@ TEST(XRDmabufAttribs, ContentPathNames) {
     EXPECT_STREQ(xrContentPathName(XR_CONTENT_BLACK), "black");
     EXPECT_STREQ(xrContentPathName(200), "none"); // unknown -> none
 }
+
+// shouldStashPresentedBuffer (XRDmabufImport.cpp) — the cross-GPU stale-buffer guard behind the
+// live 2026-07-12 "monitor created after a destroy goes blank" fix. On a force-linear XR output a
+// composite that raced ahead of the swapchain's LINEAR reconfigure presents a foreign-tiled buffer;
+// the presented listener must NOT stash it (the foreign XR GPU's EGL would reject the tiling and the
+// quad blacks out). This pins the truth table the listener relies on. 0x2000000104abb04 is the exact
+// AMD-tiled modifier the live NVIDIA import rejected (research/17 §4.1).
+static constexpr uint64_t AMD_TILED = 0x2000000104abb04ULL;
+
+TEST(XRStashGuard, ForceLinearDropsTiled) {
+    // The live bug: force-linear active, but the presented buffer is still AMD-tiled -> drop it.
+    EXPECT_FALSE(shouldStashPresentedBuffer(true, true, AMD_TILED));
+}
+
+TEST(XRStashGuard, ForceLinearKeepsLinear) {
+    // The reconfigured buffer is LINEAR (0x0) -> stash it (this is the one that imports).
+    EXPECT_TRUE(shouldStashPresentedBuffer(true, true, DRM_FORMAT_MOD_LINEAR));
+}
+
+TEST(XRStashGuard, ForceLinearKeepsInvalidImplicit) {
+    // INVALID/implicit modifier may well be linear; let the import path try it rather than blank.
+    EXPECT_TRUE(shouldStashPresentedBuffer(true, true, DRM_FORMAT_MOD_INVALID));
+}
+
+TEST(XRStashGuard, NotForceLinearKeepsEverything) {
+    // Same-GPU output: native tiling imports fine, never drop.
+    EXPECT_TRUE(shouldStashPresentedBuffer(false, true, AMD_TILED));
+    EXPECT_TRUE(shouldStashPresentedBuffer(false, true, DRM_FORMAT_MOD_LINEAR));
+}
+
+TEST(XRStashGuard, NonDmabufAlwaysKept) {
+    // A non-dmabuf (e.g. shm/CPU) buffer has no import-tiling concern regardless of force-linear.
+    EXPECT_TRUE(shouldStashPresentedBuffer(true, false, AMD_TILED));
+    EXPECT_TRUE(shouldStashPresentedBuffer(false, false, 0));
+}
