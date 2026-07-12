@@ -1,306 +1,358 @@
 # HypXRland — Virtual Monitors & Quad Layers
 
-Doc 02 of the `docs/openxr/` set. Covers `CXRMonitorLayer`
-(`src/openxr/XRMonitorLayer.{hpp,cpp}`) and the monitor-facing API of
-`COpenXRManager`: the create/destroy funnel, presented-buffer handoff, frame
-pacing, mode changes, the layer-count cap, and the (zero-code) mirroring recipe.
-Read doc 00 (thread model, handoff table) and doc 01 (frame loop, swapchain rules,
-EGL invariants) first. All code `#ifdef HAVE_OPENXR`.
+This page covers `CXRMonitorLayer` (`src/openxr/XRMonitorLayer.{hpp,cpp}`) and the
+monitor-facing surface of `COpenXRManager`: the create/destroy funnel, the
+presented-buffer handoff, frame pacing, mode changes, cross-GPU linear buffers, the
+plugged-state follow lifecycle, the runtime layer-count cap, and mirroring an XR
+monitor onto a physical one. The thread model and handoff table live in the overview
+page; the frame loop, swapchain rules, and EGL invariants live in the
+session-graphics page. All code is `#ifdef HAVE_OPENXR`.
 
-Core idea: an "XR monitor" is an ordinary **Aquamarine headless output** — a real
-`CMonitor` that Hyprland treats like any other (workspaces, rules, screenshare,
-mirroring all work untouched) — plus a `CXRMonitorLayer` that ferries its presented
-buffers into an `XrSwapchain` and submits one `XrCompositionLayerQuad` per frame.
-Monitors created while no XR session runs are **plain headless outputs**; their
-quads bind lazily when a session starts.
-
-## How headless outputs work today (verified on main)
-
-- Creation: find the headless backend implementation and call
-  `impl->createOutput(name)` — exactly what `hyprctl output create headless NAME`
-  does (`src/debug/HyprCtl.cpp:1743-1797`, `dispatchOutput`). That fires
-  `m_aqBackend->events.newOutput` (`src/Compositor.cpp:443`) →
-  `State::monitorState()->add(output)` (`src/state/MonitorState.cpp:108-148`) which
-  constructs the `CMonitor`, emits `Event::bus()->m_events.monitor.newMon`, and runs
-  `CMonitor::onConnect(false)` — all synchronously on the main thread.
-- Non-DRM outputs get `m_createdByUser = true` (`src/output/Monitor.cpp:257-258`),
-  which permits `hyprctl output destroy` and enables resize-by-state-event.
-- Normal `monitor=` rules apply to headless outputs **by name**
-  (`Config::monitorRuleMgr()->get()` in `onConnect`, `Monitor.cpp:261`).
-- Resizing: the aq output's state event with a size sets `m_forceSize` and re-runs
-  `applyMonitorRule` (`Monitor.cpp:214-242`); rule changes emit
-  `m_events.modeChanged`.
-- Destruction: `PMONITOR->m_output->destroy()` → the monitor's destroy listener
-  (`Monitor.cpp:201-212`) runs `onDisconnect(true)` and
-  `State::monitorState()->remove()` → `Event::bus()->m_events.monitor.destroyMon`.
-- Every presented frame emits `mon->m_events.presented` on the main thread
-  (`Monitor.cpp:196-199`); the committed buffer is
-  `mon->m_output->state->state().buffer` (WIP-verified).
+An **XR monitor** is an ordinary Aquamarine **headless output** — a real `CMonitor`
+that Hyprland treats like any other (workspaces, monitor rules, screenshare, and
+mirroring all work untouched) — paired with a `CXRMonitorLayer` that ferries its
+presented buffers into an `XrSwapchain` and submits one `XrCompositionLayerQuad` per
+frame. A monitor created while no XR session is running is a plain headless output;
+its quad binds lazily when a session starts.
 
 ## `CXRMonitorLayer`
 
 One instance per XR monitor, owned by `COpenXRManager::m_layers`
-(`std::vector<SP<CXRMonitorLayer>>`, guarded by `m_layersMu` — doc 00 handoff
-table). Thread ownership is annotated per field and is load-bearing:
+(guarded by `m_layersMu`; see the overview handoff table). The layer holds three
+groups of state, each with a load-bearing thread owner (annotated per field in the
+header):
+
+- **Main thread:** the monitor key (`m_monitorName`, survives monitor teardown), a
+  weak `PHLMONITORREF`, the three signal listeners (`presented`, `modeChanged`,
+  `destroy`), the live anchoring engine (`m_anchor`; interface in the anchoring
+  page), and the reconcile bookkeeping (`m_declaredByConfig`, `m_declaredAnchor`,
+  `m_reqResolution`, `m_reqRefresh`, `m_userProvidedMode`).
+- **Main → frame handoff:** `m_latestBuffer` / `m_retiredBuffers` / `m_pendingSize`
+  under `m_bufMu`, plus the `m_haveNewFrame` / `m_swapchainDirty` /
+  `m_pendingRemoval` atomics and the cached `m_monitorId`.
+- **Frame thread only:** the `XrSwapchain`, its enumerated GL image handles, the
+  swapchain/content/chrome sizes, the CPU-fallback staging texture, and the chrome
+  fade state.
+
+### The refcount thread-safety rule
+
+hyprutils `CSharedPointer`/`CWeakPointer` refcounts are **plain unsigned ints, not
+atomic**. An increment or decrement from the frame thread races the main thread's
+copies of the same object and silently corrupts the count (observed as a `CMonitor`
+freed while still owned by the monitor-state vectors). The layer is built around this
+constraint:
+
+- The frame thread never copies, destroys, or `lock()`s a hyprutils SP/WP whose impl
+  the main thread also touches. The monitor facts it needs are cached as plain values
+  written by the main thread: `m_monitorId` (atomic) and `m_pendingSize` (under
+  `m_bufMu`).
+- Presented buffer SPs are **handed back to the main thread** for their final release
+  (`retireBuffer` → `releaseBuffers`); a `std::move` never touches the refcount.
+- The layer itself crosses threads as a `std::shared_ptr` (`PXRLAYER` — a deliberate
+  deviation from the codebase-standard hyprutils SP, because only `shared_ptr`'s
+  control block is atomic), and the manager guarantees `~CXRMonitorLayer` runs on the
+  main thread so its listener/WP teardown is safe.
+
+## Create funnel
+
+Everything that makes an XR monitor — the `xrmonitor=` config keyword, the
+`xrmonitor create` dispatcher, and `hyprctl openxr create` (surfaces and syntax in
+the configuration page) — parses into an `SXRMonitorParams` (name, optional pixel
+mode, optional size, parsed anchor state) and funnels into one main-thread method:
 
 ```cpp
-// src/openxr/XRMonitorLayer.hpp
-class CXRMonitorLayer {
-  public:
-    // ---- main thread ----
-    std::string             m_monitorName;             // key; survives monitor teardown
-    PHLMONITORREF           m_monitor;                 // weak ref to the headless output's CMonitor
-    CHyprSignalListener     m_presentedListener;       // mon->m_events.presented
-    CHyprSignalListener     m_modeChangedListener;     // mon->m_events.modeChanged
-    CHyprSignalListener     m_destroyListener;         // mon->m_events.destroy (external destroy)
-    bool                    m_createdByXR = true;      // false for xrmonitor-adopted pre-existing outputs
-
-    // ---- main → frame handoff (see doc 00 table) ----
-    std::mutex              m_bufMu;
-    SP<Aquamarine::IBuffer> m_latestBuffer;            // written under m_bufMu on presented
-    Vector2D                m_pendingSize;             // written under m_bufMu on mode change
-    std::atomic<bool>       m_haveNewFrame{false};     // release-store after buffer write
-    std::atomic<bool>       m_swapchainDirty{false};   // set on mode change / (re)bind
-    std::atomic<bool>       m_pendingRemoval{false};   // removal barrier flag
-
-    // ---- quad params: main writes under COpenXRManager::m_layersMu,
-    //      frame thread copies into its per-frame snapshot ----
-    SP<CXRAnchor>           m_anchor;                  // anchor mode + pose; interface in doc 03
-    float                   m_sizeMeters = 1.6f;       // quad width (m); height = width * pxH/pxW
-    int                     m_zOrder     = 0;          // explicit composition tier override (see below)
-    uint64_t                m_seq        = 0;          // creation sequence, monotonic (cap policy)
-
-    // ---- frame thread only (touched only between xrBeginFrame/xrEndFrame or teardown) ----
-    XrSwapchain             m_swapchain = XR_NULL_HANDLE;
-    std::vector<uint32_t>   m_swapchainImages;         // GLuints from XrSwapchainImageOpenGLESKHR
-    Vector2D                m_swapchainSize;           // size the swapchain was created at
-    XR_GLuint               m_cpuTex     = 0;          // CPU-fallback staging tex, sized to mode
-    XR_EGLImageKHR          m_lastEGLImg = nullptr;    // last dmabuf EGLImage (destroyed on next blit)
-    bool                    m_hasContent = false;      // at least one successful blit since (re)create
-    bool                    m_quadActive = true;       // false while suspended by the layer cap
-};
+std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMonitorParams& params);
+void                                 COpenXRManager::destroyXRMonitor(const std::string& name);
 ```
 
-The presented-buffer handoff is the **WIP's proven pattern**
-(`onMonitorPresented` / the frame-loop grab in
-`git show openxr:src/openxr/COpenXRManager.cpp`), moved from manager-global to
-per-layer:
+`createXRMonitor` runs on the main thread and works in **every** manager state,
+including when no session exists — that is what makes lazy binding possible:
+
+1. **Validate uniqueness:** the name must not already belong to a monitor
+   (`State::monitorState()->allMonitors()`) or an existing layer.
+2. **Construct the layer** with a monotonic `m_seq` (used by the cap policy) and the
+   quad width from `params` or `openxr:default_size` (default 1.6 m). Seed the
+   anchoring engine; when the caller gave no explicit anchor (the create verb may
+   omit one), place the monitor along the current gaze at `openxr:default_distance`
+   (default 1.5 m), falling back to a fixed forward pose when there is no tracking
+   yet. Push the layer into `m_layers` (still unbound).
+3. **Create the headless output** by finding the `AQ_BACKEND_HEADLESS`
+   implementation and calling `impl->createOutput(name)` — the same recipe as
+   `hyprctl output create headless`. The `newOutput → monitorState()->add() →
+   CMonitor` ctor + `onConnect` chain runs synchronously, so the monitor is
+   queryable immediately by name. XR-created outputs are tagged
+   `mon->m_xrManagedPlug = true` so the monitor-rule manager never re-enables them
+   while the plug lifecycle holds them unplugged.
+4. **Bind** (`bindToMonitor`): cache the monitor weak ref and `m_monitorId`, seed
+   `m_pendingSize`, mark `m_swapchainDirty`, and connect the `presented` /
+   `modeChanged` / `destroy` listeners. The `destroy` callback runs the external-
+   destroy removal barrier (path B below).
+5. **Apply the requested pixel mode**, if any. An explicit user `monitor=NAME,...`
+   rule that already set a resolution **wins** (captured once as
+   `m_userProvidedMode`). Otherwise the manager registers a **persistent named
+   monitor rule** carrying the requested mode (`registerDeclaredMonitorRule`) so the
+   declared resolution survives plug/unplug/reload — without it, every plug edge's
+   `onConnect` would re-derive the mode and fall back to the headless default
+   (1920x1080@60).
+6. **Plugged-state gate:** with `openxr:monitors_follow_session` active (default
+   `visible`), a monitor created while the session is not usable starts life
+   **unplugged** — created with a stable id and mode, then immediately `onDisconnect`ed
+   through the ordinary hotplug path, so a sessionless or doffed desktop never places
+   workspaces on a display that isn't really there. It plugs in on the next
+   session/visibility edge.
+7. Emit the `xrmonitoradded` event.
+8. **If a session is running:** decide cross-GPU linear buffers now
+   (`applyCrossGpuLinear`) and mark `m_swapchainDirty` — the frame thread creates the
+   swapchain on its next pass, since it re-snapshots `m_layers` every frame and needs
+   no extra wakeup.
+9. Recompute the layer-cap active set (`recomputeQuadActive`).
+
+**Lazy binding:** on session start the manager walks `m_layers`
+(`bindExistingLayers`): records whose named monitor still exists bind and are marked
+dirty; records whose monitor disappeared while stopped are dropped.
+
+## Presented-buffer handoff
+
+The desktop's committed buffer reaches the frame thread through the layer, once per
+presented frame:
 
 ```cpp
 // main thread — connected in bindToMonitor():
 m_presentedListener = mon->m_events.presented.listen([this]() {
-    const auto mon = m_monitor.lock();
-    if (!mon) return;
-    auto buf = mon->m_output->state->state().buffer;
+    const auto pmon = m_monitor.lock();
+    if (!pmon || !pmon->m_output || !pmon->m_output->state) return;
+    auto buf = pmon->m_output->state->state().buffer;
     if (!buf) return;
     std::lock_guard lk(m_bufMu);
-    m_latestBuffer = buf;                                  // SP keeps the buffer alive across threads
+    retired.swap(m_retiredBuffers);   // release frame-consumed buffers here, on main
+    m_latestBuffer = buf;             // SP keeps the buffer alive across threads
     m_haveNewFrame.store(true, std::memory_order_release);
 });
 
-// frame thread — once per frame (doc 01 loop):
-SP<Aquamarine::IBuffer> buf;
+// frame thread — once per frame (takeLatestBuffer):
 if (m_haveNewFrame.load(std::memory_order_acquire)) {
     std::lock_guard lk(m_bufMu);
-    buf = std::move(m_latestBuffer);
+    buf = std::move(m_latestBuffer);  // MOVED out: no refcount op
     m_haveNewFrame.store(false, std::memory_order_relaxed);
 }
 ```
 
-## Create funnel
-
-Everything that makes an XR monitor — `xrmonitor=` config keyword,
-`xrmonitor create` dispatcher, `hyprctl openxr create` (surfaces + syntax in
-doc 05) — funnels into one main-thread method:
-
-```cpp
-struct SXRMonitorParams {
-    std::string                m_name;                 // e.g. "XR-1"; must be unique
-    std::optional<Vector2D>    m_resolution;           // WxH; absent => headless default (1920x1080)
-    std::optional<float>       m_refreshRate;          // @Hz part
-    SXRAnchorState             m_anchor;               // parsed initial anchor state — struct defined in doc 03
-                                                       // (its widthMeters is seeded from m_sizeMeters below)
-    std::optional<float>       m_sizeMeters;           // absent => *openxr:default_size (1.6)
-};
-
-// returns the layer, or an error string for the IPC caller
-std::expected<SP<CXRMonitorLayer>, std::string> COpenXRManager::createXRMonitor(SXRMonitorParams params);
-void                                            COpenXRManager::destroyXRMonitor(const std::string& name);
-```
-
-`createXRMonitor` flow (main thread, works in **every** manager state including
-DISABLED — that is what makes lazy binding possible):
-
-1. Validate: name not already used by any monitor
-   (`State::monitorState()->allMonitors()` by `m_name` — same checks as
-   `dispatchOutput`, HyprCtl.cpp:1753-1762) and no existing layer with that name.
-2. Construct the `CXRMonitorLayer` with `m_seq = ++m_seqCounter`, quad params from
-   `params` (defaults from `openxr:default_size` / `openxr:default_distance` via the
-   anchor spec, doc 03); push into `m_layers` under `m_layersMu` (still unbound).
-3. Find the headless implementation and create the output — same recipe as
-   `dispatchOutput` and the WIP's `createVirtualMonitor()`:
-
-   ```cpp
-   for (auto const& impl : g_pCompositor->m_aqBackend->getImplementations()) {
-       if (impl->type() == Aquamarine::AQ_BACKEND_HEADLESS) { impl->createOutput(params.m_name); break; }
-   }
-   ```
-
-   The `newOutput` → `monitorState()->add()` → `CMonitor` ctor + `onConnect` chain
-   runs synchronously, so immediately afterwards
-   `State::monitorState()->query().name(params.m_name).run()` yields the monitor.
-   No headless implementation (should not happen — headless is
-   `AQ_BACKEND_REQUEST_MANDATORY`, Compositor.cpp:320-321) → remove the layer,
-   return an error.
-4. `bindToMonitor(mon)`: set `m_monitor`, connect the three listeners
-   (`presented`, `modeChanged`, `destroy`).
-5. Apply the requested resolution, if any: copy the monitor's matched rule, set
-   `m_resolution` (and refresh), `mon->applyMonitorRule(std::move(rule))`. An
-   explicit user `monitor=` rule matching this name **wins** — skip this step when
-   `Config::monitorRuleMgr()->get(mon)` matched a non-default rule. (`xrmonitor=`
-   owns existence + XR placement only; display properties stay with `monitor=`.)
-6. Emit `xrmonitoradded` socket2 event (doc 05).
-7. If a session is running: `m_swapchainDirty = true` — the frame thread creates the
-   swapchain on its next pass (it already snapshots `m_layers` per frame, so no
-   extra wakeup is needed).
-
-**Lazy quad binding**: on `start()` (doc 01, step 8), the manager walks `m_layers`;
-records whose monitor still exists get bound (if not already) and marked dirty;
-records whose named monitor disappeared while disabled are dropped. Declared
-`xrmonitor=` entries are reconciled against live layers on config reload —
-declared-but-missing get created, layers created at runtime (dispatcher/hyprctl)
-are **left alone**; removal of a declared line does not destroy a live monitor
-(reconcile semantics + parsing live in doc 05).
+The frame thread blits `buf` into the layer's swapchain (dmabuf EGLImage import, with
+a CPU-staging fallback; blit details in the session-graphics page), then hands the SP
+back via `retireBuffer`, which stashes it in `m_retiredBuffers`. The main thread
+releases those refs in `releaseBuffers` — called from the `presented` listener each
+frame and from every removal/teardown path — so a buffer SP's final decrement always
+happens on the main thread. Which blit path last produced content
+(none/dmabuf/cpu/black) is published per layer for `hyprctl openxr status`.
 
 ## Frame pacing
 
-Headless outputs advertise a meaningless refresh rate, and nothing else schedules
-frames on an idle output. The WIP's mechanism (frame-loop comment: *"Ask Hyprland to
-render OPENXR-1 — this drives the ~90Hz render rate on the virtual monitor
-regardless of what mode it advertises"*) is kept, per layer:
+Headless outputs advertise a meaningless refresh rate and nothing else schedules
+frames on an idle output, so the XR session must drive them. While the session is
+**VISIBLE or FOCUSED**, the frame thread — once per `xrWaitFrame` iteration —
+enqueues a `SCHEDULE_FRAMES` event onto the frame→main queue. The **main thread**
+drains it and calls `mon->scheduleFrame()` for every bound, non-pending-removal
+layer.
 
-- The frame thread calls `mon->m_output->scheduleFrame()` for **each bound,
-  non-pending-removal layer**, once per XR frame-loop iteration, **only while the
-  session is VISIBLE or FOCUSED** (doc 01 loop). This is the single sanctioned
-  cross-thread monitor call (doc 00 handoff table) — never call it from the frame
-  thread outside those states, and never render/damage from the frame thread.
-- Result: the XR runtime's `xrWaitFrame` cadence (e.g. 90 Hz) drives compositor
-  renders of each visible XR monitor; when the session drops to idle/synchronized,
-  pacing stops and the outputs go back to damage-driven rendering.
+The scheduling call is deliberately main-thread-only: `CMonitor::scheduleFrame()`
+lands in aquamarine's idle-callback vector, which the main thread concurrently drains
+in `CBackend::dispatchIdle` with no lock — calling it from the frame thread would
+corrupt the heap. The result is that the runtime's frame cadence (e.g. 90 Hz) drives
+compositor renders of each visible XR monitor. When the session drops to
+idle/synchronized, pacing stops and the outputs return to damage-driven rendering.
 
 ## Mode changes (swapchain recreate protocol)
 
-Trigger paths: user edits `monitor=XR-1,2560x1440@90,...` and reloads;
-`m_forceSize` via the output state event; any `applyMonitorRule` that changes the
-pixel size (all emit `m_events.modeChanged`).
+A mode change is triggered by any `applyMonitorRule` that changes the pixel size
+(user edits `monitor=XR-1,2560x1440@90` and reloads, an output state event that sets
+`m_forceSize`, etc.) — all of which emit `mon->m_events.modeChanged`.
 
 - **Main thread** (`m_modeChangedListener`): read `mon->m_pixelSize`; if it differs
-  from the last size sent, write it to `m_pendingSize` under `m_bufMu` and
-  `m_swapchainDirty.store(true)`. Never touches the swapchain.
-- **Frame thread** (top of per-layer work, between frames — after the previous
-  `xrEndFrame`, before any acquire on this swapchain):
+  from `m_pendingSize`, write the new size under `m_bufMu` and set `m_swapchainDirty`.
+  It never touches the swapchain.
+- **Frame thread** (top of per-layer work, between frames): when
+  `m_swapchainDirty.exchange(false)` is set, `createLayerSwapchain` destroys the old
+  swapchain (context **not** current — the interop rule), creates a new one at the new
+  size in the session's swapchain format, enumerates its GL images, and reallocates
+  the CPU staging texture and chrome snapshot inside a scoped GL context.
+  `m_hasContent` resets to false, keeping the quad out of the submitted layer array
+  until the next blit lands (usually one frame).
 
-```
-if l.m_swapchainDirty.exchange(false):
-    newSize = (lock m_bufMu) l.m_pendingSize
-    if l.m_swapchain: xrDestroySwapchain(l.m_swapchain)     # context NOT current (doc 01 invariant)
-    create swapchain: format = session.m_swapchainFormat, width/height = newSize   (doc 01 rules)
-    enumerate XrSwapchainImageOpenGLESKHR images -> l.m_swapchainImages
-    l.m_swapchainSize = newSize; l.m_hasContent = false
-    { CScopedGLContext: realloc l.m_cpuTex to newSize, destroy l.m_lastEGLImg }     # CPU-fallback staging
-```
+Destroying the swapchain between frames is safe: no image of it is acquired at that
+point, and a swapchain absent from the current frame's `xrEndFrame` array is not
+referenced by the runtime's next composite. The quad's aspect follows the pixel mode
+automatically (`height = width * pxH/pxW`, computed from the content rect).
 
-  Destroying between frames is safe: no image of this swapchain is acquired, and
-  a swapchain absent from the current frame's `xrEndFrame` array is not referenced
-  by the runtime's next composite. The quad disappears for the (usually one) frame
-  until the next blit lands — acceptable; `m_hasContent = false` keeps it out of
-  the layer array until then. The quad's aspect follows automatically
-  (`height = m_sizeMeters * h / w`).
+### Chrome margins
+
+The swapchain is allocated as **content plus a transparent alpha margin**, not
+content-only. `createLayerSwapchain` takes the monitor's pixel mode as the inner
+content rect and expands it by the configured chrome margins; the desktop blits into
+the inner content rect (`m_contentSize` / `m_contentOffsetPx`) and the margin holds
+the grab affordances (move-bar and corner handles). The `size:` meters always mean
+**content** width, and the submit path grows the quad to full-quad meters and shifts
+the pose so the content stays exactly where the anchor placed it. With
+`openxr:chrome_enabled = 0` all margins collapse to zero and the swapchain is
+content-only. The chrome interaction model (hit regions, fade, grab/resize) is
+covered in the input page.
+
+## Cross-GPU linear buffers
+
+Desktop buffers are **native-tiled by default**. They are allocated
+`DRM_FORMAT_MOD_LINEAR` only when `openxr:force_linear` engages — `on` forces it,
+`off` disables it, and `auto` (the default) forces linear **only when a cross-GPU
+split is detected** between the XR runtime's EGL render node and the output's
+buffer-allocator DRM node.
+
+`applyCrossGpuLinear` (main thread) resolves both DRM nodes, calls
+`OpenXR::shouldForceLinear` (which forces linear in `auto` only when both nodes are
+positively known and differ), and flips `mon->m_forceLinearSwapchain`. On a change it
+forces aquamarine's full-reconfigure path so the buffers are actually re-allocated
+with the new modifier, then logs the modifier the buffers actually carry. Linear
+tiling costs some compositing throughput; it is the accepted cost of letting a
+second GPU import the desktop's buffers. The decision needs the XR EGL node, which
+only exists once a session is up, so monitors created while stopped get it at
+`bindExistingLayers`. The per-monitor linear state is reported in `hyprctl openxr
+status`.
 
 ## Destroy paths (removal barrier)
 
-The frame thread may be mid-frame with the layer's swapchain acquired and the
-buffer SP in hand, so `m_output->destroy()` must not run until the frame thread has
-let go. **Barrier: the layer is removed from the frame thread's snapshot set and
-any in-flight frame has completed before the output is destroyed on the main
-thread.**
+The frame thread may be mid-frame with a layer's swapchain acquired and a buffer SP in
+hand, so `m_output->destroy()` must not run until the frame thread has let go. The
+barrier removes the layer from the frame thread's snapshot set and waits for an ack
+before the output is destroyed on the main thread.
 
-**A. XR-initiated (`destroyXRMonitor`, dispatcher/hyprctl/`destroy_monitors_on_stop`):**
+**A. XR-initiated** (`destroyXRMonitor` from the dispatcher/hyprctl, or
+`destroy_monitors_on_stop`):
 
-1. Main: find layer, `m_pendingRemoval.store(true)`. Disconnect
-   `m_presentedListener` / `m_modeChangedListener` (no new buffers queued).
-2. Frame thread, at the snapshot point of its next iteration: layers with
-   `m_pendingRemoval` are excluded from the snapshot (so never blitted or
-   submitted again); after `xrEndFrame` of the current iteration it destroys the
-   layer's frame-side resources (`xrDestroySwapchain` context-not-current; EGLImage
-   + `m_cpuTex` inside a `CScopedGLContext`) and pushes a
-   `layer-removed(name)` ack onto the frame→main queue (channel [C], eventfd).
-3. Main, on ack: erase the layer from `m_layers` under `m_layersMu`, then
-   `mon->m_output->destroy()` → normal `CMonitor` teardown → emit
-   `xrmonitorremoved` (doc 05).
-4. **No session running** (no frame thread): skip the barrier — destroy frame-side
-   resources directly if any linger (there should be none while DISABLED), erase,
-   `m_output->destroy()`.
+1. Main: find the layer, `stopMainListeners()` (no new buffers/mode changes queued),
+   set `m_pendingRemoval`.
+2. Frame thread: layers with `m_pendingRemoval` are excluded from the per-frame
+   snapshot (never blitted or submitted again); after the current `xrEndFrame` it
+   destroys the layer's frame-side resources (GL objects with the context current,
+   then the swapchain with the context not current), drops its refs, and enqueues a
+   `LAYER_REMOVED` ack onto the frame→main queue.
+3. Main, on the ack (`finalizeLayerRemoval`): release any queued/retired buffers,
+   erase the layer from `m_layers`, then destroy the output. Recompute the layer cap
+   and emit `xrmonitorremoved`.
+4. **No session running** (no frame thread): skip the barrier — release buffers,
+   erase, destroy the output directly.
 
-**B. External destroy (monitor dies first — `hyprctl output destroy XR-1`, backend
-teardown):** `m_destroyListener` fires on the main thread → same as (A) but step 3
-skips `m_output->destroy()` (already gone) and `m_monitor` is already expired; the
-layer must tolerate a dead monitor ref between flag and ack (every frame-thread
-access already goes through `.lock()` guards).
+**B. External destroy** (the monitor dies first — `hyprctl output destroy`, backend
+teardown): `m_destroyListener` fires on the main thread and runs the same handoff. If
+a session is running it goes through the barrier; otherwise it finalizes directly. The
+output is already gone, so step 3 skips `m_output->destroy()`, and every frame-thread
+access already tolerates a dead monitor ref through its `.lock()` guards.
 
-**C. Session stop (doc 01 teardown, after the join):** frame thread is gone, so no
-barrier needed. If `openxr:destroy_monitors_on_stop` (default 0): destroy every
-layer with `m_createdByXR` via the no-session path of (A). Else: keep the outputs
-and the layer records (swapchain unbound) for the next `start()` — and, with
-`openxr:monitors_follow_session != off` (default `visible`, research/18 + report-18
-addendum), UNPLUG them (`updateMonitorsPlugged()` → `setMonitorsPlugged(false)` →
-`CMonitor::onDisconnect()`, the same evacuation a physical unplug runs) so a
-sessionless desktop has no phantom monitors. Session end unplugs immediately; the
-`visible`-mode anti-flap grace (`openxr:monitor_unplug_grace_ms`) only defers the
-mid-session VISIBLE→doffed drop, never `stop()`.
+The output is torn down through `destroyOutputDeferred`, which works around an
+aquamarine headless-output lifetime issue: `CHeadlessOutput::scheduleFrame()` queues
+the output's own frame callback (raw `this`, no liveness guard) into the backend's
+idle list, and neither `destroy()` nor the destructor removes it — freeing the output
+with a callback still queued would emit on freed memory on the next `dispatchIdle`.
+Because XR pacing schedules a frame on the output almost every runtime frame, this is
+a hot path during create/destroy churn. `destroyOutputDeferred` calls `destroy()`
+(which clears the frame listener, so the stale callback becomes an inert emit) and
+then keeps a reference to the output alive inside a **sentinel idle event** queued
+after any pending callback, dropping the last reference only once the idle queue has
+drained past it.
 
-**Visibility edge (`visible` mode, report-18 addendum):** distinct from (C). While a
-session persists, `updateMonitorsPlugged()` (called from the frame→main session-state
-dispatch) plugs on the VISIBLE/FOCUSED edge (headset donned — immediate, fast) and
-arms a one-shot `CEventLoopTimer` grace-unplug on the drop to IDLE/SYNCHRONIZED
-(doffed/standby). Donning within the grace cancels the timer, so a doff-and-straight-
-back-on never evacuates workspaces. WiVRn running as a service keeps a session alive
-with the headset on the shelf, so `session` mode would leave those monitors always
-plugged — `visible` is the default for exactly this reason.
+**C. Session stop:** the frame thread is already joined, so no barrier is needed.
+With `openxr:destroy_monitors_on_stop` (default false) the outputs and layer records
+are kept for the next session start (swapchain unbound, lazy binding re-runs); with it
+set, every `m_createdByXR` layer is destroyed. When monitors are kept and
+`openxr:monitors_follow_session != off`, session stop **unplugs** them immediately (no
+grace) so a sessionless desktop has no phantom monitors.
+
+## Plugged-state follow lifecycle
+
+`openxr:monitors_follow_session` controls when XR monitors behave like **unplugged
+external monitors** — held disabled, with their workspaces evacuated to the remaining
+monitors exactly like a physical unplug and returned by name on replug:
+
+- `off` — never unplug (always present).
+- `session` — plugged while any OpenXR session exists.
+- `visible` (default) — plugged only while the session is actually being worn.
+
+Under `visible`, the plug gate (`monitorsShouldBePluggedNow` →
+`OpenXR::wantXRMonitorsPlugged`) requires a live session that is **VISIBLE/FOCUSED**
+and, when the runtime exposes `XR_EXT_user_presence` (e.g. WiVRn), also **user
+presence** — both signals must currently agree. This is because a service-mode runtime
+keeps a session alive with the headset sitting doffed on a shelf, and WiVRn's presence
+signal can stick `present` while doffed; requiring visibility too lets a doff unplug
+even when presence is stuck. `session` mode would leave those shelved monitors always
+plugged, which is why `visible` is the default.
+
+The lifecycle funnels through `updateMonitorsPlugged`, driven from the session-state
+and user-presence edges on the frame→main queue:
+
+- **Donning** (edge to VISIBLE/FOCUSED, or presence becoming present) plugs
+  immediately and cancels any pending unplug.
+- **Doffing** (drop to IDLE/SYNCHRONIZED, or presence becoming absent) arms a one-shot
+  `CEventLoopTimer` for `openxr:monitor_unplug_grace_ms` (default 20000) rather than
+  unplugging at once; donning within the grace cancels it, so a quick glance away
+  never rearranges workspaces.
+- **First plug of a session:** in `visible` mode the first plug waits until visibility
+  has been continuously sustained past `openxr:monitor_plug_settle_ms` (default 1500),
+  guarding against runtimes that sprint to VISIBLE/FOCUSED at session creation even
+  while doffed. Later plugs use the grace instead and never defer.
+
+`setMonitorsPlugged` is the pure applicator: it drives each session-following,
+XR-created monitor to the target state with the same `mon->onConnect(true)` /
+`mon->onDisconnect()` the rule manager uses for a `monitor=...,disable` flip. It never
+touches adopted pre-existing monitors and never destroys the output.
+
+### Recenter on plug
+
+With `openxr:recenter_on_plug` (default true), the **first don of a session** re-seats
+`anchor:local` monitors relative to the current head pose instead of the runtime's
+(often arbitrary) LOCAL_FLOOR origin. The main thread arms a flag before plugging; the
+frame thread, which owns the head pose, consumes it on its next valid-view frame and
+calls `recenterLocalToHead` on every layer, passing the same head pose to all of them
+so a multi-monitor layout is transformed **rigidly** (relative arrangement preserved).
+A brief doff-and-don within the same session does **not** re-seat — the head-relative
+pose from the first don is kept.
+
+## Declared vs runtime monitors
+
+Monitors declared with the `xrmonitor=` config keyword are tagged `m_declaredByConfig`
+and reconciled against live layers on every config reload
+(`reconcileDeclaredMonitors`): declared-but-missing entries are created;
+declared-and-live entries are diffed for mode/anchor/size changes; and a declared line
+that disappears destroys its live monitor. Monitors created at runtime (dispatcher or
+hyprctl) are **never touched** by reconciliation — removing a declared line does not
+destroy a runtime monitor, and a name collision leaves the runtime monitor alone.
+Declared monitors persist their declared mode (via the persistent monitor rule) and
+re-materialize on the next session start. The keyword grammar and reconcile semantics
+are in the configuration page.
 
 ## Layer-count limit
 
-`CXRSession::m_maxLayerCount` = `XrSystemGraphicsProperties::maxLayerCount` from
-`xrGetSystemProperties` (doc 01; the spec guarantees ≥ 16). Total layers submitted
-in `xrEndFrame` must not exceed it — ours are all quads (plus nothing else; we
-submit no projection layer).
+`CXRSession::m_maxLayerCount` is `XrSystemGraphicsProperties::maxLayerCount` from
+`xrGetSystemProperties` (the spec guarantees at least 16). Every layer we submit in
+`xrEndFrame` is a quad, and their total must not exceed that cap.
 
-Policy (recency wins): creating a monitor **never fails** for cap reasons — the
-newest monitor always functions as an output and gets a quad; when the active-quad
-count would exceed `m_maxLayerCount`, the **oldest** quads (lowest `m_seq`) are
-dropped: `m_quadActive = false`, the layer stops being submitted, but its monitor
-keeps rendering as a normal (paced) headless output — reachable via mirroring or
-re-activation. On each change: `Log::WARN` naming the suspended monitor + a socket2
-notification (`xrmonitorquad>>NAME,0|1` — final event table in doc 05). When
-capacity frees (a monitor is destroyed), suspended layers re-activate newest-first,
-also with the event.
+The policy is **recency-wins** and creating a monitor never fails for cap reasons: the
+newest monitor always functions as an output and gets a quad. When the active-quad
+count would exceed the cap, the **oldest** quads (lowest `m_seq`) are suspended —
+`m_quadActive = false`, so the quad stops being submitted, but the monitor keeps
+rendering as a normal paced headless output (still reachable via mirroring, and
+re-activated newest-first when capacity frees). Each transition logs a `Log::WARN`
+naming the monitor and emits an `xrmonitorquad>>NAME,0|1` event. `recomputeQuadActive`
+computes the active set on the main thread whenever the layer set changes, so
+`hyprctl openxr status` matches what is rendered, and the frame thread applies the same
+cap as a final truncate.
 
-Frame-thread enforcement is the sort/truncate step in the doc 01 loop pseudocode;
-the manager recomputes `m_quadActive` flags on the main thread whenever the layer
-set changes (under `m_layersMu`), so IPC state (`hyprctl openxr status`) matches
-what is rendered.
+**Composition order** is depth-sorted per frame. OpenXR composites the `xrEndFrame`
+layer array in submission order (later entries draw on top) with no regard for 3D
+position, so the frame thread orders quads by their freshly solved distance from the
+viewer — farthest first — so nearer quads occlude farther ones. `m_zOrder` is an
+explicit override tier compared first; creation `m_seq` breaks remaining ties.
 
-AS-BUILT AMENDMENT — composition order is depth-sorted per frame: OpenXR composites
-the `xrEndFrame` layer array in submission order (later entries on top) with no
-regard for 3D position, so the frame thread orders quads by their freshly solved
-distance from the viewer, farthest first — nearer quads therefore occlude farther
-ones, as expected in a 3D scene. `m_zOrder` remains an explicit override tier
-(compared first); creation `m_seq` breaks remaining ties.
+## Mirroring an XR monitor onto a physical one
 
-## Mirroring an XR monitor onto a physical one — pure recipe, zero new code
-
-Requirement: see an XR monitor on a physical display. This already works with the
-existing mirror machinery:
+Seeing an XR monitor on a physical display needs **no XR code** — the ordinary
+`monitor=` mirror machinery handles it, because the source's backend is irrelevant to
+mirroring:
 
 ```ini
 # hyprland.conf — mirror XR-1 onto DP-1
@@ -309,65 +361,43 @@ monitor = DP-1, preferred, auto, 1, mirror, XR-1
 
 (or at runtime: `hyprctl keyword monitor "DP-1, preferred, auto, 1, mirror, XR-1"`.)
 
-Why it works for headless sources — the mechanism, verified in source:
-
-- The rule's `mirror` arg lands in `CMonitorRule::m_mirrorOf`; `applyMonitorRule`
-  calls `setMirror("XR-1")` at its end (`src/output/Monitor.cpp:710`, also
-  `onConnect` at :341-342 for boot-time rules).
-- `CMonitor::setMirror` (`Monitor.cpp:1330-1396`) resolves the source by name,
-  refuses mirror-of-mirror and self-mirror, moves DP-1's workspaces to a backup
-  monitor, sets `DP-1.m_mirrorOf = XR-1` and appends DP-1 to `XR-1.m_mirrors`,
-  software-locks the cursor on the source, and emits
-  `Event::bus()->m_events.monitor.layoutChanged` (which drops DP-1 from the
-  workspace-bearing monitor list — `src/state/MonitorState.cpp:32-46`).
-- On the **source** side: `XR-1.m_mirrors` being non-empty makes
-  `CMonitor::needsACopyFB()` return true (`Monitor.cpp:2705-2707`), so the renderer
-  keeps a **mirror FB** alive and saves each composited frame of XR-1 into it (the
-  `needsACopyFB()` checks in `src/render/Renderer.cpp` ~1745/2189 — the same
-  copy-FB path screenshare uses via `Screenshare::mgr()->outputNeedsCopyFB`).
-- On the **mirror** side: DP-1's render path sees `isMirror()` and calls
-  `IHyprRenderer::renderMirrored()` (`Renderer.cpp:1950-1978`), which draws
-  `XR-1->resources()->getMirrorTexture()` (`src/output/MonitorResources.hpp`)
-  scaled/letterboxed/transform-corrected onto DP-1.
-- None of this cares about the source's backend: the mirror FB is a GL texture copy
-  made inside the compositor at composite time — a headless source is
-  indistinguishable from a DRM one. It composes cleanly with the XR quad blit,
-  which independently consumes the *presented buffer* (`presented` signal); the two
-  consumers never touch the same object.
+- `applyMonitorRule` calls `CMonitor::setMirror("XR-1")` (`src/output/Monitor.cpp`),
+  which resolves the source by name, moves DP-1's workspaces to a backup monitor, sets
+  `DP-1.m_mirrorOf = XR-1`, appends DP-1 to `XR-1.m_mirrors`, and emits the layout-
+  changed event.
+- On the **source** side, `XR-1.m_mirrors` being non-empty makes
+  `CMonitor::needsACopyFB()` return true, so the renderer keeps a mirror framebuffer
+  and saves each composited frame of XR-1 into it — the same copy-FB path screenshare
+  uses.
+- On the **mirror** side, DP-1's render path sees `isMirror()` and calls
+  `IHyprRenderer::renderMirrored()`, which draws the source's mirror texture scaled and
+  letterboxed onto DP-1.
+- The mirror FB is a GL texture copy made inside the compositor at composite time, so a
+  headless source is indistinguishable from a DRM one. It composes cleanly with the XR
+  quad blit, which independently consumes the *presented buffer* — the two consumers
+  never touch the same object.
 - Pacing: XR-1 renders when the frame thread paces it (session visible) or when
-  damaged; each new XR-1 frame damages its mirrors, so DP-1 updates at
-  min(XR cadence, DP-1 refresh). If the session is idle (no pacing), the mirror
-  simply shows the last rendered frame — correct and cheap.
+  damaged, and each new XR-1 frame damages its mirrors, so DP-1 updates at min(XR
+  cadence, DP-1 refresh). An idle session simply shows the last rendered frame.
 
-Implementation note: there is deliberately **no code** in `src/openxr/` for
-mirroring. Doc 05's consumer recipes reference this section; hyprtester covers it
-with a `mirror` integration test (doc 06).
+## Status observability
 
-## Interaction with the rest of the surface (pointers into sibling docs)
+`hyprctl openxr status` reports, per monitor: `plugged` (the output's enabled state),
+`linear` (cross-GPU linear buffers), `contentPath` (which blit path last produced the
+layer's content), `grabbed` / `grabKind` (move vs resize), `hovered` (last ray hover),
+and the adaptive-anchoring phase. Field formats are in the configuration page.
 
-- `xrmonitor` dispatcher verbs (`create/destroy/select/anchor/move/rotate/scale/
-  distance/center`) and `hyprctl openxr` subcommands call `createXRMonitor` /
-  `destroyXRMonitor` / quad-param setters on the main thread — tables in doc 05.
-- Anchor solving and the meaning of `SXRAnchorState` — doc 03. From this doc's
-  perspective an anchor is opaque: main thread swaps/updates `m_anchor` under
-  `m_layersMu`; the frame thread calls `solve()` on its snapshot.
-- Ray input targets layers by intersecting quads and routes `motionAbsolute` bound
-  to the hit monitor's output — doc 04.
-- Events emitted here (`xrmonitoradded`, `xrmonitorremoved`, `xrmonitorquad`) and
-  `hyprctl openxr status` fields — doc 05.
+## Related pages
 
-## Context files to read before implementing
-
-- `/home/ajg/code/Hyprland/docs/openxr/00-overview.md` — thread model + handoff table (normative for every field above)
-- `/home/ajg/code/Hyprland/docs/openxr/01-session-graphics.md` — frame loop, swapchain creation rules, EGL context invariant, teardown ordering
-- `git show openxr:src/openxr/COpenXRManager.cpp` — WIP: `createVirtualMonitor`, `setupMonitor`, `onMonitorPresented`, frame-loop buffer grab + pacing
-- `/home/ajg/code/Hyprland/src/debug/HyprCtl.cpp` (lines 1743–1797) — `dispatchOutput`: the existing create/destroy path incl. name checks and `m_createdByUser` guard
-- `/home/ajg/code/Hyprland/src/state/MonitorState.cpp` — `add`/`remove` flow, `Event::bus()` monitor events
-- `/home/ajg/code/Hyprland/src/output/Monitor.cpp` — ctor listeners (destroy ~201, state/`m_forceSize` ~214), `onConnect` ~106, `m_createdByUser` ~258, `applyMonitorRule` ~715, `setMirror` ~1330, `needsACopyFB` ~2705
-- `/home/ajg/code/Hyprland/src/output/Monitor.hpp` — `CMonitor` fields + `m_events` signals
-- `/home/ajg/code/Hyprland/src/output/MonitorResources.hpp` — `getMirrorTexture` / `markMirrorFBStale` (mirroring mechanism)
-- `/home/ajg/code/Hyprland/src/render/Renderer.cpp` — `renderMirrored` (~1950), `needsACopyFB` call sites (~1745, ~2189)
-- `/home/ajg/code/Hyprland/src/render/Renderer.hpp` — `beginRender`/`beginRenderToBuffer`/`endRender` signatures (context for how render-to-buffer consumers coexist)
-- `/home/ajg/code/Hyprland/src/managers/screenshare/ScreenshareFrame.cpp` — `copyDmabuf()`: the reference `beginRender(..., RENDER_MODE_TO_BUFFER, buffer, ...)` recipe if a compositor-side copy path is ever needed instead of the presented-buffer handoff
-- `/home/ajg/code/Hyprland/src/event/EventBus.hpp` — monitor added/removed/layoutChanged signals
-- `/home/ajg/code/Hyprland/src/config/shared/monitor/MonitorRuleManager.hpp` — rule matching used in create step 5
+- Overview — thread model and handoff table (normative for the field ownership above).
+- Session & graphics — frame loop, swapchain creation, EGL context invariant, blit,
+  blend mode, teardown ordering.
+- Anchoring — `SXRAnchorState`, `CXRAnchor::solve()`, and how the frame thread poses
+  each quad; from this page an anchor is opaque (main thread mutates `m_anchor` under
+  `m_layersMu`, frame thread solves its snapshot).
+- Input — the ray pointer that targets quads and routes `motionAbsolute` to the hit
+  monitor, plus the chrome grab/resize model.
+- Configuration — the `xrmonitor=` keyword, the `xrmonitor` dispatcher and `hyprctl
+  openxr` subcommands, the event surface (`xrmonitoradded`, `xrmonitorremoved`,
+  `xrmonitorquad`, ...), and the `hyprctl openxr status` field reference.
+- Testing — the hyprtester coverage, including the mirroring integration test.
