@@ -839,6 +839,16 @@ static SDispatchResult xrmonitorDispatch(const std::string& args) {
     if (verb == "center")
         return wrapExp(g_pOpenXRManager->cmdCenter());
 
+    // Adaptive anchoring verbs (research/13 §6.3).
+    if (verb == "adaptive")
+        return wrapExp(g_pOpenXRManager->cmdAdaptive(rest));
+    if (verb == "dock")
+        return wrapExp(g_pOpenXRManager->cmdDock(rest));
+    if (verb == "undock")
+        return wrapExp(g_pOpenXRManager->cmdUndock());
+    if (verb == "roam")
+        return wrapExp(g_pOpenXRManager->cmdRoam(rest));
+
     return {.success = false, .error = "unknown xrmonitor verb '" + verb + "'"};
 #endif
 }

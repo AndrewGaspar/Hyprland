@@ -101,6 +101,13 @@ class COpenXRManager {
     std::expected<void, std::string> cmdDistance(const std::string& args); // <±m>
     std::expected<void, std::string> cmdCenter();                          // (none)
 
+    // --- adaptive anchoring verbs (research/13 §6.3). Main thread; take m_layersMu. Operate on the
+    // selected monitor (like move/center). ---
+    std::expected<void, std::string> cmdAdaptive(const std::string& args); // on|off|toggle
+    std::expected<void, std::string> cmdDock(const std::string& args);     // [here]
+    std::expected<void, std::string> cmdUndock();                          // (none)
+    std::expected<void, std::string> cmdRoam(const std::string& args);     // head|body
+
     // Snapshot of one XR monitor for `hyprctl openxr status` (doc 05 §4.3). Main thread.
     struct SXRMonitorInfo {
         std::string name;
@@ -114,6 +121,12 @@ class COpenXRManager {
         bool        grabbed  = false;
         std::string grabKind = "none"; // WP-G3: "none" | "move" | "resize" (which grab owns it)
         bool        hovered  = false;
+        // Adaptive anchoring (research/13 §6.4).
+        bool        adaptiveEnabled  = false;
+        std::string adaptivePhase    = "docked"; // docked | undocking | roaming | redocking
+        std::string adaptiveRoamMode = "body";   // head | body
+        float       adaptiveSeatDist = 0.f;      // current XZ distance from the desk seat (m)
+        float       adaptiveT        = 0.f;      // transition envelope parameter [0,1]
     };
     std::vector<SXRMonitorInfo> monitorInfos();
 
