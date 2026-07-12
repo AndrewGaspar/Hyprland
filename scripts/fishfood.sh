@@ -32,24 +32,43 @@ build() {
         -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
     # Shared build mutex: all HypXRland builds on this box serialize through it.
     flock -w 7200 /tmp/hypxrland-build.lock \
-        cmake --build "$BUILD" --target Hyprland -j"$JOBS"
+        cmake --build "$BUILD" --target Hyprland hyprctl -j"$JOBS"
+    # In-session utilities: this dir is prepended to PATH by the session
+    # launcher so `hyprctl` (with the openxr command + matching IPC surface)
+    # wins over the distro package inside the HypXRland session only.
+    mkdir -p "$BUILD/bin"
+    ln -sf "$BUILD/hyprctl/hyprctl" "$BUILD/bin/hyprctl"
     echo "==> fishfood binary: $BUILD/Hyprland ($(git -C "$WORKTREE" rev-parse --short HEAD))"
 }
 
 gen_session() {
     mkdir -p "$(dirname "$DESKTOP_OUT")"
+    local launcher="$(dirname "$DESKTOP_OUT")/launch.sh"
+    # Launcher indirection: the installed .desktop Exec never changes, so PATH
+    # tweaks / flag changes only need regenerating this user-owned script.
+    # PATH is exported BEFORE uwsm start — uwsm imports the caller environment
+    # into the systemd user manager, so Hyprland, binds (uwsm-app) and
+    # terminals all see the fishfood bin dir first.
+    cat >"$launcher" <<EOF
+#!/bin/sh
+export PATH="$BUILD/bin:\$PATH"
+export HYPXRLAND_SESSION=1
+exec uwsm start -e -D Hyprland -- $BUILD/Hyprland --config $CONF
+EOF
+    chmod +x "$launcher"
     # DesktopNames stays "Hyprland" so portals/theming/apps treat the session
     # exactly like the stock one; only the entry Name differs at the greeter.
     cat >"$DESKTOP_OUT" <<EOF
 [Desktop Entry]
 Name=HypXRland
 Comment=Hyprland + OpenXR (fishfood build from $WORKTREE)
-Exec=uwsm start -e -D Hyprland -- $BUILD/Hyprland --config $CONF
+Exec=$launcher
 TryExec=uwsm
 DesktopNames=Hyprland
 Type=Application
 Keywords=tiling;wayland;compositor;openxr;vr;
 EOF
+    echo "==> session launcher generated at $launcher"
     echo "==> session file generated at $DESKTOP_OUT"
     echo "    Install it (needs root):"
     echo "      sudo install -m644 $DESKTOP_OUT /usr/share/wayland-sessions/hypxrland.desktop"
