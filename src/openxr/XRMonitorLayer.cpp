@@ -124,6 +124,7 @@ void CXRMonitorLayer::destroySwapchain() {
     }
     m_swapchainImages.clear();
     m_hasContent = false;
+    m_contentPath.store(0 /* OpenXR::XR_CONTENT_NONE */, std::memory_order_relaxed);
 }
 
 #endif // HAVE_OPENXR
