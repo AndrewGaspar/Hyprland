@@ -57,6 +57,28 @@ namespace OpenXR {
     // unrecognized (including empty) -> VISIBLE (the default). Case/whitespace-insensitive. Pure.
     eXRMonitorFollowMode parseMonitorFollowMode(const std::string& v);
 
+    // Cross-GPU linear-buffer policy (research/17 addendum). When the XR EGL context lives on a
+    // DIFFERENT physical GPU than the one the compositor allocates the headless output's buffers on
+    // (hybrid: desktop on the AMD iGPU, WiVRn/runtime on the NVIDIA dGPU via openxr:gpu), the XR
+    // context cannot import the AMD-vendor-tiled buffers — NVIDIA's EGL rejects the foreign tiling
+    // modifier with EGL_BAD_ATTRIBUTE and the quad goes black. The multi-GPU-standard fix is to make
+    // that output's swapchain allocate DRM_FORMAT_MOD_LINEAR buffers (importable by any GPU). This
+    // mirrors openxr:force_linear = auto | on | off.
+    enum eForceLinearMode : uint8_t {
+        XR_LINEAR_AUTO = 0, // force linear iff a cross-GPU split is positively detected (default)
+        XR_LINEAR_ON,       // always force linear on XR-bound outputs
+        XR_LINEAR_OFF,      // never force (leave native tiling; for debugging / same-GPU-only setups)
+    };
+    // "auto" (or anything unrecognized) => XR_LINEAR_AUTO; "on"/"true"/"1" => ON; "off"/"false"/"0" => OFF.
+    eForceLinearMode parseForceLinearMode(const std::string& s);
+
+    // Pure decision (tests/xr/force_linear.cpp): should the XR-bound headless output allocate LINEAR
+    // buffers? `*Valid` say whether each DRM node's device numbers are known. AUTO forces linear only
+    // when BOTH nodes are known AND they differ (a genuine cross-GPU split) — an unknown node stays
+    // native (same-GPU is the common case and linear costs compositing throughput). ON/OFF ignore the
+    // nodes. No OpenXR/aquamarine types so hyprland_gtests can exercise it without a runtime.
+    bool shouldForceLinear(eForceLinearMode mode, bool xrValid, int64_t xrMajor, int64_t xrMinor, bool allocValid, int64_t allocMajor, int64_t allocMinor);
+
     // Plugged-state policy (research/18 — XR monitors behave like unplugged external monitors
     // while no session is usable). Pure and unconditional so hyprland_gtests can exercise it
     // (tests/xr/plugged.cpp). `sessionUp` is the manager's session-EXISTENCE edge (start()..stop());

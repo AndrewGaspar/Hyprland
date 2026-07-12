@@ -14,6 +14,7 @@
 
 #include "../helpers/memory/Memory.hpp"
 #include "../helpers/signal/Signal.hpp"
+#include "../desktop/DesktopTypes.hpp" // PHLMONITOR (applyCrossGpuLinear)
 #include "XRMonitorConfig.hpp"
 #include "XRInput.hpp" // SXRInputEvent / SXRStateEvent / XRQueueItem / CXRQueue / CXRInput
 
@@ -158,6 +159,9 @@ class COpenXRManager {
         // WP-L2: which blit path last filled this layer's swapchain — "none" | "dmabuf" | "cpu" |
         // "black". "black" flags a silent black-quad session (e.g. cross-GPU import failure).
         std::string contentPath = "none";
+        // Cross-GPU: true iff this output's buffers are allocated LINEAR so the XR GPU can import
+        // them (set when the XR runtime GPU differs from the buffer allocator; openxr:force_linear).
+        bool        linear = false;
         // Adaptive anchoring (research/13 §6.4).
         bool        adaptiveEnabled  = false;
         std::string adaptivePhase    = "docked"; // docked | undocking | roaming | redocking
@@ -231,6 +235,12 @@ class COpenXRManager {
     // Main thread: bind still-existing layers on start() and drop those whose monitor
     // disappeared while disabled (doc 02 lazy binding).
     void bindExistingLayers();
+    // Main thread: decide (openxr:force_linear + the XR EGL node vs this output's buffer allocator
+    // node) whether the XR-bound headless output must allocate LINEAR buffers for cross-GPU import,
+    // set CMonitor::m_forceLinearSwapchain accordingly, and reconfigure the swapchain if it changed.
+    // No-op unless a session is up (the XR render node is only known once EGL is initialized). Runs
+    // at bind time (bindExistingLayers / createXRMonitor) — never on the frame thread.
+    void applyCrossGpuLinear(const PHLMONITOR& mon);
     // Main thread: destroy all layer frame-side + monitor resources during stop() (path C —
     // no frame thread; barrier not needed). Honors openxr:destroy_monitors_on_stop.
     void teardownLayers();
