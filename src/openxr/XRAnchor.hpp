@@ -344,6 +344,19 @@ namespace OpenXR {
         bool setMode(eXRAnchorMode newMode, eXRHand hand, const SXRVerbContext& ctx, const SXRAnchorTuning& tune);
         void onReferenceSpaceChanged(const SXRPose& poseInPreviousSpace);
 
+        // Re-seat an anchor:local monitor on the first PLUG of a session (report-20 issue C). Under
+        // WiVRn boundaryless/standby the runtime's LOCAL_FLOOR origin is arbitrary, so a monitor
+        // declared at e.g. `pos:0,1.5,-1.5` lands wherever that origin happens to be — often far from
+        // the user. This re-interprets the DECLARED local offset as HEAD-RELATIVE: it plants the whole
+        // declared rig (position + facing) in a yaw-only frame at the current head's XZ, keeping the
+        // configured height (declared y = floor height) and distance. `view` is the head pose in
+        // LOCAL_FLOOR; `declared` is the layer's config-declared anchor state. A no-op for non-LOCAL
+        // modes (head/body/device are already user-relative). Multi-monitor: pass the SAME `view` for
+        // every monitor and each re-seats to its own declared offset in that shared frame, so the
+        // group is transformed rigidly (relative arrangement preserved). Warps (no glide). For an
+        // adaptive monitor it also re-docks the desk seat here (recaptured at the current head).
+        void recenterLocalToHead(const SXRPose& view, const SXRAnchorState& declared);
+
         // ---- adaptive anchoring verbs (research/13 §6.3) — main thread, under the layer mutex ----
         // Enable/disable the decorator; recaptures the desk seat on enable and resets the machine.
         void             adaptiveSetEnabled(bool en);

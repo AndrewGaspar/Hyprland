@@ -79,6 +79,10 @@ COpenXRManager::~COpenXRManager() {
     if (m_plugSettleTimer && g_pEventLoopManager)
         g_pEventLoopManager->removeTimer(m_plugSettleTimer);
     m_plugSettleTimer.reset();
+    // Same for the dormant re-probe timer (report-20 issue B1).
+    if (m_reprobeTimer && g_pEventLoopManager)
+        g_pEventLoopManager->removeTimer(m_reprobeTimer);
+    m_reprobeTimer.reset();
 }
 
 void COpenXRManager::init() {
@@ -189,6 +193,20 @@ void COpenXRManager::setState(eXRManagerState newState) {
     // Idle-inhibit is rechecked on every session-state transition (the hook itself lands in WP9).
     if (g_pInputManager)
         g_pInputManager->recheckIdleInhibitorStatus();
+
+    // Dormant re-probe lifecycle (report-17 WP-L3 / report-20 issue B1). Entering UNAVAILABLE arms the
+    // backoff timer (if enabled + openxr:reprobe); STARTING disarms it WITHOUT resetting the backoff
+    // (so a failed attempt keeps growing the delay); reaching a running or disabled steady state
+    // disarms AND resets the backoff (a clean success / user disable).
+    switch (newState) {
+        case XR_STATE_UNAVAILABLE: maybeArmReprobe(); break;
+        case XR_STATE_STARTING: cancelReprobe(/*resetBackoff=*/false); break;
+        case XR_STATE_RUNNING_IDLE:
+        case XR_STATE_RUNNING_VISIBLE:
+        case XR_STATE_RUNNING_FOCUSED:
+        case XR_STATE_DISABLED: cancelReprobe(/*resetBackoff=*/true); break;
+        default: break;
+    }
 }
 
 void COpenXRManager::start() {
@@ -197,6 +215,10 @@ void COpenXRManager::start() {
         return;
 
     setState(XR_STATE_STARTING);
+
+    // report-20 issue B1: assume "waiting for the runtime" until we learn otherwise. A failure past
+    // createInstance flips this to HEADSET (getSystem FORM_FACTOR_UNAVAILABLE) or keeps it at RUNTIME.
+    m_probeWait = XR_WAIT_RUNTIME;
 
     m_runtimeName.clear();
     m_systemName.clear();
@@ -230,7 +252,11 @@ void COpenXRManager::start() {
 
     // 2. System.
     if (!m_session->getSystem()) {
-        Log::logger->log(Log::WARN, "[OPENXR] system lookup failed, state -> unavailable");
+        // report-20 issue B1: FORM_FACTOR_UNAVAILABLE = runtime up, headset not connected/donned — the
+        // spec-intended "poll me later" result. The re-probe then waits gently for the headset rather
+        // than growing the backoff as it would for an absent runtime.
+        m_probeWait = m_session->m_formFactorUnavailable ? XR_WAIT_HEADSET : XR_WAIT_RUNTIME;
+        Log::logger->log(Log::WARN, "[OPENXR] system lookup failed ({}), state -> unavailable", m_probeWait == XR_WAIT_HEADSET ? "headset not connected" : "runtime error");
         abortStart();
         return;
     }
@@ -401,6 +427,12 @@ void COpenXRManager::start() {
     // above (bindExistingLayers); create any declared-but-missing ones now that a session is up.
     reconcileDeclaredMonitors();
     recomputeQuadActive();
+
+    // report-20 issue B2 (self-heal): re-assert the plugged state once more after the declared set is
+    // reconciled + bound, so a monitor bound during reconcile above (or a presence/visibility event
+    // that arrived on the queue DURING start(), before the frame->main channel could be drained)
+    // cannot leave the plug edge stuck. Idempotent — a no-op when nothing changed.
+    updateMonitorsPlugged(/*allowGrace=*/false);
 
     // Register the synthetic ray pointer (doc 04 §8), honoring openxr:pointer.
     ensurePointerDevice();
@@ -1056,6 +1088,23 @@ void COpenXRManager::frameThread() {
         {
             std::scoped_lock lock(m_layersMu);
             m_lastVerbCtx = OpenXR::SXRVerbContext{viewPose, viewValid, gripLeft, gripRight};
+
+            // report-20 issue C: consume a pending recenter-on-plug now that a valid head pose exists.
+            // Armed by the main thread on the first plug of a session; the frame thread owns the head
+            // pose, so it re-seats every anchor:local monitor to the CURRENT head (yaw-only, floor XZ),
+            // reinterpreting each monitor's DECLARED offset as head-relative. Passing the same viewPose
+            // to every layer transforms the group rigidly (relative arrangement preserved). Held armed
+            // while the view is invalid so a plug during momentary tracking loss still recenters on the
+            // next good frame. onReferenceSpaceChanged already ran above (this overrides it for LOCAL).
+            if (viewValid && m_recenterArmed.load(std::memory_order_acquire)) {
+                m_recenterArmed.store(false, std::memory_order_release);
+                for (auto& l : m_layers) {
+                    if (l->m_pendingRemoval.load(std::memory_order_acquire))
+                        continue;
+                    l->m_anchor.recenterLocalToHead(viewPose, l->m_declaredAnchor);
+                }
+            }
+
             for (size_t i = 0; i < active.size(); ++i) {
                 auto&      l         = active[i];
                 // Adaptive anchoring needs the head pose for the geofence even though its persistent
@@ -1441,6 +1490,13 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
         return std::unexpected<std::string>("headless output did not materialize");
     }
 
+    // report-20 issue A: mark this headless output as XR-plug-managed so the monitor-rule manager's
+    // ensureMonitorStatus never re-enables it while we hold it unplugged (the phantom-plug leak: its
+    // config rule says "enabled", so an ordinary rule refresh would onConnect() it back). Only
+    // XR-created outputs get the flag — an adopted pre-existing monitor keeps its normal lifecycle.
+    if (layer->m_createdByXR)
+        mon->m_xrManagedPlug = true;
+
     // 4. Bind: cache the monitor + wire listeners. The onGone callback runs the removal
     //    barrier when the monitor is externally destroyed (path B).
     layer->bindToMonitor(mon, [this, name = params.m_name]() {
@@ -1463,19 +1519,18 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
             finalizeLayerRemoval(name); // no frame thread — clean up directly
     });
 
-    // 5. Apply the requested pixel mode, if any. An explicit user `monitor=` rule matching this
-    //    name wins (doc 02 step 5): only override the resolution when the matched rule left it at
-    //    the default "preferred" (Vector2D{}). `xrmonitor=` owns existence + XR placement only.
+    // 5. Apply the requested pixel mode, if any. An explicit user `monitor=` rule matching this name
+    //    wins (doc 02 step 5): capture whether the user already set a resolution BEFORE we register our
+    //    own declared-mode rule (report-20 issue E), so we never clobber theirs. Then register the
+    //    persistent rule (durable across plug/unplug/reload) and apply the effective rule now so the
+    //    initial swapchain is the right size (registration only schedules an ensureMonitorStatus pass).
     if (params.m_resolution && Config::monitorRuleMgr()) {
-        Config::CMonitorRule rule       = Config::monitorRuleMgr()->get(mon);
-        const bool           userSetRes = rule.m_resolution != Vector2D{};
-        if (!userSetRes) {
-            rule.m_resolution = *params.m_resolution;
-            if (params.m_refreshRate)
-                rule.m_refreshRate = *params.m_refreshRate;
-            mon->applyMonitorRule(std::move(rule));
-        } else
+        layer->m_userProvidedMode = Config::monitorRuleMgr()->get(mon).m_resolution != Vector2D{};
+        if (layer->m_userProvidedMode)
             Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}' keeps its explicit monitor= resolution", params.m_name);
+        registerDeclaredMonitorRule(mon, layer);
+        Config::CMonitorRule rule = Config::monitorRuleMgr()->get(mon);
+        mon->applyMonitorRule(std::move(rule));
     }
 
     // 5b. Plugged-state gate (research/18 WP-M1/M3 + report-18 addendum): with
@@ -1618,6 +1673,28 @@ void COpenXRManager::destroyOutputDeferred(SP<Aquamarine::IOutput> output) {
     g_pCompositor->m_aqBackend->addIdleEvent(sentinel);
 }
 
+void COpenXRManager::registerDeclaredMonitorRule(const PHLMONITOR& mon, const PXRLAYER& layer) {
+    // report-20 issue E. Make the xrmonitor-declared pixel mode DURABLE by giving the rule manager a
+    // persistent named rule for the XR output — otherwise every plug edge's onConnect (and every
+    // ensureMonitorStatus refresh) re-derives the mode from a rule manager that has no XR entry and
+    // falls back to the headless default (1920x1080@60), silently dropping the declared 2560x1440@90.
+    // Precedence: an explicit user `monitor=NAME,<mode>,...` wins — captured once at create as
+    // layer->m_userProvidedMode, so we never clobber it. Building the rule from get(mon) preserves any
+    // other user-set fields (scale/transform) while we override only the mode. add() replaces our own
+    // prior rule by name (idempotent) and schedules an ensureMonitorStatus pass to apply it.
+    if (!mon || !layer || !layer->m_reqResolution || layer->m_userProvidedMode || !Config::monitorRuleMgr())
+        return;
+    Config::CMonitorRule rule = Config::monitorRuleMgr()->get(mon);
+    rule.m_name               = mon->m_name;
+    rule.m_resolution         = *layer->m_reqResolution;
+    if (layer->m_reqRefresh)
+        rule.m_refreshRate = *layer->m_reqRefresh;
+    // Keep the output ENABLED in the rule — the unplug lifecycle is driven separately through
+    // onConnect/onDisconnect + the m_xrManagedPlug guard (issue A), not the rule's disabled bit.
+    rule.m_disabled = false;
+    Config::monitorRuleMgr()->add(std::move(rule));
+}
+
 void COpenXRManager::bindExistingLayers() {
     // Main thread, on start(): layers created while disabled bind to their still-live monitor
     // and get marked dirty; layers whose named monitor disappeared are dropped (doc 02).
@@ -1650,6 +1727,10 @@ void COpenXRManager::bindExistingLayers() {
                 } else
                     finalizeLayerRemoval(name);
             });
+            // report-20 issue A: keep the XR-plug-managed flag set on the (re)bound output so the rule
+            // manager never re-enables it while we hold it unplugged (see createXRMonitor).
+            if (l->m_createdByXR)
+                mon->m_xrManagedPlug = true;
             l->m_swapchainDirty.store(true, std::memory_order_release);
         }
     }
@@ -1841,11 +1922,13 @@ bool COpenXRManager::monitorsShouldBePluggedNow() const {
     const bool  want    = OpenXR::wantXRMonitorsPlugged(mode, sessionExists(), sessionVisible(), m_userPresenceSupported, m_presenceKnown, m_userPresent);
     if (!want)
         return false;
-    // The first-plug blip guard is a VISIBLE-mode fallback concern only — OFF (always) and SESSION
-    // (existence) must never be deferred by it.
+    // The first-plug settle guard is a VISIBLE-mode concern only — OFF (always) and SESSION
+    // (existence) must never be deferred by it. In VISIBLE mode it now applies regardless of presence
+    // support (report-20 issue D): the FIRST plug waits for sustained visibility even with presence,
+    // since a presence-capable runtime can report 'present' on the session-create blip.
     if (mode != OpenXR::XR_FOLLOW_VISIBLE)
         return true;
-    return !OpenXR::xrDeferFirstPlug(m_userPresenceSupported, m_everPlugged, visibleSustainedMs(), plugSettleMs());
+    return !OpenXR::xrDeferFirstPlug(m_everPlugged, visibleSustainedMs(), plugSettleMs());
 }
 
 void COpenXRManager::armPlugSettleTimer(int ms) {
@@ -1878,6 +1961,83 @@ void COpenXRManager::resetPresenceState() {
     m_everPlugged   = false;
     m_visibleSince.reset();
     cancelPlugSettleTimer();
+    // report-20 issue C: a fresh session re-earns its recenter-on-plug. The frame thread's armed flag
+    // is cleared too so a stale arm from a prior session cannot re-seat the next one.
+    m_recenteredThisSession = false;
+    m_recenterArmed.store(false, std::memory_order_release);
+}
+
+// ---- dormant re-probe (report-17 WP-L3 / report-20 issue B1). Main thread only. ----
+
+void COpenXRManager::maybeArmReprobe() {
+    static auto PENABLED = CConfigValue<Hyprlang::INT>("openxr:enabled");
+    static auto PREPROBE = CConfigValue<Hyprlang::INT>("openxr:reprobe");
+    // Only re-probe a dormant session the user actually wants enabled. Session loss / a failed start
+    // both land here (UNAVAILABLE); a user disable lands in DISABLED and never arms.
+    if (m_state != XR_STATE_UNAVAILABLE || !*PENABLED || !*PREPROBE) {
+        cancelReprobe(/*resetBackoff=*/true);
+        return;
+    }
+
+    static auto   PBASE = CConfigValue<Hyprlang::INT>("openxr:reprobe_interval_ms");
+    const int64_t base  = std::max<int64_t>(250, (int64_t)*PBASE);
+    // HEADSET wait (runtime up, headset undonned) polls at the gentle fixed cadence — this is the
+    // spec-intended xrGetSystem poll; growing a backoff there would just make donning feel laggy.
+    // RUNTIME wait (no runtime/server yet) grows the backoff so a permanently-absent runtime is cheap.
+    const int64_t ms = m_probeWait == XR_WAIT_HEADSET ? base : OpenXR::xrReprobeBackoffMs(m_reprobeAttempt, base, 30000);
+    Log::logger->log(Log::DEBUG, "[OPENXR] dormant — re-probing in {}ms (waiting for {}, attempt {})", ms, m_probeWait == XR_WAIT_HEADSET ? "headset" : "runtime", m_reprobeAttempt);
+    armReprobeTimer((int)ms);
+}
+
+void COpenXRManager::armReprobeTimer(int ms) {
+    const auto dur = std::chrono::milliseconds(std::max(0, ms));
+    if (!m_reprobeTimer) {
+        m_reprobeTimer = makeShared<CEventLoopTimer>(
+            dur, [this](SP<CEventLoopTimer> self, void*) { onReprobeExpired(); }, nullptr);
+        if (g_pEventLoopManager)
+            g_pEventLoopManager->addTimer(m_reprobeTimer);
+    } else
+        m_reprobeTimer->updateTimeout(dur);
+}
+
+void COpenXRManager::cancelReprobe(bool resetBackoff) {
+    if (m_reprobeTimer)
+        m_reprobeTimer->updateTimeout(std::nullopt); // disarm; keep the object (removed in dtor)
+    if (resetBackoff) {
+        m_reprobeAttempt = 0;
+        m_probeWait      = XR_WAIT_NONE;
+    }
+}
+
+void COpenXRManager::onReprobeExpired() {
+    static auto PENABLED = CConfigValue<Hyprlang::INT>("openxr:enabled");
+    static auto PREPROBE = CConfigValue<Hyprlang::INT>("openxr:reprobe");
+    if (m_state != XR_STATE_UNAVAILABLE || !*PENABLED || !*PREPROBE)
+        return; // state moved on / disabled since the timer was armed
+
+    m_reprobeAttempt++;
+    // start() re-attempts from scratch. On success setState() cancels+resets us; on failure it lands
+    // back in UNAVAILABLE and setState() re-arms with the grown backoff (or the headset cadence).
+    start();
+}
+
+std::string COpenXRManager::reprobeWaitString() const {
+    if (m_state != XR_STATE_UNAVAILABLE || !m_reprobeTimer || !m_reprobeTimer->armed())
+        return "";
+    return m_probeWait == XR_WAIT_HEADSET ? "headset" : "runtime";
+}
+
+int COpenXRManager::reprobePendingMs() const {
+    if (m_state != XR_STATE_UNAVAILABLE || !m_reprobeTimer || !m_reprobeTimer->armed())
+        return -1;
+    const float leftUs = m_reprobeTimer->leftUs();
+    return leftUs <= 0.f ? 0 : (int)(leftUs / 1000.f);
+}
+
+std::string COpenXRManager::visibleStatusString() const {
+    if (!sessionExists())
+        return "n/a";
+    return sessionVisible() ? "yes" : "no";
 }
 
 void COpenXRManager::updateMonitorsPlugged(bool allowGrace) {
@@ -1898,26 +2058,44 @@ void COpenXRManager::updateMonitorsPlugged(bool allowGrace) {
     if (!up)
         resetPresenceState(); // session gone — forget presence + first-plug bookkeeping
 
-    const bool want = monitorsShouldBePluggedNow();
+    const bool want      = monitorsShouldBePluggedNow();
+    const bool firstPlug = !m_everPlugged;
 
     if (want) {
         // Donned / session came up (and past any settle): plug immediately, cancel pending timers.
         cancelUnplugTimer();
         cancelPlugSettleTimer();
+        // report-20 issue C: on the FIRST (presence/visibility-confirmed) plug of a session, re-seat
+        // anchor:local monitors relative to the current head pose. Arm the frame thread (which owns the
+        // head pose) BEFORE the plug so it re-seats on its next valid-view frame. A re-plug after a
+        // brief doff (firstPlug == false) never re-arms — the head-relative pose from the first don is
+        // kept. Gated on openxr:recenter_on_plug.
+        if (firstPlug && !m_recenteredThisSession) {
+            static auto PRECENTER = CConfigValue<Hyprlang::INT>("openxr:recenter_on_plug");
+            if (*PRECENTER) {
+                m_recenteredThisSession = true;
+                m_recenterArmed.store(true, std::memory_order_release);
+                Log::logger->log(Log::DEBUG, "[OPENXR] first plug of session — arming recenter-on-plug (anchor:local monitors re-seat to the current head)");
+            }
+        }
         setMonitorsPlugged(true);
         m_everPlugged = true;
         return;
     }
 
-    // want == false. In the VISIBLE mode on a no-presence runtime this can be *only* because the
-    // first-plug settle window has not yet elapsed while the session is visible — arm the settle timer
-    // to re-check (there is no other edge coming; the pure predicate is already plug-worthy).
+    // want == false. In VISIBLE mode this can be *only* because the first-plug settle window has not
+    // yet elapsed while the pure predicate (both signals agreeing) is already plug-worthy — arm the
+    // settle timer to re-check (there is no other edge coming). Applies with OR without presence
+    // support now (report-20 issue D): the settle guards the visibility side of the create-time blip.
     {
         static auto PFOLLOW = CConfigValue<std::string>("openxr:monitors_follow_session");
         const auto  mode    = OpenXR::parseMonitorFollowMode(*PFOLLOW);
-        if (mode == OpenXR::XR_FOLLOW_VISIBLE && up && vis && !m_userPresenceSupported && !m_everPlugged && !m_monitorsPlugged) {
+        const bool  signalsAgree =
+            OpenXR::wantXRMonitorsPlugged(mode, up, vis, m_userPresenceSupported, m_presenceKnown, m_userPresent);
+        if (mode == OpenXR::XR_FOLLOW_VISIBLE && firstPlug && !m_monitorsPlugged && signalsAgree &&
+            OpenXR::xrDeferFirstPlug(m_everPlugged, visibleSustainedMs(), plugSettleMs())) {
             const int64_t remaining = std::max<int64_t>(0, (int64_t)plugSettleMs() - visibleSustainedMs());
-            Log::logger->log(Log::DEBUG, "[OPENXR] session visible on a no-presence runtime — deferring first plug {}ms (session-start blip guard)", remaining);
+            Log::logger->log(Log::DEBUG, "[OPENXR] plug signals agree — deferring first plug {}ms (session-start visibility blip guard)", remaining);
             armPlugSettleTimer((int)remaining);
             return;
         }
@@ -2033,7 +2211,12 @@ void COpenXRManager::onConfigReload() {
     static auto PENABLED = CConfigValue<Hyprlang::INT>("openxr:enabled");
     const bool  enabled  = *PENABLED;
 
-    if (enabled && m_state == XR_STATE_DISABLED)
+    // report-17 WP-L7 / report-20 issue B1: also start from UNAVAILABLE, not just DISABLED. Previously
+    // `hyprctl keyword openxr:enabled 1` while dormant in UNAVAILABLE (value already 1) was a silent
+    // no-op — start()'s own guard accepts UNAVAILABLE, the reload path just never asked. Now a keyword
+    // re-assert kicks a fresh attempt immediately (the dormant re-probe timer makes it unnecessary, but
+    // this keeps the explicit control working).
+    if (enabled && (m_state == XR_STATE_DISABLED || m_state == XR_STATE_UNAVAILABLE))
         start(); // start() reconciles declared monitors itself
     else if (!enabled && m_state != XR_STATE_DISABLED)
         stop();
@@ -2210,16 +2393,20 @@ void COpenXRManager::reconcileDeclaredMonitors() {
         if (existing && existing->m_declaredByConfig) {
             // D ∩ L: diff. Mode change -> apply new rule (emits modeChanged -> swapchain recreate).
             const bool modeChanged = existing->m_reqResolution != d.m_resolution || existing->m_reqRefresh != d.m_refreshRate;
-            if (modeChanged && d.m_resolution && Config::monitorRuleMgr()) {
-                if (auto mon = existing->m_monitor.lock()) {
-                    Config::CMonitorRule rule = Config::monitorRuleMgr()->get(mon);
-                    rule.m_resolution         = *d.m_resolution;
-                    if (d.m_refreshRate)
-                        rule.m_refreshRate = *d.m_refreshRate;
-                    mon->applyMonitorRule(std::move(rule));
-                }
+            if (modeChanged) {
                 existing->m_reqResolution = d.m_resolution;
                 existing->m_reqRefresh    = d.m_refreshRate;
+            }
+            if (auto mon = existing->m_monitor.lock()) {
+                // report-20 issue E: (re-)register the persistent declared-mode rule every reconcile —
+                // a config reparse (reload) clears our rule from the manager, so this re-installs it
+                // (idempotent otherwise, and a no-op when the user set their own mode). Then, on an
+                // actual declared-mode change, apply the effective rule now so the swapchain recreates.
+                registerDeclaredMonitorRule(mon, existing);
+                if (modeChanged && d.m_resolution && Config::monitorRuleMgr()) {
+                    Config::CMonitorRule rule = Config::monitorRuleMgr()->get(mon);
+                    mon->applyMonitorRule(std::move(rule));
+                }
             }
             // Anchor / size change -> re-anchor to the new declared state (doc 05 §2.5 / doc 03).
             static auto PSIZE             = CConfigValue<Hyprlang::FLOAT>("openxr:default_size");

@@ -108,12 +108,24 @@ TEST(XRPresenceGating, UnknownBeforeFirstEventReadsAbsent) {
                                        /*presenceSupported*/ true, /*presenceKnown*/ false, /*userPresent*/ true));
 }
 
-TEST(XRPresenceGating, DonnedPlugs) {
+TEST(XRPresenceGating, DonnedAndVisiblePlugs) {
+    // report-20 issue D: the gate is now the CONJUNCTION — both visible AND present must hold.
     EXPECT_TRUE(wantXRMonitorsPlugged(XR_FOLLOW_VISIBLE, /*up*/ true, /*vis*/ true,
                                       /*presenceSupported*/ true, /*presenceKnown*/ true, /*userPresent*/ true));
-    // Presence is authoritative: donned plugs even if the visibility bit lags behind the sensor.
-    EXPECT_TRUE(wantXRMonitorsPlugged(XR_FOLLOW_VISIBLE, /*up*/ true, /*vis*/ false,
-                                      /*presenceSupported*/ true, /*presenceKnown*/ true, /*userPresent*/ true));
+}
+
+TEST(XRPresenceGating, DoffUnplugsEvenIfPresenceSticksPresent) {
+    // The never-unplugs standby bug: WiVRn's user_presence sticks 'present' with the headset on the
+    // shelf, but the session correctly drops out of VISIBLE. Requiring visibility too means the doff
+    // unplugs (arms the grace) despite the stuck-present signal.
+    EXPECT_FALSE(wantXRMonitorsPlugged(XR_FOLLOW_VISIBLE, /*up*/ true, /*vis*/ false,
+                                       /*presenceSupported*/ true, /*presenceKnown*/ true, /*userPresent*/ true));
+}
+
+TEST(XRPresenceGating, PresenceAbsentUnplugsEvenIfStillVisible) {
+    // Symmetric: a presence-absent event unplugs even while a stale VISIBLE bit lingers.
+    EXPECT_FALSE(wantXRMonitorsPlugged(XR_FOLLOW_VISIBLE, /*up*/ true, /*vis*/ true,
+                                       /*presenceSupported*/ true, /*presenceKnown*/ true, /*userPresent*/ false));
 }
 
 TEST(XRPresenceGating, PresencePathStillRequiresSession) {
@@ -129,25 +141,44 @@ TEST(XRPresenceGating, SessionAndOffModesIgnorePresence) {
     EXPECT_FALSE(wantXRMonitorsPlugged(XR_FOLLOW_SESSION, /*up*/ false, /*vis*/ false, true, true, true));
 }
 
-// ---- report-19: no-presence fallback first-plug blip guard (xrDeferFirstPlug) ----
+// ---- report-19/20: first-plug settle blip guard (xrDeferFirstPlug) ----
 
 TEST(XRDeferFirstPlug, DefersBeforeBlipElapsed) {
-    // Fresh session, no presence: a would-be plug is held until visibility is sustained past the blip.
-    EXPECT_TRUE(xrDeferFirstPlug(/*presenceSupported*/ false, /*everPlugged*/ false, /*sustainedMs*/ 200, /*blipMs*/ 1500));
-    EXPECT_FALSE(xrDeferFirstPlug(/*presenceSupported*/ false, /*everPlugged*/ false, /*sustainedMs*/ 1500, /*blipMs*/ 1500));
-    EXPECT_FALSE(xrDeferFirstPlug(/*presenceSupported*/ false, /*everPlugged*/ false, /*sustainedMs*/ 3000, /*blipMs*/ 1500));
+    // Fresh session: a would-be plug is held until visibility is sustained past the blip window.
+    EXPECT_TRUE(xrDeferFirstPlug(/*everPlugged*/ false, /*sustainedMs*/ 200, /*blipMs*/ 1500));
+    EXPECT_FALSE(xrDeferFirstPlug(/*everPlugged*/ false, /*sustainedMs*/ 1500, /*blipMs*/ 1500));
+    EXPECT_FALSE(xrDeferFirstPlug(/*everPlugged*/ false, /*sustainedMs*/ 3000, /*blipMs*/ 1500));
 }
 
 TEST(XRDeferFirstPlug, NeverDefersOncePlugged) {
     // After the first plug the anti-flap grace governs re-plugs — the blip gate must not re-arm.
-    EXPECT_FALSE(xrDeferFirstPlug(/*presenceSupported*/ false, /*everPlugged*/ true, /*sustainedMs*/ 0, /*blipMs*/ 1500));
+    EXPECT_FALSE(xrDeferFirstPlug(/*everPlugged*/ true, /*sustainedMs*/ 0, /*blipMs*/ 1500));
 }
 
-TEST(XRDeferFirstPlug, NeverDefersWhenPresenceSupported) {
-    // Presence already suppresses the blip; the fallback guard must stay out of the presence path.
-    EXPECT_FALSE(xrDeferFirstPlug(/*presenceSupported*/ true, /*everPlugged*/ false, /*sustainedMs*/ 0, /*blipMs*/ 1500));
+TEST(XRDeferFirstPlug, DefersEvenWithPresence) {
+    // report-20 issue D: the settle now applies to the visibility side REGARDLESS of presence —
+    // WiVRn reported 'present' 0.5ms after session create, so the first plug still waits for
+    // sustained visibility before trusting either signal.
+    EXPECT_TRUE(xrDeferFirstPlug(/*everPlugged*/ false, /*sustainedMs*/ 5, /*blipMs*/ 1500));
 }
 
 TEST(XRDeferFirstPlug, ZeroBlipNeverDefers) {
-    EXPECT_FALSE(xrDeferFirstPlug(/*presenceSupported*/ false, /*everPlugged*/ false, /*sustainedMs*/ 0, /*blipMs*/ 0));
+    EXPECT_FALSE(xrDeferFirstPlug(/*everPlugged*/ false, /*sustainedMs*/ 0, /*blipMs*/ 0));
+}
+
+// ---- report-17 WP-L3 / report-20 issue B1: dormant re-probe backoff schedule ----
+
+TEST(XRReprobeBackoff, DoublesFromBaseToCap) {
+    EXPECT_EQ(xrReprobeBackoffMs(0, 2000, 30000), 2000);
+    EXPECT_EQ(xrReprobeBackoffMs(1, 2000, 30000), 4000);
+    EXPECT_EQ(xrReprobeBackoffMs(2, 2000, 30000), 8000);
+    EXPECT_EQ(xrReprobeBackoffMs(3, 2000, 30000), 16000);
+    EXPECT_EQ(xrReprobeBackoffMs(4, 2000, 30000), 30000); // capped (32000 -> 30000)
+    EXPECT_EQ(xrReprobeBackoffMs(9, 2000, 30000), 30000); // stays capped
+}
+
+TEST(XRReprobeBackoff, DefensiveInputs) {
+    EXPECT_EQ(xrReprobeBackoffMs(0, 0, 30000), 2000);    // base<=0 -> 2000 default
+    EXPECT_EQ(xrReprobeBackoffMs(5, 5000, 1000), 5000);  // cap<base -> clamped to base
+    EXPECT_EQ(xrReprobeBackoffMs(-1, 2000, 30000), 2000); // negative attempt behaves like 0
 }

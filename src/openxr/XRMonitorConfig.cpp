@@ -3,6 +3,7 @@
 // Compiled unconditionally (no OpenXR headers, no HAVE_OPENXR guard) — see the header. Only
 // std + hyprutils string helpers here.
 
+#include <algorithm>
 #include <charconv>
 #include <cctype>
 #include <cmath>
@@ -342,26 +343,57 @@ OpenXR::eXRMonitorFollowMode OpenXR::parseMonitorFollowMode(const std::string& v
 }
 
 bool OpenXR::wantXRMonitorsPlugged(eXRMonitorFollowMode mode, bool sessionUp, bool sessionVisible, bool presenceSupported, bool presenceKnown, bool userPresent) {
-    // research/18 + report-18/19 addenda: instantaneous plugged predicate. See the header for the
+    // research/18 + report-18/19/20 addenda: instantaneous plugged predicate. See the header for the
     // full contract. OFF keeps XR monitors always plugged (pre-feature); SESSION plugs while a session
-    // exists; VISIBLE gates on the real donned signal — user presence when the runtime exposes it
-    // (the fix for WiVRn's doffed-on-the-shelf session sprinting to FOCUSED), else raw visibility.
+    // exists; VISIBLE gates on the real donned signal.
+    //
+    // report-20 (issue D): the VISIBLE gate is now the CONJUNCTION of BOTH available signals —
+    // visibility AND, when the runtime exposes it, user presence. Presence alone was insufficient
+    // because WiVRn's user_presence STICKS 'present' while the headset sits doffed in standby; the
+    // session correctly drops VISIBLE->SYNCHRONIZED on doff, so requiring visibility too lets a doff
+    // unplug even when presence is stuck. Symmetrically, presence-absent (if it ever fires) unplugs
+    // even while a stale VISIBLE bit lingers. Both must currently agree.
     switch (mode) {
         case XR_FOLLOW_OFF: return true;
         case XR_FOLLOW_SESSION: return sessionUp;
         case XR_FOLLOW_VISIBLE: break;
     }
     if (!sessionUp)
-        return false; // VISIBLE mode still requires a live session
-    if (presenceSupported)
+        return false;      // VISIBLE mode still requires a live session
+    if (!sessionVisible)
+        return false;      // doffed / standby -> not visible -> unplug (even if presence sticks present)
+    if (presenceSupported) // visible AND the runtime has a presence signal: require present too
         return presenceKnown && userPresent; // absent until the first presence event -> blip-proof
-    return sessionVisible;                    // no presence ext: fall back to visibility
+    return true;                             // no presence ext: visibility alone is the signal
 }
 
-bool OpenXR::xrDeferFirstPlug(bool presenceSupported, bool everPlugged, int64_t visibleSustainedMs, int64_t blipMs) {
-    if (presenceSupported || everPlugged)
-        return false; // presence already suppresses the blip; later plugs use the anti-flap grace
+bool OpenXR::xrDeferFirstPlug(bool everPlugged, int64_t visibleSustainedMs, int64_t blipMs) {
+    // First-plug settle guard (report-20 issue D): the FIRST plug of a session must wait until
+    // visibility has been continuously sustained past the session-create blip window, so a runtime
+    // that sprints to VISIBLE/FOCUSED at session creation (WiVRn does within ~40ms, even doffed)
+    // cannot plug on that blip. This applies to the VISIBLE-side of the gate REGARDLESS of presence
+    // support: at 10:57 WiVRn reported presence 'present' 0.5ms after session creation (a headset
+    // possibly mid-don, indistinguishable from a spurious blip), so both signals agreeing is not on
+    // its own enough for the first plug — visibility must also be sustained. Later plugs
+    // (everPlugged) use the anti-flap grace instead and never defer.
+    if (everPlugged)
+        return false;
     return visibleSustainedMs < blipMs;
+}
+
+int64_t OpenXR::xrReprobeBackoffMs(int attempt, int64_t baseMs, int64_t capMs) {
+    // report-17 WP-L3 / report-20 issue B1: growing backoff for re-probing the runtime while dormant
+    // in UNAVAILABLE. attempt is the 0-based count of consecutive failed probes. Doubling from base,
+    // clamped to cap: with base=2000, cap=30000 -> 2s, 4s, 8s, 16s, 30s(cap)... (the report's
+    // "2s->5s->10s cap 30s" suggestion, approximated by a clean power-of-two schedule). Pure/gtested.
+    if (baseMs <= 0)
+        baseMs = 2000;
+    if (capMs < baseMs)
+        capMs = baseMs;
+    int64_t v = baseMs;
+    for (int i = 0; i < attempt && v < capMs; ++i)
+        v = std::min<int64_t>(v * 2, capMs);
+    return v;
 }
 
 OpenXR::eForceLinearMode OpenXR::parseForceLinearMode(const std::string& s) {

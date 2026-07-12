@@ -87,6 +87,12 @@ class CXRSession {
     bool       m_hasUserPresence      = false;
     bool       m_supportsUserPresence = false;
 
+    // report-20 issue B1: set by getSystem() when xrGetSystem fails with XR_ERROR_FORM_FACTOR_UNAVAILABLE
+    // — the spec's "runtime up, headset not connected/donned, poll me later" result. Lets the manager's
+    // dormant re-probe distinguish "waiting for the runtime" from "waiting for the headset". Reset to
+    // false on a successful getSystem().
+    bool       m_formFactorUnavailable = false;
+
     // Overlay session (XR_EXTX_overlay, doc 01). COpenXRManager::start() sets m_overlayRequested /
     // m_overlayZ from openxr:overlay / openxr:overlay_z BEFORE createInstance(). m_hasOverlay records
     // whether the runtime advertises the extension; m_isOverlay is the ACTUAL state — true only when

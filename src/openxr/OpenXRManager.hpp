@@ -123,6 +123,15 @@ class COpenXRManager {
     // `hyprctl openxr status` presence field (report-19): "unsupported" (no XR_EXT_user_presence /
     // device can't report it) | "unknown" (supported, no event yet) | "yes"/"no" (donned/doffed).
     std::string presenceStatusString() const;
+    // `hyprctl openxr status` raw visibility field (report-20 issue D): "yes" while the session is
+    // VISIBLE/FOCUSED, "no" while it exists but is not visible (doffed/standby), "n/a" with no session.
+    // Surfaced alongside presence so the combined plug gate (needs both) is diagnosable in one command.
+    std::string visibleStatusString() const;
+    // `hyprctl openxr status` dormant re-probe field (report-17 WP-L3 / report-20 issue B1): while
+    // UNAVAILABLE with a re-probe armed, "runtime" (no runtime yet) or "headset" (runtime up, headset
+    // undonned); empty otherwise. reprobePendingMs(): ms until the next probe, or -1 when none armed.
+    std::string reprobeWaitString() const;
+    int         reprobePendingMs() const;
 
     // --- IPC verb funnel (main thread). ONE implementation, two transports: the xrmonitor
     // dispatcher and the hyprctl openxr subcommands both call these (doc 05 §3/§4). Return
@@ -239,6 +248,25 @@ class COpenXRManager {
     // Reset the per-session presence/plug bookkeeping (start()/session end).
     void          resetPresenceState();
 
+    // --- dormant re-probe (report-17 WP-L3 / report-20 issue B1). Main thread only. ---
+    // Why the last start() attempt landed in UNAVAILABLE, so the re-probe can distinguish "no runtime
+    // yet" (grow the backoff) from "runtime up, headset undonned" (gentle fixed cadence + status hint).
+    enum eXRProbeWait : uint8_t {
+        XR_WAIT_NONE = 0, // not waiting (not dormant, or reprobe disabled)
+        XR_WAIT_RUNTIME,  // xrCreateInstance / system lookup failed -> waiting for the runtime/server
+        XR_WAIT_HEADSET,  // xrGetSystem returned FORM_FACTOR_UNAVAILABLE -> runtime up, headset undonned
+    };
+    // Arm the re-probe timer (if UNAVAILABLE + openxr:enabled + openxr:reprobe) using the backoff for
+    // the current attempt (RUNTIME) or the fixed cadence (HEADSET). Called on entering UNAVAILABLE.
+    void          maybeArmReprobe();
+    void          armReprobeTimer(int ms);
+    // Disarm the re-probe timer. resetBackoff clears the consecutive-failure count (on a real start()
+    // success / user disable); a mere STARTING transition disarms without resetting so the backoff
+    // keeps growing across failed attempts.
+    void          cancelReprobe(bool resetBackoff);
+    // Timer body: re-attempt start() while still UNAVAILABLE + enabled + reprobe.
+    void          onReprobeExpired();
+
     // Aborts an in-progress start(), tearing down whatever was created, and lands in
     // UNAVAILABLE. Safe to call at any failure point in start().
     void abortStart();
@@ -253,6 +281,12 @@ class COpenXRManager {
     // Main thread: bind still-existing layers on start() and drop those whose monitor
     // disappeared while disabled (doc 02 lazy binding).
     void bindExistingLayers();
+    // Main thread (report-20 issue E): register a persistent monitor rule carrying the xrmonitor-
+    // declared pixel mode, so it survives plug/unplug/reload (onConnect/ensureMonitorStatus otherwise
+    // re-derive the mode from the rule manager, which has no XR entry and falls back to the headless
+    // default). No-op when the layer has no declared resolution or the user supplied their own mode
+    // (layer->m_userProvidedMode). Idempotent; re-asserted from createXRMonitor + reconcileDeclaredMonitors.
+    void registerDeclaredMonitorRule(const PHLMONITOR& mon, const PXRLAYER& layer);
     // Main thread: decide (openxr:force_linear + the XR EGL node vs this output's buffer allocator
     // node) whether the XR-bound headless output must allocate LINEAR buffers for cross-GPU import,
     // set CMonitor::m_forceLinearSwapchain accordingly, and reconfigure the swapchain if it changed.
@@ -350,6 +384,22 @@ class COpenXRManager {
     bool                       m_everPlugged = false;
     std::optional<Time::steady_tp> m_visibleSince;
     SP<CEventLoopTimer>        m_plugSettleTimer;
+
+    // Recenter-on-plug (report-20 issue C). m_recenteredThisSession: gate so a session re-seats its
+    // anchor:local monitors exactly once, on the FIRST presence-confirmed plug (a brief doff+don in
+    // the same session must NOT re-seat). Reset per session in resetPresenceState(). m_recenterArmed
+    // is set on that first plug (main thread) and consumed by the frame thread, which owns the head
+    // pose — it re-seats when a valid view is available (so a plug while the view is momentarily
+    // invalid still recenters on the next good frame). Atomic: main writes, frame reads/clears.
+    bool                m_recenteredThisSession = false;
+    std::atomic<bool>   m_recenterArmed{false};
+
+    // Dormant re-probe timer (report-17 WP-L3 / report-20 issue B1). m_reprobeTimer re-attempts
+    // start() while UNAVAILABLE; m_reprobeAttempt counts consecutive failures (drives the backoff);
+    // m_probeWait records why we are waiting (status + cadence choice).
+    SP<CEventLoopTimer> m_reprobeTimer;
+    int                 m_reprobeAttempt = 0;
+    eXRProbeWait        m_probeWait      = XR_WAIT_NONE;
 
     // Populated from xrInstanceProperties/xrSystemProperties once a session exists.
     std::string       m_runtimeName;

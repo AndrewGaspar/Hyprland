@@ -29,6 +29,12 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     // report-19: the user-presence signal driving the `visible`-mode plug gate — "yes"/"no" when the
     // runtime exposes XR_EXT_user_presence, "unknown" before the first event, "unsupported" otherwise.
     const std::string PRESENCE = g_pOpenXRManager->presenceStatusString();
+    // report-20 issue D: surface the RAW visibility signal next to presence so the combined plug gate
+    // (needs BOTH) is diagnosable in one command. "yes"/"no"/"n/a".
+    const std::string VISIBLE = g_pOpenXRManager->visibleStatusString();
+    // report-20 issue B1: dormant re-probe hint — what we're waiting for + ms until the next probe.
+    const std::string REPROBE_WAIT = g_pOpenXRManager->reprobeWaitString();
+    const int         REPROBE_MS   = g_pOpenXRManager->reprobePendingMs();
     // Read-only observability for the idle-inhibit predicate (doc 05 §6.1). There is otherwise
     // no queryable surface for "is the compositor's idle-inhibit bit currently raised because of
     // XR" — CIdleNotifyProtocol::isInhibited is private with no getter, and it's a fold of every
@@ -94,6 +100,9 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "monitorsFollowSession": "{}",
     "monitorUnplugPendingMs": {},
     "userPresence": "{}",
+    "visible": "{}",
+    "reprobeWaiting": "{}",
+    "reprobePendingMs": {},
     "inhibitingIdle": {},
     "input": {{
         "left": {{ "kind": "{}", "gesture": "{}", "filtered": {} }},
@@ -102,16 +111,20 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "monitors": [{}{}]
 }}
 )#",
-                           STATE, RUNTIME, SYSTEM, RTGPU, BLEND, OVERLAY ? "true" : "false", FOLLOW, UNPLUG_PEND, PRESENCE, INHIBITING_IDLE ? "true" : "false",
+                           STATE, RUNTIME, SYSTEM, RTGPU, BLEND, OVERLAY ? "true" : "false", FOLLOW, UNPLUG_PEND, PRESENCE, VISIBLE, REPROBE_WAIT, REPROBE_MS, INHIBITING_IDLE ? "true" : "false",
                            HANDS[0].hands ? "hands" : "controllers", HANDS[0].gesture,
                            HANDS[0].filtered ? "true" : "false", HANDS[1].hands ? "hands" : "controllers", HANDS[1].gesture, HANDS[1].filtered ? "true" : "false",
                            MONS.empty() ? "" : "\n", mons);
     }
 
     const std::string FOLLOWLINE = UNPLUG_PEND >= 0 ? std::format("{} (unplug in {}ms)", FOLLOW, UNPLUG_PEND) : FOLLOW;
-    std::string       out = std::format("state: {}\nruntime: {}\nsystem: {}\nruntime gpu: {}\nblend mode: {}\noverlay: {}\nmonitors follow session: {}\npresence: {}\nidle inhibited: {}\ninput: left {}, right {}\n",
-                                        STATE, RUNTIME, SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, BLEND, OVERLAY ? "yes" : "no", FOLLOWLINE, PRESENCE, INHIBITING_IDLE ? "yes" : "no",
-                                        handLabel(HANDS[0]), handLabel(HANDS[1]));
+    // report-20 issue B1: append the dormant re-probe hint to the state line, e.g.
+    // "unavailable (waiting for headset, retrying in 1800ms)".
+    const std::string STATELINE = REPROBE_WAIT.empty() ? STATE : std::format("{} (waiting for {}, retrying in {}ms)", STATE, REPROBE_WAIT, REPROBE_MS < 0 ? 0 : REPROBE_MS);
+    std::string       out = std::format(
+        "state: {}\nruntime: {}\nsystem: {}\nruntime gpu: {}\nblend mode: {}\noverlay: {}\nmonitors follow session: {}\nvisible: {}\npresence: {}\nidle inhibited: {}\ninput: left {}, right {}\n",
+        STATELINE, RUNTIME, SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, BLEND, OVERLAY ? "yes" : "no", FOLLOWLINE, VISIBLE, PRESENCE, INHIBITING_IDLE ? "yes" : "no",
+        handLabel(HANDS[0]), handLabel(HANDS[1]));
     for (const auto& m : MONS) {
         out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} ({}) hovered: {} plugged: {} content: {}{}", m.name,
                            m.id, m.w, m.h, m.refresh, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.grabbed ? "yes" : "no", m.grabKind, m.hovered ? "yes" : "no",

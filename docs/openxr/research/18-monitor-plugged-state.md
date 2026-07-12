@@ -16,6 +16,18 @@ Base commit: `452d6b02`.
 > behavior (legacy `false/0`→off, `true/1`→session). Session end / `stop()` still unplugs
 > immediately. Funnel is `COpenXRManager::updateMonitorsPlugged()`.
 
+> **Addendum 2 (2026-07-12, report-20 — SHIPPED).** Four follow-ups from live fishfood use:
+> (A) phantom-plug leak fixed — `CMonitor::m_xrManagedPlug` makes `ensureMonitorStatus` leave a
+> disabled XR output alone (its config rule says "enabled", so the ordinary refresh was re-enabling it
+> with no logged edge). (D) the `visible` gate is now the CONJUNCTION of visibility AND presence (when
+> supported): WiVRn's presence sticks 'present' in standby, but the session drops VISIBLE on doff, so
+> requiring both unplugs correctly; the first-plug settle now applies to the visibility side regardless
+> of presence. `hyprctl openxr status` shows both raw signals (`visible:` + `presence:`). (E) the
+> xrmonitor-declared pixel mode is made durable across plug/unplug/reload via a persistent monitor rule
+> (`registerDeclaredMonitorRule`), respecting an explicit user `monitor=` mode. (C, sibling concern)
+> recenter-on-plug re-seats anchor:local monitors head-relative on the first don of a session
+> (`openxr:recenter_on_plug`). Pure truth table + backoff/recenter math gtested; funnel unchanged.
+
 The ask (user's words): *"I don't really want the xrmonitors to be instantiated if an OpenXR session
 is not actually active. Go learn how to automatically cycle the monitors' 'plugged' state off when
 the session is not connected. I assume this is something Hyprland must already handle with

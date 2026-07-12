@@ -5,6 +5,17 @@ read-only observation (`hyprctl openxr status`, log/crash-report reads) of the u
 session. Author: research pass 2026-07-11 against branch `hypxrland` (worktree base `452d6b02`),
 source-read + live-log evidence.
 
+> **Addendum (2026-07-12, report-20 issue B1 — SHIPPED).** WP-L3 + WP-L7 implemented.
+> `XR_STATE_UNAVAILABLE` is now dormant, not terminal: a `CEventLoopTimer` re-attempts `start()` while
+> `openxr:enabled` + `openxr:reprobe` (default on). Two-phase probe via `start()` itself —
+> `createInstance` failure => "waiting for runtime" (growing backoff `xrReprobeBackoffMs`, base
+> `openxr:reprobe_interval_ms` default 2000, cap 30s); `xrGetSystem` returning
+> `XR_ERROR_FORM_FACTOR_UNAVAILABLE` (recorded in `CXRSession::m_formFactorUnavailable`) => "waiting for
+> headset" (fixed gentle cadence). Timer armed/cancelled from `setState()`. WP-L7:
+> `onConfigReload()` now starts from UNAVAILABLE as well as DISABLED. `hyprctl openxr status` gains the
+> re-probe hint (`unavailable (waiting for headset, retrying in Ns)`). WP-L1/L2/L4/L5/L6 are NOT in this
+> change (L2 shipped earlier as force_linear; L4 rides the same reprobe path since loss lands UNAVAILABLE).
+
 The incident (user's first fishfood session, logged in at SDDM with the runtime absent):
 
 1. `openxr { enabled = 1 }` at login while **wivrn-server was not running and the headset was not

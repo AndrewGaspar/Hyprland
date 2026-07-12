@@ -91,6 +91,11 @@ class CXRMonitorLayer {
     OpenXR::SXRAnchorState  m_declaredAnchor;
     std::optional<Vector2D> m_reqResolution;   // last requested pixel mode (for reconcile diff)
     std::optional<float>    m_reqRefresh;      // last requested refresh (for reconcile diff)
+    // report-20 issue E: true iff an explicit user `monitor=NAME,...` rule set this output's
+    // resolution when it was created. Captured once (before the manager registers its own declared-mode
+    // rule), so the manager never clobbers the user's mode. When false, the manager owns a persistent
+    // monitor rule carrying the xrmonitor-declared mode so it survives plug/unplug/reload.
+    bool                    m_userProvidedMode = false;
     bool                    m_hovered = false; // last ray-hovered (WP7 sets this; status field)
 
     // ---- main -> frame handoff (doc 00 table) ----
