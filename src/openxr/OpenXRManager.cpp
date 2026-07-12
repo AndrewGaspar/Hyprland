@@ -14,11 +14,14 @@
 #include <openxr/openxr_platform.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstring>
+#include <memory>
 #include <numeric>
 #include <cstdint>
 #include <chrono>
+#include <thread>
 #include <cmath>
 #include <format>
 #include <optional>
@@ -32,6 +35,7 @@
 #include "XRIpc.hpp"
 #include "XRSession.hpp"
 #include "XRGraphics.hpp"
+#include "XRGpuProbe.hpp"
 #include "XRMonitorLayer.hpp"
 #include "XRDmabufImport.hpp" // OpenXR::xrContentPathName (status contentPath)
 #include "XRInput.hpp"
@@ -111,6 +115,10 @@ const std::string& COpenXRManager::systemName() const {
     return m_systemName;
 }
 
+const std::string& COpenXRManager::runtimeGpu() const {
+    return m_runtimeGpu;
+}
+
 std::string COpenXRManager::blendModeName() const {
     // Reflect the mode the frame loop actually submits while a session exists; the OPAQUE default
     // otherwise (nothing composited).
@@ -177,6 +185,7 @@ void COpenXRManager::start() {
 
     m_runtimeName.clear();
     m_systemName.clear();
+    m_runtimeGpu.clear();
     m_frameRequestedTeardown = false;
 
     // Parse the adaptive STRING options to enums up front (main thread) so the frame thread never
@@ -237,6 +246,74 @@ void COpenXRManager::start() {
         Log::logger->log(Log::ERR, "[OPENXR] EGL/GBM init failed, state -> unavailable");
         abortStart();
         return;
+    }
+
+    // 3b. Fail closed on a wrong openxr:gpu (coredumps 8986/39318). If the XR EGL context landed on
+    // a DIFFERENT physical GPU than the one the runtime composites on, the runtime imports
+    // cross-GPU buffers at xrCreateSwapchain (on the frame thread) and HARD-CRASHES inside the
+    // graphics driver (radeonsi driUnbindContext) — an uncatchable SEGV that takes the whole
+    // compositor, and with it the user's desktop session, down. WiVRn/Monado accept a mismatched
+    // EGL binding at xrCreateSession without complaint, so this is the last point we can refuse
+    // while the desktop is still intact. The runtime's GPU is probed via XR_KHR_vulkan_enable2
+    // (best-effort: an undeterminable result proceeds with a warning rather than blocking a setup
+    // that might be fine). Runs on the main thread, before the frame thread — no interop yet.
+    {
+        const auto&         node = m_graphics->selectedRenderNode();
+        OpenXR::SRuntimeGpu rt;
+        if (m_session->m_hasVulkanEnable2) {
+            // Run the probe on a THROWAWAY thread with a bounded wait. vkCreateInstance inside it
+            // can deadlock indefinitely against the runtime's own in-process Vulkan usage (observed
+            // hanging forever vs Monado's null compositor), and this must NEVER freeze the
+            // compositor. On timeout we abandon the thread (it bails before any XrInstance call, so
+            // a late unblock can't touch a torn-down instance) and proceed UNVERIFIED — strictly no
+            // worse than before this guard existed. When the probe does answer (the common case on
+            // a healthy runtime) we get a reliable cross-GPU verdict.
+            auto             result  = std::make_shared<OpenXR::SRuntimeGpu>();
+            auto             done    = std::make_shared<std::atomic<bool>>(false);
+            auto             abandon = std::make_shared<std::atomic<bool>>(false);
+            const XrInstance inst    = m_session->m_instance;
+            const XrSystemId sys     = m_session->m_systemId;
+            std::thread([result, done, abandon, inst, sys]() {
+                auto r = OpenXR::probeRuntimeRenderNode(inst, sys, abandon.get());
+                if (!abandon->load(std::memory_order_acquire))
+                    *result = r;
+                done->store(true, std::memory_order_release);
+            }).detach();
+
+            constexpr int kProbeTimeoutMs = 3000;
+            for (int waited = 0; waited < kProbeTimeoutMs && !done->load(std::memory_order_acquire); waited += 25)
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+
+            if (done->load(std::memory_order_acquire))
+                rt = *result;
+            else {
+                abandon->store(true, std::memory_order_release);
+                rt.note = "GPU probe timed out";
+                Log::logger->log(Log::WARN, "[OPENXR] runtime GPU probe did not respond within {}ms; proceeding without GPU verification", kProbeTimeoutMs);
+            }
+        } else
+            rt.note = "runtime does not advertise XR_KHR_vulkan_enable2";
+
+        // Publish the resolved runtime GPU for `hyprctl openxr status` (empty when undeterminable).
+        m_runtimeGpu = rt.determined ? std::format("{} (drm {}:{})", rt.deviceName.empty() ? "GPU" : rt.deviceName, rt.drmMajor, rt.drmMinor) : "";
+
+        if (rt.determined && node.valid && (rt.drmMajor != node.major || rt.drmMinor != node.minor)) {
+            Log::logger->log(Log::ERR,
+                             "[OPENXR] openxr:gpu selects {} (drm {}:{}) but the runtime '{}' composites on {} (drm {}:{}). Cross-GPU buffer import "
+                             "crashes the graphics driver and would take the whole session down, so XR is refusing to start. Point openxr:gpu at the "
+                             "runtime's GPU (or unset it). Desktop session unaffected.",
+                             node.path, node.major, node.minor, m_runtimeName, rt.deviceName.empty() ? "another GPU" : rt.deviceName, rt.drmMajor, rt.drmMinor);
+            abortStart();
+            return;
+        }
+
+        if (rt.determined && node.valid)
+            Log::logger->log(Log::DEBUG, "[OPENXR] XR GPU verified against runtime: {} (drm {}:{})", rt.deviceName.empty() ? node.path : rt.deviceName, node.major, node.minor);
+        else
+            Log::logger->log(Log::WARN,
+                             "[OPENXR] could not verify the XR GPU matches the runtime ({}); proceeding. If the session crashes at swapchain creation, "
+                             "openxr:gpu is pointing at the wrong GPU (it must be the GPU the runtime renders on).",
+                             !node.valid ? "XR render node unknown (shared-display fallback)" : rt.note);
     }
 
     // 4. Session (XrGraphicsBindingEGLMNDX).
@@ -324,6 +401,7 @@ void COpenXRManager::abortStart() {
 
     m_runtimeName.clear();
     m_systemName.clear();
+    m_runtimeGpu.clear();
 
     setState(XR_STATE_UNAVAILABLE);
 }
@@ -387,6 +465,7 @@ void COpenXRManager::stop() {
 
     m_runtimeName.clear();
     m_systemName.clear();
+    m_runtimeGpu.clear();
 
     setState(lost ? XR_STATE_UNAVAILABLE : XR_STATE_DISABLED);
 }
