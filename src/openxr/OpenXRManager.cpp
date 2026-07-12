@@ -1426,8 +1426,19 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
     if (params.m_name.empty())
         return std::unexpected<std::string>("monitor name must not be empty");
     for (auto const& m : State::monitorState()->allMonitors())
-        if (m->m_name == params.m_name)
+        if (m->m_name == params.m_name) {
+            // Name reuse right after `openxr destroy`: the removal barrier is asynchronous (the
+            // frame thread must ack before the output is finalized), and status hides
+            // pendingRemoval layers early — so a scripted destroy+create of the same name can land
+            // in this window. Tell the caller the truth instead of a misleading generic collision.
+            {
+                std::scoped_lock lock(m_layersMu);
+                for (auto& l : m_layers)
+                    if (l->m_monitorName == params.m_name && l->m_pendingRemoval.load(std::memory_order_acquire))
+                        return std::unexpected<std::string>("that XR monitor is still being destroyed — retry shortly");
+            }
             return std::unexpected<std::string>("a monitor already uses that name");
+        }
     {
         std::scoped_lock lock(m_layersMu);
         for (auto& l : m_layers)
