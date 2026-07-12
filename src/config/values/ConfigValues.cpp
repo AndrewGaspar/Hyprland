@@ -824,13 +824,20 @@ std::vector<SP<IValue>> Values::getConfigValues() {
                    "when XR-created virtual monitors behave like UNPLUGGED external monitors (held disabled — workspaces evacuate to the remaining monitors exactly like a "
                    "physical unplug, then return by name when re-plugged). off = never (the old always-present behavior); session = while no OpenXR session exists; visible "
                    "(default) = while the session is not VISIBLE/FOCUSED, so a doffed/standby headset (whose runtime keeps a session alive) reads as unplugged. Unplugging on a "
-                   "visibility drop waits out monitor_unplug_grace_ms (anti-flap). Legacy 0/false => off, 1/true => session. See also destroy_monitors_on_stop (research/18)",
+                   "visibility drop waits out monitor_unplug_grace_ms (anti-flap). When the runtime exposes XR_EXT_user_presence (e.g. WiVRn), visible gates on the real "
+                   "donned/doffed signal instead of session visibility — so a session created with the headset on the shelf never plugs. Legacy 0/false => off, 1/true => "
+                   "session. See also destroy_monitors_on_stop (research/18)",
                    "visible"),
         MS<Int>("openxr:monitor_unplug_grace_ms",
-                "with monitors_follow_session = visible, how long the headset must stay doffed/standby (session not VISIBLE) before the XR monitors unplug and their workspaces "
-                "evacuate, in milliseconds. Absorbs a brief doff-and-don and proximity-sensor churn so a quick glance away never rearranges workspaces. Donning re-plugs "
-                "immediately regardless",
+                "with monitors_follow_session = visible, how long the headset must stay doffed/standby (not present / session not VISIBLE) before the XR monitors unplug and "
+                "their workspaces evacuate, in milliseconds. Absorbs a brief doff-and-don and proximity-sensor churn so a quick glance away never rearranges workspaces. Donning "
+                "re-plugs immediately regardless",
                 20000, {.min = 0, .max = 600000}),
+        MS<Int>("openxr:monitor_plug_settle_ms",
+                "with monitors_follow_session = visible AND a runtime that does NOT expose XR_EXT_user_presence, how long the session must stay continuously VISIBLE before the "
+                "FIRST plug of the session, in milliseconds. Suppresses the session-create visibility blip (some runtimes sprint to FOCUSED at startup even while doffed) without "
+                "slowing a real don. Ignored once presence is available (presence is blip-proof by construction) and after the first plug",
+                1500, {.min = 0, .max = 60000}),
         MS<Bool>("openxr:destroy_monitors_on_stop",
                  "destroy XR-created virtual monitors when the session stops, instead of keeping them (unplugged when monitors_follow_session != off, plain headless outputs "
                  "otherwise). Declared xrmonitors re-materialize on the next session start",
