@@ -72,8 +72,9 @@ Add one block to `getConfigValues()` under a new `/* openxr: */` section comment
 | `openxr:grab_threshold_release` | `Float` | `0.4` | squeeze analog value that ends a grab (hysteresis) | hot-live |
 | `openxr:scroll_speed` | `Float` | `1.0` | multiplier for thumbstick scrolling on XR monitors | hot-live |
 | `openxr:inhibit_idle` | `Bool` | `true` | inhibit idle (hypridle etc.) while the XR session is focused | hot — triggers an idle recheck (§6) |
-| `openxr:monitors_follow_session` | `String` | `visible` | when XR-created monitors behave like UNPLUGGED external monitors (created/held disabled — workspaces evacuate — then re-enabled/returned by name as the headset comes and goes): `off` = never (old always-present behavior); `session` = while no session exists (research/18); `visible` = while the session is not VISIBLE/FOCUSED, so a doffed/standby headset reads as unplugged (report-18 addendum). Legacy `false/0`→off, `true/1`→session | hot — `updateMonitorsPlugged()` re-asserts on reload/keyword |
-| `openxr:monitor_unplug_grace_ms` | `Int` | `20000` | under `monitors_follow_session = visible`, ms the headset must stay doffed/standby (session not VISIBLE) before its monitors unplug and workspaces evacuate — anti-flap for a quick doff-and-don / proximity-sensor churn (report-18 addendum). Donning re-plugs immediately | hot-live (re-read at each arm) |
+| `openxr:monitors_follow_session` | `String` | `visible` | when XR-created monitors behave like UNPLUGGED external monitors (created/held disabled — workspaces evacuate — then re-enabled/returned by name as the headset comes and goes): `off` = never (old always-present behavior); `session` = while no session exists (research/18); `visible` = while the headset is not being WORN. When the runtime exposes `XR_EXT_user_presence` (WiVRn) this is the real donned/doffed signal — a shelf session sprinting to FOCUSED never plugs; otherwise it falls back to session VISIBLE/FOCUSED + the settle guard below (report-18/19 addenda). Legacy `false/0`→off, `true/1`→session | hot — `updateMonitorsPlugged()` re-asserts on reload/keyword |
+| `openxr:monitor_unplug_grace_ms` | `Int` | `20000` | under `monitors_follow_session = visible`, ms the headset must stay doffed/not-present before its monitors unplug and workspaces evacuate — anti-flap for a quick doff-and-don / proximity-sensor churn (report-18 addendum). Donning re-plugs immediately | hot-live (re-read at each arm) |
+| `openxr:monitor_plug_settle_ms` | `Int` | `1500` | under `monitors_follow_session = visible` on a runtime WITHOUT `XR_EXT_user_presence` only: ms the session must stay continuously VISIBLE before the FIRST plug — suppresses the session-create visibility blip without slowing a real don. Ignored when presence is available (blip-proof by construction) and after the first plug (report-19) | hot-live (re-read on reload/keyword) |
 | `openxr:destroy_monitors_on_stop` | `Bool` | `false` | destroy XR-created virtual monitors when the session stops, instead of keeping them (unplugged under `monitors_follow_session != off`, plain headless outputs otherwise). The research/18 option-(a) escape hatch | hot-live (consulted at stop time) |
 | `openxr:overlay` | `Bool` | `false` | run as an `XR_EXTX_overlay` session so monitors composite ON TOP of another XR client (a game, or `hypxrpaper`). Requires a runtime that advertises `XR_EXTX_overlay` (Monado/WiVRn); requested-but-unsupported downgrades to a normal exclusive session with a WARN, never failing startup (doc 01) | **start-only** — read at session start; changing it takes effect on the next start |
 | `openxr:overlay_z` | `Int` | `1` | overlay composition placement (`XR_EXTX_overlay` `sessionLayersPlacement`); higher composites later / on top. On Monado this maps straight into the layer `z_order` (primary pinned to `INT64_MIN`), so any value puts our quads above the primary | **start-only** — read at session start |
@@ -401,6 +402,7 @@ runtime: Monado(XRT) by Collabora et al.
 system: Simulated HMD
 blend mode: opaque
 monitors follow session: visible
+presence: yes
 monitor XR-code (ID 3): 2560x1440@90.00 size 1.80m anchor local pos [0.00, 1.40, -1.50] grabbed: no (none) hovered: yes plugged: yes
 ```
 
@@ -416,6 +418,7 @@ present:
     "overlay": false,
     "monitorsFollowSession": "visible",
     "monitorUnplugPendingMs": -1,
+    "userPresence": "yes",
     "inhibitingIdle": true,
     "monitors": [
         {
@@ -460,16 +463,23 @@ present:
 - `plugged` (research/18 + report-18 addendum) — whether the backing headless output is currently
   enabled. `openxr:monitors_follow_session` decides WHEN XR monitors are unplugged (disabled,
   workspaces evacuated — like an unplugged external monitor): `off` = never; `session` = whenever
-  no session exists; `visible` (**default**) = whenever the session is not `VISIBLE`/`FOCUSED`, so
-  a doffed/standby headset (whose runtime keeps a session alive on the shelf) reads as unplugged.
-  Under `visible`, an unplug on a visibility drop is deferred by `openxr:monitor_unplug_grace_ms`
-  (default 20000) so a quick doff-and-don never evacuates workspaces; donning re-plugs immediately.
-  Text form: `plugged: yes|no`.
+  no session exists; `visible` (**default**) = whenever the headset is not being WORN. When the
+  runtime advertises `XR_EXT_user_presence` (WiVRn) this keys on the real donned/doffed signal, so a
+  session created with the headset on the shelf never plugs (the report-19 fix — WiVRn sprints a
+  doffed session to `FOCUSED` at startup, which the old visibility gating mistook for donned); on
+  runtimes without presence it falls back to `VISIBLE`/`FOCUSED` plus the first-plug settle guard.
+  Under `visible`, an unplug on a doff is deferred by `openxr:monitor_unplug_grace_ms` (default
+  20000) so a quick doff-and-don never evacuates workspaces; donning re-plugs immediately. Text
+  form: `plugged: yes|no`.
 - `monitorsFollowSession` (report-18 addendum) — the active follow mode: `off` | `session` |
   `visible`. Text form: `monitors follow session: <mode>`.
 - `monitorUnplugPendingMs` (report-18 addendum) — ms remaining before a pending grace-period
   unplug fires (headset doffed under `visible` mode), or `-1` when no unplug is pending. Text form
   appends `(unplug in <n>ms)` to the follow-mode line while pending.
+- `userPresence` (report-19) — the `XR_EXT_user_presence` signal driving the `visible`-mode plug
+  gate: `yes`/`no` (donned/doffed) when the runtime supports it, `unknown` before the first presence
+  event of a session, `unsupported` when the runtime/device can't report presence (the gate then
+  falls back to visibility). Text form: `presence: <value>`.
 - `anchor.mode` — `local` | `head` | `body` | `device:left` | `device:right`.
 - `anchor.pose` — for `local`: pose in LOCAL_FLOOR. For leashed/device modes: the configured
   offset in the leash frame as `pos` and the relative rotation as `quat`. **WP8 deviation (as
