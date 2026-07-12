@@ -352,6 +352,7 @@ bool OpenXR::wantXRMonitorsPlugged(eXRMonitorFollowMode mode, bool sessionUp, bo
         case XR_FOLLOW_VISIBLE: return sessionVisible;
     }
     return sessionVisible;
+}
 
 OpenXR::eForceLinearMode OpenXR::parseForceLinearMode(const std::string& s) {
     if (s == "on" || s == "true" || s == "1" || s == "yes")
@@ -375,12 +376,6 @@ bool OpenXR::shouldForceLinear(eForceLinearMode mode, bool xrValid, int64_t xrMa
                 return false;
             return xrMajor != allocMajor || xrMinor != allocMinor;
     }
-}
-
-bool OpenXR::wantXRMonitorsPlugged(bool followSession, bool sessionUp) {
-    // research/18: with monitors_follow_session (default), XR monitors are plugged exactly while
-    // a session exists; opting out keeps them always plugged (the pre-feature behavior).
-    return sessionUp || !followSession;
 }
 
 std::string OpenXR::anchorModeToString(eXRAnchorMode mode, eXRHand device) {
