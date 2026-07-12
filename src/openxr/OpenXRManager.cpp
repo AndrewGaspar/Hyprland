@@ -176,6 +176,10 @@ void COpenXRManager::start() {
     m_systemName.clear();
     m_frameRequestedTeardown = false;
 
+    // Parse the adaptive STRING options to enums up front (main thread) so the frame thread never
+    // reads a CConfigValue<const char*>. Must happen before the frame thread launches below.
+    publishAdaptiveStringTuning();
+
     m_session  = makeUnique<CXRSession>();
     m_graphics = makeUnique<CXRGraphics>();
 
@@ -1551,6 +1555,11 @@ void COpenXRManager::markSwapchainsDirtyIfChromeChanged() {
 }
 
 void COpenXRManager::onConfigReload() {
+    // Re-parse the adaptive string options to enums for the frame thread (main-thread parse). Cheap
+    // + unconditional so hot re-tuning (openxr:adaptive_roam_mode / adaptive_transition_ease) applies
+    // live on both /reload and the keyword special-cases below.
+    publishAdaptiveStringTuning();
+
     static auto PENABLED = CConfigValue<Hyprlang::INT>("openxr:enabled");
     const bool  enabled  = *PENABLED;
 
@@ -1609,6 +1618,21 @@ namespace {
     }
 }
 
+void COpenXRManager::publishAdaptiveStringTuning() {
+    // MAIN-THREAD ONLY. Parse the two adaptive STRING options to plain enums and publish them as
+    // atomics for the frame thread (readAnchorTuning) to read. Never let the frame thread read a
+    // string config value: a reload frees/rebuilds the backing value and dangles the cached pointer.
+    // Called from start() (before the frame thread launches) and onConfigReload() (hot re-tune).
+    // NOTE: must be CConfigValue<std::string> — NOT CConfigValue<Hyprlang::STRING> (const char*).
+    // Under the legacy hyprlang manager, string values populate m_hlangp and leave m_p null (the
+    // "cursed case" in local__configValuePopulate); only the CConfigValue<std::string> operator*
+    // specialization handles that — the generic const char* ptr() derefs the null m_p -> SIGSEGV.
+    static auto PADEASE = CConfigValue<std::string>("openxr:adaptive_transition_ease");
+    static auto PADROAM = CConfigValue<std::string>("openxr:adaptive_roam_mode");
+    m_adEase.store(OpenXR::xrParseEase(*PADEASE), std::memory_order_relaxed);
+    m_adRoamMode.store(*PADROAM == "head" ? OpenXR::XR_ANCHOR_HEAD : OpenXR::XR_ANCHOR_BODY, std::memory_order_relaxed);
+}
+
 OpenXR::SXRAnchorTuning COpenXRManager::readAnchorTuning() const {
     static auto             PRESP    = CConfigValue<Hyprlang::FLOAT>("openxr:leash_response");
     static auto             PANG     = CConfigValue<Hyprlang::FLOAT>("openxr:leash_deadzone_angle");
@@ -1616,13 +1640,21 @@ OpenXR::SXRAnchorTuning COpenXRManager::readAnchorTuning() const {
     static auto             PFOLLOW  = CConfigValue<Hyprlang::INT>("openxr:body_leash_follow_height");
     static auto             PDEFDIST = CConfigValue<Hyprlang::FLOAT>("openxr:default_distance");
     // Adaptive anchoring (research/13 §6.1) — hot-read per frame, same as the leash vars above.
+    // THREAD-SAFETY RULE: this runs on the FRAME THREAD (OpenXRManager.cpp frameThread). It may
+    // read NUMERIC CConfigValues directly — a config reload can swap the cached pointer under us so
+    // we may read a torn number from live memory, but that is a tolerated benign race (a well-formed
+    // number, never a crash). It must NEVER read STRING CConfigValues here: a reload can rebuild and
+    // free the backing value, so the cached pointer DANGLES and dereferencing it is a use-after-free
+    // -> SIGSEGV (crash report 54542). (The original code additionally used CConfigValue<Hyprlang::
+    // STRING>, whose generic ptr() derefs the null m_p for legacy-manager strings — see the note in
+    // publishAdaptiveStringTuning.) The two string options (openxr:adaptive_transition_ease /
+    // adaptive_roam_mode) are therefore parsed to enums on the MAIN thread in
+    // publishAdaptiveStringTuning() and read here as atomics — see m_adEase/m_adRoamMode.
     static auto             PADLEAVE   = CConfigValue<Hyprlang::FLOAT>("openxr:adaptive_leave_radius");
     static auto             PADRETURN  = CConfigValue<Hyprlang::FLOAT>("openxr:adaptive_return_radius");
     static auto             PADLDWELL  = CConfigValue<Hyprlang::INT>("openxr:adaptive_leave_dwell_ms");
     static auto             PADRDWELL  = CConfigValue<Hyprlang::INT>("openxr:adaptive_return_dwell_ms");
     static auto             PADTRANS   = CConfigValue<Hyprlang::INT>("openxr:adaptive_transition_ms");
-    static auto             PADEASE    = CConfigValue<Hyprlang::STRING>("openxr:adaptive_transition_ease");
-    static auto             PADROAM    = CConfigValue<Hyprlang::STRING>("openxr:adaptive_roam_mode");
     static auto             PADHEIGHT  = CConfigValue<Hyprlang::INT>("openxr:adaptive_use_height");
     static auto             PADCARRY   = CConfigValue<Hyprlang::INT>("openxr:adaptive_carry_offset");
 
@@ -1637,8 +1669,9 @@ OpenXR::SXRAnchorTuning COpenXRManager::readAnchorTuning() const {
     t.adLeaveDwell     = (float)*PADLDWELL / 1000.f;
     t.adReturnDwell    = (float)*PADRDWELL / 1000.f;
     t.adTransition     = (float)*PADTRANS / 1000.f;
-    t.adEase           = OpenXR::xrParseEase(std::string{*PADEASE});
-    t.adRoamMode       = std::string{*PADROAM} == "head" ? OpenXR::XR_ANCHOR_HEAD : OpenXR::XR_ANCHOR_BODY;
+    // Strings NOT read here (frame thread) — published as enums on the main thread. See rule above.
+    t.adEase           = (OpenXR::eXREase)m_adEase.load(std::memory_order_relaxed);
+    t.adRoamMode       = (OpenXR::eXRAnchorMode)m_adRoamMode.load(std::memory_order_relaxed);
     t.adUseHeight      = *PADHEIGHT;
     t.adCarryOffset    = *PADCARRY;
     return t;

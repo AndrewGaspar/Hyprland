@@ -232,6 +232,17 @@ class COpenXRManager {
     // --- anchoring (WP5) ---
     // Read the leash/placement tuning from config (hot-live; called per frame + per verb).
     OpenXR::SXRAnchorTuning readAnchorTuning() const;
+
+    // Adaptive-anchoring STRING options (openxr:adaptive_roam_mode / adaptive_transition_ease) are
+    // parsed to plain enums on the MAIN thread and published here as atomics, so the per-frame
+    // readAnchorTuning() (frame thread) never dereferences a CConfigValue<const char*>: a config
+    // reload can rebuild/free the underlying string, dangling the cached pointer -> SIGSEGV.
+    // (Numeric CConfigValues are still read directly on the frame thread — a torn read of a live
+    // number is a tolerated benign race; a dangling string pointer is not. See readAnchorTuning.)
+    // Refreshed from start() and onConfigReload(), both main-thread. Ints hold OpenXR enum values.
+    void              publishAdaptiveStringTuning();      // main thread only
+    std::atomic<int>  m_adRoamMode{OpenXR::XR_ANCHOR_BODY};
+    std::atomic<int>  m_adEase{OpenXR::XR_EASE_SMOOTHSTEP};
     // Copy of the most recent frame-thread solve inputs, so verbs (main thread) get a view/grip
     // context without blocking the frame thread. Written by the frame thread under m_layersMu.
     OpenXR::SXRVerbContext currentVerbContext();
