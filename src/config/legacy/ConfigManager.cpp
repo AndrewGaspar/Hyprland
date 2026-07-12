@@ -1135,10 +1135,12 @@ std::string CConfigManager::parseKeyword(const std::string& COMMAND, const std::
     if (COMMAND == "openxr:enabled" && g_pOpenXRManager)
         g_pOpenXRManager->onConfigReload();
 
-    // openxr:monitors_follow_session (research/18) is applied by onConfigReload()'s idempotent
-    // setMonitorsPlugged() re-assert — same legacy-keyword gap as openxr:enabled above: a bare
-    // `hyprctl keyword` fires neither reloaded nor props_refreshed, so route it explicitly.
-    if (COMMAND == "openxr:monitors_follow_session" && g_pOpenXRManager)
+    // openxr:monitors_follow_session (research/18) + openxr:monitor_unplug_grace_ms (report-18
+    // addendum) are applied by onConfigReload()'s idempotent updateMonitorsPlugged() re-assert —
+    // same legacy-keyword gap as openxr:enabled above: a bare `hyprctl keyword` fires neither
+    // reloaded nor props_refreshed, so route them explicitly. (The grace value is otherwise re-read
+    // at each arm, so this only matters for applying a mode change live.)
+    if ((COMMAND == "openxr:monitors_follow_session" || COMMAND == "openxr:monitor_unplug_grace_ms") && g_pOpenXRManager)
         g_pOpenXRManager->onConfigReload();
 
     // openxr:chrome_* geometry (enabled/margin/bar_height/bar_width_frac/corner_size) is frozen
