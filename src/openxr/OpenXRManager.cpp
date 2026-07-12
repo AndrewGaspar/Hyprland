@@ -1519,6 +1519,20 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
             finalizeLayerRemoval(name); // no frame thread — clean up directly
     });
 
+    // 4b. Cross-GPU linear policy — decide it NOW, BEFORE the mode-apply below triggers the output's
+    //     first composite. Setting m_forceLinearSwapchain up front means that very first composite (and
+    //     every one after) allocates LINEAR buffers, so the presented listener never stashes a
+    //     foreign-tiled buffer that the XR GPU can't import. Running it AFTER the mode apply (the old
+    //     order) left a window where a tiled buffer was composited + stashed before the flag flipped —
+    //     the frame thread would import that stale tiled buffer and the quad went black (live
+    //     2026-07-12 "monitor created after a destroy goes blank", intermittent by timing). Needs the
+    //     XR EGL node, known only while running; monitors created while stopped get this at
+    //     bindExistingLayers() (before the frame thread starts, so no stale stash there either).
+    if (m_running.load()) {
+        applyCrossGpuLinear(mon);
+        layer->m_swapchainDirty.store(true, std::memory_order_release);
+    }
+
     // 5. Apply the requested pixel mode, if any. An explicit user `monitor=` rule matching this name
     //    wins (doc 02 step 5): capture whether the user already set a resolution BEFORE we register our
     //    own declared-mode rule (report-20 issue E), so we never clobber theirs. Then register the
@@ -1551,14 +1565,9 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
     if (g_pEventManager)
         g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitoradded", params.m_name});
 
-    // 7. If a session is running, the frame thread creates the swapchain on its next pass (it
-    //    already snapshots m_layers per frame, so no extra wakeup is needed). Also decide now
-    //    whether this output must allocate LINEAR buffers for cross-GPU import (needs the XR EGL
-    //    node, only known while running; monitors created while stopped get this at bindExistingLayers).
-    if (m_running.load()) {
-        applyCrossGpuLinear(mon);
-        layer->m_swapchainDirty.store(true, std::memory_order_release);
-    }
+    // 7. The cross-GPU linear policy + swapchain-dirty flag were set in step 4b (before the mode
+    //    apply). If a session is running the frame thread creates the swapchain on its next pass — it
+    //    already snapshots m_layers per frame, so no extra wakeup is needed.
 
     // 8. Layer cap: a new quad may push the oldest past maxLayerCount (doc 02 recency policy).
     recomputeQuadActive();

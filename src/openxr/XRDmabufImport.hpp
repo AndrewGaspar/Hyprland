@@ -41,4 +41,16 @@ namespace OpenXR {
     // omitted, matching stock Hyprland behavior). Result is EGL_NONE-terminated. planes is clamped
     // to [1, 4]; each plane must have a valid entry in `planes`.
     std::vector<EGLint> buildDmabufImportAttribs(int width, int height, uint32_t fourcc, const std::vector<SDmabufPlaneImport>& planes, uint64_t modifier, bool withModifiers);
+
+    // Cross-GPU stale-buffer guard (live 2026-07-12 "blank monitor created after a destroy"). When an
+    // XR-bound output must hand LINEAR buffers to a foreign XR GPU (m_forceLinearSwapchain), a composite
+    // that raced AHEAD of the force-linear swapchain reconfigure still presents a foreign-vendor-TILED
+    // buffer. The frame thread would import it, the XR GPU's EGL rejects the tiling
+    // (EGL_BAD_ATTRIBUTE), and the quad goes black — precisely the intermittent blank seen when
+    // monitors are created/destroyed in a burst (the flag is applied a beat after the first composite).
+    // Return whether a presented buffer is safe to hand to the XR import: drop a dmabuf whose modifier
+    // is a KNOWN non-linear tiling while force-linear is active (INVALID/implicit is allowed through —
+    // it may well be linear and the import path handles it). Non-force-linear and non-dmabuf buffers
+    // always pass. Pure (no OpenXR/aquamarine types) so hyprland_gtests can exercise it.
+    bool shouldStashPresentedBuffer(bool forceLinear, bool bufIsDmabuf, uint64_t modifier);
 }
