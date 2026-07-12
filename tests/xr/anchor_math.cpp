@@ -583,3 +583,82 @@ TEST(XRAnchorMath, GrabPushPullResizeClamps) {
     EXPECT_EQ(a.state().mode, XR_ANCHOR_LOCAL);
     expectVecNear(a.state().anchorPose.pos, lastGrabbedWorld.pos, 1e-4f);
 }
+
+// ---- report-20 issue C: recenter-on-plug (recenterLocalToHead) ----
+
+TEST(XRAnchorRecenter, LocalReseatsHeadRelativePreservingHeightAndDistance) {
+    // Declared "1.5m up, 1.5m in front, facing origin" (identity rot = faces +Z toward a user at the
+    // origin looking down -Z). The runtime origin is arbitrary; the head is off at (10, 1.6, 5) facing
+    // +X (yaw = -90deg: -Z rotates to +X). After recenter the monitor must sit 1.5m in front of the
+    // head along its facing, at the configured floor height 1.5, facing back at the head.
+    SXRAnchorState decl;
+    decl.mode           = XR_ANCHOR_LOCAL;
+    decl.anchorPose.pos = {0.f, 1.5f, -1.5f};
+    decl.anchorPose.rot = Quat{}; // identity
+
+    CXRAnchor a;
+    a.initFromState(decl);
+
+    // Head at (10,1.6,5), yaw = -90deg so forward (-Z) points +X.
+    const float yaw = -90.f * PI / 180.f;
+    SXRPose     head{{10.f, 1.6f, 5.f}, qFromYaw(yaw)};
+
+    a.recenterLocalToHead(head, decl);
+
+    const SXRPose& W = a.state().anchorPose;
+    // Configured height preserved (floor-relative), independent of head y.
+    EXPECT_NEAR(W.pos.y, 1.5f, 1e-4f);
+    // 1.5m in front of the head along +X (yaw -90): head XZ (10,5) + (1.5, 0) = (11.5, 5).
+    EXPECT_NEAR(W.pos.x, 11.5f, 1e-4f);
+    EXPECT_NEAR(W.pos.z, 5.f, 1e-4f);
+    // Distance from head is exactly the configured horizontal 1.5m (heights differ by 0.1).
+    const float dxz = std::sqrt((W.pos.x - head.pos.x) * (W.pos.x - head.pos.x) + (W.pos.z - head.pos.z) * (W.pos.z - head.pos.z));
+    EXPECT_NEAR(dxz, 1.5f, 1e-4f);
+    // Facing: the quad's +Z (its normal toward the viewer) now points back toward the head (-X).
+    const Vec3 normal = qRotate(W.rot, Vec3{0.f, 0.f, 1.f});
+    EXPECT_NEAR(normal.x, -1.f, 1e-4f);
+    EXPECT_NEAR(normal.y, 0.f, 1e-4f);
+    EXPECT_NEAR(normal.z, 0.f, 1e-4f);
+}
+
+TEST(XRAnchorRecenter, MultiMonitorGroupTransformedRigidly) {
+    // Two monitors with distinct declared offsets, recentered with the SAME head pose, must keep the
+    // exact vector between them (rigid transform), just rotated/translated into the head frame.
+    SXRAnchorState left, right;
+    left.mode            = XR_ANCHOR_LOCAL;
+    left.anchorPose.pos  = {-1.f, 1.5f, -1.5f};
+    left.anchorPose.rot  = Quat{};
+    right.mode           = XR_ANCHOR_LOCAL;
+    right.anchorPose.pos = {1.f, 1.5f, -1.5f};
+    right.anchorPose.rot = Quat{};
+
+    const Vec3 declSep = right.anchorPose.pos - left.anchorPose.pos; // (2,0,0)
+
+    CXRAnchor la, ra;
+    la.initFromState(left);
+    ra.initFromState(right);
+
+    SXRPose head{{3.f, 1.7f, -2.f}, qFromYaw(40.f * PI / 180.f)};
+    la.recenterLocalToHead(head, left);
+    ra.recenterLocalToHead(head, right);
+
+    const Vec3  sep = ra.state().anchorPose.pos - la.state().anchorPose.pos;
+    // Rigid: separation length is preserved (2m), and it is the declared separation rotated by yaw.
+    EXPECT_NEAR(sep.length(), declSep.length(), 1e-4f);
+    const Vec3 expected = qRotate(qFromYaw(40.f * PI / 180.f), declSep);
+    expectVecNear(sep, expected, 1e-4f);
+}
+
+TEST(XRAnchorRecenter, NonLocalModesUnaffected) {
+    // head/body/device anchors are already user-relative; recenter must be a no-op for them.
+    SXRAnchorState st;
+    st.mode           = XR_ANCHOR_HEAD;
+    st.anchorPose.pos = {0.f, 0.f, -1.5f};
+    CXRAnchor a;
+    a.initFromState(st);
+    const SXRPose before = a.state().anchorPose;
+
+    a.recenterLocalToHead(SXRPose{{5.f, 1.6f, 5.f}, qFromYaw(1.f)}, st);
+    expectVecNear(a.state().anchorPose.pos, before.pos, 1e-6f);
+    EXPECT_EQ(a.state().mode, XR_ANCHOR_HEAD);
+}

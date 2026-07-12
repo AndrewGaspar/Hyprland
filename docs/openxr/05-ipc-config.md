@@ -55,6 +55,9 @@ Add one block to `getConfigValues()` under a new `/* openxr: */` section comment
 | Name | Type | Default | Description (verbatim for the `MS<>` entry) | Reload behavior |
 |---|---|---|---|---|
 | `openxr:enabled` | `Bool` | `false` | enable the OpenXR integration (session starts when a runtime is available) | **hot** — toggling starts/stops the session (§1.3) |
+| `openxr:reprobe` | `Bool` | `true` | while enabled but no runtime/headset yet, keep re-probing (backoff) so the session comes up automatically once the runtime starts / the headset is donned; also auto-reconnects after a session/runtime loss (report-17 WP-L3 / report-20 B1) | hot — armed on entering `unavailable` |
+| `openxr:reprobe_interval_ms` | `Int` | `2000` | base interval for the `openxr:reprobe` backoff. "Waiting for runtime" grows from this to 30s; "waiting for headset" polls at this fixed cadence | hot-live (re-read at each arm) |
+| `openxr:recenter_on_plug` | `Bool` | `true` | on the FIRST don of a session, re-seat `anchor:local` monitors relative to the current head pose (not the runtime's arbitrary LOCAL_FLOOR origin) — they appear in front of you at their configured height/distance; a multi-monitor layout is recentered rigidly. A brief doff-and-don within the same session does not re-seat (report-20 C) | hot (consulted at the first plug of each session) |
 | `openxr:gpu` | `String` | `""` | DRM render node to use for XR (e.g. /dev/dri/renderD128). Empty = follow Hyprland's primary GPU | **start-only** — read at session start; changing it takes effect on the next start |
 | `openxr:force_linear` | `String` | `"auto"` | allocate `DRM_FORMAT_MOD_LINEAR` buffers for XR monitors so the XR GPU can import them cross-GPU: `auto` (force only when the XR EGL node differs from the buffer allocator node) \| `on` \| `off`. Needed when `openxr:gpu` is a different GPU than the desktop renders on — otherwise the runtime's EGL rejects the compositor's native-tiled buffers (`EGL_BAD_ATTRIBUTE`) and the quad goes black. Linear costs some compositing throughput (the accepted multi-GPU cost). | **at monitor bind** — applied when a monitor binds (session start / create); change takes effect on the next start |
 | `openxr:blend_mode` | `String` | `"auto"` | environment blend mode: `auto` (runtime preferred) \| `opaque` \| `alpha` (passthrough) \| `additive`. `auto` = the runtime's first-enumerated mode; an explicit mode the runtime doesn't advertise falls back to the preferred with a WARN (doc 01) | **start-only** — read at session start; changing it takes effect on the next start |
@@ -402,8 +405,17 @@ runtime: Monado(XRT) by Collabora et al.
 system: Simulated HMD
 blend mode: opaque
 monitors follow session: visible
+visible: yes
 presence: yes
 monitor XR-code (ID 3): 2560x1440@90.00 size 1.80m anchor local pos [0.00, 1.40, -1.50] grabbed: no (none) hovered: yes plugged: yes
+```
+
+While dormant (report-20 issue B1) the state line carries the re-probe hint, e.g.:
+
+```
+state: unavailable (waiting for headset, retrying in 1800ms)
+visible: n/a
+presence: unsupported
 ```
 
 JSON (`hyprctl -j openxr` / `hyprctl -j openxr status`) — full schema, all keys always
@@ -419,6 +431,9 @@ present:
     "monitorsFollowSession": "visible",
     "monitorUnplugPendingMs": -1,
     "userPresence": "yes",
+    "visible": "yes",
+    "reprobeWaiting": "",
+    "reprobePendingMs": -1,
     "inhibitingIdle": true,
     "monitors": [
         {
@@ -478,8 +493,15 @@ present:
   appends `(unplug in <n>ms)` to the follow-mode line while pending.
 - `userPresence` (report-19) — the `XR_EXT_user_presence` signal driving the `visible`-mode plug
   gate: `yes`/`no` (donned/doffed) when the runtime supports it, `unknown` before the first presence
-  event of a session, `unsupported` when the runtime/device can't report presence (the gate then
-  falls back to visibility). Text form: `presence: <value>`.
+  event of a session, `unsupported` when the runtime/device can't report presence. Text form:
+  `presence: <value>`.
+- `visible` (report-20 issue D) — the RAW session-visibility signal, the other half of the `visible`-mode
+  gate (which requires visibility AND presence): `yes` while VISIBLE/FOCUSED, `no` while the session
+  exists but is not visible (doffed/standby), `n/a` with no session. Text form: `visible: <value>`.
+- `reprobeWaiting` / `reprobePendingMs` (report-20 issue B1) — while dormant in `unavailable` with a
+  re-probe armed: what we are waiting for (`runtime` | `headset`, else `""`) and the ms until the next
+  probe (`-1` when none armed). Text form: the state line becomes
+  `unavailable (waiting for <what>, retrying in <n>ms)`.
 - `anchor.mode` — `local` | `head` | `body` | `device:left` | `device:right`.
 - `anchor.pose` — for `local`: pose in LOCAL_FLOOR. For leashed/device modes: the configured
   offset in the leash frame as `pos` and the relative rotation as `quat`. **WP8 deviation (as

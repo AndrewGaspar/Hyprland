@@ -85,21 +85,33 @@ namespace OpenXR {
     // grace and the first-plug blip guard are the caller's concern (see xrDeferFirstPlug).
     //   OFF     => always plugged.
     //   SESSION => sessionUp (a session exists; WiVRn-on-the-shelf counts).
-    //   VISIBLE => gate on the REAL donned signal:
-    //     * presenceSupported (XR_EXT_user_presence advertised AND supported): userPresent, but only
-    //       once presenceKnown (>=1 presence event seen) — before the first event we read as ABSENT so
-    //       the session-create visibility sprint (WiVRn goes FOCUSED within ~40ms while doffed on the
-    //       shelf) never plugs. This is the authoritative signal (proximity sensor / don-doff).
-    //     * otherwise (no presence ext): fall back to raw sessionVisible. On such runtimes visibility
-    //       IS the best we have; the create-time blip is handled by the caller's xrDeferFirstPlug gate.
+    //   VISIBLE => gate on the CONJUNCTION of BOTH available real signals (report-20 issue D):
+    //     * sessionVisible must be true. WiVRn drops VISIBLE->SYNCHRONIZED reliably on doff, so
+    //       visibility is the reliable doff signal even when presence sticks 'present' in standby.
+    //     * AND, when presenceSupported (XR_EXT_user_presence advertised AND supported): userPresent,
+    //       but only once presenceKnown (>=1 presence event seen) — before the first event we read as
+    //       ABSENT so the session-create sprint never plugs.
+    //     * otherwise (no presence ext): visibility alone is the signal.
+    //   Requiring BOTH means a doff (visibility drop) unplugs even if presence is stuck, and a
+    //   presence-absent unplugs even if a stale VISIBLE bit lingers — the fix for the never-unplugs
+    //   standby bug. The first-plug settle (xrDeferFirstPlug) still guards the create-time blip.
     bool wantXRMonitorsPlugged(eXRMonitorFollowMode mode, bool sessionUp, bool sessionVisible, bool presenceSupported, bool presenceKnown, bool userPresent);
 
-    // First-plug blip guard for the no-presence fallback (report-19). Whether a would-be plug must be
-    // DEFERRED because it is the first plug of the session and visibility has not yet been sustained
-    // past the session-start blip window. Presence-capable runtimes and any subsequent plug (everPlugged)
-    // never defer — presence already suppresses the blip, and later edges use the anti-flap grace.
+    // First-plug settle guard (report-20 issue D). Whether a would-be plug must be DEFERRED because it
+    // is the first plug of the session and visibility has not yet been sustained past the session-start
+    // blip window. Applies to the visibility side REGARDLESS of presence support: at session creation a
+    // presence-capable runtime can report 'present' within a millisecond (indistinguishable from a
+    // spurious blip), so requiring visibility to be sustained is the safety margin before the FIRST
+    // plug. Any subsequent plug (everPlugged) never defers — later edges use the anti-flap grace.
     // Pure/gtestable; the caller supplies how long visibility has been continuously true.
-    bool xrDeferFirstPlug(bool presenceSupported, bool everPlugged, int64_t visibleSustainedMs, int64_t blipMs);
+    bool xrDeferFirstPlug(bool everPlugged, int64_t visibleSustainedMs, int64_t blipMs);
+
+    // Re-probe backoff schedule (report-17 WP-L3 / report-20 issue B1). Milliseconds to wait before
+    // the Nth consecutive re-probe of an absent runtime while dormant in UNAVAILABLE. `attempt` is
+    // 0-based; doubling from baseMs, clamped to capMs. Pure/gtestable so the manager's dormant timer
+    // (which reads config + owns the CEventLoopTimer) can rely on it. HEADSET-wait (runtime up, headset
+    // undonned) uses a fixed gentle cadence instead and does not consult this.
+    int64_t xrReprobeBackoffMs(int attempt, int64_t baseMs, int64_t capMs);
 }
 
 namespace OpenXR {

@@ -710,6 +710,19 @@ std::vector<SP<IValue>> Values::getConfigValues() {
          */
 
         MS<Bool>("openxr:enabled", "enable the OpenXR integration (session starts when a runtime is available)", false),
+        MS<Bool>("openxr:reprobe",
+                 "when enabled but no runtime/headset is available yet, keep re-probing in the background (with a backoff) so the session comes up automatically once the "
+                 "runtime starts or the headset is donned — no need to toggle openxr:enabled. Also drives auto-reconnect after a session/runtime loss (report-17)",
+                 true),
+        MS<Int>("openxr:reprobe_interval_ms",
+                "base interval for the openxr:reprobe backoff, in milliseconds. Waiting for the runtime grows the delay from this base up to 30s; waiting for the headset "
+                "(runtime up, not donned) polls at this fixed cadence",
+                2000, {.min = 250, .max = 60000}),
+        MS<Bool>("openxr:recenter_on_plug",
+                 "on the first time the headset is donned in a session, re-seat anchor:local monitors relative to your current head pose instead of the runtime's (often "
+                 "arbitrary, under boundaryless/standby) LOCAL_FLOOR origin — the monitors appear in front of you at their configured height/distance. Multi-monitor layouts "
+                 "are recentered rigidly (relative arrangement preserved). A brief doff-and-don within the same session does NOT re-seat (report-20)",
+                 true),
         MS<String>("openxr:gpu", "DRM render node to use for XR (e.g. /dev/dri/renderD128). Empty = follow Hyprland's primary GPU", ""),
         MS<String>("openxr:force_linear",
                    "allocate LINEAR buffers for XR monitors so the XR GPU can import them: auto (only when a cross-GPU split is detected, "

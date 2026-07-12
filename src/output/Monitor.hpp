@@ -120,6 +120,12 @@ namespace Monitor {
         int                         m_sdrMaxLuminance  = 80;
         bool                        m_createdByUser    = false;
         bool                        m_isUnsafeFallback = false;
+        // OpenXR (report-20 issue A): true for a headless output whose plugged/enabled state is owned
+        // by COpenXRManager (an XR virtual monitor that unplugs when the headset is doffed). The
+        // monitor-rule manager must NOT re-enable such an output while it is intentionally held
+        // disabled — its config rule says "enabled" (no `monitor=NAME,disable` line), so the ordinary
+        // ensureMonitorStatus refresh would otherwise onConnect() it right back (the phantom-plug leak).
+        bool                        m_xrManagedPlug    = false;
 
         SP<CEventLoopTimer>         m_dpmsRetryTimer;
 
