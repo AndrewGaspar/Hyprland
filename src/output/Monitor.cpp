@@ -2680,12 +2680,29 @@ bool CMonitorState::updateSwapchain() {
     if (OPTIONS.format == m_owner->m_drmFormat && OPTIONS.scanout && OPTIONS.length == 3 && OPTIONS.size == MODE->pixelSize && OPTIONS.multigpu == forceLinear)
         return true;
 
+    // aquamarine's CSwapchain::reconfigure() only re-allocates buffers (the path that honors
+    // SSwapchainOptions::multigpu → DRM_FORMAT_MOD_LINEAR) when the FORMAT or SIZE differs. A bare
+    // multigpu flip with identical format/size/length is swallowed as a no-op (or handled by the
+    // resize path, which re-acquires without .multigpu) — so the buffers keep their old, foreign-
+    // vendor tiling and the cross-GPU import still fails (research/17 addendum; live 2026-07-12).
+    // Force the fullReconfigure path: when multigpu itself changes, first clear the swapchain (empty
+    // size ⇒ buffers dropped + the remembered size forgotten) so the follow-up reconfigure can no
+    // longer match the no-op/resize predicates and must re-acquire every buffer with the new policy.
+    const bool multigpuChanged = OPTIONS.multigpu != forceLinear && OPTIONS.length != 0 && OPTIONS.size != Vector2D{};
+
     auto options     = OPTIONS;
     options.format   = m_owner->m_drmFormat;
     options.scanout  = true;
     options.length   = 3;
     options.size     = MODE->pixelSize;
     options.multigpu = forceLinear;
+
+    if (multigpuChanged) {
+        auto clearOpts = options;
+        clearOpts.size = Vector2D{}; // empty size ⇒ CSwapchain::reconfigure() clears + forgets size
+        m_owner->m_output->swapchain->reconfigure(clearOpts);
+    }
+
     return m_owner->m_output->swapchain->reconfigure(options);
 }
 void CMonitorState::applyModeWithSwapchain(const SP<Aquamarine::SOutputMode>& mode) {

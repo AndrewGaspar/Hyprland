@@ -5,8 +5,10 @@
 #include "../../hyprctlCompat.hpp"
 #include "../../Log.hpp"
 #include "../../xr/xr_helpers.hpp"
+#include "../../shared.hpp" // HIS (hyprland.log path for the force_linear reallocation check)
 
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -79,6 +81,99 @@ TEST_CASE(xr_monitor_create_destroy) {
            true);
 
     NLog::green("xr_monitor_create_destroy: create+destroy round-trip verified in both j/monitors and j/openxr");
+}
+
+// xr_force_linear_realloc — Defect A (2026-07-12): a bare multigpu flip was swallowed by aquamarine's
+// CSwapchain::reconfigure() no-op (it compares only format/size/length), so the XR-bound output's
+// buffers kept their native (foreign-vendor-tiled) modifier and the cross-GPU import stayed black —
+// even though `hyprctl openxr status` already reported `linear`. CMonitorState::updateSwapchain() now
+// forces the fullReconfigure path on a multigpu change so the buffers ACTUALLY re-allocate LINEAR.
+//
+// We assert on AQUAMARINE's own allocator log, not the OpenXR manager's: the manager logs via
+// Log::logger, whose sink the harness doesn't route into hyprlandd.log, but aquamarine's allocator
+// DOES land there — and it is stronger evidence anyway, being the layer that actually honors
+// SSwapchainOptions::multigpu. The signature of a real LINEAR re-allocation is the pair
+//   "GBM: Buffer is marked as multigpu, forcing linear"  +  "modifier 0x0 : LINEAR"
+// In the BUGGY build the flag flip was swallowed by aquamarine's reconfigure() no-op, so this pair
+// never appeared and the buffers kept their native tiling. status `linear: true` alone is NOT
+// sufficient — it was `true` in the buggy build too; the aquamarine reallocation is what changed.
+//
+// This host happens to be cross-GPU (openxr:gpu pins a different node than the nested compositor
+// allocates on), so the `auto` default already force-linears the declared XR-conf monitors AT
+// STARTUP — the exact live scenario. We observe that first; if the host turns out same-GPU (no
+// forced-linear monitor), we drive it explicitly via `force_linear = on` + a fresh monitor. Either
+// way the assertion is the aquamarine reallocation evidence.
+TEST_CASE(xr_force_linear_realloc) {
+    XR_SKIP_IF_UNAVAILABLE();
+    SArtifactGuard guard{this->failed, name(), {}};
+
+    if (!gateUp()) {
+        XR::logSkip(name(), "session never reached focused/visible (known env instability)");
+        return;
+    }
+
+    auto readHyprlandLog = []() -> std::string {
+        const char* xdg = std::getenv("XDG_RUNTIME_DIR");
+        if (!xdg || HIS.empty())
+            return "";
+        // Logger.cpp writes hyprlandd.log for HYPRLAND_DEBUG (CMAKE_BUILD_TYPE=Debug) builds and
+        // hyprland.log otherwise — read whichever exists so this works under both (docs §5.2 gap).
+        const std::string base = std::string(xdg) + "/hypr/" + HIS + "/";
+        std::string       out;
+        for (const char* fn : {"hyprlandd.log", "hyprland.log"}) {
+            std::ifstream f(base + fn);
+            if (f) {
+                std::stringstream ss;
+                ss << f.rdbuf();
+                out += ss.str();
+            }
+        }
+        return out;
+    };
+    // The reallocation is proven iff the log holds BOTH the multigpu-forcing note and a LINEAR (0x0)
+    // buffer allocation. (Same-GPU builds without the fix would have neither; the buggy build had a
+    // set flag + status linear=true but neither aquamarine line.)
+    auto reallocatedLinear = [&](const std::string& log) { return log.find("multigpu, forcing linear") != std::string::npos && log.find("modifier 0x0 : LINEAR") != std::string::npos; };
+    // Does any monitor report linear:true in status?
+    auto anyMonitorLinear = []() { return getFromSocket("j/openxr").find("\"linear\": true") != std::string::npos; };
+
+    // Path 1 (this host): the auto default already forced the declared monitors linear at startup.
+    bool sawRealloc = reallocatedLinear(readHyprlandLog());
+    bool sawStatus  = anyMonitorLinear();
+
+    // Path 2 (same-GPU host): drive it explicitly so the mechanics are still exercised.
+    std::string mon;
+    if (!sawRealloc || !sawStatus) {
+        ASSERT(getFromSocket("/keyword openxr:force_linear on"), std::string("ok")); // read fresh at create
+        mon                          = XR::monitorName(13);
+        const std::string nameMarker = "\"name\": \"" + mon + "\"";
+        ASSERT(getFromSocket("/openxr create " + mon + " 1280x720"), std::string("ok"));
+        guard.monitorNames.push_back(mon);
+        ASSERT(XR::waitForJson(
+                   "j/openxr", [&](const std::string& r) { return r.contains(nameMarker); }, std::chrono::milliseconds(10000)),
+               true);
+        // Poll: the forced swapchain re-allocates once the monitor's mode is applied + first rendered.
+        for (int i = 0; i < 100 && !(sawRealloc && sawStatus); ++i) {
+            sawRealloc = reallocatedLinear(readHyprlandLog());
+            sawStatus  = anyMonitorLinear();
+            if (!(sawRealloc && sawStatus))
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+
+    if (!sawRealloc)
+        NLog::red("xr_force_linear_realloc diag: aquamarine never logged 'multigpu, forcing linear' + 'modifier 0x0 : LINEAR' (log bytes={})", readHyprlandLog().size());
+    ASSERT(sawRealloc, true); // the Defect A fix: the multigpu flip actually re-allocates LINEAR
+    EXPECT(sawStatus, true);  // status surface reflects it
+
+    // Cleanup: destroy any monitor we created + restore the default (auto).
+    if (!mon.empty()) {
+        getFromSocket("/openxr destroy " + mon);
+        guard.monitorNames.clear();
+        getFromSocket("/keyword openxr:force_linear auto");
+    }
+
+    NLog::green("xr_force_linear_realloc: multigpu flip re-allocates the XR swapchain LINEAR (aquamarine 'multigpu, forcing linear' + 'modifier 0x0 : LINEAR'), status linear=true");
 }
 
 // xr_config_declared — WP11 (doc 06 §6 row 3, extended per the roadmap's explicit ask for
