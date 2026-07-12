@@ -6,6 +6,7 @@
 #include "../../Log.hpp"
 #include "../../xr/xr_helpers.hpp"
 #include "../../shared.hpp" // HIS (hyprland.log path for the force_linear reallocation check)
+#include "../shared.hpp"    // Tests:: client helpers (spawnKitty, processAlive — destroy-survival test)
 
 #include <chrono>
 #include <cstdlib>
@@ -174,6 +175,147 @@ TEST_CASE(xr_force_linear_realloc) {
     }
 
     NLog::green("xr_force_linear_realloc: multigpu flip re-allocates the XR swapchain LINEAR (aquamarine 'multigpu, forcing linear' + 'modifier 0x0 : LINEAR'), status linear=true");
+}
+
+// xr_monitor_churn_content — live 2026-07-12 regression: creating/destroying XR monitors in a burst
+// left monitors created AFTER a destroy showing a BLANK (black) quad. Root cause: the cross-GPU
+// force-linear policy was applied a beat AFTER the monitor's first composite, so a foreign-tiled
+// buffer got composited + stashed before the swapchain reconfigured LINEAR; the frame thread then
+// imported that stale tiled buffer, the foreign XR GPU's EGL rejected the tiling, and the quad went
+// black (intermittent by timing — some monitors in the burst, not all). Fixed by (a) setting the
+// force-linear flag BEFORE the first mode-apply/composite (createXRMonitor step 4b) and (b) a
+// presented-listener guard that never stashes a still-tiled buffer while force-linear is active.
+//
+// The invariant this pins: EVERY living XR monitor's content path resolves to a real blit
+// ("dmabuf" on this cross-GPU host — never stuck "black"), including monitors created after a
+// destroy in the same burst. This host is genuinely cross-GPU (xr-test-local.conf pins a different
+// node than the nested compositor allocates on), so the force-linear import path is live in-suite —
+// the exact condition that reproduced the blank.
+TEST_CASE(xr_monitor_churn_content) {
+    XR_SKIP_IF_UNAVAILABLE();
+    SArtifactGuard guard{this->failed, name(), {}};
+
+    if (!gateUp()) {
+        XR::logSkip(name(), "session never reached focused/visible (known env instability)");
+        return;
+    }
+
+    // Does this monitor's status block report a NON-black content path (a real blit landed)?
+    // "name" precedes "contentPath" in each block (XRIpc.cpp), and "contentPath" precedes the next
+    // block's "name", so scanning from the name marker to the next name bounds it to this monitor.
+    auto blockOf = [](const std::string& json, const std::string& mon) -> std::string {
+        const std::string marker = "\"name\": \"" + mon + "\"";
+        const size_t      pos    = XR::findAfter(json, marker); // position OF the marker (plain find)
+        if (pos == std::string::npos)
+            return "";
+        const size_t from = pos + marker.size(); // start past our own name key or the next find hits it
+        const size_t end  = json.find("\"name\":", from);
+        return json.substr(from, end == std::string::npos ? std::string::npos : end - from);
+    };
+    auto contentReady = [&](const std::string& mon) {
+        return [&, mon](const std::string& r) {
+            const std::string b = blockOf(r, mon);
+            // The blank bug parked contentPath at "black". Accept any real blit path; assert it is
+            // specifically "dmabuf" separately below once it has settled.
+            return !b.empty() && b.find("\"contentPath\": \"dmabuf\"") != std::string::npos;
+        };
+    };
+
+    // Burst: create three, destroy the first, create two more — every survivor + newcomer must reach
+    // a real (dmabuf) content path. The destroy-then-create is the exact scenario that blanked.
+    const std::string a = XR::monitorName(20), b = XR::monitorName(21), c = XR::monitorName(22), d = XR::monitorName(23);
+    for (auto& n : {a, b, c}) {
+        ASSERT(getFromSocket("/openxr create " + n + " 1280x720"), std::string("ok"));
+        guard.monitorNames.push_back(n);
+    }
+    // Destroy the first, then create two more AFTER the destroy (the regression trigger). The
+    // destroy is asynchronous (removal barrier: the frame thread must ack before the output is
+    // finalized), and j/openxr hides pendingRemoval layers EARLY — the compositor monitor object
+    // outlives that by a beat. Wait for the name to leave j/monitors (the real resource) before
+    // re-using it, or the create races the teardown and fails on the name collision.
+    ASSERT(getFromSocket("/openxr destroy " + a), std::string("ok"));
+    guard.monitorNames.erase(guard.monitorNames.begin());
+    ASSERT(XR::waitForJson(
+               "j/monitors all", [&](const std::string& r) { return !r.contains("\"name\": \"" + a + "\""); }, std::chrono::milliseconds(10000)),
+           true);
+    for (auto& n : {d, a}) { // create a brand-new one AND re-create the destroyed name
+        ASSERT(getFromSocket("/openxr create " + n + " 1280x720"), std::string("ok"));
+        guard.monitorNames.push_back(n);
+    }
+
+    // Every living monitor (b, c, d, and the re-created a) must reach dmabuf content — the blank
+    // regression left one or more stuck at "black". Generous timeout: the frame thread must blit a
+    // freshly-composited LINEAR buffer.
+    for (auto& n : {b, c, d, a}) {
+        const bool ok = XR::waitForJson("j/openxr", contentReady(n), std::chrono::milliseconds(20000));
+        if (!ok)
+            NLog::red("xr_monitor_churn_content: monitor '{}' never reached contentPath=dmabuf (blank regression); block=[{}] full=[{}]", n, blockOf(getFromSocket("j/openxr"), n),
+                      getFromSocket("j/openxr"));
+        ASSERT(ok, true);
+    }
+
+    NLog::green("xr_monitor_churn_content: all monitors (incl. created-after-destroy) reached dmabuf content — no blank quads");
+}
+
+// xr_monitor_destroy_client_survives — live 2026-07-12 symptom 2 companion: destroying an XR
+// monitor whose workspace holds client windows must never kill the clients. The destroy path is
+// required to evacuate FIRST (CMonitor::onDisconnect -> moveWorkspaceToMonitor, live-log verified)
+// and only then remove the output — so the client keeps a valid output and merely moves. (The live
+// ghostty SIGSEGV turned out to be a GTK4 client-side bug in its own wl_output dispatch — cores
+// present, zero compositor protocol errors — but this pins OUR side of the contract: graceful
+// evacuation, no protocol error, client alive.)
+TEST_CASE(xr_monitor_destroy_client_survives) {
+    XR_SKIP_IF_UNAVAILABLE();
+    SArtifactGuard guard{this->failed, name(), {}};
+
+    if (!gateUp()) {
+        XR::logSkip(name(), "session never reached focused/visible (known env instability)");
+        return;
+    }
+
+    const std::string mon        = XR::monitorName(24);
+    const std::string nameMarker = "\"name\": \"" + mon + "\"";
+    ASSERT(getFromSocket("/openxr create " + mon + " 1280x720"), std::string("ok"));
+    guard.monitorNames.push_back(mon);
+    ASSERT(XR::waitForJson(
+               "j/monitors", [&](const std::string& r) { return r.contains(nameMarker); }, std::chrono::milliseconds(10000)),
+           true);
+
+    // Park a client on the XR monitor's active workspace.
+    ASSERT(getFromSocket("/dispatch focusmonitor " + mon), std::string("ok"));
+    auto kitty = Tests::spawnKitty("xr_destroy_survivor");
+    if (!kitty) {
+        XR::logSkip(name(), "kitty did not spawn (env limitation)");
+        return;
+    }
+    const pid_t kittyPid = kitty->pid();
+    ASSERT(Tests::processAlive(kittyPid), true);
+    // Confirm it landed on the XR monitor before we pull the rug.
+    ASSERT(XR::waitForJson(
+               "j/clients", [&](const std::string& r) { return r.contains("\"xr_destroy_survivor\""); }, std::chrono::milliseconds(10000)),
+           true);
+
+    // Destroy the monitor under the client; wait until the output is fully gone.
+    ASSERT(getFromSocket("/openxr destroy " + mon), std::string("ok"));
+    guard.monitorNames.clear();
+    ASSERT(XR::waitForJson(
+               "j/monitors all", [&](const std::string& r) { return !r.contains(nameMarker); }, std::chrono::milliseconds(10000)),
+           true);
+
+    // The client must survive the output removal (evacuated, not killed): still in j/clients and
+    // the process alive. Give the evacuation a beat to settle before judging.
+    const bool stillListed = XR::waitForJson(
+        "j/clients", [&](const std::string& r) { return r.contains("\"xr_destroy_survivor\""); }, std::chrono::milliseconds(5000));
+    EXPECT(stillListed, true);
+    Tests::sync();
+    ASSERT(Tests::processAlive(kittyPid), true);
+
+    // And it must have been MOVED to a real monitor (its workspace's monitor is not the dead one).
+    const std::string clients = getFromSocket("j/clients");
+    EXPECT(clients.contains("\"" + mon + "\""), false);
+
+    Tests::killAllWindows(); // our kitty included; preTestCleanup would do this anyway
+    NLog::green("xr_monitor_destroy_client_survives: client evacuated and alive after XR monitor destroy");
 }
 
 // xr_config_declared — WP11 (doc 06 §6 row 3, extended per the roadmap's explicit ask for
