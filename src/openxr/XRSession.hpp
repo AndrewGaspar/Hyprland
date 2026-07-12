@@ -77,6 +77,8 @@ class CXRSession {
     XrSpace    m_viewSpace       = XR_NULL_HANDLE; // VIEW
     bool       m_usingLocalFloor = false;
     bool       m_hasLocalFloor = false, m_hasHandInteraction = false, m_hasHandTracking = false;
+    // XR_KHR_vulkan_enable2 advertised AND enabled (probe-only, for the wrong-GPU guard in start()).
+    bool       m_hasVulkanEnable2 = false;
 
     // Overlay session (XR_EXTX_overlay, doc 01). COpenXRManager::start() sets m_overlayRequested /
     // m_overlayZ from openxr:overlay / openxr:overlay_z BEFORE createInstance(). m_hasOverlay records
