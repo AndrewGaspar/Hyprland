@@ -1,20 +1,19 @@
-# HypXRland — Session & Graphics Core
+# 01 — Session & Graphics Core
 
-Doc 01 of the `docs/openxr/` set. Covers `CXRSession` (`src/openxr/XRSession.{hpp,cpp}`)
-and `CXRGraphics` (`src/openxr/XRGraphics.{hpp,cpp}`), plus the frame-thread loop
-that `COpenXRManager` runs. This is a **port-and-harden** of the WIP prototype
-(`git show openxr:src/openxr/COpenXRManager.cpp`, branch `openxr`, commit
-`d5c54bb9`) — the WIP proved this exact stack against Monado on real hardware, so
-where this doc says "port", copy the WIP code and its comments; where it says
-"changed", the delta is spelled out. Read doc 00 first for the thread model and
-lifecycle states (`XR_STATE_*`).
+The OpenXR session and its graphics backend: `CXRSession`
+(`src/openxr/XRSession.{hpp,cpp}`), `CXRGraphics` (`src/openxr/XRGraphics.{hpp,cpp}`),
+and the frame-thread loop that `COpenXRManager` runs. Read doc 00 first for the thread
+model and lifecycle states. Everything here is behind `#ifdef HAVE_OPENXR`.
 
-Everything here is `#ifdef HAVE_OPENXR`.
+The session binds OpenXR to a GLES/EGL context living on a GBM device, submits one
+`XrCompositionLayerQuad` per virtual monitor, and paces those monitors from a dedicated frame
+thread. It targets runtimes that expose an EGL graphics binding — Monado (including its null
+compositor) and WiVRn.
 
-## Header / include-order contract (port verbatim)
+## Header / include-order contract
 
-Platform macros must be defined **before** EGL/GLES headers, and those before the
-OpenXR headers, in every TU that touches the graphics binding:
+Platform macros must be defined **before** the EGL/GLES headers, and those before the OpenXR
+headers, in every translation unit that touches the graphics binding:
 
 ```cpp
 #define XR_USE_PLATFORM_EGL
@@ -28,8 +27,8 @@ OpenXR headers, in every TU that touches the graphics binding:
 #include <openxr/openxr_platform.h>   // XrGraphicsBindingEGLMNDX, XrSwapchainImageOpenGLESKHR
 ```
 
-Headers that must compile in TUs without GL/EGL (e.g. `XRMonitorLayer.hpp`) use the
-WIP's forward-declaration trick:
+Headers that must compile in TUs without GL/EGL (e.g. `XRMonitorLayer.hpp`) forward-declare the
+handle types instead:
 
 ```cpp
 using XR_GLuint      = unsigned int; // = GLuint
@@ -38,562 +37,311 @@ using XR_EGLImageKHR = void*;        // = EGLImageKHR
 
 ## Extensions
 
-Enumerate with `xrEnumerateInstanceExtensionProperties` (two-call idiom) and check
-by name (WIP `hasExt` lambda):
+Enumerated with `xrEnumerateInstanceExtensionProperties` and checked by name:
 
 | Extension | Requirement | Purpose |
 |---|---|---|
 | `XR_MNDX_egl_enable` | **required** | EGL graphics binding (`XrGraphicsBindingEGLMNDX`) |
-| `XR_KHR_opengl_es_enable` | **required** | GLES swapchain images (`XrSwapchainImageOpenGLESKHR`), `xrGetOpenGLESGraphicsRequirementsKHR` |
-| `XR_EXT_local_floor` | optional | `LOCAL_FLOOR` reference space; else LOCAL + `openxr:floor_offset` |
-| `XR_EXT_hand_interaction` | optional | hand-interaction bindings (doc 04) |
-| `XR_EXT_hand_tracking` | optional | hand tracking (doc 04) |
+| `XR_KHR_opengl_es_enable` | **required** | GLES swapchain images, `xrGetOpenGLESGraphicsRequirementsKHR` |
+| `XR_EXT_local_floor` | optional | `LOCAL_FLOOR` reference space; else `LOCAL` + `openxr:floor_offset` |
+| `XR_EXTX_overlay` | optional | overlay sessions (compose over another XR app) |
+| `XR_EXT_user_presence` | optional | real donned/doffed signal for the monitor plug gate (doc 02) |
+| `XR_KHR_vulkan_enable2` | optional | probe the runtime's GPU for the cross-GPU safety check |
+| `XR_EXT_hand_interaction` / `XR_EXT_hand_tracking` | optional | hand-tracking input (doc 04) |
 
-If either required extension is missing → `start()` fails → `XR_STATE_UNAVAILABLE`.
-Enable every optional extension that is present and record availability flags
-(`m_hasLocalFloor`, `m_hasHandInteraction`, `m_hasHandTracking`) on `CXRSession` for
-the other components to read.
+If either required extension is missing, `start()` fails to `XR_STATE_UNAVAILABLE`. Every
+optional extension that is present is enabled, and its availability is recorded on `CXRSession`
+for the other components to read.
 
-## Class sketches
+## Session bring-up
 
-```cpp
-// src/openxr/XRSession.hpp
-class CXRSession {
-  public:
-    // all creation runs on the MAIN thread inside COpenXRManager::start(),
-    // BEFORE the frame thread exists. pollEvents() runs on the frame thread.
-    bool           createInstance();                    // false => UNAVAILABLE
-    bool           getSystem();                         // xrGetSystem + xrGetSystemProperties
-    bool           createSession(CXRGraphics& gfx);     // XrGraphicsBindingEGLMNDX
-    bool           createSpaces();                      // ref space + view space
-    void           destroy();                           // spaces, session, instance (see teardown ordering)
+All creation runs on the **main thread** inside `COpenXRManager::start()` (state
+`XR_STATE_STARTING`), before the frame thread exists:
 
-    void           pollEvents();                        // frame thread: XR event pump + state machine
+1. **Overlay probe.** `openxr:overlay` / `openxr:overlay_z` are read once, before
+   `createInstance()` (see "Overlay sessions" below).
+2. `createInstance()` — extension checks; `XrApplicationInfo` names the app `Hyprland`,
+   `apiVersion = XR_API_VERSION_1_0`. A missing runtime (loader returns
+   `XR_ERROR_RUNTIME_UNAVAILABLE`/`_FAILURE`/`_INSTANCE_LOST` or file-not-found) →
+   `XR_STATE_UNAVAILABLE`.
+3. `getSystem()` — `xrGetSystem` with a head-mounted form factor
+   (`XR_ERROR_FORM_FACTOR_UNAVAILABLE` → UNAVAILABLE, the dormant "waiting for the headset"
+   case), then `xrGetSystemProperties` records `maxLayerCount` (spec floor 16), and
+   `xrEnumerateEnvironmentBlendModes` records the runtime's blend modes preferred-first.
+4. **Blend-mode selection** from `openxr:blend_mode` against the enumerated list (below).
+5. `gfx.initEGL(openxr:gpu)` — GPU selection (below).
+6. **Cross-GPU safety check** — refuse to start on a GPU mismatch (below).
+7. `createSession(gfx)` — `xrGetOpenGLESGraphicsRequirementsKHR` first (mandatory before
+   session creation), then `xrCreateSession` with the EGL binding:
 
-    XrInstance     m_instance   = XR_NULL_HANDLE;
-    XrSystemId     m_systemId   = XR_NULL_SYSTEM_ID;
-    XrSession      m_session    = XR_NULL_HANDLE;
-    XrSpace        m_refSpace   = XR_NULL_HANDLE;       // LOCAL_FLOOR or LOCAL
-    XrSpace        m_viewSpace  = XR_NULL_HANDLE;       // VIEW
-    bool           m_usingLocalFloor = false;
-    bool           m_hasLocalFloor = false, m_hasHandInteraction = false, m_hasHandTracking = false;
+   ```cpp
+   XrGraphicsBindingEGLMNDX binding = {XR_TYPE_GRAPHICS_BINDING_EGL_MNDX};
+   binding.getProcAddress = eglGetProcAddress;
+   binding.display        = gfx.m_eglDisplay;
+   binding.config         = gfx.m_config;
+   binding.context        = gfx.m_xrContext;
+   ```
 
-    XrSessionState m_xrState      = XR_SESSION_STATE_UNKNOWN; // frame-thread-only after start
-    bool           m_sessionBegan = false;                    // frame-thread-only after start
-    bool           m_exitRequested = false;                   // set by pollEvents on EXITING/LOSS_PENDING
-    bool           m_instanceLost  = false;                   // set on XrEventDataInstanceLossPending / LOSS_PENDING
-    uint32_t       m_maxLayerCount = 16;  // XrSystemGraphicsProperties::maxLayerCount (spec floor 16)
-    int64_t        m_swapchainFormat = 0; // chosen once after session creation
+8. `createSpaces()` — the reference space and the view space (below).
+9. `initBlitGL()` — compile the blit program, still on the main thread while the context is
+   free.
+10. Choose the swapchain format once (below).
+11. **Action system** (doc 04): build the action set, suggest bindings for every interaction
+    profile, create the aim/grip action spaces, and `xrAttachSessionActionSets`. This is
+    eager — there is no lazy/first-use deferral.
+12. Bind any existing `CXRMonitorLayer`s (monitors created while disabled — doc 02), spawn the
+    frame thread (`m_running = true`), state → `XR_STATE_RUNNING_IDLE`.
 
-    std::vector<OpenXR::eXRBlendMode> m_blendModes = {OpenXR::XR_BLEND_OPAQUE}; // enumerated in getSystem(), preference order
-    XrEnvironmentBlendMode            m_blendMode  = XR_ENVIRONMENT_BLEND_MODE_OPAQUE; // selected at session start; submitted every xrEndFrame
-};
-
-// src/openxr/XRGraphics.hpp
-class CXRGraphics {
-  public:
-    bool        initEGL(const std::string& gpuOverride); // display + context + proc ptrs (main thread, in start())
-    bool        initBlitGL();                             // program, VAO, external tex (main thread, in start())
-    void        destroy();                                // GL then EGL (see teardown ordering)
-
-    // frame thread, inside a CScopedGLContext:
-    bool        blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer& layer, XR_GLuint dstTex);
-    void        clearTex(XR_GLuint dstTex, const Vector2D& size, float r, float g, float b);
-
-    // RAII guard: ctor eglMakeCurrent(m_xrContext), dtor eglMakeCurrent(EGL_NO_CONTEXT).
-    // The ONLY way GL work is done — see "EGL context ownership" below.
-    struct CScopedGLContext { explicit CScopedGLContext(CXRGraphics&); ~CScopedGLContext(); };
-
-    EGLDisplay         m_eglDisplay = EGL_NO_DISPLAY;
-    EGLContext         m_xrContext  = EGL_NO_CONTEXT; // owned exclusively by frame thread after start
-    EGLConfig          m_config     = nullptr;
-    struct gbm_device* m_gbmOwned   = nullptr;        // set iff we opened our own device
-    int                m_gbmFd      = -1;
-
-    XR_GLuint          m_blitProg = 0, m_blitVAO = 0;
-    XR_GLuint          m_extTex   = 0;                // GL_TEXTURE_EXTERNAL_OES, rebound per blit
-    // eglCreateImageKHR / eglDestroyImageKHR / glEGLImageTargetTexture2DOES proc ptrs (WIP pattern)
-};
-```
-
-Per-layer GL state (CPU-fallback staging texture `m_cpuTex`, last `EGLImageKHR`)
-lives on `CXRMonitorLayer` (doc 02) because it is sized per monitor mode.
-
-## Instance / system / session creation sequence
-
-Runs on the **main thread** inside `COpenXRManager::start()` (state `XR_STATE_STARTING`),
-exactly like the WIP's `init()` did all setup before `startFrameThread()`:
-
-1. `createInstance()` — extension checks as above; `XrApplicationInfo` name/engine
-   `"Hyprland"`, `apiVersion = XR_API_VERSION_1_0`. Failure (including "no runtime":
-   the loader returns `XR_ERROR_INSTANCE_LOST`/`XR_ERROR_RUNTIME_FAILURE`/
-   `XR_ERROR_RUNTIME_UNAVAILABLE` or file-not-found style errors) →
-   `XR_STATE_UNAVAILABLE`, **no auto-retry polling** — the user retries via
-   `hyprctl openxr enable` or a config reload.
-2. `getSystem()` — `xrGetSystem` with `XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY`
-   (`XR_ERROR_FORM_FACTOR_UNAVAILABLE` → UNAVAILABLE too), then
-   `xrGetSystemProperties` and record
-   `XrSystemProperties::graphicsProperties.maxLayerCount` into `m_maxLayerCount`
-   (spec guarantees ≥ 16; doc 02's layer-cap policy consumes this).
-3. `gfx.initEGL(*openxr:gpu)` — GPU selection below.
-4. `createSession(gfx)` — `xrGetOpenGLESGraphicsRequirementsKHR` first (mandatory
-   before session creation), then:
-
-```cpp
-XrGraphicsBindingEGLMNDX binding = {XR_TYPE_GRAPHICS_BINDING_EGL_MNDX};
-binding.getProcAddress = eglGetProcAddress;
-binding.display        = gfx.m_eglDisplay;
-binding.config         = gfx.m_config;
-binding.context        = gfx.m_xrContext;
-// sessionInfo.next = &binding; xrCreateSession(...)
-```
-
-   The WIP binds `m_xrContext` current around `xrCreateSession` +
-   `xrCreateReferenceSpace` and unbinds after — keep that.
-5. `createSpaces()` — reference spaces below.
-6. `gfx.initBlitGL()` — compile blit program (below), still on the main thread,
-   before the frame thread exists (WIP comment: *"All of this happens before
-   startFrameThread() so m_xrContext is still available here"*).
-7. Enumerate + choose the swapchain format once (below); store on the session.
-8. **Action system** (doc 04): build the `hyprland` action set, suggest bindings for all
-   profiles, create the aim/grip action spaces, and `xrAttachSessionActionSets` —
-   `CXRInput::init()`, called eagerly here (still on the main thread, still before the frame
-   thread exists). Doc 04's own text already says the action set is "created at session init,
-   before `xrAttachSessionActionSets`"; this step is where that happens — there is no lazy or
-   first-use deferral anywhere in the code.
-9. Bind existing `CXRMonitorLayer`s (monitors created while disabled — doc 02),
-   spawn the frame thread (`m_running = true`), state → `XR_STATE_RUNNING_IDLE`.
-
-Note: **no swapchains are created here.** Per-layer swapchains are created lazily by
-the frame thread when the session reaches READY / when layers appear (doc 02),
-mirroring the WIP which created swapchains on first READY.
+**No swapchains are created here.** Per-layer swapchains are created by the frame thread once
+the session reaches READY (doc 02).
 
 ## GPU selection
 
-**Default (changed from WIP): match Hyprland's primary GPU render node.** Resolve
-Hyprland's render node from `g_pCompositor->m_drmRenderNode.fd` (set from
-`m_aqBackend->drmRenderNodeFD()` in `initServer`) via `drmGetDeviceNameFromFd2()`,
-then enumerate EGL devices (`eglQueryDevicesEXT` / `eglQueryDeviceStringEXT` with
-`EGL_DRM_RENDER_NODE_FILE_EXT`, falling back to `EGL_DRM_DEVICE_FILE_EXT` — WIP
-code) and pick the device whose render-node path matches.
+The XR EGL context lives on a GBM device on a specific DRM render node:
 
-**Override:** `openxr:gpu` (string config var) = explicit DRM render-node path
-(e.g. `/dev/dri/renderD129`); if set and non-empty it wins outright; if it matches
-no EGL device, log `Log::ERR` and fail `start()` → UNAVAILABLE (misconfiguration
-should be loud, not silently fall back).
+- **Default:** match Hyprland's primary GPU. The render node is resolved from the compositor's
+  DRM node and matched against the EGL devices (`eglQueryDevicesEXT` /
+  `eglQueryDeviceStringEXT`).
+- **Override:** `openxr:gpu` = an explicit render-node path (e.g. `/dev/dri/renderD129`). If
+  set it wins outright; if it matches no EGL device, `start()` fails loudly to UNAVAILABLE
+  rather than silently falling back.
 
-**Historical rationale to preserve in comments** (this knowledge is why the code is
-shaped the way it is — keep it even though the default heuristic changes):
+Two implementation choices, kept because they are load-bearing:
 
-- The WIP walked all EGL devices and picked the one whose DRM node's PCI vendor in
-  sysfs (`/sys/class/drm/<node>/device/vendor`) was `0x1002` (AMD), skipping NVIDIA
-  (`0x10de`). WIP comment: *"We need an EGL display on the SAME GPU that Monado uses
-  (Mesa/AMD). Hyprland on this hybrid system uses the NVIDIA EGL device; passing a
-  NVIDIA-backed context to Monado causes it to crash in driUnbindContext when
-  importing AMD DMA-BUFs."* I.e. **cross-GPU dmabuf import crashes Monado** — that
-  is the real constraint; "match Hyprland's GPU" is the better general default and
-  `openxr:gpu` covers hybrid setups where Monado runs on the *other* GPU.
-- **GBM platform, not device platform** (port verbatim): open the render node
-  `O_RDWR | O_CLOEXEC`, `gbm_create_device(fd)`, then
-  `eglGetPlatformDisplayEXT(EGL_PLATFORM_GBM_KHR, gbm, nullptr)`. WIP comment:
-  *"EGL_PLATFORM_DEVICE_EXT is headless/compute-only and leaves gallium
-  pipe_context state partially uninitialised, causing driUnbindContext to crash."*
-  Track ownership in `m_gbmOwned`/`m_gbmFd` and destroy them last in teardown.
-- Last-resort fallback if enumeration extensions are unavailable: reuse
-  `g_pHyprOpenGL->m_eglDisplay` (WIP did this; *"may crash on cross-GPU DMA-BUF
-  import, but worth trying"*). `eglInitialize` is refcounted, so initializing an
-  already-initialized display is fine.
+- **The context is created on a GBM platform display**, not a device-platform display:
+  `gbm_create_device(fd)` then `eglGetPlatformDisplayEXT(EGL_PLATFORM_GBM_KHR, ...)`. The
+  device platform is headless/compute-only and leaves gallium's pipe context partially
+  uninitialised, which crashes in `driUnbindContext`. Ownership is tracked in `m_gbmOwned` /
+  `m_gbmFd` and destroyed last in teardown.
+- **A cross-GPU dmabuf import can hard-crash the graphics driver** (`radeonsi
+  driUnbindContext`) — an uncatchable SEGV that would take the whole desktop session down.
+  That single fact shapes the GPU handling: match GPUs when possible, refuse when a mismatch
+  is detected, and allocate linear buffers when a cross-GPU split is unavoidable (doc 02,
+  `openxr:force_linear`).
 
-## EGL config + context (port verbatim)
+### Cross-GPU safety check (fail closed)
 
-`eglBindAPI(EGL_OPENGL_ES_API)`, then the WIP's progressive config cascade — keep
-all rungs and comments:
+On a multi-GPU / hybrid (Optimus) machine the runtime may composite on a different GPU than
+the one the XR EGL context landed on — and the runtime imports the compositor's buffers at
+`xrCreateSwapchain`, on the frame thread, where a mismatch crashes. WiVRn and Monado accept a
+mismatched EGL binding at `xrCreateSession` without complaint, so session bring-up is the last
+point at which the compositor can refuse while the desktop is still intact.
 
-1. GLES3 + `EGL_SURFACE_TYPE = EGL_WINDOW_BIT | EGL_PBUFFER_BIT` + RGBA8 (GBM path)
-2. GLES3 + `EGL_SURFACE_TYPE = EGL_PBUFFER_BIT` + RGBA8 (device/NVIDIA path)
-3. GLES3, `EGL_SURFACE_TYPE 0`, RGBA8
-4. GLES3, `EGL_SURFACE_TYPE 0`, anything
+When the runtime advertises `XR_KHR_vulkan_enable2`, `start()` probes the runtime's DRM render
+node via Vulkan device enumeration and compares it to the XR context's node:
 
-WIP note to keep: *"default EGL_SURFACE_TYPE is EGL_WINDOW_BIT which excludes
-pbuffer-only configs on EGL device platform — so we must specify it explicitly."*
-(The WIP also has an alternative `getCompatibleConfig()` that re-finds Hyprland's
-own config via `EGL_CONFIG_ID` and manually scans `eglGetConfigs` to work around
-Mesa `eglChooseConfig` quirks — relevant only for the shared-display fallback.)
+- **Mismatch** → `start()` aborts to UNAVAILABLE with an error telling the user to point
+  `openxr:gpu` at the runtime's GPU. The desktop session is untouched.
+- **Match** → proceed.
+- **Undeterminable** (runtime lacks the extension, or the probe times out) → proceed with a
+  warning, since a setup that would actually work should not be blocked.
 
-Context: `eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, {EGL_CONTEXT_CLIENT_VERSION, 3})`,
-surfaceless (`EGL_NO_SURFACE` everywhere). Load `eglCreateImageKHR`,
-`eglDestroyImageKHR`, `glEGLImageTargetTexture2DOES` via `eglGetProcAddress` once.
+The probe runs on a throwaway thread with a bounded (3s) wait: `vkCreateInstance` can deadlock
+against the runtime's own in-process Vulkan use, and the check must never freeze the
+compositor — on timeout the thread is abandoned (it bails before touching any XR handle) and
+bring-up continues unverified. The resolved runtime GPU is surfaced as `runtimeGpu` in
+`hyprctl openxr status`.
 
-## EGL context ownership — the critical invariant (port verbatim)
+## EGL context ownership — the critical invariant
 
-The XR frame thread **exclusively owns `m_xrContext`** after the frame thread
-starts; before it starts (during `start()`) and after it is joined (during `stop()`)
-the main thread may use it. But ownership is not enough — the context must also be
-**unbound whenever we are not actively issuing GL commands**, because Monado's
-in-process compositor thread binds our context itself. Two WIP comments carry the
-full reasoning; preserve both in code:
+The XR frame thread **exclusively owns the EGL context** while it runs; the main thread may
+use it only before the frame thread starts and after it is joined. Ownership alone is not
+enough — the context must also be **unbound whenever GL commands are not actively being
+issued**, because the runtime's in-process compositor thread binds the context itself during
+`xrCreateSwapchain`. If our context is already current when the runtime calls
+`eglMakeCurrent`, Mesa takes a rebind path that calls `driUnbindContext` on the surfaceless
+drawable and crashes in AMD gallium.
 
-- Frame loop: *"Do NOT hold m_xrContext current continuously — Monado's compositor
-  thread needs to bind it during xrCreateSwapchain. Only make it current around
-  actual GL calls."*
-- Before `xrCreateSwapchain`: *"Do NOT bind the context ourselves — Monado's
-  context_begin will call eglMakeCurrent internally. If our context is already
-  current when it does so, Mesa enters the 'rebind same context' path which still
-  calls driUnbindContext on the surfaceless drawable, and that crashes in AMD
-  gallium. Starting with no context current means Monado's eglMakeCurrent has
-  nothing to unbind first."*
-
-Concretely: every GL burst is wrapped in `CXRGraphics::CScopedGLContext`
-(`eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, m_xrContext)` /
-`... EGL_NO_CONTEXT` on scope exit), and **no XR call that may touch the runtime's
-GL interop (`xrCreateSwapchain`, `xrDestroySwapchain`, `xrEnumerateSwapchainImages`,
-`xrAcquire/Wait/ReleaseSwapchainImage`, `xrEndFrame`) is made while our context is
-current.** The WIP acquires/waits, then binds → blits → unbinds, then releases —
-keep exactly that shape.
+Concretely: every GL burst is wrapped in `CXRGraphics::CScopedGLContext` (which does
+`eglMakeCurrent(..., m_xrContext)` on entry and `EGL_NO_CONTEXT` on exit), and **no XR call
+that may touch the runtime's GL interop** — `xrCreateSwapchain`, `xrDestroySwapchain`,
+`xrEnumerateSwapchainImages`, `xrAcquire/Wait/ReleaseSwapchainImage`, `xrEndFrame` — is made
+while the context is current. The frame loop acquires/waits, then binds → blits → unbinds,
+then releases.
 
 ## Reference spaces
 
-Created in `createSpaces()` with identity `poseInReferenceSpace = {{0,0,0,1},{0,0,0}}`:
+Created with an identity pose:
 
-- `m_refSpace`: `XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR_EXT` if `XR_EXT_local_floor`
-  was enabled (`m_usingLocalFloor = true`); else `XR_REFERENCE_SPACE_TYPE_LOCAL`.
-  When falling back to LOCAL, all floor-relative Y placement adds
-  `openxr:floor_offset` (float, default 1.5 m = assumed eye height above floor);
-  the offset is applied inside `CXRAnchor` math (doc 03), not by shifting the space.
-- `m_viewSpace`: `XR_REFERENCE_SPACE_TYPE_VIEW` — used every frame to locate the
-  head pose for head/body anchor modes and input rays
-  (`xrLocateSpace(m_viewSpace, m_refSpace, predictedDisplayTime, &loc)`).
+- **`m_refSpace`:** `LOCAL_FLOOR` when `XR_EXT_local_floor` is available (`m_usingLocalFloor =
+  true`); otherwise `LOCAL`, in which case floor-relative Y placement adds `openxr:floor_offset`
+  (default 1.5 m, assumed eye height) inside the anchor math (doc 03).
+- **`m_viewSpace`:** `VIEW` — located every frame to drive head/body anchor modes and input
+  rays.
 
-`XrEventDataReferenceSpaceChangePending` (runtime recenter) is forwarded to the
-anchor engine — handling in doc 03.
+`XrEventDataReferenceSpaceChangePending` (a runtime recenter) is forwarded to the anchor
+engine (doc 03).
 
-## Swapchain format selection (port verbatim)
+## Swapchain format
 
-Once per session: `xrEnumerateSwapchainFormats`, prefer `GL_SRGB8_ALPHA8` (0x8C43),
-else `GL_RGBA8` (0x8058), else `GL_RGBA4` (0x8056), else first enumerated. WIP
-comment to keep: *"Monado may crash (instead of returning an error) if given an
-unsupported format, so always pick from this list."* Store on
-`CXRSession::m_swapchainFormat`; per-layer swapchain creation (doc 02) uses it with
-`usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT`,
-`sampleCount/faceCount/arraySize/mipCount = 1`, and `width/height` = the **monitor's
-pixel mode** (not eye resolution — quads have no eye resolution).
+Chosen once per session from `xrEnumerateSwapchainFormats`, preferring `GL_SRGB8_ALPHA8`, then
+`GL_RGBA8`, then `GL_RGBA4`, else the first enumerated — a format is never passed unless it was
+enumerated, because some runtimes crash rather than return an error on an unsupported format.
+Per-layer swapchains (doc 02) use it with color-attachment + sampled usage, single
+sample/face/array/mip, sized to the **monitor's pixel mode** (a quad has no per-eye
+resolution).
 
-## Environment blend mode (passthrough)
+## Environment blend mode
 
-The mode passed to `xrEndFrame` as `environmentBlendMode` decides what an XR quad is
-composited *over*:
+The mode submitted to `xrEndFrame` decides what a quad is composited *over*:
 
 | `XrEnvironmentBlendMode` | `openxr:blend_mode` | Effect |
 |---|---|---|
-| `OPAQUE` | `opaque` | quads over black — the classic VR "floating in a void" look |
-| `ALPHA_BLEND` | `alpha` | quads over the runtime's **passthrough** underlay via layer alpha (e.g. WiVRn on Quest 3 — monitors float in the user's real room) |
-| `ADDITIVE` | `additive` | additive (optical see-through / additive displays) |
+| `OPAQUE` | `opaque` | quads over black — the classic "floating in a void" look |
+| `ALPHA_BLEND` | `alpha` | quads over the runtime's **passthrough** underlay (e.g. WiVRn on Quest 3 — monitors in your real room) |
+| `ADDITIVE` | `additive` | additive / optical-see-through displays |
 
-**Enumeration.** `getSystem()` calls `xrEnumerateEnvironmentBlendModes(instance,
-systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, ...)` (two-call idiom) once and
-stores the result on `CXRSession::m_blendModes` as the unconditional
-`OpenXR::eXRBlendMode` mirror, **in the runtime's advertised order** (the spec returns
-it preferred-first). It needs only instance + system — no session — so it runs in
-`getSystem()`. A failed/empty enumeration falls back to `{OPAQUE}` with a WARN.
-
-**Selection (pure, unit-tested).** `OpenXR::pickBlendMode(supported, config)`
-(`XRMonitorConfig.cpp`, compiled unconditionally — tests in `tests/xr/blendmode.cpp`)
-maps `openxr:blend_mode` onto the enumerated list:
-
-- `auto` (or any unrecognized value) → the runtime's **first-listed** (preferred) mode.
-- an explicit `opaque`/`alpha`/`additive` → honored **iff supported**, else it falls
-  back to the preferred mode and sets `requestedUnsupported` so `start()` logs a WARN.
-- an empty supported list (spec-illegal, defended) → `OPAQUE`.
-
-`COpenXRManager::start()` reads `openxr:blend_mode` once, right after `getSystem()`,
-converts the pick to `XrEnvironmentBlendMode` via `xrBlendModeToXr` (XRSession.hpp), and
-stores it on `CXRSession::m_blendMode`. The value is read **once at session start** —
-changing `openxr:blend_mode` takes effect on the next session start (`hyprctl openxr
-disable && enable`, or a reload that toggles `openxr:enabled`). The frame loop just
-submits `m_session->m_blendMode`. The active mode is surfaced as `blendMode` in
-`hyprctl openxr status` (doc 05 §4.3).
+`OpenXR::pickBlendMode(supported, config)` (pure, unit-tested in `tests/xr/`) maps
+`openxr:blend_mode` onto the enumerated list: `auto` (or an unrecognized value) takes the
+runtime's first-listed (preferred) mode; an explicit mode is honored if supported, else it
+falls back to the preferred mode with a warning. The value is read **once at session start** —
+changing `openxr:blend_mode` takes effect on the next start (`hyprctl openxr disable && enable`,
+or a reload that toggles `openxr:enabled`). The active mode is surfaced as `blendMode` in
+`hyprctl openxr status`.
 
 ## Overlay sessions (`XR_EXTX_overlay`)
 
-By default HypXRland runs as an **exclusive** XR client: it owns the frame and its quads
-composite over a black (or passthrough) void. Setting `openxr:overlay = 1` instead makes it an
-**overlay** session so its monitor quads composite ON TOP of *another* XR client's scene — a game,
-or the `hypxrpaper` ambient-background app. This is the `XR_EXTX_overlay` provisional extension
-(registry #34), implemented natively by Monado's out-of-process compositor (and inherited by
-WiVRn); SteamVR-Linux does **not** support it. See `research/01-vr-app-composition.md`.
+By default HypXRland is an **exclusive** XR client: it owns the frame and its quads composite
+over the blend-mode background. With `openxr:overlay = 1` it instead runs as an **overlay**
+session, so its quads composite on top of *another* XR client's scene — a VR game, or the
+`hypxrpaper` ambient-background app.
 
-**What we do (tiny):**
-1. `createInstance()` probes `XR_EXTX_overlay` (records `m_hasOverlay`) and enables it *only* when
-   `openxr:overlay` was requested AND the runtime advertises it (`m_isOverlay = requested &&
-   supported`). Requested-but-unsupported logs a one-time WARN and creates a **normal** session —
-   overlay never fails startup.
-2. `createSession()` chains `XrSessionCreateInfoOverlayEXTX{ createFlags = 0,
-   sessionLayersPlacement = openxr:overlay_z }` into `xrCreateSession`'s `next` chain (between the
-   `XrSessionCreateInfo` and the EGL binding struct) when `m_isOverlay`.
-3. `COpenXRManager::start()` reads `openxr:overlay` / `openxr:overlay_z` **once at session start**
-   (same semantics as `blend_mode` — change requires `hyprctl openxr disable && enable`), *before*
-   `createInstance()`, and sets `m_session->m_overlayRequested` / `m_overlayZ`.
+- `createInstance()` enables `XR_EXTX_overlay` only when it was requested **and** the runtime
+  advertises it. Requested-but-unsupported logs a warning and creates a normal session —
+  overlay never fails startup.
+- `createSession()` chains `XrSessionCreateInfoOverlayEXTX{ sessionLayersPlacement =
+  openxr:overlay_z }` into the session-create `next` chain.
+- `openxr:overlay` / `openxr:overlay_z` are read once at session start (same semantics as
+  `blend_mode`).
 
-The extension's struct/constants are provided by the installed `<openxr/openxr.h>` (the `openxr`
-package we build against defines `XR_EXTX_overlay`); `XRSession.cpp` carries an `#ifndef
-XR_EXTX_overlay` fallback that defines the (stable-shaped) struct locally for older headers.
+On Monado (and WiVRn, which inherits its compositor) an overlay session is held **visible +
+focused** the whole time the service runs — even with no primary app — so ray input, grab, and
+idle-inhibit behave exactly as in exclusive mode. Delivered client frames are composited
+bottom-to-top by `z_order` with the primary pinned beneath, so any `overlay_z` puts our quads
+above it; the environment blend comes from the primary client, so our own blend mode is
+effectively ignored while we are an overlay. The runtime delivers controller input to both
+clients at once — input is **not** arbitrated between the game and the desktop. The actual
+session type is surfaced as `overlay` in `hyprctl openxr status` (a downgraded request reads
+`false`). SteamVR-Linux does not support the extension. See doc 05 for the user-facing setup and
+`hypxrpaper` recipe.
 
-**Monado semantics (verified against the vendored tree @ `c2ddab59`):**
-- `ipc_server_process.c` `handle_focused_client_events` sets every overlay session
-  `visible = true, focused = true` **unconditionally** — even while a game is the primary client
-  and also focused, and even when no primary client exists at all. So our FOCUSED-gated input
-  (ray/grab/idle-inhibit) keeps working **unchanged** as an overlay. (Spike confirmed: overlay
-  session reaches FOCUSED both alone and with `hypxrpaper` as primary — two clients connected,
-  ours the overlay.)
-- `comp_multi_system.c` sorts delivered client frames by `state.z_order` and replays **all** layer
-  types bottom-to-top; the primary is pinned to `INT64_MIN`, so any `sessionLayersPlacement`
-  composites our quads above the game. `overlay_z` maps straight into `z_order` (higher = on top).
-- The environment blend mode comes from the *focused, bottom-most* client (the game), so our own
-  `m_blendMode` in `xrEndFrame` is effectively ignored when we're an overlay — quads blend over the
-  game via their layer alpha regardless.
-- **Idle note:** since overlays sit at FOCUSED whenever the service runs us, `openxr:inhibit_idle`
-  stays active for the whole time the runtime is up — acceptable, but worth knowing.
-- **Input caveat (not solved here):** Monado duplicates input to both clients; a trigger pull that
-  clicks a desktop window *also* reaches the game. Input arbitration ("point at desktop without
-  shooting") is deliberately out of scope for this change (see research doc Option D).
+## Session-state handling (`CXRSession::pollEvents`, frame thread)
 
-The actual state is surfaced as `overlay` in `hyprctl openxr status` (doc 05 §4.3) — reflecting the
-real session type, not the config request (a downgraded request reads `false`).
-
-## Session state handling (`CXRSession::pollEvents`, frame thread)
-
-The WIP only handled READY and STOPPING; this is the complete version. Pump with
-the standard loop (`XrEventDataBuffer` reset each iteration, `while (xrPollEvent
-== XR_SUCCESS)`).
-
+Pumped each frame with the standard `xrPollEvent` loop.
 `XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED`:
 
-| `XrSessionState` | Frame-thread action | Manager state reported to main (channel [C]) |
+| `XrSessionState` | Frame-thread action | Manager state |
 |---|---|---|
 | `IDLE` | nothing | `RUNNING_IDLE` |
-| `READY` | `xrBeginSession` with `primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO` (a view configuration is required even though we submit only quad layers); `m_sessionBegan = true` | `RUNNING_IDLE` |
-| `SYNCHRONIZED` | frame loop must keep calling `xrWaitFrame`/`xrBeginFrame`/`xrEndFrame`; not visible yet — no pacing | `RUNNING_IDLE` |
+| `READY` | `xrBeginSession` (primary stereo view config — required even though we submit only quads); `m_sessionBegan = true` | `RUNNING_IDLE` |
+| `SYNCHRONIZED` | keep pumping `xrWaitFrame`/`xrBeginFrame`/`xrEndFrame`; not visible — no pacing | `RUNNING_IDLE` |
 | `VISIBLE` | pacing on (doc 02) | `RUNNING_VISIBLE` |
-| `FOCUSED` | pacing + `xrSyncActions` legal (doc 04) | `RUNNING_FOCUSED` |
-| `STOPPING` | `xrEndSession`; `m_sessionBegan = false`; stop pacing; **stay alive** and keep polling — the runtime may return to READY | `RUNNING_IDLE` |
-| `EXITING` | `m_exitRequested = true` → frame loop exits; notify main via channel [C]: main runs the `stop()` teardown (join is instant since the loop exited) and lands in `XR_STATE_DISABLED` (user exited XR deliberately; `openxr:enabled` untouched — re-enable is manual) | `STOPPING` → `DISABLED` |
-| `LOSS_PENDING` | as EXITING but also `m_instanceLost = true`; main tears down and lands in `XR_STATE_UNAVAILABLE` | `STOPPING` → `UNAVAILABLE` |
+| `FOCUSED` | pacing + `xrSyncActions` (doc 04) | `RUNNING_FOCUSED` |
+| `STOPPING` | `xrEndSession`; stop pacing; **stay alive** and keep polling — the runtime may return to READY | `RUNNING_IDLE` |
+| `EXITING` | frame loop exits; the main thread tears down and lands in `DISABLED` (a deliberate quit; `openxr:enabled` untouched) | → `DISABLED` |
+| `LOSS_PENDING` | as EXITING but the main thread lands in `UNAVAILABLE` (auto-reconnects via the reprobe timer) | → `UNAVAILABLE` |
 
-`XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING`: treat as LOSS_PENDING → teardown →
-`UNAVAILABLE` (no auto-retry; per spec the instance may be recreatable after
-`lossTime`, but we deliberately leave retry to the user).
+`XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING` is treated as `LOSS_PENDING`. So is a **dead
+runtime**: `xrPollEvent` itself returning `XR_ERROR_INSTANCE_LOST`/`_SESSION_LOST` (the runtime
+process simply vanished, delivering no event) is handled identically.
+`XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING` is forwarded to the anchors (doc 03). Every
+reported transition makes the main thread post `openxrsessionstate` and re-run the idle check.
 
-`XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING`: forward to anchors (doc 03).
+The pump runs continuously from `xrBeginSession` onward (gated only on `m_sessionBegan`). It
+does **not** wait for the session to already be VISIBLE — a runtime only advances READY →
+SYNCHRONIZED → VISIBLE once the app starts submitting frames, so `xrEndFrame` (with zero or
+blank layers, which is valid) is what carries the session forward. Pacing
+(`scheduleFrame()`, doc 02) is the only thing gated on VISIBLE/FOCUSED.
 
-**Dead-runtime case (as built, WP13 reconciliation):** `xrPollEvent` itself can return
-`XR_ERROR_INSTANCE_LOST`/`XR_ERROR_SESSION_LOST` directly (no event delivered at all — the
-runtime process is simply gone) rather than always delivering a well-formed
-`XrEventDataInstanceLossPending`. `pollEvents()` treats these return codes exactly like
-`LOSS_PENDING` (`m_instanceLost = true`, `m_exitRequested = true`) — add this as an implicit row
-alongside the `XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING` handling above.
+## Frame-thread loop
 
-Every reported transition makes the main thread emit `openxrsessionstate` (doc 05)
-and re-run the idle-inhibit check.
-
-## Frame-thread loop (pseudocode)
-
-`COpenXRManager::frameThread()` — the orchestration; blit details next section,
-layer/pacing/mode-change specifics in doc 02, anchors doc 03, input doc 04:
+`COpenXRManager::frameThread()` — orchestration; blit, pacing, and mode-change details are in
+doc 02, anchors in doc 03, input in doc 04:
 
 ```
 while m_running:
     session.pollEvents()
     if session.m_exitRequested: break                      # EXITING / LOSS_PENDING
+    if !session.m_sessionBegan: sleep 50ms; continue       # idle throttle
 
-    if !session.m_sessionBegan:
-        sleep 50ms; continue                               # WIP idle throttle
+    layers = snapshot()          # lock, copy the layer refs + each layer's quad params, unlock;
+                                 # also destroy layers pending removal, then ack to main (doc 02)
 
-    layers = snapshot()          # lock m_layersMu; copy SP vector (bound, !m_pendingRemoval)
-                                 # + copy each layer's quad params (anchor spec, size, z);
-                                 # unlock. Also collect + destroy layers pending removal
-                                 # (swapchain/GL teardown, then ack to main — doc 02).
-
-    if session.m_xrState in {VISIBLE, FOCUSED}:            # pacing — doc 02
+    if session.m_xrState in {VISIBLE, FOCUSED}:            # pacing (doc 02)
         for l in layers: l.monitor->m_output->scheduleFrame()
 
-    xrWaitFrame  -> frameState (predictedDisplayTime); on failure: continue
-    xrBeginFrame                                          ; on failure: continue
-
+    xrWaitFrame -> frameState (predictedDisplayTime)
+    xrBeginFrame
     headPose = xrLocateSpace(viewSpace, refSpace, predictedDisplayTime)
 
     for l in layers:
-        if l.m_swapchainDirty: recreate swapchain at new size (doc 02); l.m_hasContent = false
-        if l.m_swapchain == XR_NULL_HANDLE: create swapchain sized to monitor pixel mode (doc 02)
+        recreate/create the swapchain if dirty or absent (doc 02)
+        if l presented a new buffer: acquire/wait swapchain image;
+            { CScopedGLContext ctx: blit dmabuf -> swapchain image }   # bind ONLY here
+            release swapchain image
+        else if the quad already has content: skip (it re-presents its last image)
 
-        buf = null
-        if l.m_haveNewFrame.load(acquire):
-            lock l.m_bufMu; buf = move(l.m_latestBuffer); l.m_haveNewFrame = false; unlock
-
-        if buf == null and l.m_hasContent:
-            continue                                       # skip blit — quad keeps showing the
-                                                           # last released swapchain image
-        xrAcquireSwapchainImage(l.m_swapchain) -> imgIdx
-        xrWaitSwapchainImage(timeout = XR_INFINITE_DURATION)
-        { CScopedGLContext ctx(gfx)                        # bind ONLY here
-          if buf: gfx.blitBuffer(buf, l, l.m_swapchainImages[imgIdx]); l.m_hasContent = true
-          else:   gfx.clearTex(l.m_swapchainImages[imgIdx], l.m_swapchainSize, 0, 0, 0)
-        }                                                  # unbound again
-        xrReleaseSwapchainImage(l.m_swapchain)
-
-    input.frame(predictedDisplayTime)                      # xrSyncActions, rays, grab — doc 04
+    input.frame(predictedDisplayTime)                      # xrSyncActions, rays, grab (doc 04)
 
     quads = []
-    for l in layers sorted by (m_zOrder, m_seq), while quads.size < session.m_maxLayerCount:
-        if !l.m_quadActive or !l.m_hasContent: continue    # cap policy — doc 02
-        (space, pose) = l.m_anchor->solve(headPose, dt)    # doc 03; device-locked layers
-                                                           # return the grip XrActionSpace
-        quads.push(XrCompositionLayerQuad{
-            .layerFlags    = 0,
-            .space         = space,
-            .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
-            .subImage      = { l.m_swapchain, {{0,0}, {w, h}}, 0 },
-            .pose          = pose,
-            .size          = { l.m_sizeMeters, l.m_sizeMeters * h / w },
-        })
+    for l in layers sorted by (z_order, sequence), while quads.size < maxLayerCount:
+        if !l.quadActive or !l.hasContent: continue        # layer-cap policy (doc 02)
+        (space, pose) = l.m_anchor->solve(headPose, dt)    # doc 03; device layers return the grip action space
+        quads.push(XrCompositionLayerQuad{ space, pose, subImage, size, eyeVisibility=BOTH })
 
-    xrEndFrame(displayTime = frameState.predictedDisplayTime,
-               environmentBlendMode = session.m_blendMode, # selected at session start from openxr:blend_mode
-               layers = quads)                             # array of quad layer pointers
+    xrEndFrame(predictedDisplayTime, session.m_blendMode, quads)
 ```
 
-Notes:
-
-- `xrEndFrame` with zero layers is valid (nothing composited yet) — required while
-  SYNCHRONIZED and before any layer has content.
-- The skip-blit optimization is safe because a quad layer re-presents the most
-  recently released swapchain image every runtime frame; we only acquire when the
-  monitor actually presented a new buffer.
-- `scheduleFrame()` from the frame thread is the WIP-proven pacing mechanism (WIP
-  comment: *"this drives the ~90Hz render rate on the virtual monitor regardless of
-  what mode it advertises"*). Only while VISIBLE/FOCUSED.
-- **DEVIATION from the original pseudocode (as built, WP13 reconciliation):** an earlier
-  draft of this loop gated the pump itself on `session.m_xrState` already being in
-  `{SYNCHRONIZED, VISIBLE, FOCUSED}`. In practice the runtime only advances
-  READY → SYNCHRONIZED → VISIBLE once the application *starts submitting frames*
-  (confirmed against Monado's null compositor) — gating the pump on those states is a
-  deadlock: the session sits at READY forever because nothing ever calls
-  `xrWaitFrame`/`xrBeginFrame`/`xrEndFrame` to let it progress. The implemented gate is
-  simply `!session.m_sessionBegan` (set `true` in the `READY` row's `xrBeginSession` above):
-  the pump runs continuously from `xrBeginSession` onward, and `xrEndFrame` with zero/blank
-  layers (first note above) is what correctly carries the session through SYNCHRONIZED. The
-  pacing gate (`scheduleFrame()` only while VISIBLE/FOCUSED) is unaffected and matches this
-  doc as written.
+A quad layer re-presents its most recently released swapchain image every runtime frame, so the
+loop only acquires a swapchain image for monitors that actually presented a new desktop buffer;
+otherwise it skips the blit. `xrEndFrame` with zero layers is valid and is what carries the
+session through SYNCHRONIZED before any monitor has content.
 
 ## Blit pipeline (`CXRGraphics::blitBuffer`)
 
-Ported from WIP `blitBufferToEye`, generalized to per-layer targets. Three paths,
-tried in order:
+A monitor's presented buffer is copied into the acquired swapchain image, on the frame thread
+inside a `CScopedGLContext`. Three paths, tried in order:
 
-**1. DMA-BUF path (primary).** `buf->dmabuf()` (`Aquamarine::SDMABUFAttrs`) →
-build `EGLint` attrib list: `EGL_WIDTH/HEIGHT`, `EGL_LINUX_DRM_FOURCC_EXT` =
-`dmab.format`, plane 0 fd/offset/pitch, plus plane 1/2 attribs when
-`dmab.planes > 1` (WIP has the exact attrib tables) →
-`eglCreateImageKHR(dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attribs)`.
-Destroy the layer's previous `m_lastEGLImg` first; store the new one on the layer
-(per-layer, so removal teardown is self-contained). Then:
-`glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_extTex)` →
-`glEGLImageTargetTexture2DOES` → transient FBO with `dstTex` as
-`GL_COLOR_ATTACHMENT0` → `glViewport(0, 0, layerW, layerH)` → fullscreen-triangle
-draw with the blit program. Shaders port verbatim (GLSL ES 3.00; vertex generates
-the triangle from `gl_VertexID`, no VBO; fragment requires
-`GL_OES_EGL_image_external_essl3` and samples a `samplerExternalOES`).
+1. **DMA-BUF (primary).** Build an `EGL_LINUX_DMA_BUF_EXT` image from the buffer's dmabuf
+   attributes (fourcc, per-plane fd/offset/pitch), import it as a `GL_TEXTURE_EXTERNAL_OES`
+   texture, and draw a fullscreen triangle (no VBO; the fragment shader samples a
+   `samplerExternalOES`) into a transient FBO with the swapchain image as the color
+   attachment. The previous EGL image is destroyed and the new one stored per-layer.
+2. **CPU data-pointer fallback.** For buffers that expose a CPU data pointer,
+   `glTexSubImage2D` into a per-layer staging texture sized to the actual monitor mode, then
+   blit to the swapchain image. (`DRM_FORMAT_XRGB8888` is BGRX in memory; `GL_BGRA_EXT` swaps
+   it to RGBA.)
+3. **Clear fallback.** A transient FBO + `glClear` to opaque black.
 
-**2. CPU data-pointer fallback.** `buf->caps() & Aquamarine::BUFFER_CAPABILITY_DATAPTR`
-→ `beginDataPtr(0)` → `glTexSubImage2D(GL_TEXTURE_2D, ..., GL_BGRA_EXT,
-GL_UNSIGNED_BYTE, data)` into the layer's staging texture → `endDataPtr()` →
-`glBlitFramebuffer` staging → `dstTex`. WIP comment to keep: *"DRM_FORMAT_XRGB8888
-is BGRX in memory; GL_BGRA_EXT swaps to RGBA correctly."*
-**Fixed vs WIP:** the WIP allocated the staging texture hard-coded at **1920×1080**
-(`initBlitGL`), which corrupts any other mode. The staging texture is now per-layer
-(`CXRMonitorLayer::m_cpuTex`), allocated lazily at the **actual monitor pixel mode**
-and reallocated on mode change (doc 02).
-
-**3. Clear fallback.** `clearTex(dstTex, size, r, g, b)` — transient FBO +
-`glClear`. Black in production (WIP used cyan as a debug sentinel).
-
-All three run on the frame thread inside a `CScopedGLContext`.
-
-**Alpha is forced opaque in every path.** Hyprland monitor buffers are typically XRGB —
-the alpha channel is undefined. Under `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND`
-(passthrough) the runtime composites each quad over the passthrough underlay using that
-alpha, so undefined alpha would punch see-through holes in monitors. To keep monitors
-fully opaque against passthrough regardless of blend mode:
-
-- **DMA-BUF path:** the fragment shader writes `fragColor.a = 1.0` after sampling.
-- **CPU fallback:** after the `glBlitFramebuffer`, an alpha-only pass on the destination
-  (`glColorMask(F,F,F,T)` + `glClearColor(0,0,0,1)` + `glClear`, mask restored) forces
-  dst alpha to 1.0. `glClear` ignores the viewport, so it covers the whole attachment.
-- **Clear fallback:** `clearTex` already clears with alpha `1.0` — a cleared/blank quad
-  is opaque black, not a transparent hole.
+**Alpha is forced opaque in every path.** Hyprland monitor buffers are typically XRGB — the
+alpha channel is undefined. Under passthrough (`ALPHA_BLEND`) the runtime composites each quad
+over the passthrough underlay using its alpha, so undefined alpha would punch see-through holes
+in the monitors. To keep monitors fully opaque regardless of blend mode: the DMA-BUF shader
+writes `a = 1.0`; the CPU path forces destination alpha to 1.0 with a masked clear after the
+blit; the clear fallback already clears with alpha 1.0.
 
 ## Teardown ordering (`COpenXRManager::stop()`, main thread)
 
-State → `XR_STATE_STOPPING`, then, strictly in order (the WIP destructor got this
-right — generalize it):
+State → `XR_STATE_STOPPING`, then strictly in order:
 
-1. `m_running = false`; **join the frame thread** — before touching any EGL or XR
-   object. After the join the main thread owns `m_xrContext` again.
-2. GL cleanup **with the context current** (WIP comment: *"context must be current —
-   briefly make it so"*): per-layer `eglDestroyImageKHR(m_lastEGLImg)` and
-   `glDeleteTextures(m_cpuTex)`, then shared `m_extTex`, `m_blitVAO`, `m_blitProg`;
-   unbind (`EGL_NO_CONTEXT`).
-3. Per-layer `xrDestroySwapchain` (context NOT current — same interop rule as
-   creation), and mark layers unbound (`m_swapchain = XR_NULL_HANDLE`,
-   `m_hasContent = false`).
-4. `xrDestroySpace(m_viewSpace)`, `xrDestroySpace(m_refSpace)`,
-   `xrDestroySession`, `xrDestroyInstance`. If `m_instanceLost`, calls may return
-   errors — ignore, but still null the handles.
-5. `eglDestroyContext`, `eglTerminate(m_eglDisplay)`; if `m_gbmOwned`:
-   `gbm_device_destroy` + `close(m_gbmFd)` — last, the display depends on them.
-6. Monitor disposition per `openxr:destroy_monitors_on_stop` (doc 02): destroy
-   XR-created headless outputs, or keep them with unbound layer records for the
-   next `start()` — unplugged (disabled, workspaces evacuated) when
-   `openxr:monitors_follow_session != off` (research/18; on session end this is
-   immediate regardless of the `visible`-mode doff-grace), plain live outputs
-   otherwise.
-7. State → `XR_STATE_DISABLED` (or `XR_STATE_UNAVAILABLE` when stop was triggered
-   by instance loss), emit `openxrsessionstate`.
+1. `m_running = false`; **join the frame thread** — before touching any EGL or XR object. The
+   main thread then owns the context again.
+2. GL cleanup **with the context current**: per-layer EGL images and staging textures, then
+   the shared blit program/VAO/external texture; unbind.
+3. Per-layer `xrDestroySwapchain` (context **not** current — same interop rule as creation).
+4. `xrDestroySpace` ×2, `xrDestroySession`, `xrDestroyInstance` (errors ignored if the instance
+   was lost).
+5. `eglDestroyContext`, `eglTerminate`, then (if we opened it) `gbm_device_destroy` + `close` —
+   last, since the display depends on them.
+6. Monitor disposition per `openxr:destroy_monitors_on_stop` and `openxr:monitors_follow_session`
+   (doc 02): keep the outputs (unplugged) or destroy them.
+7. State → `DISABLED` (or `UNAVAILABLE` on instance loss); post `openxrsessionstate`.
 
-`stop()` must be idempotent and callable from: config hot-toggle, `hyprctl openxr
-disable`, EXITING/LOSS_PENDING notifications (channel [C] callback), and compositor
-shutdown (manager destructor).
-
-**Process-shutdown ordering, as built (WP13 reconciliation):** the sequence above is what runs
-inside `COpenXRManager::stop()` itself — but on a *full compositor shutdown* (not a session
-stop), the global `g_pOpenXRManager` (which owns the manager and would otherwise only be
-destroyed at static/global teardown, i.e. after `main()`'s local state is torn down) is instead
-reset **explicitly and very early** in `CCompositor::cleanup()`
-(`src/Compositor.cpp`, right after `g_pPluginSystem->unloadAllPlugins()`), well **before**
-`g_pInputManager`/`g_pSeatManager`/the renderer/`g_pXWayland` are reset. This is required, not
-incidental: if the manager were left to the default global-destructor order, its destructor would
-run `stop()` → `removePointerDevice()` → the pointer's destroy signal →
-`CInputManager::destroyPointer` → `CSeatManager::setMouse`, by which point `cleanup()` has
-already reset `g_pInputManager`/`g_pSeatManager` — a use-after-free. Doc 00's lifecycle section
-cross-references this; see also doc 04 §8 for the pointer-device teardown path this ordering
-protects.
+`stop()` is idempotent and callable from a config toggle, `hyprctl openxr disable`, an
+EXITING/LOSS_PENDING notification, or compositor shutdown. On full shutdown the manager is
+reset early in `CCompositor::cleanup()` (doc 00) so the synthetic pointer's teardown
+(`removePointerDevice()`, doc 04) reaches a live input manager and seat.
 
 ## Logging
 
-Use `Log::logger->log(Log::DEBUG | Log::WARN | Log::ERR, ...)` (there is no
-`Log::LOG` level). Drop the WIP's `fprintf(stderr, ...)` duplication and its
-`XR_LOG`/`XR_CHK` macros in favor of a small local `XR_CHK`-style helper that logs
-via `Log::logger` and returns false.
-
-## Context files to read before implementing
-
-- `git show openxr:src/openxr/COpenXRManager.cpp` — the WIP source this doc ports (861 lines; read all of it)
-- `git show openxr:src/openxr/COpenXRManager.hpp`
-- `git diff main...openxr -- CMakeLists.txt src/Compositor.cpp src/Compositor.hpp` — build gating + hook point
-- `/home/ajg/code/Hyprland/docs/openxr/00-overview.md` — thread model, lifecycle states, handoff table
-- `/home/ajg/code/Hyprland/docs/openxr/02-virtual-monitors.md` — `CXRMonitorLayer`, swapchain-per-layer lifecycle consumed by the frame loop
-- `/home/ajg/code/Hyprland/src/Compositor.cpp` — `initServer` (~315–352: backend creation, `m_drmRenderNode.fd` at ~367), `initManagers` `STAGE_LATE` (~706)
-- `/home/ajg/code/Hyprland/src/render/OpenGL.hpp` — `g_pHyprOpenGL->m_eglDisplay` (shared-display fallback)
-- `/home/ajg/code/Hyprland/src/output/Monitor.hpp` — `m_output`, `scheduleFrame`, `m_events.presented`
-- `/home/ajg/code/Hyprland/src/debug/log/Logger.hpp` — logging API
-- `/home/ajg/code/Hyprland/src/config/values/ConfigValues.cpp` — `getConfigValues()`, where `openxr:gpu`, `openxr:floor_offset` are declared (see doc 05 §1.1)
-- `/home/ajg/code/Hyprland/src/managers/eventLoop/EventLoopManager.hpp` — event loop hosting the frame→main eventfd
+`Log::logger->log(Log::DEBUG | Log::WARN | Log::ERR, ...)` — there is no `Log::LOG` level.
