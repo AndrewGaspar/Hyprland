@@ -127,6 +127,14 @@ class CXRMonitorLayer {
     bool                  m_hasContent = false;   // at least one successful blit since (re)create
     bool                  m_quadActive = true;    // false while suspended by the layer cap
 
+    // WP-L2 import-failure log-once state (frame thread only; the blit is single-threaded per layer).
+    // The dmabuf import used to spam one EGL error per frame on a cross-GPU black session — we now log
+    // one line per changed (fourcc, modifier, EGL-error) signature. See XRGraphics.cpp blitBuffer.
+    bool     m_importFailLogged = false;
+    uint32_t m_importFailFourcc = 0;
+    uint64_t m_importFailMod    = 0;
+    unsigned m_importFailEgl    = 0;
+
     // ---- chrome content snapshot (WP-G2, frame thread only) ----
     // A persistent RGBA copy of the last fully-composited swapchain image (content @ alpha 1 +
     // transparent margin), kept so an ANIMATION-ONLY frame (chrome fading with NO new desktop
@@ -154,6 +162,12 @@ class CXRMonitorLayer {
     // dock/undock events exactly once) and a status-readable mirror. Written frame-thread after the
     // solve, read main-thread (status JSON) under m_layersMu. Plain atomic — never a refcount op.
     std::atomic<uint8_t> m_adPhase{0 /* OpenXR::XRAD_DOCKED */};
+
+    // WP-L2 observability: which blit path last produced this layer's content (OpenXR::eXRContentPath
+    // — none/dmabuf/cpu/black). Written frame-thread in CXRGraphics::blitBuffer, read main-thread for
+    // `hyprctl openxr status` (contentPath field) under m_layersMu. Plain atomic — never a refcount op.
+    // "black" pinpoints a silent black-quad session (e.g. cross-GPU import failure) in one command.
+    std::atomic<uint8_t> m_contentPath{0 /* OpenXR::XR_CONTENT_NONE */};
 
     // Fade-envelope state (frame thread only; only the blit loop touches these). Alpha is advanced
     // every frame from predicted-display-time deltas via OpenXR::chromeFadeAdvance; the *Drawn*

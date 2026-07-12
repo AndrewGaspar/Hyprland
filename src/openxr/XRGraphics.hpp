@@ -92,6 +92,11 @@ class CXRGraphics {
     struct gbm_device* m_gbmOwned    = nullptr;        // set iff we opened our own GBM device
     int                m_gbmFd       = -1;
     bool               m_ownsDisplay = false;          // false = shared-display fallback (do not terminate)
+    // EGL_EXT_image_dma_buf_import_modifiers present on m_eglDisplay (queried in initEGL). When true,
+    // blitBuffer passes explicit per-plane dmabuf modifiers — REQUIRED for cross-GPU import on NVIDIA
+    // (rejects modifier-less imports with EGL_BAD_ATTRIBUTE even for LINEAR; research/17 §4.2, WP-L2).
+    // When false we keep the modifier-less attrib list so drivers without the ext are not regressed.
+    bool               m_hasModifiers = false;
 
     // Shared blit resources (all in the m_xrContext share group).
     XR_GLuint m_blitProg = 0; // external-OES -> FBO program

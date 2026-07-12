@@ -56,6 +56,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
             "grabKind": "{}",
             "hovered": {},
             "plugged": {},
+            "contentPath": "{}",
             "adaptive": {{
                 "enabled": {},
                 "phase": "{}",
@@ -65,8 +66,8 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
             }}
         }})#",
                                 m.name, m.id, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.quatX, m.quatY, m.quatZ, m.quatW, m.grabbed ? "true" : "false",
-                                m.grabKind, m.hovered ? "true" : "false", m.plugged ? "true" : "false", m.adaptiveEnabled ? "true" : "false", m.adaptivePhase, m.adaptiveRoamMode,
-                                m.adaptiveSeatDist, m.adaptiveT);
+                                m.grabKind, m.hovered ? "true" : "false", m.plugged ? "true" : "false", m.contentPath, m.adaptiveEnabled ? "true" : "false", m.adaptivePhase,
+                                m.adaptiveRoamMode, m.adaptiveSeatDist, m.adaptiveT);
             if (i + 1 < MONS.size())
                 mons += ",\n";
             else
@@ -95,9 +96,9 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     std::string out = std::format("state: {}\nruntime: {}\nsystem: {}\nblend mode: {}\noverlay: {}\nidle inhibited: {}\ninput: left {}, right {}\n", STATE, RUNTIME, SYSTEM, BLEND,
                                   OVERLAY ? "yes" : "no", INHIBITING_IDLE ? "yes" : "no", handLabel(HANDS[0]), handLabel(HANDS[1]));
     for (const auto& m : MONS) {
-        out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} ({}) hovered: {} plugged: {}", m.name, m.id, m.w,
-                           m.h, m.refresh, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.grabbed ? "yes" : "no", m.grabKind, m.hovered ? "yes" : "no",
-                           m.plugged ? "yes" : "no");
+        out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} ({}) hovered: {} plugged: {} content: {}", m.name,
+                           m.id, m.w, m.h, m.refresh, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.grabbed ? "yes" : "no", m.grabKind, m.hovered ? "yes" : "no",
+                           m.plugged ? "yes" : "no", m.contentPath);
         if (m.adaptiveEnabled)
             out += std::format(" adaptive: {} (roam {}, seat {:.2f}m)", m.adaptivePhase, m.adaptiveRoamMode, m.adaptiveSeatDist);
         out += "\n";

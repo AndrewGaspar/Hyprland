@@ -21,6 +21,7 @@
 #include "../debug/log/Logger.hpp"
 #include "../config/ConfigValue.hpp"
 #include "XRMonitorLayer.hpp"
+#include "XRDmabufImport.hpp"
 #include <aquamarine/buffer/Buffer.hpp>
 
 // EGL/GL extension procs — loaded once in initEGL. Kept at file scope (the WIP pattern);
@@ -225,7 +226,13 @@ bool CXRGraphics::initEGL(const std::string& gpuOverride) {
     s_eglDestroyImage = (PFNEGLDESTROYIMAGEKHRPROC_t)eglGetProcAddress("eglDestroyImageKHR");
     s_glImageTarget2D = (PFNGLEGLIMAGETARGETTEX2DOESPROC_t)eglGetProcAddress("glEGLImageTargetTexture2DOES");
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] EGL context created");
+    // Whether we may pass explicit dmabuf modifiers on import. On a hybrid box (desktop on the AMD
+    // iGPU, this XR context on the NVIDIA dGPU per openxr:gpu) NVIDIA's EGL rejects modifier-less
+    // imports with EGL_BAD_ATTRIBUTE even for LINEAR — the black-screen root cause (research/17 §4.2,
+    // WP-L2). blitBuffer appends the per-plane MODIFIER_LO/HI attribs when this is set.
+    if (const char* exts = eglQueryString(m_eglDisplay, EGL_EXTENSIONS))
+        m_hasModifiers = std::strstr(exts, "EGL_EXT_image_dma_buf_import_modifiers") != nullptr;
+    Log::logger->log(Log::DEBUG, "[OPENXR] EGL context created (dmabuf import modifiers: {})", m_hasModifiers ? "yes" : "no");
     return true;
 }
 
@@ -368,37 +375,20 @@ void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer
             layer.m_lastEGLImg = nullptr;
         }
 
-        std::vector<EGLint> attribs = {
-            EGL_WIDTH,
-            (EGLint)buf->size.x,
-            EGL_HEIGHT,
-            (EGLint)buf->size.y,
-            EGL_LINUX_DRM_FOURCC_EXT,
-            (EGLint)dmab.format,
-            EGL_DMA_BUF_PLANE0_FD_EXT,
-            dmab.fds[0],
-            EGL_DMA_BUF_PLANE0_OFFSET_EXT,
-            (EGLint)dmab.offsets[0],
-            EGL_DMA_BUF_PLANE0_PITCH_EXT,
-            (EGLint)dmab.strides[0],
-        };
-        if (dmab.planes > 1) {
-            const EGLenum pfd[]  = {EGL_DMA_BUF_PLANE1_FD_EXT, EGL_DMA_BUF_PLANE2_FD_EXT};
-            const EGLenum poff[] = {EGL_DMA_BUF_PLANE1_OFFSET_EXT, EGL_DMA_BUF_PLANE2_OFFSET_EXT};
-            const EGLenum ppit[] = {EGL_DMA_BUF_PLANE1_PITCH_EXT, EGL_DMA_BUF_PLANE2_PITCH_EXT};
-            for (int p = 1; p < dmab.planes && p < 3; p++) {
-                attribs.push_back(pfd[p - 1]);
-                attribs.push_back(dmab.fds[p]);
-                attribs.push_back(poff[p - 1]);
-                attribs.push_back((EGLint)dmab.offsets[p]);
-                attribs.push_back(ppit[p - 1]);
-                attribs.push_back((EGLint)dmab.strides[p]);
-            }
-        }
-        attribs.push_back(EGL_NONE);
+        // Build the import attrib list via the pure helper (gtested). It appends explicit per-plane
+        // MODIFIER_LO/HI when the display advertises EGL_EXT_image_dma_buf_import_modifiers AND the
+        // buffer carries a non-INVALID modifier — the cross-GPU black-screen fix (research/17 §4.2,
+        // WP-L2). When the ext is absent it emits the legacy modifier-less list (no vendor regressed).
+        std::vector<OpenXR::SDmabufPlaneImport> planes;
+        planes.reserve(dmab.planes);
+        for (int p = 0; p < dmab.planes && p < 4; p++)
+            planes.push_back({dmab.fds[p], dmab.offsets[p], dmab.strides[p]});
+        std::vector<EGLint> attribs = OpenXR::buildDmabufImportAttribs((int)buf->size.x, (int)buf->size.y, dmab.format, planes, dmab.modifier, m_hasModifiers);
 
         layer.m_lastEGLImg = s_eglCreateImage(m_eglDisplay, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attribs.data());
         if (layer.m_lastEGLImg != nullptr) {
+            layer.m_contentPath.store(OpenXR::XR_CONTENT_DMABUF, std::memory_order_relaxed);
+            layer.m_importFailLogged = false; // reset so a later failure logs afresh
             clearMargin(); // transparent margin first
 
             glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_extTex);
@@ -422,7 +412,18 @@ void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer
             glDeleteFramebuffers(1, &fbo);
             return;
         }
-        Log::logger->log(Log::WARN, "[OPENXR] eglCreateImageKHR failed (0x{:x}), falling back to CPU path", (unsigned)eglGetError());
+        // Import failed. Log ONCE per (fourcc, modifier, EGL-error) signature — a cross-GPU black
+        // session used to emit ~30 of these per second (43k in one 23-min run, research/17 §4.1). The
+        // one line names everything needed to diagnose it: format, modifier, plane count, whether we
+        // even passed modifiers, and the EGL error (WP-L2 mini-L6 observability).
+        const unsigned eglErr = (unsigned)eglGetError();
+        if (!layer.m_importFailLogged || layer.m_importFailFourcc != dmab.format || layer.m_importFailMod != dmab.modifier || layer.m_importFailEgl != eglErr) {
+            layer.m_importFailLogged = true;
+            layer.m_importFailFourcc = dmab.format;
+            layer.m_importFailMod    = dmab.modifier;
+            layer.m_importFailEgl    = eglErr;
+            Log::logger->log(Log::WARN, "[OPENXR] dmabuf import failed for XR monitor {}: fourcc 0x{:x} modifier 0x{:x} planes {} (modifiers {}) EGL 0x{:x} — falling back (cross-GPU? see openxr:gpu)", layer.m_monitorName, dmab.format, dmab.modifier, dmab.planes, m_hasModifiers ? "passed" : "unavailable", eglErr);
+        }
     }
 
     // --- 2. CPU data-pointer fallback ---
@@ -470,12 +471,15 @@ void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer
             glDisable(GL_SCISSOR_TEST);
             glDeleteFramebuffers(1, &srcFBO);
             glDeleteFramebuffers(1, &dstFBO);
+            layer.m_contentPath.store(OpenXR::XR_CONTENT_CPU, std::memory_order_relaxed);
             return;
         }
     }
 
     // --- 3. Clear fallback (black in production; WIP used cyan as a debug sentinel) ---
-    // Transparent margin, opaque-black content rect (both blit paths failed).
+    // Transparent margin, opaque-black content rect (both blit paths failed). `hyprctl openxr status`
+    // now reports contentPath "black" so this silent-black-quad state is diagnosable in one command.
+    layer.m_contentPath.store(OpenXR::XR_CONTENT_BLACK, std::memory_order_relaxed);
     clearMargin();
     {
         GLuint fbo = 0;

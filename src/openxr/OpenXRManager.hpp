@@ -133,6 +133,9 @@ class COpenXRManager {
         std::string grabKind = "none"; // WP-G3: "none" | "move" | "resize" (which grab owns it)
         bool        hovered  = false;
         bool        plugged  = false; // research/18: the headless output is currently enabled
+        // WP-L2: which blit path last filled this layer's swapchain — "none" | "dmabuf" | "cpu" |
+        // "black". "black" flags a silent black-quad session (e.g. cross-GPU import failure).
+        std::string contentPath = "none";
         // Adaptive anchoring (research/13 §6.4).
         bool        adaptiveEnabled  = false;
         std::string adaptivePhase    = "docked"; // docked | undocking | roaming | redocking
