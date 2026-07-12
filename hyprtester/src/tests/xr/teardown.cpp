@@ -18,11 +18,13 @@ namespace {
 }
 
 // xr_disable_teardown — WP11 (doc 06 §6 row 10). `hyprctl openxr disable` must stop the session
-// cleanly (no crash) and, per `openxr:destroy_monitors_on_stop` (default 1, unset in
-// xr-test.conf), destroy every XR-backed headless output — both a runtime-created one and the
+// cleanly (no crash) and, with `openxr:destroy_monitors_on_stop = 1` (the research/18 option-a
+// escape hatch — default is 0 since monitors_follow_session landed, so this test sets it
+// explicitly), destroy every XR-backed headless output — both a runtime-created one and the
 // config-declared fixtures. `hyprctl openxr enable` must bring the session back up and
 // re-materialize the declared fixtures (lazy quad binding, doc 02); the runtime-created one is
-// gone for good (it was never in the declared set).
+// gone for good (it was never in the declared set). The default keep-but-unplug disposition is
+// covered by xr_plugged_follow_session (plugged.cpp).
 TEST_CASE(xr_disable_teardown) {
     XR_SKIP_IF_UNAVAILABLE();
 
@@ -30,9 +32,10 @@ TEST_CASE(xr_disable_teardown) {
         const bool& failed;
         std::string testName;
         ~SGuard() {
-            // This test intentionally disables the whole session; always try to bring it back
+            // Restore the default stop disposition, then always try to bring the session back
             // up for any XR tests that run after this one in the same shared Hyprland+Monado
             // instance (docs/openxr/06-testing.md §2.1 — one instance for the whole --xr run).
+            getFromSocket("/keyword openxr:destroy_monitors_on_stop 0");
             getFromSocket("/openxr enable");
             XR::waitForXrState("focused", std::chrono::milliseconds(15000));
             if (failed)
@@ -46,6 +49,9 @@ TEST_CASE(xr_disable_teardown) {
         return;
     }
 
+    // Opt into option-a full removal (read at stop() time; a plain keyword-set suffices).
+    ASSERT(getFromSocket("/keyword openxr:destroy_monitors_on_stop 1"), std::string("ok"));
+
     const std::string mon = XR::monitorName(15);
     ASSERT(getFromSocket("/openxr create " + mon + " 1280x720"), std::string("ok"));
     ASSERT(XR::waitForJson(
@@ -55,7 +61,7 @@ TEST_CASE(xr_disable_teardown) {
     ASSERT(getFromSocket("/openxr disable"), std::string("ok"));
     ASSERT(XR::waitForXrState("disabled", std::chrono::milliseconds(10000)), true);
 
-    // destroy_monitors_on_stop (default 1) -> every XR output (runtime + declared) is gone.
+    // destroy_monitors_on_stop = 1 (set above) -> every XR output (runtime + declared) is gone.
     ASSERT(XR::waitForJson(
                "j/monitors", [&](const std::string& r) { return !r.contains("\"name\": \"" + mon + "\""); }, std::chrono::milliseconds(10000)),
            true);

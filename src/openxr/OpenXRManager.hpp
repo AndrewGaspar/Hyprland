@@ -86,6 +86,17 @@ class COpenXRManager {
     std::expected<PXRLAYER, std::string> createXRMonitor(const SXRMonitorParams& params);
     void                                 destroyXRMonitor(const std::string& name);
 
+    // Plugged-state edge (research/18 WP-M1/M2): make every XR-created monitor behave like a
+    // plugged/unplugged external monitor. `sessionUp` is the session-EXISTENCE edge (the
+    // start()/stop() boundary — never VISIBLE/FOCUSED, which flaps on the proximity sensor).
+    // With openxr:monitors_follow_session (default on), unplugging drives CMonitor::onDisconnect()
+    // (full workspace evacuation) and plugging drives onConnect(true) (name-keyed workspace
+    // return) — the exact functions the rule manager uses for `monitor=...,disable` toggles.
+    // Never destroys an output (that path is the aquamarine framecb UAF, destroyOutputDeferred).
+    // Main thread only. Idempotent — future session-lifecycle code (research/17) can call it on
+    // any re-probed edge.
+    void setMonitorsPlugged(bool sessionUp);
+
     // --- IPC verb funnel (main thread). ONE implementation, two transports: the xrmonitor
     // dispatcher and the hyprctl openxr subcommands both call these (doc 05 §3/§4). Return
     // empty-expected on success, an error string otherwise. ---
@@ -121,6 +132,7 @@ class COpenXRManager {
         bool        grabbed  = false;
         std::string grabKind = "none"; // WP-G3: "none" | "move" | "resize" (which grab owns it)
         bool        hovered  = false;
+        bool        plugged  = false; // research/18: the headless output is currently enabled
         // Adaptive anchoring (research/13 §6.4).
         bool        adaptiveEnabled  = false;
         std::string adaptivePhase    = "docked"; // docked | undocking | roaming | redocking
