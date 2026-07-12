@@ -352,6 +352,35 @@ bool OpenXR::wantXRMonitorsPlugged(eXRMonitorFollowMode mode, bool sessionUp, bo
         case XR_FOLLOW_VISIBLE: return sessionVisible;
     }
     return sessionVisible;
+
+OpenXR::eForceLinearMode OpenXR::parseForceLinearMode(const std::string& s) {
+    if (s == "on" || s == "true" || s == "1" || s == "yes")
+        return XR_LINEAR_ON;
+    if (s == "off" || s == "false" || s == "0" || s == "no")
+        return XR_LINEAR_OFF;
+    return XR_LINEAR_AUTO; // "auto" and anything unrecognized
+}
+
+bool OpenXR::shouldForceLinear(eForceLinearMode mode, bool xrValid, int64_t xrMajor, int64_t xrMinor, bool allocValid, int64_t allocMajor, int64_t allocMinor) {
+    switch (mode) {
+        case XR_LINEAR_OFF: return false;
+        case XR_LINEAR_ON: return true;
+        case XR_LINEAR_AUTO:
+        default:
+            // Only force when we can positively confirm the XR EGL device differs from the buffer
+            // allocator's device. An unknown node (shared-display fallback, unstat-able fd) is treated
+            // as same-GPU and left native — the fail-closed guard in start() already refuses the truly
+            // dangerous wrong-GPU case, and forcing linear on a same-GPU setup just wastes bandwidth.
+            if (!xrValid || !allocValid)
+                return false;
+            return xrMajor != allocMajor || xrMinor != allocMinor;
+    }
+}
+
+bool OpenXR::wantXRMonitorsPlugged(bool followSession, bool sessionUp) {
+    // research/18: with monitors_follow_session (default), XR monitors are plugged exactly while
+    // a session exists; opting out keeps them always plugged (the pre-feature behavior).
+    return sessionUp || !followSession;
 }
 
 std::string OpenXR::anchorModeToString(eXRAnchorMode mode, eXRHand device) {
