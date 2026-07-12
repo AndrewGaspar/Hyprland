@@ -140,6 +140,16 @@ void CMonitorRuleManager::ensureMonitorStatus() {
         if (!m || !m->m_output || m->m_isUnsafeFallback)
             continue;
 
+        // report-20 issue A: an XR virtual monitor that COpenXRManager is holding UNPLUGGED (disabled)
+        // is owned by the XR plug lifecycle. Its config rule says "enabled" (there is no
+        // `monitor=NAME,disable` line), so applying that rule here would re-enable it (and the
+        // re-enable line below would onConnect() it), re-materializing the phantom monitor the XR
+        // manager just unplugged. Leave a disabled XR-managed output completely alone; the XR manager
+        // re-plugs it (onConnect) on the next visibility/presence edge. Enabled XR monitors fall
+        // through to normal rule application (mode/scale tweaks still apply while plugged).
+        if (m->m_xrManagedPlug && !m->m_enabled)
+            continue;
+
         auto rule = get(m);
 
         auto cmp = rule.compare(m->m_activeMonitorRule);

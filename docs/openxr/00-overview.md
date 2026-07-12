@@ -122,7 +122,8 @@ Monado's compositor thread can bind it).
 enum eXRManagerState : uint8_t {
     XR_STATE_DISABLED = 0,   // openxr:enabled == 0, or stopped; no XR objects exist
     XR_STATE_UNAVAILABLE,    // start attempted: no runtime / xrCreateInstance or system lookup failed,
-                             // or instance loss. NO auto-retry polling — user re-enables explicitly.
+                             // or instance loss. DORMANT: a backoff reprobe timer retries start() while
+                             // openxr:enabled + openxr:reprobe (report-17 WP-L3). User re-enable also works.
     XR_STATE_STARTING,       // start() in progress on the main thread
     XR_STATE_RUNNING_IDLE,   // session exists; XrSessionState IDLE/READY/SYNCHRONIZED/STOPPING
     XR_STATE_RUNNING_VISIBLE,// XrSessionState VISIBLE — quads composited, pacing active
@@ -161,8 +162,16 @@ Transition rules:
   `CCompositor::initManagers`, after XWayland, same hook point as the WIP);
   (2) a dynamic config callback on `openxr:enabled` fired on config reload;
   (3) `hyprctl openxr enable|disable`.
-- `UNAVAILABLE` is sticky: no retry timer, no polling. A subsequent
-  `start()` (hyprctl/config toggle) retries from scratch.
+- `UNAVAILABLE` is **dormant, not terminal** (report-17 WP-L3 / report-20 issue B1). While
+  `openxr:enabled` and `openxr:reprobe` are set, a `CEventLoopTimer` re-attempts `start()` on a
+  backoff: "waiting for the runtime" (no runtime/server) grows the delay from
+  `openxr:reprobe_interval_ms` up to 30s; "waiting for the headset" (runtime up, `xrGetSystem` returns
+  `XR_ERROR_FORM_FACTOR_UNAVAILABLE`) polls at the fixed interval. The timer is armed on entering
+  UNAVAILABLE, disarmed (backoff preserved) on `STARTING`, and disarmed+reset on any running/disabled
+  steady state. A subsequent explicit `start()` (hyprctl/config toggle) also retries from scratch —
+  and `onConfigReload()` now starts from UNAVAILABLE too (WP-L7), so `hyprctl keyword openxr:enabled 1`
+  is no longer a silent no-op. Session/instance loss lands here and thus auto-reconnects; `EXITING`
+  (user quit XR from the runtime UI) lands in DISABLED and does not.
 - `RUNNING` sub-states mirror `XrSessionState` and are driven by the frame thread's
   `pollEvents()`; the frame thread reports transitions over channel [C] so the main
   thread emits the `openxrsessionstate` socket2 event (payloads: `disabled`,
