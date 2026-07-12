@@ -17,6 +17,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     const auto        STATE   = COpenXRManager::stateToString(g_pOpenXRManager->state());
     const std::string RUNTIME = g_pOpenXRManager->runtimeName();
     const std::string SYSTEM  = g_pOpenXRManager->systemName();
+    const std::string RTGPU   = g_pOpenXRManager->runtimeGpu();
     const std::string BLEND   = g_pOpenXRManager->blendModeName();
     const bool        OVERLAY = g_pOpenXRManager->isOverlay();
     const auto        MONS    = g_pOpenXRManager->monitorInfos();
@@ -78,6 +79,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "state": "{}",
     "runtimeName": "{}",
     "systemName": "{}",
+    "runtimeGpu": "{}",
     "blendMode": "{}",
     "overlay": {},
     "inhibitingIdle": {},
@@ -88,13 +90,13 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "monitors": [{}{}]
 }}
 )#",
-                           STATE, RUNTIME, SYSTEM, BLEND, OVERLAY ? "true" : "false", INHIBITING_IDLE ? "true" : "false", HANDS[0].hands ? "hands" : "controllers", HANDS[0].gesture,
+                           STATE, RUNTIME, SYSTEM, RTGPU, BLEND, OVERLAY ? "true" : "false", INHIBITING_IDLE ? "true" : "false", HANDS[0].hands ? "hands" : "controllers", HANDS[0].gesture,
                            HANDS[0].filtered ? "true" : "false", HANDS[1].hands ? "hands" : "controllers", HANDS[1].gesture, HANDS[1].filtered ? "true" : "false",
                            MONS.empty() ? "" : "\n", mons);
     }
 
-    std::string out = std::format("state: {}\nruntime: {}\nsystem: {}\nblend mode: {}\noverlay: {}\nidle inhibited: {}\ninput: left {}, right {}\n", STATE, RUNTIME, SYSTEM, BLEND,
-                                  OVERLAY ? "yes" : "no", INHIBITING_IDLE ? "yes" : "no", handLabel(HANDS[0]), handLabel(HANDS[1]));
+    std::string out = std::format("state: {}\nruntime: {}\nsystem: {}\nruntime gpu: {}\nblend mode: {}\noverlay: {}\nidle inhibited: {}\ninput: left {}, right {}\n", STATE, RUNTIME,
+                                  SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, BLEND, OVERLAY ? "yes" : "no", INHIBITING_IDLE ? "yes" : "no", handLabel(HANDS[0]), handLabel(HANDS[1]));
     for (const auto& m : MONS) {
         out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} ({}) hovered: {} plugged: {} content: {}", m.name,
                            m.id, m.w, m.h, m.refresh, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.grabbed ? "yes" : "no", m.grabKind, m.hovered ? "yes" : "no",

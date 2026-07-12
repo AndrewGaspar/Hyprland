@@ -601,6 +601,20 @@ endif()
 if(WITH_OPENXR AND openxr_dep_FOUND)
   target_compile_definitions(hyprland_lib PRIVATE HAVE_OPENXR=1)
   target_link_libraries(hyprland_lib PUBLIC PkgConfig::openxr_dep)
+  # Wrong-GPU fail-closed guard: the XR-vs-runtime GPU probe (src/openxr/XRGpuProbe.cpp) needs
+  # Vulkan headers (XR_KHR_vulkan_enable2 structs) and dlopen's libvulkan at runtime. Prefer system
+  # headers; fall back to the vendored vulkan-headers submodule. If neither is present the probe
+  # compiles to a no-op stub and start() proceeds with a "could not verify GPU" warning.
+  find_path(HYPR_VULKAN_INCLUDE_DIR vulkan/vulkan_core.h
+            PATHS ${CMAKE_CURRENT_SOURCE_DIR}/subprojects/vulkan-headers/include)
+  if(HYPR_VULKAN_INCLUDE_DIR)
+    target_include_directories(hyprland_lib PRIVATE ${HYPR_VULKAN_INCLUDE_DIR})
+    target_compile_definitions(hyprland_lib PRIVATE HAVE_XR_VULKAN_PROBE=1)
+    target_link_libraries(hyprland_lib PUBLIC ${CMAKE_DL_LIBS})
+    message(STATUS "OpenXR wrong-GPU probe enabled (Vulkan headers: ${HYPR_VULKAN_INCLUDE_DIR})")
+  else()
+    message(STATUS "OpenXR wrong-GPU probe disabled (no Vulkan headers found); start() will warn instead of verifying the GPU")
+  endif()
 endif()
 
 pkg_check_modules(hyprland_protocols_dep hyprland-protocols>=0.6.4)
