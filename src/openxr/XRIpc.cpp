@@ -21,6 +21,11 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     const std::string BLEND   = g_pOpenXRManager->blendModeName();
     const bool        OVERLAY = g_pOpenXRManager->isOverlay();
     const auto        MONS    = g_pOpenXRManager->monitorInfos();
+    // report-18 addendum: the plugged-state follow mode and, when the headset has just been
+    // doffed under `visible` mode, the ms remaining before the anti-flap grace-unplug fires (-1
+    // when no unplug is pending).
+    const std::string FOLLOW      = g_pOpenXRManager->monitorFollowModeName();
+    const int         UNPLUG_PEND = g_pOpenXRManager->monitorUnplugPendingMs();
     // Read-only observability for the idle-inhibit predicate (doc 05 §6.1). There is otherwise
     // no queryable surface for "is the compositor's idle-inhibit bit currently raised because of
     // XR" — CIdleNotifyProtocol::isInhibited is private with no getter, and it's a fold of every
@@ -82,6 +87,8 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "runtimeGpu": "{}",
     "blendMode": "{}",
     "overlay": {},
+    "monitorsFollowSession": "{}",
+    "monitorUnplugPendingMs": {},
     "inhibitingIdle": {},
     "input": {{
         "left": {{ "kind": "{}", "gesture": "{}", "filtered": {} }},
@@ -90,13 +97,16 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "monitors": [{}{}]
 }}
 )#",
-                           STATE, RUNTIME, SYSTEM, RTGPU, BLEND, OVERLAY ? "true" : "false", INHIBITING_IDLE ? "true" : "false", HANDS[0].hands ? "hands" : "controllers", HANDS[0].gesture,
+                           STATE, RUNTIME, SYSTEM, RTGPU, BLEND, OVERLAY ? "true" : "false", FOLLOW, UNPLUG_PEND, INHIBITING_IDLE ? "true" : "false",
+                           HANDS[0].hands ? "hands" : "controllers", HANDS[0].gesture,
                            HANDS[0].filtered ? "true" : "false", HANDS[1].hands ? "hands" : "controllers", HANDS[1].gesture, HANDS[1].filtered ? "true" : "false",
                            MONS.empty() ? "" : "\n", mons);
     }
 
-    std::string out = std::format("state: {}\nruntime: {}\nsystem: {}\nruntime gpu: {}\nblend mode: {}\noverlay: {}\nidle inhibited: {}\ninput: left {}, right {}\n", STATE, RUNTIME,
-                                  SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, BLEND, OVERLAY ? "yes" : "no", INHIBITING_IDLE ? "yes" : "no", handLabel(HANDS[0]), handLabel(HANDS[1]));
+    const std::string FOLLOWLINE = UNPLUG_PEND >= 0 ? std::format("{} (unplug in {}ms)", FOLLOW, UNPLUG_PEND) : FOLLOW;
+    std::string       out = std::format("state: {}\nruntime: {}\nsystem: {}\nruntime gpu: {}\nblend mode: {}\noverlay: {}\nmonitors follow session: {}\nidle inhibited: {}\ninput: left {}, right {}\n",
+                                        STATE, RUNTIME, SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, BLEND, OVERLAY ? "yes" : "no", FOLLOWLINE, INHIBITING_IDLE ? "yes" : "no",
+                                        handLabel(HANDS[0]), handLabel(HANDS[1]));
     for (const auto& m : MONS) {
         out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} ({}) hovered: {} plugged: {} content: {}", m.name,
                            m.id, m.w, m.h, m.refresh, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.grabbed ? "yes" : "no", m.grabKind, m.hovered ? "yes" : "no",

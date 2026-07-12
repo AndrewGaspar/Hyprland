@@ -4,6 +4,18 @@ Status: **research / design only. Nothing here is implemented.** No live runs, n
 product source, no session start/stop. `hyprctl` was read-only. Author: research pass 2026-07-11.
 Base commit: `452d6b02`.
 
+> **Addendum (2026-07-12, implemented).** Shipped as option (b) per this report, but with the
+> plug edge gated on session **VISIBILITY**, not existence: a live finding showed WiVRn running as
+> a service creates a session even with the headset **doffed on the shelf** (`state: idle`), so
+> existence-gating left the monitor effectively always plugged. `openxr:monitors_follow_session`
+> became a **mode** — `off | session | visible`, default **`visible`** — where `visible` plugs on
+> the VISIBLE/FOCUSED edge (fast don) and unplugs after `openxr:monitor_unplug_grace_ms` (default
+> 20000) of the session sitting not-visible (doffed/standby). The grace is the anti-flap this
+> report's §"why not visibility" worried about: a doff-and-straight-back-on never evacuates
+> workspaces. `session` = the original existence-gating; `off` = the pre-feature always-present
+> behavior (legacy `false/0`→off, `true/1`→session). Session end / `stop()` still unplugs
+> immediately. Funnel is `COpenXRManager::updateMonitorsPlugged()`.
+
 The ask (user's words): *"I don't really want the xrmonitors to be instantiated if an OpenXR session
 is not actually active. Go learn how to automatically cycle the monitors' 'plugged' state off when
 the session is not connected. I assume this is something Hyprland must already handle with

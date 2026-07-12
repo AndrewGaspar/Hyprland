@@ -42,13 +42,29 @@ namespace OpenXR {
     // (spec-illegal, but defended) yields XR_BLEND_OPAQUE.
     SXRBlendModePick pickBlendMode(const std::vector<eXRBlendMode>& supported, const std::string& config);
 
+    // openxr:monitors_follow_session mode (research/18 + report-18 addendum). Governs WHEN
+    // XR-created monitors behave like a plugged external display.
+    enum eXRMonitorFollowMode : uint8_t {
+        XR_FOLLOW_OFF = 0,  // never unplug — always-present (the pre-feature behavior). Legacy 0/false/no.
+        XR_FOLLOW_SESSION,  // plug while an OpenXR session EXISTS (start()..stop()). Legacy 1/true/yes.
+        XR_FOLLOW_VISIBLE,  // plug only while the session is VISIBLE/FOCUSED — a doffed/standby headset
+                            // (WiVRn keeps a session alive on the shelf) reads as unplugged. Default.
+    };
+
+    // Parse the openxr:monitors_follow_session config string to the mode. Accepts the new
+    // "off"|"session"|"visible" spellings AND the legacy boolean spellings for config compat:
+    // 0/false/no/off -> OFF, 1/true/yes/session -> SESSION, visible/focused -> VISIBLE. Anything
+    // unrecognized (including empty) -> VISIBLE (the default). Case/whitespace-insensitive. Pure.
+    eXRMonitorFollowMode parseMonitorFollowMode(const std::string& v);
+
     // Plugged-state policy (research/18 — XR monitors behave like unplugged external monitors
-    // while no session exists). Pure and unconditional so hyprland_gtests can exercise it
-    // (tests/xr/plugged.cpp). `followSession` is openxr:monitors_follow_session; `sessionUp` is
-    // the manager's session-EXISTENCE edge (start()..stop(), NOT visible/focused — mid-session
-    // proximity-sensor idle<->visible churn must never evacuate workspaces). Returns whether
-    // XR-created monitors should currently be enabled ("plugged").
-    bool wantXRMonitorsPlugged(bool followSession, bool sessionUp);
+    // while no session is usable). Pure and unconditional so hyprland_gtests can exercise it
+    // (tests/xr/plugged.cpp). `sessionUp` is the manager's session-EXISTENCE edge (start()..stop());
+    // `sessionVisible` is the VISIBLE/FOCUSED edge. Returns whether XR-created monitors should
+    // currently be enabled ("plugged"): OFF => always; SESSION => sessionUp; VISIBLE => sessionVisible.
+    // The anti-flap grace period around a VISIBLE->hidden drop is applied by the caller, NOT here —
+    // this stays a pure instantaneous predicate.
+    bool wantXRMonitorsPlugged(eXRMonitorFollowMode mode, bool sessionUp, bool sessionVisible);
 }
 
 namespace OpenXR {

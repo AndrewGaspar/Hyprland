@@ -553,7 +553,8 @@ right — generalize it):
 6. Monitor disposition per `openxr:destroy_monitors_on_stop` (doc 02): destroy
    XR-created headless outputs, or keep them with unbound layer records for the
    next `start()` — unplugged (disabled, workspaces evacuated) when
-   `openxr:monitors_follow_session` is set (research/18), plain live outputs
+   `openxr:monitors_follow_session != off` (research/18; on session end this is
+   immediate regardless of the `visible`-mode doff-grace), plain live outputs
    otherwise.
 7. State → `XR_STATE_DISABLED` (or `XR_STATE_UNAVAILABLE` when stop was triggered
    by instance loss), emit `openxrsessionstate`.

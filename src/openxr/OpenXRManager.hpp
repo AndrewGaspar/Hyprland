@@ -41,6 +41,7 @@ class CXRSession;
 class CXRGraphics;
 class CXRMonitorLayer;
 class CXRPointerDevice;
+class CEventLoopTimer;
 
 // XR monitor layers cross the frame thread via std::shared_ptr (atomic control block), NOT the
 // codebase-standard hyprutils SP whose refcount is a plain int (see the thread-safety rule in
@@ -91,16 +92,32 @@ class COpenXRManager {
     std::expected<PXRLAYER, std::string> createXRMonitor(const SXRMonitorParams& params);
     void                                 destroyXRMonitor(const std::string& name);
 
-    // Plugged-state edge (research/18 WP-M1/M2): make every XR-created monitor behave like a
-    // plugged/unplugged external monitor. `sessionUp` is the session-EXISTENCE edge (the
-    // start()/stop() boundary — never VISIBLE/FOCUSED, which flaps on the proximity sensor).
-    // With openxr:monitors_follow_session (default on), unplugging drives CMonitor::onDisconnect()
-    // (full workspace evacuation) and plugging drives onConnect(true) (name-keyed workspace
-    // return) — the exact functions the rule manager uses for `monitor=...,disable` toggles.
-    // Never destroys an output (that path is the aquamarine framecb UAF, destroyOutputDeferred).
-    // Main thread only. Idempotent — future session-lifecycle code (research/17) can call it on
-    // any re-probed edge.
-    void setMonitorsPlugged(bool sessionUp);
+    // Plugged-state applicator (research/18 WP-M1/M2): drive every XR-created monitor to the given
+    // final `plugged` state. Unplugging drives CMonitor::onDisconnect() (full workspace evacuation),
+    // plugging drives onConnect(true) (name-keyed workspace return) — the exact functions the rule
+    // manager uses for `monitor=...,disable` toggles. Never destroys an output (that path is the
+    // aquamarine framecb UAF, destroyOutputDeferred). Main thread only. Idempotent; records the
+    // applied intent in m_monitorsPlugged so updateMonitorsPlugged() can reason about the grace edge.
+    // Most callers want updateMonitorsPlugged() (which decides the target from mode+state); this is
+    // the raw apply, also used by createXRMonitor's own per-monitor gate.
+    void setMonitorsPlugged(bool plugged);
+
+    // Plugged-state decision funnel (research/18 + report-18 addendum). Reads
+    // openxr:monitors_follow_session (off|session|visible) and the current session facts, computes
+    // the desired plugged state, and applies it via setMonitorsPlugged() — EXCEPT that under the
+    // `visible` mode a VISIBLE->hidden drop (headset doffed/standby while the session persists) is
+    // deferred by openxr:monitor_unplug_grace_ms so a doff-and-straight-back-on does not evacuate
+    // workspaces. `allowGrace` enables that deferral (true only on the live session-state edge;
+    // false forces the steady state immediately — start()/stop()/reload). Cancels any pending grace
+    // timer whenever it settles the state. Main thread only. start()/stop()/onConfigReload() and the
+    // frame->main session-state dispatch all funnel here.
+    void updateMonitorsPlugged(bool allowGrace);
+
+    // Milliseconds until the pending grace-period unplug fires, or -1 when none is armed. Cheap
+    // read of the timer for `hyprctl openxr status` observability. Main thread only.
+    int  monitorUnplugPendingMs() const;
+    // The active openxr:monitors_follow_session mode as "off"|"session"|"visible" (status).
+    std::string monitorFollowModeName() const;
 
     // --- IPC verb funnel (main thread). ONE implementation, two transports: the xrmonitor
     // dispatcher and the hyprctl openxr subcommands both call these (doc 05 §3/§4). Return
@@ -189,6 +206,17 @@ class COpenXRManager {
   private:
     void setState(eXRManagerState newState);
 
+    // --- plugged-state grace timer (report-18 addendum). Main thread only. ---
+    // Session facts derived from m_state for the plugged predicate.
+    bool sessionExists() const;  // m_state ∈ {idle, visible, focused}
+    bool sessionVisible() const; // m_state ∈ {visible, focused}
+    // Arm/reschedule the one-shot grace timer to fire in `ms`; lazily created + added to the loop.
+    void armUnplugTimer(int ms);
+    // Disarm the grace timer without firing (keeps the timer object; removed only in stop()/dtor).
+    void cancelUnplugTimer();
+    // Grace-timer callback body: re-evaluate and unplug iff we still want unplugged.
+    void onUnplugGraceExpired();
+
     // Aborts an in-progress start(), tearing down whatever was created, and lands in
     // UNAVAILABLE. Safe to call at any failure point in start().
     void abortStart();
@@ -269,6 +297,13 @@ class COpenXRManager {
 
     eXRManagerState        m_state  = XR_STATE_DISABLED;
     bool                   m_active = false; // derived: state ∈ {visible, focused}
+
+    // Plugged-state bookkeeping (report-18 addendum). m_monitorsPlugged is the last plugged intent
+    // setMonitorsPlugged() applied to the session-following XR monitors, so updateMonitorsPlugged()
+    // only arms the grace timer on a real plugged->unplugged edge (never to unplug something already
+    // unplugged). m_unplugTimer is the one-shot anti-flap grace timer for the VISIBLE->hidden drop.
+    bool                m_monitorsPlugged = false;
+    SP<CEventLoopTimer> m_unplugTimer;
 
     // Populated from xrInstanceProperties/xrSystemProperties once a session exists.
     std::string       m_runtimeName;

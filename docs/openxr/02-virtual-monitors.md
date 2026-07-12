@@ -252,9 +252,21 @@ access already goes through `.lock()` guards).
 barrier needed. If `openxr:destroy_monitors_on_stop` (default 0): destroy every
 layer with `m_createdByXR` via the no-session path of (A). Else: keep the outputs
 and the layer records (swapchain unbound) for the next `start()` — and, with
-`openxr:monitors_follow_session` (default 1, research/18), UNPLUG them
-(`setMonitorsPlugged(false)` → `CMonitor::onDisconnect()`, the same evacuation a
-physical unplug runs) so a sessionless desktop has no phantom monitors.
+`openxr:monitors_follow_session != off` (default `visible`, research/18 + report-18
+addendum), UNPLUG them (`updateMonitorsPlugged()` → `setMonitorsPlugged(false)` →
+`CMonitor::onDisconnect()`, the same evacuation a physical unplug runs) so a
+sessionless desktop has no phantom monitors. Session end unplugs immediately; the
+`visible`-mode anti-flap grace (`openxr:monitor_unplug_grace_ms`) only defers the
+mid-session VISIBLE→doffed drop, never `stop()`.
+
+**Visibility edge (`visible` mode, report-18 addendum):** distinct from (C). While a
+session persists, `updateMonitorsPlugged()` (called from the frame→main session-state
+dispatch) plugs on the VISIBLE/FOCUSED edge (headset donned — immediate, fast) and
+arms a one-shot `CEventLoopTimer` grace-unplug on the drop to IDLE/SYNCHRONIZED
+(doffed/standby). Donning within the grace cancels the timer, so a doff-and-straight-
+back-on never evacuates workspaces. WiVRn running as a service keeps a session alive
+with the headset on the shelf, so `session` mode would leave those monitors always
+plugged — `visible` is the default for exactly this reason.
 
 ## Layer-count limit
 

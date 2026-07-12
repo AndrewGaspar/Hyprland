@@ -324,10 +324,34 @@ OpenXR::SXRBlendModePick OpenXR::pickBlendMode(const std::vector<eXRBlendMode>& 
     return {preferred, true};
 }
 
-bool OpenXR::wantXRMonitorsPlugged(bool followSession, bool sessionUp) {
-    // research/18: with monitors_follow_session (default), XR monitors are plugged exactly while
-    // a session exists; opting out keeps them always plugged (the pre-feature behavior).
-    return sessionUp || !followSession;
+OpenXR::eXRMonitorFollowMode OpenXR::parseMonitorFollowMode(const std::string& v) {
+    // Lower-case + strip surrounding whitespace (hyprlang trims already, but be defensive).
+    std::string s;
+    s.reserve(v.size());
+    for (const unsigned char c : v)
+        if (!std::isspace(c))
+            s += (char)std::tolower(c);
+
+    if (s == "off" || s == "0" || s == "false" || s == "no" || s == "none")
+        return XR_FOLLOW_OFF;
+    if (s == "session" || s == "1" || s == "true" || s == "yes" || s == "existence" || s == "exists")
+        return XR_FOLLOW_SESSION;
+    if (s == "visible" || s == "focused" || s == "visibility" || s == "worn")
+        return XR_FOLLOW_VISIBLE;
+    return XR_FOLLOW_VISIBLE; // default (report-18 addendum: doffed/standby headset reads as unplugged)
+}
+
+bool OpenXR::wantXRMonitorsPlugged(eXRMonitorFollowMode mode, bool sessionUp, bool sessionVisible) {
+    // research/18 + report-18 addendum: instantaneous plugged predicate. OFF keeps XR monitors
+    // always plugged (pre-feature). SESSION plugs while a session exists (WiVRn-on-the-shelf still
+    // counts). VISIBLE plugs only while the session is VISIBLE/FOCUSED — a doffed/standby headset
+    // reads as unplugged. The anti-flap grace on the VISIBLE->hidden drop is a caller concern.
+    switch (mode) {
+        case XR_FOLLOW_OFF: return true;
+        case XR_FOLLOW_SESSION: return sessionUp;
+        case XR_FOLLOW_VISIBLE: return sessionVisible;
+    }
+    return sessionVisible;
 }
 
 std::string OpenXR::anchorModeToString(eXRAnchorMode mode, eXRHand device) {

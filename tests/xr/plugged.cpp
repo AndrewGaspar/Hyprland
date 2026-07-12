@@ -4,28 +4,79 @@
 
 using namespace OpenXR;
 
-// wantXRMonitorsPlugged (XRMonitorConfig.cpp) is the pure plugged-state policy behind
-// research/18 (XR monitors behave like unplugged external monitors while no OpenXR session
-// exists). COpenXRManager::setMonitorsPlugged and createXRMonitor both consult it; these tests
-// pin the full truth table so the compositor-side wiring can rely on it blindly.
+// wantXRMonitorsPlugged / parseMonitorFollowMode (XRMonitorConfig.cpp) are the pure plugged-state
+// policy behind research/18 + the report-18 addendum (XR monitors behave like unplugged external
+// monitors while their session is not usable). COpenXRManager::updateMonitorsPlugged and
+// createXRMonitor both consult them; these tests pin the full truth table so the compositor-side
+// wiring (mode decision + the doff-grace timer) can rely on it blindly. The anti-flap grace itself
+// is manager-side timer wiring (updateMonitorsPlugged), exercised by the hyprtester suite; the
+// instantaneous predicate here is what the grace defers.
 
-// ---- monitors_follow_session = true (the default): plugged tracks session existence ----
+// ---- parse: new mode spellings + legacy boolean compat + default ----
 
-TEST(XRPluggedPolicy, FollowSessionUnpluggedWhileSessionless) {
+TEST(XRFollowModeParse, NewSpellings) {
+    EXPECT_EQ(parseMonitorFollowMode("off"), XR_FOLLOW_OFF);
+    EXPECT_EQ(parseMonitorFollowMode("session"), XR_FOLLOW_SESSION);
+    EXPECT_EQ(parseMonitorFollowMode("visible"), XR_FOLLOW_VISIBLE);
+}
+
+TEST(XRFollowModeParse, LegacyBooleanCompat) {
+    // Pre-report-18 configs used a Bool: false/0 was the always-present opt-out (off), true/1 was
+    // the existence-gated feature (session).
+    EXPECT_EQ(parseMonitorFollowMode("0"), XR_FOLLOW_OFF);
+    EXPECT_EQ(parseMonitorFollowMode("false"), XR_FOLLOW_OFF);
+    EXPECT_EQ(parseMonitorFollowMode("no"), XR_FOLLOW_OFF);
+    EXPECT_EQ(parseMonitorFollowMode("1"), XR_FOLLOW_SESSION);
+    EXPECT_EQ(parseMonitorFollowMode("true"), XR_FOLLOW_SESSION);
+    EXPECT_EQ(parseMonitorFollowMode("yes"), XR_FOLLOW_SESSION);
+}
+
+TEST(XRFollowModeParse, CaseAndWhitespaceInsensitive) {
+    EXPECT_EQ(parseMonitorFollowMode("  Visible "), XR_FOLLOW_VISIBLE);
+    EXPECT_EQ(parseMonitorFollowMode("SESSION"), XR_FOLLOW_SESSION);
+    EXPECT_EQ(parseMonitorFollowMode("Off"), XR_FOLLOW_OFF);
+    EXPECT_EQ(parseMonitorFollowMode("focused"), XR_FOLLOW_VISIBLE);
+}
+
+TEST(XRFollowModeParse, UnknownAndEmptyDefaultVisible) {
+    // report-18 addendum: the default is `visible` (a doffed/standby headset reads as unplugged).
+    EXPECT_EQ(parseMonitorFollowMode(""), XR_FOLLOW_VISIBLE);
+    EXPECT_EQ(parseMonitorFollowMode("garbage"), XR_FOLLOW_VISIBLE);
+}
+
+// ---- mode = visible (the default): plugged tracks session VISIBILITY ----
+
+TEST(XRPluggedPolicy, VisibleUnpluggedWhileDoffed) {
+    // The report-18 case: WiVRn keeps a session alive with the headset on the shelf (sessionUp but
+    // not visible) — the monitors must read as unplugged.
+    EXPECT_FALSE(wantXRMonitorsPlugged(XR_FOLLOW_VISIBLE, /*sessionUp*/ true, /*sessionVisible*/ false));
+}
+
+TEST(XRPluggedPolicy, VisiblePluggedWhileWorn) {
+    EXPECT_TRUE(wantXRMonitorsPlugged(XR_FOLLOW_VISIBLE, /*sessionUp*/ true, /*sessionVisible*/ true));
+}
+
+TEST(XRPluggedPolicy, VisibleUnpluggedWhileSessionless) {
+    EXPECT_FALSE(wantXRMonitorsPlugged(XR_FOLLOW_VISIBLE, /*sessionUp*/ false, /*sessionVisible*/ false));
+}
+
+// ---- mode = session: plugged tracks session EXISTENCE (the research/18 default) ----
+
+TEST(XRPluggedPolicy, SessionUnpluggedWhileSessionless) {
     // The fishfood login case: xrmonitor= lines materialize at init() with no headset in sight.
-    EXPECT_FALSE(wantXRMonitorsPlugged(/*followSession*/ true, /*sessionUp*/ false));
+    EXPECT_FALSE(wantXRMonitorsPlugged(XR_FOLLOW_SESSION, /*sessionUp*/ false, /*sessionVisible*/ false));
 }
 
-TEST(XRPluggedPolicy, FollowSessionPluggedWhileSessionUp) {
-    EXPECT_TRUE(wantXRMonitorsPlugged(/*followSession*/ true, /*sessionUp*/ true));
+TEST(XRPluggedPolicy, SessionPluggedWhileSessionUp) {
+    // Existence, not visibility: a doffed-but-alive session still counts as plugged in this mode.
+    EXPECT_TRUE(wantXRMonitorsPlugged(XR_FOLLOW_SESSION, /*sessionUp*/ true, /*sessionVisible*/ false));
+    EXPECT_TRUE(wantXRMonitorsPlugged(XR_FOLLOW_SESSION, /*sessionUp*/ true, /*sessionVisible*/ true));
 }
 
-// ---- monitors_follow_session = false: the pre-feature always-present behavior ----
+// ---- mode = off: the pre-feature always-present behavior ----
 
-TEST(XRPluggedPolicy, OptOutPluggedWhileSessionless) {
-    EXPECT_TRUE(wantXRMonitorsPlugged(/*followSession*/ false, /*sessionUp*/ false));
-}
-
-TEST(XRPluggedPolicy, OptOutPluggedWhileSessionUp) {
-    EXPECT_TRUE(wantXRMonitorsPlugged(/*followSession*/ false, /*sessionUp*/ true));
+TEST(XRPluggedPolicy, OffAlwaysPlugged) {
+    EXPECT_TRUE(wantXRMonitorsPlugged(XR_FOLLOW_OFF, /*sessionUp*/ false, /*sessionVisible*/ false));
+    EXPECT_TRUE(wantXRMonitorsPlugged(XR_FOLLOW_OFF, /*sessionUp*/ true, /*sessionVisible*/ false));
+    EXPECT_TRUE(wantXRMonitorsPlugged(XR_FOLLOW_OFF, /*sessionUp*/ true, /*sessionVisible*/ true));
 }

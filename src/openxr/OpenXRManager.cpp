@@ -64,6 +64,11 @@ COpenXRManager::COpenXRManager() = default;
 COpenXRManager::~COpenXRManager() {
     if (m_state != XR_STATE_DISABLED)
         stop();
+    // Drop the grace timer from the event loop so its `this`-capturing callback can never fire on
+    // freed memory (report-18 addendum). stop() only disarms it; the loop still holds an SP ref.
+    if (m_unplugTimer && g_pEventLoopManager)
+        g_pEventLoopManager->removeTimer(m_unplugTimer);
+    m_unplugTimer.reset();
 }
 
 void COpenXRManager::init() {
@@ -367,10 +372,13 @@ void COpenXRManager::start() {
     setState(XR_STATE_RUNNING_IDLE);
     Log::logger->log(Log::DEBUG, "[OPENXR] session up (runtime: {}, system: {}), frame thread started", m_runtimeName, m_systemName);
 
-    // Plug the XR monitors now that a session EXISTS (research/18 WP-M2): monitors held disabled
-    // while sessionless re-enable through the hotplug path (workspaces return by name). Done
-    // before the reconcile below so declared-set diffs (mode changes) apply to enabled outputs.
-    setMonitorsPlugged(true);
+    // Re-assert the plugged state now that a session EXISTS (research/18 WP-M2). Under the
+    // `session` mode this plugs the XR monitors immediately; under the default `visible` mode the
+    // session is still IDLE here (not worn yet), so this is a no-op until the frame->main
+    // dispatch reports VISIBLE/FOCUSED (report-18 addendum). allowGrace=false: settle the steady
+    // state at once, no doff-grace on a fresh start. Done before the reconcile below so declared-set
+    // diffs (mode changes) apply to enabled outputs.
+    updateMonitorsPlugged(/*allowGrace=*/false);
 
     // Monitors now come only from the config keyword / dispatcher / hyprctl (WP4). Any monitors
     // declared/created while disabled were already materialized as headless outputs and bound
@@ -456,9 +464,11 @@ void COpenXRManager::stop() {
     // 7. Unplug the surviving XR monitors — the session no longer exists (research/18 WP-M2).
     //    Workspaces evacuate to the remaining monitors through the ordinary hotplug path; the
     //    layers (anchor state, adaptive phase, declared spec) persist for the next start().
-    //    Runs on the session-EXISTENCE edge only — mid-session IDLE<->VISIBLE churn (proximity
-    //    sensor) never reaches stop(). No-op for layers teardownLayers just destroyed/erased.
-    setMonitorsPlugged(false);
+    //    allowGrace=false: session END is immediate, never deferred by the doff-grace (which only
+    //    covers a VISIBLE->hidden drop WHILE the session persists). m_state is STOPPING here, so
+    //    the predicate sees sessionUp=false and unplugs (unless mode==off, which stays plugged).
+    //    Also cancels any pending grace timer. No-op for layers teardownLayers just destroyed.
+    updateMonitorsPlugged(/*allowGrace=*/false);
 
     m_graphics.reset();
     m_session.reset();
@@ -553,7 +563,15 @@ void COpenXRManager::reportState(eXRManagerState s) {
 
 void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
     switch (e.type) {
-        case eXRStateEventType::SESSION_STATE: setState((eXRManagerState)e.a); break;
+        case eXRStateEventType::SESSION_STATE:
+            setState((eXRManagerState)e.a);
+            // report-18 addendum: the plugged-state visibility edge. Under the `visible` mode,
+            // reaching VISIBLE/FOCUSED plugs the XR monitors immediately (fast don), and dropping
+            // to IDLE/SYNCHRONIZED (doffed/standby) arms the anti-flap grace-unplug. allowGrace=true
+            // — this is the live proximity-sensor edge the grace exists to smooth. No-op under the
+            // `session`/`off` modes (their plugged state does not track visibility).
+            updateMonitorsPlugged(/*allowGrace=*/true);
+            break;
         case eXRStateEventType::LAYER_REMOVED:
             // Removal barrier step 3: the frame thread released a layer's resources and acked.
             finalizeLayerRemoval(e.str);
@@ -1421,15 +1439,18 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
             Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}' keeps its explicit monitor= resolution", params.m_name);
     }
 
-    // 5b. Plugged-state gate (research/18 WP-M1/M3): with monitors_follow_session (default), a
-    //     monitor created while NO session exists starts life UNPLUGGED — created (stable id,
-    //     mode applied above) then immediately disabled through the ordinary hotplug path, so a
-    //     sessionless desktop never places workspaces on a display that isn't really there. It
-    //     plugs in at the next session start (setMonitorsPlugged(true) in start()).
+    // 5b. Plugged-state gate (research/18 WP-M1/M3 + report-18 addendum): with
+    //     monitors_follow_session (default `visible`), a monitor created while the session is not
+    //     usable (no session, or — under `visible` — a doffed/standby session) starts life
+    //     UNPLUGGED: created (stable id, mode applied above) then immediately disabled through the
+    //     ordinary hotplug path, so a sessionless/doffed desktop never places workspaces on a
+    //     display that isn't really there. It plugs in on the next visibility/session edge
+    //     (updateMonitorsPlugged()). Consults the same instantaneous predicate as that funnel.
     {
-        static auto PFOLLOW = CConfigValue<Hyprlang::INT>("openxr:monitors_follow_session");
-        if (!OpenXR::wantXRMonitorsPlugged(*PFOLLOW != 0, m_running.load()) && mon->m_enabled) {
-            Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}' created unplugged (no session)", params.m_name);
+        static auto PFOLLOW = CConfigValue<std::string>("openxr:monitors_follow_session");
+        const auto  mode    = OpenXR::parseMonitorFollowMode(*PFOLLOW);
+        if (!OpenXR::wantXRMonitorsPlugged(mode, sessionExists(), sessionVisible()) && mon->m_enabled) {
+            Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}' created unplugged (session not visible)", params.m_name);
             mon->onDisconnect();
         }
     }
@@ -1632,14 +1653,106 @@ void COpenXRManager::teardownLayers() {
     }
 }
 
-void COpenXRManager::setMonitorsPlugged(bool sessionUp) {
+bool COpenXRManager::sessionExists() const {
+    return m_state == XR_STATE_RUNNING_IDLE || m_state == XR_STATE_RUNNING_VISIBLE || m_state == XR_STATE_RUNNING_FOCUSED;
+}
+
+bool COpenXRManager::sessionVisible() const {
+    return m_state == XR_STATE_RUNNING_VISIBLE || m_state == XR_STATE_RUNNING_FOCUSED;
+}
+
+std::string COpenXRManager::monitorFollowModeName() const {
+    static auto PFOLLOW = CConfigValue<std::string>("openxr:monitors_follow_session");
+    switch (OpenXR::parseMonitorFollowMode(*PFOLLOW)) {
+        case OpenXR::XR_FOLLOW_OFF: return "off";
+        case OpenXR::XR_FOLLOW_SESSION: return "session";
+        case OpenXR::XR_FOLLOW_VISIBLE: return "visible";
+    }
+    return "visible";
+}
+
+int COpenXRManager::monitorUnplugPendingMs() const {
+    if (!m_unplugTimer || !m_unplugTimer->armed())
+        return -1;
+    const float leftUs = m_unplugTimer->leftUs();
+    return leftUs <= 0.f ? 0 : (int)(leftUs / 1000.f);
+}
+
+void COpenXRManager::armUnplugTimer(int ms) {
+    const auto dur = std::chrono::milliseconds(std::max(0, ms));
+    if (!m_unplugTimer) {
+        m_unplugTimer = makeShared<CEventLoopTimer>(
+            dur, [this](SP<CEventLoopTimer> self, void*) { onUnplugGraceExpired(); }, nullptr);
+        if (g_pEventLoopManager)
+            g_pEventLoopManager->addTimer(m_unplugTimer);
+    } else
+        m_unplugTimer->updateTimeout(dur);
+}
+
+void COpenXRManager::cancelUnplugTimer() {
+    if (m_unplugTimer)
+        m_unplugTimer->updateTimeout(std::nullopt); // disarm; keep the object (removed in stop()/dtor)
+}
+
+void COpenXRManager::onUnplugGraceExpired() {
+    // The grace window elapsed with the headset still doffed/standby. Re-evaluate against the
+    // CURRENT state — if visibility returned in the meantime, updateMonitorsPlugged already
+    // cancelled us and re-plugged, but re-check defensively so a stale fire can never unplug a
+    // visible session.
+    static auto PFOLLOW = CConfigValue<std::string>("openxr:monitors_follow_session");
+    const bool  want    = OpenXR::wantXRMonitorsPlugged(OpenXR::parseMonitorFollowMode(*PFOLLOW), sessionExists(), sessionVisible());
+    if (!want && m_monitorsPlugged) {
+        Log::logger->log(Log::DEBUG, "[OPENXR] monitor unplug grace elapsed (headset doffed/standby) — unplugging XR monitors");
+        setMonitorsPlugged(false);
+    }
+}
+
+void COpenXRManager::updateMonitorsPlugged(bool allowGrace) {
+    // Decision funnel (report-18 addendum). Compute the desired plugged state from the mode +
+    // current session facts, then apply — deferring only the plugged->unplugged edge under the
+    // `visible` mode's anti-flap grace. Main thread only.
+    static auto PFOLLOW = CConfigValue<std::string>("openxr:monitors_follow_session");
+    const auto  mode    = OpenXR::parseMonitorFollowMode(*PFOLLOW);
+    const bool  up      = sessionExists();
+    const bool  vis     = sessionVisible();
+    const bool  want    = OpenXR::wantXRMonitorsPlugged(mode, up, vis);
+
+    if (want) {
+        // Donning / session came up: plug immediately (cancel any pending doff-grace unplug).
+        cancelUnplugTimer();
+        setMonitorsPlugged(true);
+        return;
+    }
+
+    // want == false. If the monitors are already unplugged there is nothing to grace — settle.
+    if (!m_monitorsPlugged) {
+        cancelUnplugTimer();
+        return;
+    }
+
+    // Currently plugged, now want unplugged. `want==false && up` can only happen under the
+    // `visible` mode (a doffed/standby headset whose session persists) — that is the anti-flap
+    // case. A vanished session (up==false: stop/session-end) or a deliberate reload unplugs now.
+    if (allowGrace && up) {
+        static auto PGRACE = CConfigValue<Hyprlang::INT>("openxr:monitor_unplug_grace_ms");
+        const int   ms     = (int)std::max<int64_t>(0, (int64_t)*PGRACE);
+        Log::logger->log(Log::DEBUG, "[OPENXR] session no longer visible (doffed/standby) — arming {}ms monitor unplug grace", ms);
+        armUnplugTimer(ms);
+        return;
+    }
+
+    cancelUnplugTimer();
+    setMonitorsPlugged(false);
+}
+
+void COpenXRManager::setMonitorsPlugged(bool plugged) {
     // research/18 WP-M1/M2 (option b — create-but-disabled): XR-created headless outputs behave
-    // like UNPLUGGED external monitors while no OpenXR session exists. This is the single
-    // plugged-state edge; start()/stop()/onConfigReload() (and future research/17 lifecycle
-    // re-probes) all funnel here. Main thread only — onConnect/onDisconnect are hotplug entry
-    // points and CMonitor refs are hyprutils SPs (see the thread rule in XRMonitorLayer.hpp).
-    static auto PFOLLOW = CConfigValue<Hyprlang::INT>("openxr:monitors_follow_session");
-    const bool  want    = OpenXR::wantXRMonitorsPlugged(*PFOLLOW != 0, sessionUp);
+    // like UNPLUGGED external monitors while their session is unusable. Pure applicator: drive
+    // every session-following XR monitor to `plugged`. Main thread only — onConnect/onDisconnect
+    // are hotplug entry points and CMonitor refs are hyprutils SPs (see the thread rule in
+    // XRMonitorLayer.hpp). The plug/unplug DECISION (mode + grace) lives in updateMonitorsPlugged().
+    const bool want   = plugged;
+    m_monitorsPlugged = plugged;
 
     // Snapshot under the lock; drive the transitions without it (onConnect/onDisconnect re-enter
     // large parts of the compositor: workspace moves, focus, events).
@@ -1660,7 +1773,7 @@ void COpenXRManager::setMonitorsPlugged(bool sessionUp) {
         if (mon->m_enabled == want)
             continue;
 
-        Log::logger->log(Log::DEBUG, "[OPENXR] {} XR monitor '{}' (session {})", want ? "plugging" : "unplugging", l->m_monitorName, sessionUp ? "up" : "down");
+        Log::logger->log(Log::DEBUG, "[OPENXR] {} XR monitor '{}'", want ? "plugging" : "unplugging", l->m_monitorName);
 
         // The same two functions the rule manager dispatches for a runtime `monitor=...,disable`
         // flip (MonitorRuleManager::ensureMonitorStatus): onDisconnect() evacuates workspaces to a
@@ -1734,12 +1847,13 @@ void COpenXRManager::onConfigReload() {
         markSwapchainsDirtyIfChromeChanged();
     }
 
-    // Re-assert the plugged state (research/18): idempotent, so the normal reload path is a
-    // no-op, but this (a) applies a toggled openxr:monitors_follow_session live, and (b) heals
-    // the rare reload where a changed `monitor=` rule made the rule manager re-enable a monitor
-    // we hold unplugged (ensureMonitorStatus runs before config.reloaded is emitted, so this
-    // listener always has the last word).
-    setMonitorsPlugged(m_running.load());
+    // Re-assert the plugged state (research/18 + report-18 addendum): idempotent, so the normal
+    // reload path is a no-op, but this (a) applies a re-tuned openxr:monitors_follow_session mode
+    // live, and (b) heals the rare reload where a changed `monitor=` rule made the rule manager
+    // re-enable a monitor we hold unplugged (ensureMonitorStatus runs before config.reloaded is
+    // emitted, so this listener always has the last word). allowGrace=false: a deliberate reload
+    // settles the steady state at once rather than arming a doff-grace.
+    updateMonitorsPlugged(/*allowGrace=*/false);
 
     // Re-run so that toggling openxr:inhibit_idle takes effect immediately (WP9 hook).
     if (g_pInputManager)
