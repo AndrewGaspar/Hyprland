@@ -135,7 +135,18 @@ bool CXRSession::createInstance() {
 bool CXRSession::getSystem() {
     XrSystemGetInfo sysInfo = {XR_TYPE_SYSTEM_GET_INFO};
     sysInfo.formFactor      = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
-    XR_CHK(xrGetSystem(m_instance, &sysInfo, &m_systemId));
+    // report-20 issue B1: classify the failure so the manager's dormant re-probe can tell "runtime up
+    // but headset not connected" (FORM_FACTOR_UNAVAILABLE — the spec-intended poll-me result) from a
+    // genuine runtime error. Don't use XR_CHK here: it early-returns before we can record the reason.
+    {
+        const XrResult _sr    = xrGetSystem(m_instance, &sysInfo, &m_systemId);
+        m_formFactorUnavailable = (_sr == XR_ERROR_FORM_FACTOR_UNAVAILABLE);
+        if (XR_FAILED(_sr)) {
+            Log::logger->log(m_formFactorUnavailable ? Log::DEBUG : Log::ERR, "[OPENXR] xrGetSystem failed: {}{}", (int)_sr,
+                             m_formFactorUnavailable ? " (headset not connected / not donned)" : "");
+            return false;
+        }
+    }
 
     XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
     // Chain XrSystemUserPresencePropertiesEXT to learn whether the DEVICE supports user presence
