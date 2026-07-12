@@ -83,6 +83,15 @@ bool CXRSession::createInstance() {
         exts.push_back("XR_EXT_hand_tracking");
     m_usingLocalFloor = m_hasLocalFloor;
 
+    // XR_KHR_vulkan_enable2 (probe-only): enabled purely so start() can learn which GPU the
+    // runtime composites on (OpenXR::probeRuntimeRenderNode) and fail closed on a wrong openxr:gpu
+    // BEFORE the frame thread hands the runtime a cross-GPU EGL context — which hard-crashes the
+    // graphics driver (radeonsi driUnbindContext, coredumps 8986/39318). The session itself still
+    // uses the EGL/GLES binding; the two graphics enable-extensions coexist on one instance.
+    m_hasVulkanEnable2 = hasExt("XR_KHR_vulkan_enable2");
+    if (m_hasVulkanEnable2)
+        exts.push_back("XR_KHR_vulkan_enable2");
+
     // Overlay session (doc 01): enable XR_EXTX_overlay only when requested (openxr:overlay) AND
     // advertised by the runtime. Requested-but-unsupported downgrades to a normal session with a
     // one-time WARN — never fail startup for this. m_isOverlay is the actual decision, consumed by

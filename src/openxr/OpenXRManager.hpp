@@ -67,6 +67,11 @@ class COpenXRManager {
     eXRManagerState    state() const;
     const std::string& runtimeName() const;
     const std::string& systemName() const;
+    // Human-readable description of the GPU the runtime composites on, as resolved by the
+    // wrong-GPU probe at start() ("<device name> (drm <maj>:<min>)"), or empty when it could not
+    // be determined (runtime lacks XR_KHR_vulkan_enable2, no Vulkan, etc.). Surfaced in status so
+    // the user can see which GPU to point openxr:gpu at.
+    const std::string& runtimeGpu() const;
     // Currently-active environment blend mode as "opaque"|"alpha"|"additive" (doc 05 §4.3). The
     // selected mode while a session exists; "opaque" (the default) otherwise.
     std::string        blendModeName() const;
@@ -268,6 +273,8 @@ class COpenXRManager {
     // Populated from xrInstanceProperties/xrSystemProperties once a session exists.
     std::string       m_runtimeName;
     std::string       m_systemName;
+    // Set by the wrong-GPU probe in start() (see runtimeGpu()); empty when undeterminable.
+    std::string       m_runtimeGpu;
 
     UP<CXRIpc>        m_ipc;
     UP<CXRSession>    m_session;

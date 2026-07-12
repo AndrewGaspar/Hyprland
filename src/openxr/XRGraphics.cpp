@@ -12,6 +12,8 @@
 #include <vector>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 
 #include <gbm.h>
 #include <xf86drm.h>
@@ -42,13 +44,28 @@ static PFNGLEGLIMAGETARGETTEX2DOESPROC_t s_glImageTarget2D = nullptr;
 #endif
 
 CXRGraphics::CScopedGLContext::CScopedGLContext(CXRGraphics& gfx) : m_gfx(gfx) {
+    // Save the binding that is current on THIS thread so the dtor can restore it verbatim (WP-L1,
+    // doc 17 §5). On the main thread this is Hyprland's renderer context (+ its surfaces); on the
+    // frame thread nothing is current between bursts, so this captures EGL_NO_CONTEXT.
+    m_savedDisplay = eglGetCurrentDisplay();
+    m_savedContext = eglGetCurrentContext();
+    m_savedDraw    = eglGetCurrentSurface(EGL_DRAW);
+    m_savedRead    = eglGetCurrentSurface(EGL_READ);
     eglMakeCurrent(m_gfx.m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, m_gfx.m_xrContext);
 }
 
 CXRGraphics::CScopedGLContext::~CScopedGLContext() {
-    // Always leave the context UNBOUND — Monado's compositor thread binds it itself, and
-    // leaving it current across an XR interop call crashes AMD gallium (doc 01).
-    eglMakeCurrent(m_gfx.m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    // Restore the pre-burst binding instead of blindly unbinding. This both keeps the interop
+    // contract (the XR context must NOT stay current across a runtime GL call — Monado/WiVRn bind
+    // it themselves; a lingering XR context crashes AMD gallium, doc 01) AND repairs the main
+    // thread's binding so Hyprland's renderer is not left running against an unbound/stale context
+    // (doc 17 §5 "bug a"). Never restore the XR context itself: it is only ever transiently current
+    // inside this scope, and re-binding it would violate the interop contract and pin it to this
+    // thread (blocking the frame thread from claiming it). Fall back to a clean unbind otherwise.
+    if (m_savedContext != EGL_NO_CONTEXT && m_savedContext != m_gfx.m_xrContext && m_savedDisplay != EGL_NO_DISPLAY)
+        eglMakeCurrent(m_savedDisplay, m_savedDraw, m_savedRead, m_savedContext);
+    else
+        eglMakeCurrent(m_gfx.m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 }
 
 CXRGraphics::~CXRGraphics() {
@@ -127,6 +144,15 @@ bool CXRGraphics::selectDisplay(const std::string& gpuOverride) {
             m_gbmOwned    = gbm;
             m_gbmFd       = fd;
             m_ownsDisplay = true;
+            // Record the node's DRM device numbers so start() can verify it matches the runtime's
+            // GPU before handing the runtime a (possibly cross-GPU) EGL binding.
+            struct stat st;
+            if (fstat(fd, &st) == 0) {
+                m_selectedNode.path  = path;
+                m_selectedNode.major = (int64_t)major(st.st_rdev);
+                m_selectedNode.minor = (int64_t)minor(st.st_rdev);
+                m_selectedNode.valid = true;
+            }
             return true;
         }
     }
@@ -655,8 +681,12 @@ void CXRGraphics::destroyGL() {
     if (m_xrContext == EGL_NO_CONTEXT)
         return;
 
-    // GL objects must be deleted with the context current — briefly make it so.
-    eglMakeCurrent(m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, m_xrContext);
+    // GL objects must be deleted with the XR context current. Go through CScopedGLContext so this
+    // teardown burst (main-thread stop()/abortStart(), or the dtor) SAVES and RESTORES the caller's
+    // EGL binding instead of dropping to EGL_NO_CONTEXT (WP-L1, doc 17 §5): the stop path is
+    // precisely where the old unconditional unbind left Hyprland's renderer running against an
+    // unbound context on the same GPU — a candidate for the on-toggle host-monitor corruption.
+    CScopedGLContext ctx(*this);
     if (m_extTex) {
         glDeleteTextures(1, &m_extTex);
         m_extTex = 0;
@@ -669,7 +699,6 @@ void CXRGraphics::destroyGL() {
         glDeleteProgram(m_blitProg);
         m_blitProg = 0;
     }
-    eglMakeCurrent(m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 }
 
 void CXRGraphics::destroyEGL() {

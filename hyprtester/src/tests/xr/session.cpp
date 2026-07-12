@@ -6,7 +6,9 @@
 #include "../../Log.hpp"
 #include "../../xr/xr_helpers.hpp"
 
+#include <filesystem>
 #include <string>
+#include <system_error>
 
 namespace {
     // RAII: dump artifacts iff the test ended up failed (docs §5.2).
@@ -84,6 +86,82 @@ TEST_CASE(xr_runtime_absent) {
     // the monitor is HEADLESS-1 under the headless backend, WAYLAND-1 when nested.)
     const std::string monitorsJson = getFromSocket("j/monitors");
     EXPECT_CONTAINS(monitorsJson, "\"activeWorkspace\"");
+}
+
+// Test — xr_gpu_mismatch_fails_closed: pointing openxr:gpu at a GPU that is NOT the one the
+// runtime composites on used to take the WHOLE compositor down — the runtime imports cross-GPU
+// buffers at xrCreateSwapchain and hard-crashes inside the graphics driver (radeonsi
+// driUnbindContext SEGV, coredumps 8986/39318). The runtime-GPU probe (XR_KHR_vulkan_enable2)
+// now catches the mismatch at start() and fails closed: `enable` reports the runtime unavailable,
+// the manager lands in "unavailable", and the desktop session keeps running.
+//
+// Requirements to actually exercise it (SKIP otherwise, so single-GPU CI stays green):
+//   * a runtime is present (XR_SKIP_IF_UNAVAILABLE),
+//   * the probe determined the runtime's GPU (status.runtimeGpu non-empty) — WITHOUT a working
+//     probe, forcing the wrong GPU would reintroduce the very crash we're guarding, so we refuse
+//     to try,
+//   * openxr:gpu is pinned to a render node, and a SECOND distinct render node exists to force.
+TEST_CASE(xr_gpu_mismatch_fails_closed) {
+    XR_SKIP_IF_UNAVAILABLE();
+
+    SArtifactGuard guard{this->failed, name()};
+
+    // The probe must be able to name the runtime's GPU, or forcing a wrong pin is unsafe.
+    const std::string status0   = getFromSocket("j/openxr");
+    const std::string runtimeGpu = XR::fieldAfter(status0, 0, "runtimeGpu");
+    if (runtimeGpu.empty()) {
+        XR::logSkip(name(), "runtime GPU could not be probed (no XR_KHR_vulkan_enable2 / Vulkan); forcing a wrong GPU would risk the crash");
+        return;
+    }
+
+    // The currently-pinned (working) GPU is, by definition, the runtime's node — that's why the
+    // suite is up. Any OTHER existing render node is a guaranteed cross-GPU mismatch.
+    const std::string optJson   = getFromSocket("j/getoption openxr:gpu");
+    const std::string currentGpu = XR::fieldAfter(optJson, 0, "str");
+    if (currentGpu.find("/dev/dri/render") == std::string::npos) {
+        XR::logSkip(name(), "openxr:gpu is not pinned to a render node; cannot derive a deterministically-wrong GPU");
+        return;
+    }
+
+    std::string     wrongGpu;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator("/dev/dri", ec)) {
+        const std::string p = e.path().string();
+        if (p.find("/renderD") != std::string::npos && p != currentGpu) {
+            wrongGpu = p;
+            break;
+        }
+    }
+    if (wrongGpu.empty()) {
+        XR::logSkip(name(), "only one DRM render node present; cross-GPU mismatch is not reproducible on this box");
+        return;
+    }
+
+    NLog::log("xr_gpu_mismatch_fails_closed: runtime GPU {} (pinned {}), forcing wrong GPU {}", runtimeGpu, currentGpu, wrongGpu);
+
+    // Force the wrong GPU and restart the session. Pre-fix, this crashed the whole compositor;
+    // the assertion is that we now survive and fail closed.
+    getFromSocket("/keyword openxr:gpu " + wrongGpu);
+    getFromSocket("/openxr disable");
+    XR::waitForXrState("disabled", std::chrono::milliseconds(5000));
+
+    const std::string enableReply = getFromSocket("/openxr enable");
+    // Guard fired: the runtime-GPU probe rejected the cross-GPU pin (start() returns UNAVAILABLE).
+    EXPECT_CONTAINS(enableReply, "unavailable");
+    ASSERT(XR::waitForXrState("unavailable", std::chrono::milliseconds(10000)), true);
+
+    // The whole point: the compositor is fully alive after refusing the bad GPU.
+    EXPECT_CONTAINS(getFromSocket("j/monitors"), "\"activeWorkspace\"");
+    EXPECT_CONTAINS(getFromSocket("j/openxr"), "\"state\": \"unavailable\"");
+
+    // Restore the good GPU and bring XR back up so the rest of the group is unaffected.
+    getFromSocket("/keyword openxr:gpu " + currentGpu);
+    getFromSocket("/openxr disable");
+    XR::waitForXrState("disabled", std::chrono::milliseconds(5000));
+    getFromSocket("/openxr enable");
+    // Best-effort recovery (timing varies); don't hard-fail the test on the restore leg.
+    if (!XR::waitForXrState("focused", std::chrono::milliseconds(15000)))
+        XR::waitForXrState("visible", std::chrono::milliseconds(3000));
 }
 
 #endif // WITH_XR_TESTS
