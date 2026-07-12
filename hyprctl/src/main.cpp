@@ -444,6 +444,8 @@ int main(int argc, char** argv) {
                     std::println("{}", HYPRSUNSET_HELP);
                 } else if (cmd == "notify") {
                     std::println("{}", NOTIFY_HELP);
+                } else if (cmd == "openxr") {
+                    std::println("{}", OPENXR_HELP);
                 } else if (cmd == "output") {
                     std::println("{}", OUTPUT_HELP);
                 } else if (cmd == "plugin") {

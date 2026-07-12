@@ -37,6 +37,8 @@ commands:
                           'monitors all' lists active and inactive outputs
     notify ...          → Sends a notification using the built-in Hyprland
                           notification system
+    openxr ...          → Controls the OpenXR extension: session state, XR
+                          monitor lifecycle, pose verbs, adaptive anchoring
     output ...          → Allows you to add and remove fake outputs to your
                           preferred backend
     plugin ...          → Issue a plugin request
@@ -115,6 +117,36 @@ color:
 
 message:
     Notification message
+
+flags:
+    See 'hyprctl --help')#";
+
+const std::string_view OPENXR_HELP = R"#(usage: hyprctl [flags] openxr [request]
+
+requests:
+    status (default) → Session/runtime state and all XR monitors (supports -j)
+    enable           → Start the OpenXR session (connect to the runtime)
+    disable          → Stop the OpenXR session
+
+    create <name> <WxH[@Hz]> <anchor-spec...> [size:M]
+                     → Create an XR monitor (same grammar as the xrmonitor
+                       config keyword, space-separated; see example/openxr.conf)
+    destroy <name>   → Destroy an XR monitor
+    select <name>    → Select the monitor subsequent verbs act on
+    layout           → Dump paste-ready xrmonitor config lines with the LIVE
+                       poses (persist an in-headset arrangement)
+
+    anchor <spec>    → Re-anchor the selected monitor (local/head/body/device)
+    move <dx dy dz>  → Nudge the selected monitor (metres)
+    rotate <yaw [pitch]> → Rotate (degrees)
+    scale <factor|size:M> → Resize the quad
+    distance <±M|M>  → Push/pull along the anchor ray
+    center           → Recenter in front of the current view
+
+    adaptive <on|off|toggle> → Adaptive dock<->follow on the selected monitor
+    dock [here]      → Force-dock (optionally at the current pose)
+    undock           → Force-undock into the roam leash
+    roam <head|body> → Roam-follow mode while undocked
 
 flags:
     See 'hyprctl --help')#";
