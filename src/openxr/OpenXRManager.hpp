@@ -14,6 +14,7 @@
 
 #include "../helpers/memory/Memory.hpp"
 #include "../helpers/signal/Signal.hpp"
+#include "../helpers/time/Time.hpp" // Time::steady_tp (presence blip window)
 #include "../desktop/DesktopTypes.hpp" // PHLMONITOR (applyCrossGpuLinear)
 #include "XRMonitorConfig.hpp"
 #include "XRInput.hpp" // SXRInputEvent / SXRStateEvent / XRQueueItem / CXRQueue / CXRInput
@@ -119,6 +120,9 @@ class COpenXRManager {
     int  monitorUnplugPendingMs() const;
     // The active openxr:monitors_follow_session mode as "off"|"session"|"visible" (status).
     std::string monitorFollowModeName() const;
+    // `hyprctl openxr status` presence field (report-19): "unsupported" (no XR_EXT_user_presence /
+    // device can't report it) | "unknown" (supported, no event yet) | "yes"/"no" (donned/doffed).
+    std::string presenceStatusString() const;
 
     // --- IPC verb funnel (main thread). ONE implementation, two transports: the xrmonitor
     // dispatcher and the hyprctl openxr subcommands both call these (doc 05 §3/§4). Return
@@ -221,6 +225,20 @@ class COpenXRManager {
     // Grace-timer callback body: re-evaluate and unplug iff we still want unplugged.
     void onUnplugGraceExpired();
 
+    // report-19 plug decision. monitorsShouldBePluggedNow(): the pure predicate (mode + session +
+    // presence facts) AND the first-plug blip guard — the single source of truth for the plugged
+    // target, shared by updateMonitorsPlugged(), createXRMonitor()'s per-monitor gate, and the timer
+    // callbacks. visibleSustainedMs(): how long the session has been continuously VISIBLE (0 if not).
+    bool          monitorsShouldBePluggedNow() const;
+    int64_t       visibleSustainedMs() const;
+    int           plugSettleMs() const; // openxr:monitor_plug_settle_ms, clamped >= 0
+    // Fallback first-plug settle timer (mirrors the unplug grace timer).
+    void          armPlugSettleTimer(int ms);
+    void          cancelPlugSettleTimer();
+    void          onPlugSettleExpired();
+    // Reset the per-session presence/plug bookkeeping (start()/session end).
+    void          resetPresenceState();
+
     // Aborts an in-progress start(), tearing down whatever was created, and lands in
     // UNAVAILABLE. Safe to call at any failure point in start().
     void abortStart();
@@ -314,6 +332,24 @@ class COpenXRManager {
     // unplugged). m_unplugTimer is the one-shot anti-flap grace timer for the VISIBLE->hidden drop.
     bool                m_monitorsPlugged = false;
     SP<CEventLoopTimer> m_unplugTimer;
+
+    // User-presence gating (report-19). m_userPresenceSupported is latched at start() from
+    // CXRSession::m_supportsUserPresence (the ext advertised AND the device supports presence); when
+    // true the `visible` mode gates on presence, not raw visibility. m_presenceKnown flips true on
+    // the first presence event of a session (before it, `visible` reads as ABSENT so a doffed
+    // session-create sprint never plugs). m_userPresent is the last don/doff state. All main thread.
+    bool                m_userPresenceSupported = false;
+    bool                m_presenceKnown         = false;
+    bool                m_userPresent           = false;
+
+    // First-plug blip guard for the no-presence fallback (report-19). m_everPlugged: have we plugged
+    // at least once this session (after that the anti-flap grace governs, not the blip gate).
+    // m_visibleSince: when the session last became VISIBLE (for the sustained-visibility check).
+    // m_plugSettleTimer: one-shot that re-runs the funnel once the blip window elapses so the first
+    // plug lands without an external edge to trigger it.
+    bool                       m_everPlugged = false;
+    std::optional<Time::steady_tp> m_visibleSince;
+    SP<CEventLoopTimer>        m_plugSettleTimer;
 
     // Populated from xrInstanceProperties/xrSystemProperties once a session exists.
     std::string       m_runtimeName;
