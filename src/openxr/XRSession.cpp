@@ -92,6 +92,13 @@ bool CXRSession::createInstance() {
     if (m_hasVulkanEnable2)
         exts.push_back("XR_KHR_vulkan_enable2");
 
+    // XR_EXT_user_presence (report-19): enable it when advertised so the plug gate can key on the
+    // real donned/doffed signal instead of session visibility (WiVRn advertises it; system support is
+    // confirmed separately in getSystem). Availability recorded either way for the visibility fallback.
+    m_hasUserPresence = hasExt(XR_EXT_USER_PRESENCE_EXTENSION_NAME);
+    if (m_hasUserPresence)
+        exts.push_back(XR_EXT_USER_PRESENCE_EXTENSION_NAME);
+
     // Overlay session (doc 01): enable XR_EXTX_overlay only when requested (openxr:overlay) AND
     // advertised by the runtime. Requested-but-unsupported downgrades to a normal session with a
     // one-time WARN — never fail startup for this. m_isOverlay is the actual decision, consumed by
@@ -120,8 +127,8 @@ bool CXRSession::createInstance() {
     if (XR_SUCCEEDED(xrGetInstanceProperties(m_instance, &props)))
         m_runtimeName = props.runtimeName;
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] instance created (runtime: {}, local_floor: {}, hand_interaction: {}, hand_tracking: {}, overlay: {})",
-                     m_runtimeName.empty() ? "?" : m_runtimeName, m_hasLocalFloor, m_hasHandInteraction, m_hasHandTracking, m_isOverlay);
+    Log::logger->log(Log::DEBUG, "[OPENXR] instance created (runtime: {}, local_floor: {}, hand_interaction: {}, hand_tracking: {}, overlay: {}, user_presence: {})",
+                     m_runtimeName.empty() ? "?" : m_runtimeName, m_hasLocalFloor, m_hasHandInteraction, m_hasHandTracking, m_isOverlay, m_hasUserPresence);
     return true;
 }
 
@@ -131,14 +138,26 @@ bool CXRSession::getSystem() {
     XR_CHK(xrGetSystem(m_instance, &sysInfo, &m_systemId));
 
     XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
+    // Chain XrSystemUserPresencePropertiesEXT to learn whether the DEVICE supports user presence
+    // (report-19): the ext may be enabled while the current device does not report presence (Monado
+    // null/remote), in which case we must fall back to the visibility signal rather than gate on a
+    // presence event that never comes.
+    XrSystemUserPresencePropertiesEXT presenceProps = {XR_TYPE_SYSTEM_USER_PRESENCE_PROPERTIES_EXT};
+    if (m_hasUserPresence) {
+        presenceProps.next = sysProps.next;
+        sysProps.next      = &presenceProps;
+    }
     if (XR_SUCCEEDED(xrGetSystemProperties(m_instance, m_systemId, &sysProps))) {
         m_systemName    = sysProps.systemName;
         m_maxLayerCount = sysProps.graphicsProperties.maxLayerCount;
         if (m_maxLayerCount < 16) // spec guarantees at least 16
             m_maxLayerCount = 16;
+        if (m_hasUserPresence)
+            m_supportsUserPresence = presenceProps.supportsUserPresence;
     }
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] system id {} ({}), maxLayerCount {}", (unsigned long long)m_systemId, m_systemName.empty() ? "?" : m_systemName, m_maxLayerCount);
+    Log::logger->log(Log::DEBUG, "[OPENXR] system id {} ({}), maxLayerCount {}, user_presence {}", (unsigned long long)m_systemId, m_systemName.empty() ? "?" : m_systemName,
+                     m_maxLayerCount, !m_hasUserPresence ? "ext-absent" : (m_supportsUserPresence ? "supported" : "unsupported"));
 
     // Enumerate the supported environment blend modes for the primary-stereo view configuration
     // (doc 01). This needs only instance + system (not a session), so it runs here. The list is
@@ -344,6 +363,16 @@ void CXRSession::pollEvents() {
                 // happen in CXRInput::refreshHandProfiles.
                 m_interactionProfileChanged = true;
                 Log::logger->log(Log::DEBUG, "[OPENXR] interaction profile changed");
+                break;
+            }
+            case XR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT: {
+                // report-19: the headset was donned or doffed (or the runtime's initial presence
+                // report at session begin). Record it + flag for the frame loop to forward to main,
+                // where it drives the `visible`-mode monitor plug/unplug edges.
+                auto* ev              = reinterpret_cast<XrEventDataUserPresenceChangedEXT*>(&event);
+                m_userPresent         = ev->isUserPresent;
+                m_userPresenceChanged = true;
+                Log::logger->log(Log::DEBUG, "[OPENXR] user presence changed -> {}", (bool)m_userPresent ? "present" : "absent");
                 break;
             }
             case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING: {

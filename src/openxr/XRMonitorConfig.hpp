@@ -79,14 +79,27 @@ namespace OpenXR {
     // nodes. No OpenXR/aquamarine types so hyprland_gtests can exercise it without a runtime.
     bool shouldForceLinear(eForceLinearMode mode, bool xrValid, int64_t xrMajor, int64_t xrMinor, bool allocValid, int64_t allocMajor, int64_t allocMinor);
 
-    // Plugged-state policy (research/18 — XR monitors behave like unplugged external monitors
-    // while no session is usable). Pure and unconditional so hyprland_gtests can exercise it
-    // (tests/xr/plugged.cpp). `sessionUp` is the manager's session-EXISTENCE edge (start()..stop());
-    // `sessionVisible` is the VISIBLE/FOCUSED edge. Returns whether XR-created monitors should
-    // currently be enabled ("plugged"): OFF => always; SESSION => sessionUp; VISIBLE => sessionVisible.
-    // The anti-flap grace period around a VISIBLE->hidden drop is applied by the caller, NOT here —
-    // this stays a pure instantaneous predicate.
-    bool wantXRMonitorsPlugged(eXRMonitorFollowMode mode, bool sessionUp, bool sessionVisible);
+    // Plugged-state policy (research/18 + report-18/19 addenda — XR monitors behave like unplugged
+    // external monitors while the headset is not being worn). Pure and unconditional so
+    // hyprland_gtests can exercise it (tests/xr/plugged.cpp). Instantaneous predicate — the anti-flap
+    // grace and the first-plug blip guard are the caller's concern (see xrDeferFirstPlug).
+    //   OFF     => always plugged.
+    //   SESSION => sessionUp (a session exists; WiVRn-on-the-shelf counts).
+    //   VISIBLE => gate on the REAL donned signal:
+    //     * presenceSupported (XR_EXT_user_presence advertised AND supported): userPresent, but only
+    //       once presenceKnown (>=1 presence event seen) — before the first event we read as ABSENT so
+    //       the session-create visibility sprint (WiVRn goes FOCUSED within ~40ms while doffed on the
+    //       shelf) never plugs. This is the authoritative signal (proximity sensor / don-doff).
+    //     * otherwise (no presence ext): fall back to raw sessionVisible. On such runtimes visibility
+    //       IS the best we have; the create-time blip is handled by the caller's xrDeferFirstPlug gate.
+    bool wantXRMonitorsPlugged(eXRMonitorFollowMode mode, bool sessionUp, bool sessionVisible, bool presenceSupported, bool presenceKnown, bool userPresent);
+
+    // First-plug blip guard for the no-presence fallback (report-19). Whether a would-be plug must be
+    // DEFERRED because it is the first plug of the session and visibility has not yet been sustained
+    // past the session-start blip window. Presence-capable runtimes and any subsequent plug (everPlugged)
+    // never defer — presence already suppresses the blip, and later edges use the anti-flap grace.
+    // Pure/gtestable; the caller supplies how long visibility has been continuously true.
+    bool xrDeferFirstPlug(bool presenceSupported, bool everPlugged, int64_t visibleSustainedMs, int64_t blipMs);
 }
 
 namespace OpenXR {

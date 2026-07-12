@@ -341,17 +341,27 @@ OpenXR::eXRMonitorFollowMode OpenXR::parseMonitorFollowMode(const std::string& v
     return XR_FOLLOW_VISIBLE; // default (report-18 addendum: doffed/standby headset reads as unplugged)
 }
 
-bool OpenXR::wantXRMonitorsPlugged(eXRMonitorFollowMode mode, bool sessionUp, bool sessionVisible) {
-    // research/18 + report-18 addendum: instantaneous plugged predicate. OFF keeps XR monitors
-    // always plugged (pre-feature). SESSION plugs while a session exists (WiVRn-on-the-shelf still
-    // counts). VISIBLE plugs only while the session is VISIBLE/FOCUSED — a doffed/standby headset
-    // reads as unplugged. The anti-flap grace on the VISIBLE->hidden drop is a caller concern.
+bool OpenXR::wantXRMonitorsPlugged(eXRMonitorFollowMode mode, bool sessionUp, bool sessionVisible, bool presenceSupported, bool presenceKnown, bool userPresent) {
+    // research/18 + report-18/19 addenda: instantaneous plugged predicate. See the header for the
+    // full contract. OFF keeps XR monitors always plugged (pre-feature); SESSION plugs while a session
+    // exists; VISIBLE gates on the real donned signal — user presence when the runtime exposes it
+    // (the fix for WiVRn's doffed-on-the-shelf session sprinting to FOCUSED), else raw visibility.
     switch (mode) {
         case XR_FOLLOW_OFF: return true;
         case XR_FOLLOW_SESSION: return sessionUp;
-        case XR_FOLLOW_VISIBLE: return sessionVisible;
+        case XR_FOLLOW_VISIBLE: break;
     }
-    return sessionVisible;
+    if (!sessionUp)
+        return false; // VISIBLE mode still requires a live session
+    if (presenceSupported)
+        return presenceKnown && userPresent; // absent until the first presence event -> blip-proof
+    return sessionVisible;                    // no presence ext: fall back to visibility
+}
+
+bool OpenXR::xrDeferFirstPlug(bool presenceSupported, bool everPlugged, int64_t visibleSustainedMs, int64_t blipMs) {
+    if (presenceSupported || everPlugged)
+        return false; // presence already suppresses the blip; later plugs use the anti-flap grace
+    return visibleSustainedMs < blipMs;
 }
 
 OpenXR::eForceLinearMode OpenXR::parseForceLinearMode(const std::string& s) {

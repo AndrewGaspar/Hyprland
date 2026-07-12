@@ -51,6 +51,8 @@ struct SXRInputEvent {
 
 enum class eXRStateEventType : uint8_t {
     SESSION_STATE,   // XrSessionState changed -> openxrsessionstate / openxractive
+    USER_PRESENCE,   // report-19: XR_EXT_user_presence donned/doffed (a = 1 present / 0 absent) ->
+                     // drives the `visible`-mode monitor plug gate on the main thread
     GRAB,            // §6 -> xrmonitorgrab (WP8)
     ADAPTIVE,        // research/13 -> xrmonitordocked/xrmonitorundocked (a = 1 undocked / 0 docked, str = name)
     TRACKING,        // device-lock tracking gained/lost (informational, logged)

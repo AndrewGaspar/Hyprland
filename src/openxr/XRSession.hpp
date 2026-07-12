@@ -80,6 +80,13 @@ class CXRSession {
     // XR_KHR_vulkan_enable2 advertised AND enabled (probe-only, for the wrong-GPU guard in start()).
     bool       m_hasVulkanEnable2 = false;
 
+    // XR_EXT_user_presence (report-19): the real donned/doffed signal. m_hasUserPresence = extension
+    // advertised AND enabled; m_supportsUserPresence = the system property (a runtime may enable the
+    // ext but the device not support presence — e.g. Monado's null/remote drivers). Read on the main
+    // thread at start(); the manager gates `visible`-mode plugging on presence when supported.
+    bool       m_hasUserPresence      = false;
+    bool       m_supportsUserPresence = false;
+
     // Overlay session (XR_EXTX_overlay, doc 01). COpenXRManager::start() sets m_overlayRequested /
     // m_overlayZ from openxr:overlay / openxr:overlay_z BEFORE createInstance(). m_hasOverlay records
     // whether the runtime advertises the extension; m_isOverlay is the ACTUAL state — true only when
@@ -98,6 +105,10 @@ class CXRSession {
     // WP-G5: set by pollEvents on XrEventDataInteractionProfileChanged; the frame loop forwards it
     // to CXRInput (re-read xrGetCurrentInteractionProfile) then clears it. Frame-thread only.
     bool           m_interactionProfileChanged = false;
+    // report-19: set by pollEvents on XrEventDataUserPresenceChangedEXT; the frame loop forwards the
+    // new presence to main (SXRStateEvent USER_PRESENCE) then clears the flag. Frame-thread only.
+    bool           m_userPresenceChanged = false;
+    bool           m_userPresent         = false; // last isUserPresent seen (frame thread)
 
     uint32_t       m_maxLayerCount   = 16; // XrSystemGraphicsProperties::maxLayerCount (spec floor 16)
     int64_t        m_swapchainFormat = 0;  // chosen once after session creation
