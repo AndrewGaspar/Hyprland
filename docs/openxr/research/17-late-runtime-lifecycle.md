@@ -312,6 +312,21 @@ DEBUG from aquamarine ]: GBM: Allocated a new buffer with size [Vector2D: x: 192
 > **required**, not a no-op guard. Fixed by `openxr:force_linear` (auto): when the XR EGL node ≠ the
 > buffer allocator node, the XR output's aquamarine swapchain is reconfigured with
 > `SSwapchainOptions::multigpu` (forces `DRM_FORMAT_MOD_LINEAR`), which NVIDIA imports fine.
+>
+> **Correction 2 (2026-07-12, Defect A).** The first cut of the fix (349da50e) set the multigpu flag
+> and called `swapchain->reconfigure()`, but the buffers **still** came back AMD-tiled — the live log
+> showed the exact same `0x2000000104abb04` modifier reaching the import. Root cause: aquamarine's
+> `CSwapchain::reconfigure()` (v0.12.0) only honors `multigpu` on its **fullReconfigure** path, which
+> runs only when the FORMAT or SIZE changes. A bare `multigpu` flip with identical format/size/length
+> is swallowed by the no-op early-out (or handled by the `resize` path, which re-acquires buffers
+> WITHOUT passing `.multigpu`) — so no LINEAR re-allocation ever happened. We can't patch the system
+> lib, so `CMonitorState::updateSwapchain()` now forces the fullReconfigure path on a multigpu change:
+> it first clears the swapchain (empty-size reconfigure drops the buffers and the remembered size) so
+> the follow-up reconfigure can no longer match the no-op/resize predicates and must re-acquire every
+> buffer with the new modifier policy. `applyCrossGpuLinear` then logs the **negotiated** modifier of
+> the re-allocated buffers (peek + rollback) so a live run confirms LINEAR (`0x0`) in one line, and
+> damages the monitor so the fresh buffer is presented promptly (`content:` flips black→dmabuf on the
+> next import). Upstream aquamarine bug worth filing: `reconfigure()`'s early-out ignores `multigpu`.
 
 ### 4.2 The failing import and the black fallback
 

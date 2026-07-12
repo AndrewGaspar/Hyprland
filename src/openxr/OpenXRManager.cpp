@@ -51,6 +51,8 @@
 #include "../managers/input/InputManager.hpp"
 #include "../output/Monitor.hpp"
 #include "../state/MonitorState.hpp"
+#include "../helpers/Format.hpp" // NFormatUtils::drmModifierName (post-reconfigure modifier log)
+#include "../render/Renderer.hpp" // damageMonitor (force a fresh present into the re-allocated buffers)
 #include "../desktop/state/FocusState.hpp"
 #include "../config/shared/monitor/MonitorRuleManager.hpp"
 #include "../config/shared/monitor/MonitorRule.hpp"
@@ -61,6 +63,7 @@
 #include <aquamarine/backend/Headless.hpp>
 #include <aquamarine/buffer/Buffer.hpp>
 #include <aquamarine/allocator/Allocator.hpp>
+#include <drm_fourcc.h> // DRM_FORMAT_MOD_INVALID (negotiated-modifier log)
 
 COpenXRManager::COpenXRManager() = default;
 
@@ -1668,13 +1671,33 @@ void COpenXRManager::applyCrossGpuLinear(const PHLMONITOR& mon) {
         return; // already in the desired state — no reconfigure churn
 
     mon->m_forceLinearSwapchain = force;
-    // Rebuild the swapchain with the new modifier policy (idempotent — updateSwapchain() no-ops if
-    // nothing else changed, and it now compares multigpu so the flag flip actually takes).
+    // Rebuild the swapchain with the new modifier policy. updateSwapchain() now forces aquamarine's
+    // fullReconfigure path on a multigpu flip (a bare flag flip is otherwise swallowed as a no-op /
+    // resize that keeps the old tiling — the live 2026-07-12 black-quad root cause), so the buffers
+    // are actually re-allocated LINEAR here.
     mon->m_state.updateSwapchain();
 
+    // Report the modifier the (re)allocated buffers ACTUALLY carry — the one thing that decides
+    // whether the cross-GPU EGL import can succeed — so a live run confirms LINEAR in one line
+    // instead of inferring it from the absence of import-failure spam. Peek + rollback so the
+    // render loop's buffer rotation is undisturbed.
+    uint64_t negModifier = DRM_FORMAT_MOD_INVALID;
+    if (auto& sc = mon->m_output->swapchain) {
+        if (auto buf = sc->next(nullptr)) {
+            negModifier = buf->dmabuf().modifier;
+            sc->rollback();
+        }
+    }
+
     Log::logger->log(Log::DEBUG,
-                     "[OPENXR] XR monitor '{}' buffers: {} (force_linear={}, XR drm {}:{} {}, allocator drm {}:{} {})", mon->m_name, force ? "LINEAR (cross-GPU import)" : "native tiling",
-                     *PFORCE, xrNode.major, xrNode.minor, xrNode.valid ? "valid" : "unknown", allocMajor, allocMinor, allocValid ? "valid" : "unknown");
+                     "[OPENXR] XR monitor '{}' buffers: {} — negotiated modifier 0x{:x} ({}) (force_linear={}, XR drm {}:{} {}, allocator drm {}:{} {})", mon->m_name,
+                     force ? "LINEAR (cross-GPU import)" : "native tiling", negModifier, NFormatUtils::drmModifierName(negModifier), *PFORCE, xrNode.major, xrNode.minor,
+                     xrNode.valid ? "valid" : "unknown", allocMajor, allocMinor, allocValid ? "valid" : "unknown");
+
+    // Force a fresh composite so the newly-allocated buffer is presented promptly (and the XR import
+    // flips content: black → dmabuf without waiting for incidental desktop damage).
+    if (g_pHyprRenderer)
+        g_pHyprRenderer->damageMonitor(mon);
 }
 
 void COpenXRManager::teardownLayers() {
