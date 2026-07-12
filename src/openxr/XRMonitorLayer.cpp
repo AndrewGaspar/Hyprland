@@ -8,6 +8,7 @@
 
 #include "../output/Monitor.hpp"
 #include "../debug/log/Logger.hpp"
+#include "XRDmabufImport.hpp" // OpenXR::shouldStashPresentedBuffer (cross-GPU stale-buffer guard)
 #include <aquamarine/buffer/Buffer.hpp>
 
 CXRMonitorLayer::CXRMonitorLayer(const std::string& name, uint64_t seq, float sizeMeters) : m_monitorName(name), m_sizeMeters(sizeMeters), m_seq(seq) {
@@ -35,6 +36,16 @@ void CXRMonitorLayer::bindToMonitor(PHLMONITOR mon, std::function<void()> onGone
         auto buf = pmon->m_output->state->state().buffer;
         if (!buf)
             return;
+        // Cross-GPU stale-buffer guard: on a force-linear output, never stash a still-foreign-tiled
+        // buffer from a composite that raced ahead of the swapchain's LINEAR reconfigure — the frame
+        // thread's dmabuf import would be rejected by the foreign XR GPU and the quad would go black
+        // (live 2026-07-12 "monitor created after a destroy goes blank"). Drop it; the reconfigured
+        // LINEAR composite that follows feeds the layer. Reading dmabuf() here is main-thread only.
+        if (pmon->m_forceLinearSwapchain) {
+            const auto dmab = buf->dmabuf();
+            if (!OpenXR::shouldStashPresentedBuffer(true, dmab.success, dmab.modifier))
+                return;
+        }
         std::vector<SP<Aquamarine::IBuffer>> retired;
         {
             std::lock_guard<std::mutex> lk(m_bufMu);
