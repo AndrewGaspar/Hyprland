@@ -52,6 +52,7 @@ struct SXRInputEvent {
 enum class eXRStateEventType : uint8_t {
     SESSION_STATE,   // XrSessionState changed -> openxrsessionstate / openxractive
     GRAB,            // §6 -> xrmonitorgrab (WP8)
+    ADAPTIVE,        // research/13 -> xrmonitordocked/xrmonitorundocked (a = 1 undocked / 0 docked, str = name)
     TRACKING,        // device-lock tracking gained/lost (informational, logged)
     LAYER_REMOVED,   // DEVIATION (doc 04 §7.1 lists 3): internal removal-barrier ack (str = name)
     SCHEDULE_FRAMES, // pacing: main thread must scheduleFrame() the visible XR monitors —
