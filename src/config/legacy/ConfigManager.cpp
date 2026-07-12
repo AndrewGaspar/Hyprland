@@ -1141,6 +1141,15 @@ std::string CConfigManager::parseKeyword(const std::string& COMMAND, const std::
     // `hyprctl keyword openxr:chrome_margin ...` would not apply until a full /reload.
     if (COMMAND.starts_with("openxr:chrome_") && g_pOpenXRManager)
         g_pOpenXRManager->onConfigReload();
+
+    // openxr:adaptive_* live tuning: the numeric adaptive vars are hot-read per frame directly, but
+    // the two STRING options (adaptive_roam_mode / adaptive_transition_ease) are parsed to enums on
+    // the main thread in onConfigReload()->publishAdaptiveStringTuning() (the frame thread must never
+    // deref a CConfigValue<const char*> — a reload dangles the cached pointer -> SIGSEGV). Same legacy-
+    // keyword gap as chrome_ above: a bare `hyprctl keyword openxr:adaptive_roam_mode ...` fires
+    // neither reloaded nor props_refreshed, so re-publish the enums explicitly here.
+    if (COMMAND.starts_with("openxr:adaptive_") && g_pOpenXRManager)
+        g_pOpenXRManager->onConfigReload();
 #endif
 
     // Update window border colors
