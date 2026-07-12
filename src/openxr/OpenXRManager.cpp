@@ -33,6 +33,7 @@
 #include "XRSession.hpp"
 #include "XRGraphics.hpp"
 #include "XRMonitorLayer.hpp"
+#include "XRDmabufImport.hpp" // OpenXR::xrContentPathName (status contentPath)
 #include "XRInput.hpp"
 #include "XRPointerDevice.hpp"
 #include "../Compositor.hpp"
@@ -2003,6 +2004,7 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
             default: info.grabKind = "none"; break;
         }
         info.hovered                     = l->m_hovered;          // WP7
+        info.contentPath                 = OpenXR::xrContentPathName(l->m_contentPath.load(std::memory_order_relaxed)); // WP-L2
         // Adaptive anchoring (research/13 §6.4).
         info.adaptiveEnabled  = l->m_anchor.adaptiveEnabled();
         info.adaptivePhase    = OpenXR::xrAdaptivePhaseName(l->m_anchor.adaptivePhase());
