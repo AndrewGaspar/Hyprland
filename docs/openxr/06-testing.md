@@ -1,657 +1,466 @@
-# 06 — Testing: Unit Tests, Monado Orchestration, and the XR Integration Suite
+# 06 — Testing
 
-This document specifies the complete test strategy for the OpenXR extension: an always-on
-gtest unit tier and a local-only hyprtester integration tier that drives a real (headless)
-Monado runtime with scripted head/controller input. It is self-contained; sibling docs are
-cited where the behavior under test is designed (`02-virtual-monitors.md`, `03-anchoring.md`,
-`04-input.md`, `05-ipc-config.md`).
+This page is a developer's guide to how the OpenXR extension is tested today. There are two
+tiers, and one containerized runner that ties them together:
 
-The conventions here deliberately adopt the lessons from
-`/home/ajg/code/omedora-4/omedora/testing.md` (a battle-tested headless-compositor test
-harness): **TAP-style reporting with a CI exit code; a strict `waitFor*` / `assert*` split
-(never assert on state you haven't waited for); artifact dumps on failure instead of
-interactive debugging; unique per-run resource names so concurrent/repeated runs never
-collide; and keeping the heavy runtime-dependent tier local-only until it has proven stable**
-(omedora's L4 lesson: their GPU-dependent session tier stayed a local/pre-release gate, not a
-per-PR CI gate — same posture here for anything needing `monado-service`).
+1. **Unit tier** — GoogleTest cases over the extension's pure functions (parsing, anchor math,
+   ray/quad intersection, blend-mode selection, chrome/grab classifiers, and more). Compiled
+   unconditionally into the existing `hyprland_gtests` target; needs no OpenXR runtime and runs
+   on every test build.
+2. **Integration tier** — the `hyprtester --xr` suite, which brings up a real (headless) Monado
+   session, drives scripted head/controller input over Monado's remote driver, and asserts
+   against the live compositor via `hyprctl openxr` JSON and socket2 events. Gated behind a
+   CMake option and a local Monado build; skips cleanly when no Monado is present.
+
+The **containerized hermetic suite** (`scripts/xr-container.sh test`) runs the integration tier
+inside a rootless-podman container with its own GPU, network namespace, and vendored Monado. It
+is the preferred, reproducible way to run the suite, because it touches no host sockets and can
+run alongside a live desktop session.
+
+Behavior under test is specified in the sibling docs: the session/graphics lifecycle (00, 01),
+virtual monitors (02), anchoring math (03), input (04), and the IPC/config surface — the
+`hyprctl openxr` JSON schema and event names every integration assertion parses — in the
+configuration reference (05).
 
 ---
 
-## 1. Two-tier posture
+## 1. Unit tier — GoogleTest
 
-| Tier | Framework | Lives in | Needs | Runs |
-|---|---|---|---|---|
-| **Unit** | gtest (`hyprland_gtests`) | `tests/xr/` | nothing (pure math/parsing, no XR runtime, no session) | always — every CI run, `-DWITH_TESTS=ON` |
-| **Integration** | hyprtester | `hyprtester/src/xr/` + `hyprtester/src/tests/xr/` | built Hyprland with OpenXR, `monado-service`, a Vulkan device (lavapipe OK) | local only, behind CMake option `WITH_XR_TESTS` (default **OFF**); runtime-SKIPs (TAP `# SKIP`) when `monado-service` is not found |
+The unit tests live in `tests/xr/*.cpp` and are picked up automatically by the root
+`CMakeLists.txt` (`file(GLOB_RECURSE TESTFILES "tests/*.cpp")`), compiled into the
+`hyprland_gtests` executable and linked against `hyprland_lib` + `GTest::gtest_main`, then
+registered with `gtest_discover_tests`. They exercise code that is compiled **unconditionally**
+— pure functions with no `HAVE_OPENXR` guard and no OpenXR headers — so they build and run even
+on a tree configured without an OpenXR SDK. They are part of the normal `-DWITH_TESTS=ON` test
+build and carry no extra dependencies.
 
-### 1.1 Unit tier
+Each file follows the standard gtest style used elsewhere in `tests/` (`TEST(Group, Case) { … }`,
+including the header under test by its `src/`-relative path). Coverage as it stands:
 
-Three files under `tests/xr/`, picked up automatically by the root `CMakeLists.txt`
-(`file(GLOB_RECURSE TESTFILES "tests/*.cpp")`, ~line 688; linked against `hyprland_lib` +
-`GTest::gtest_main`, discovered via `gtest_discover_tests`). They test code that is compiled
-**unconditionally** (no `HAVE_OPENXR`, no OpenXR headers) — see `00-overview.md` build
-gating and `05-ipc-config.md` §2.3:
+| File | Area under test |
+|---|---|
+| `tests/xr/parser.cpp` | `parseXRMonitorLine` grammar: the documented examples, defaults, all anchor modes, adaptive-radius validation, and malformed-input errors. |
+| `tests/xr/anchor_math.cpp` | `src/openxr` anchor math + `XRMath.hpp`: critically-damped spring convergence and large-dt stability, yaw-frame extraction (incl. near-vertical gaze), positional/angular deadzones, grab offset round-trip, resize clamping, reference-space change, and re-center/recenter behavior. |
+| `tests/xr/ray_intersect.cpp` | ray–quad intersection: hit UV in [0,1]², misses (behind/parallel/out of bounds), nearest-t across overlapping quads, rotated quads, and slack expansion. |
+| `tests/xr/blendmode.cpp` | `OpenXR::pickBlendMode`: `auto`/explicit `opaque`/`alpha`/`additive`, runtime-preferred selection, and unsupported-mode fallback. |
+| `tests/xr/chrome_hit.cpp` | the chrome region classifier: body vs. bar vs. corners vs. dead margin, content-rect insets, pose-offset placement, and UV remap that keeps clicks pixel-exact. |
+| `tests/xr/chrome_fade.cpp` | the pure chrome fade-in/out advance (hide-delay hold, active-beats-hide, zero-dt/zero-fade edge cases). |
+| `tests/xr/grab_gating.cpp` | `grabActionForRegion` gating: bar always moves, corners always resize, body moves only per the grab-anywhere / hand-body flags, margins never grab. |
+| `tests/xr/grab_ring.cpp` | the release pose-latch ring buffer and the release-velocity rewind/reject heuristic (calm vs. flick trajectories, ratio-based outlier detection). |
+| `tests/xr/hand_grab.cpp` | hand-grab mode parsing and semantics: pinch vs. grasp space selection, per-profile input-kind mapping, and grab-value-by-mode. |
+| `tests/xr/one_euro.cpp` | the 1-euro filter used for the grab carry: passthrough first sample, jitter reduction, dt robustness, per-axis/quaternion pose filtering against a reference series. |
+| `tests/xr/adaptive.cpp` | adaptive (dock↔follow) anchoring: geofence dwell, walk-away undock/redock, ease endpoints, height handling, and serialize/parse round-trip. |
+| `tests/xr/plugged.cpp` | the monitor plug/unplug policy state machine: follow-session vs. presence gating, doff/donn transitions, defer-first-plug, and reprobe backoff. |
+| `tests/xr/force_linear.cpp` | the `force_linear` swapchain policy: `on`/`off`/`auto`, and auto's cross-GPU detection. |
+| `tests/xr/dmabuf_attribs.cpp` | dmabuf attribute emission for imported swapchain images: size/format/plane emission, multi-plane and modifier handling. |
+| `tests/xr/event_queue.cpp` | the lock-free frame→main event queue: lossless ordered bursts, fill-to-capacity, empty-pop, and reset. |
 
-- `tests/xr/anchor_math.cpp` — `src/openxr/XRAnchor.{hpp,cpp}` + `XRMath.hpp`: the
-  critically-damped spring (ω = 2/leash_response) converges without overshoot and respects
-  dt independence; yaw-frame extraction from a view quaternion (forward projected to XZ,
-  including the near-vertical-gaze degenerate case); angular and positional deadzones
-  (inside → no motion, outside → target re-acquired); grab offset composition
-  `inv(gripPose)∘quadPose` round-trips (see `03-anchoring.md` for the derivations).
-- `tests/xr/ray_intersect.cpp` — ray–quad intersection (`04-input.md`): hit → correct UV in
-  [0,1]²; miss (behind, parallel, outside bounds); nearest-t selection across two
-  overlapping quads; UV → output-local pixel mapping for a known mode.
-- `tests/xr/parser.cpp` — `parseXRMonitorLine` (`05-ipc-config.md` §2.3): the four grammar
-  examples, defaults, all four anchor modes, malformed-input errors.
+These are the compile-time and pure-logic guarantees. Anything that needs a live session — real
+device poses, swapchain import, focus routing, teardown — belongs to the integration tier.
 
-Follow the existing style (`tests/helpers/*.cpp`, e.g. `tests/helpers/Color.cpp`):
-plain `TEST(XRAnchor, springConverges) { ... }`, include the header under test by its
-`src/`-relative path.
+---
 
-### 1.2 Integration tier — CMake gating
+## 2. Integration tier — `hyprtester --xr`
 
-Root `CMakeLists.txt`, inside the existing `if(BUILD_TESTING OR WITH_TESTS)` block
-(~line 679, where `add_subdirectory(hyprtester)` lives):
+### 2.1 What it is and how it is gated
+
+The integration suite is a group of `hyprtester` test cases (group name `xr`) that launch a
+dedicated Hyprland instance against a live headless Monado runtime and assert over IPC. Its
+sources live in two directories, both entirely wrapped in `#ifdef WITH_XR_TESTS`:
+
+- `hyprtester/src/xr/` — infrastructure: `MonadoOrchestrator`, `RemoteClient`, the vendored
+  Monado wire header, and `xr_helpers`.
+- `hyprtester/src/tests/xr/` — the test cases themselves, one concern per file, plus the group
+  header `tests.hpp`.
+
+`hyprtester` GLOBs all of `src/*.cpp` into one binary, so the tier is gated by a **compile
+definition**, not by excluding files. The root `CMakeLists.txt` declares the option inside the
+`if(BUILD_TESTING OR WITH_TESTS)` block:
 
 ```cmake
 option(WITH_XR_TESTS "Build the OpenXR integration test suite into hyprtester (needs a local Monado for running)" OFF)
 ```
 
-`hyprtester/CMakeLists.txt` GLOBs all of `src/*.cpp` into one binary, so gating is by compile
-definition, not file exclusion:
+and `hyprtester/CMakeLists.txt` turns it into `target_compile_definitions(hyprtester PRIVATE
+WITH_XR_TESTS)` plus a `HYPRTESTER_SOURCE_ROOT` define (the repo root, used to find the vendored
+Monado build and the test configs). It also defines a convenience `monado` custom target that
+runs `scripts/build-monado.sh` — deliberately *not* part of `ALL`, since Monado is a multi-minute
+external build needed only to *run* the suite.
 
-```cmake
-if(WITH_XR_TESTS)
-  target_compile_definitions(hyprtester PRIVATE WITH_XR_TESTS)
-endif()
-```
+The group header `tests.hpp` defines `TEST_GROUP_NAME "xr"` and stores cases in `xrTestCases`.
+Cases use `TEST_CASE(name)` from `hyprtester/src/shared.hpp` (registering into both the global
+`testCases` map and `xrTestCases`) and the shared assertion macros (`EXPECT`, `EXPECT_OK`,
+`EXPECT_CONTAINS`, the `ASSERT*` variants, `OK`). Each case begins with the
+`XR_SKIP_IF_UNAVAILABLE()` macro, which skips (counting as a pass) when the runtime is absent or
+the wire ABI has drifted (§4).
 
-Every file under `hyprtester/src/xr/` and `hyprtester/src/tests/xr/` wraps its entire
-contents in `#ifdef WITH_XR_TESTS`. The suite is additionally **runtime-gated**: even when
-built, if `monado-service` can't be located/started, every XR test emits
-`ok N - <name> # SKIP monado-service not found` and the run passes (omedora SKIP-gating
-pattern — absence of the optional runtime is not a failure).
+### 2.2 How the suite runs its own Hyprland + Monado
 
----
+`XR_RUNTIME_JSON` must be in Hyprland's environment *at launch*, and Monado must be up *before*
+Hyprland starts its session — so the XR suite is a separate `hyprtester` invocation, selected by
+the `--xr` flag. Under `--xr`, `main.cpp`'s `runXrSuite()`:
 
-## 2. Directory layout
+1. Defaults the config to `hyprtester/xr-test.conf` (instead of `test.lua`) and runs only
+   `xrTestCases`.
+2. Constructs a single `CMonadoOrchestrator` and starts it (§3). If Monado is unavailable, the
+   suite still launches Hyprland — **without** `XR_RUNTIME_JSON` — so `xr_runtime_absent` can
+   assert the graceful-unavailable path; all other cases skip.
+3. Launches Hyprland with `XR_RUNTIME_JSON=<manifest>` and the shared isolated
+   `XDG_RUNTIME_DIR` (§3).
 
-```
-hyprtester/
-├── xr-test.conf                     # Hyprland config for the XR suite (classic hyprlang)
-└── src/
-    ├── xr/                          # infrastructure (all #ifdef WITH_XR_TESTS)
-    │   ├── MonadoOrchestrator.hpp/.cpp   # launch/ready-poll/teardown monado-service
-    │   ├── RemoteClient.hpp/.cpp         # TCP 4242 client speaking the remote wire protocol
-    │   ├── monado_remote_wire.hpp        # VENDORED wire structs (see §4) — pinned to a Monado commit
-    │   └── xr_helpers.hpp/.cpp           # waitFor*/artifact helpers (see §5)
-    └── tests/
-        └── xr/                      # test cases (all #ifdef WITH_XR_TESTS)
-            ├── tests.hpp            # group header: TEST_GROUP_NAME "xr", GROUP_TEST_CASE_STORAGE xrTestCases
-            ├── session.cpp          # xr_session_up, xr_runtime_absent
-            ├── monitors.cpp         # xr_monitor_create_destroy, xr_config_declared, xr_mirror
-            ├── anchors.cpp          # xr_anchor_transitions
-            ├── input.cpp            # xr_ray_click_routing, xr_select_hysteresis, xr_two_hand_pointer, xr_scroll, xr_menu_right_click
-            ├── ray_live.cpp         # xr_ray_hover (WP7 bounded live smoke test, added alongside input.cpp's WP12 suite)
-            ├── grab_live.cpp        # xr_grab_move (WP8 bounded live smoke test — NOT in input.cpp, despite doc 07's WP12 deliverable list saying so)
-            ├── idle.cpp             # xr_idle_inhibit
-            └── teardown.cpp         # xr_disable_teardown
-```
-
-**As built (WP13 reconciliation):** the file layout above is the actual one — `xr_grab_move`
-lives in its own `grab_live.cpp` (not folded into `input.cpp` as WP12's roadmap entry implied),
-and `xr_ray_hover` (a WP7 deliverable, predating WP12's input suite) lives in `ray_live.cpp`.
-`input.cpp` itself grew three more `TEST_CASE`s beyond the three originally scoped for WP12
-(`xr_select_hysteresis`, `xr_two_hand_pointer`, `xr_menu_right_click`) — see §6's table for all
-15. There is no dedicated integration (or unit) test for the layer-count cap policy
-(`02-virtual-monitors.md` "Layer-count limit") — it is implemented and code-reviewed but has no
-automated coverage as of WP13; a 16th-layer creation/suspension test remains a gap for a future
-WP, not something this doc set can currently claim passes.
-
-Group mechanism: copy `hyprtester/src/tests/main/tests.hpp` exactly — the group header
-defines `TEST_GROUP_NAME "xr"` and `GROUP_TEST_CASE_STORAGE xrTestCases`
-(`inline std::vector<std::shared_ptr<CTestCase>> xrTestCases;`), each `.cpp` includes it and
-uses `TEST_CASE(name)` from `hyprtester/src/shared.hpp` (which registers into both the global
-`testCases` map and `xrTestCases`). Assertion macros come from the same header:
-`EXPECT(expr, val)`, `EXPECT_OK(x)` (= `EXPECT(x, "ok")`), `EXPECT_CONTAINS(haystack,
-needle)`, `ASSERT*` variants that also return from the test, `OK(x)`.
-
-### 2.1 How the XR suite runs (its own Hyprland + Monado instance)
-
-hyprtester launches **one** Hyprland at startup (`launchHyprland` in
-`hyprtester/src/main.cpp:67` — `CProcess` on the binary with `--config <path>` and
-`addEnv("HYPRLAND_HEADLESS_ONLY", "1")`, then IPC via `getFromSocket()` from
-`hyprctlCompat.hpp`). The XR runtime env (`XR_RUNTIME_JSON`) must be present in Hyprland's
-environment *at launch*, and Monado must be up *before* Hyprland starts its session — so the
-XR suite is a **separate invocation**, selected by a new `--xr` flag in `main.cpp`:
-
-1. `--xr` implies: config defaults to `hyprtester/xr-test.conf` (instead of `test.lua`), the
-   test list defaults to `xrTestCases` only, and the standard groups are not run.
-2. Before `launchHyprland`, construct `MonadoOrchestrator` and start it (§3). If it reports
-   `unavailable` (no `monado-service` binary), remember that: all tests except
-   `xr_runtime_absent` will SKIP (§5.3), and Hyprland is launched **without**
-   `XR_RUNTIME_JSON` so `xr_runtime_absent` can assert the graceful-unavailable path.
-3. `launchHyprland` gains an optional env map parameter; `--xr` passes
-   `XR_RUNTIME_JSON=<manifest>` (§3.2) plus the shared `XDG_RUNTIME_DIR` (§3.1).
-4. Skip the `preTestCleanup()` steps that assume the standard config (plugin load stays; the
-   Lua-dispatch cursor/workspace resets are harmless but reference the standard setup — guard
-   them on `!xrMode` if they fail against `xr-test.conf`).
+**Launch-mode fallback.** The stock `HYPRLAND_HEADLESS_ONLY=1` launch cannot bring up
+Aquamarine's headless backend in a seatless sandbox (rootless podman, some CI). `runXrSuite()`
+handles this: it tries the headless launch first, and on failure symlinks the host's Wayland
+socket into the isolated run directory and relaunches **nested** inside the host's Wayland
+session (a few retries). Under the nested fallback Aquamarine names the base output `WAYLAND-1`
+rather than the `HEADLESS-1` from `xr-test.conf`'s `monitor =` line, so tests never hard-code the
+base monitor's name; every XR monitor a test creates is backend-independent.
 
 `xr-test.conf` is a **classic hyprlang** config (the `xrmonitor` keyword is registered in the
-legacy config manager, `05-ipc-config.md` §2.1). Contents:
-
-```ini
-monitor = HEADLESS-1, 1920x1080@60, 0x0, 1
-
-openxr {
-    enabled = 1
-}
-
-# declared-set fixtures for xr_config_declared (unique names come from runtime creation;
-# these two are static because the config file is static)
-xrmonitor = XR-conf-a, 1280x720@60, anchor:local pos:0,1.4,-1.5 yaw:0, size:1.0
-xrmonitor = XR-conf-b, 1024x768,    anchor:head offset:0.3,-0.1,-1.0, size:0.5
-```
-
-### 2.2 Launch-mode fallback: nested Wayland (as built, WP13 reconciliation)
-
-The stock `HYPRLAND_HEADLESS_ONLY=1` launch (§2.1 step 1) can fail to bring up Aquamarine's
-headless backend in an isolated sandbox that has no seat — observed in this project's own dev
-environment. `hyprtester/src/main.cpp`'s `runXrSuite()` handles this with a fallback, not just
-a hard failure:
-
-1. Attempt the stock headless-only launch in the isolated `XDG_RUNTIME_DIR` (§3.1) and wait for
-   the instance to come up (`waitForHyprlandInstance`, 15 s budget).
-2. On failure: kill the process, symlink the **host's** `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`
-   socket (and its `.lock` file) into the isolated run directory, set `WAYLAND_DISPLAY` to that
-   name in the child's environment, and relaunch **without** `HYPRLAND_HEADLESS_ONLY` (i.e.
-   nested inside the host's own Wayland session) — up to 2 retries.
-
-**This changes the base output's name.** Under the stock headless-only launch the base monitor
-from `monitor = HEADLESS-1, ...` above is `HEADLESS-1`; under the nested fallback it is
-`WAYLAND-1` instead (Aquamarine's nested-Wayland backend names its output that way, regardless of
-what the config's `monitor =` line names). The config line's literal name (`HEADLESS-1`) then
-matches no real output when the fallback triggers, so that line's mode/position settings are
-effectively inert on a nested-fallback run — this is a known, currently-unaddressed gap in
-`xr-test.conf`, not a bug in the fallback logic itself. It does not affect the XR test cases
-themselves: every XR monitor the suite creates goes through `createXRMonitor`/`/output create
-headless` (both backend-independent), and `xr_mirror`'s `HEADLESS-2` target is likewise created
-dynamically. Don't assert a hard-coded `HEADLESS-1` in new XR tests; if a test needs the base
-monitor's name, query it rather than assuming.
+legacy config manager — see the configuration reference). It enables OpenXR, sets a headless base
+monitor, and declares two static XR monitors (`XR-conf-a`, `XR-conf-b`) used as reconciliation
+fixtures. It intentionally carries no machine-specific GPU pin; per-box settings are merged in at
+runtime (§3).
 
 ---
 
 ## 3. MonadoOrchestrator
 
-Owns the `monado-service` process for the whole `--xr` run (started once in `main`, torn down
-after `cleanupAndReport`). Monado source of truth: the `subprojects/monado` git submodule,
-pinned to the same commit as the vendored wire structs (§4.2); build it once with
-`scripts/build-monado.sh` (or `cmake --build build-debug --target monado`; service binary
-lands at `subprojects/monado/build/src/xrt/targets/service/monado-service`). Header-only
-build deps are vendored too: `subprojects/eigen` (3.4.0) and `subprojects/vulkan-headers`
-(v1.4.350) — only the Vulkan ICD loader library remains a system dependency.
+`CMonadoOrchestrator` owns the `monado-service` process for the whole `--xr` run (started once,
+torn down after reporting). The Monado source of truth is the `subprojects/monado` git submodule,
+pinned to the same commit as the vendored wire header (§4). Build it once with
+`scripts/build-monado.sh` (or `cmake --build build-debug --target monado`); the service binary
+lands at `subprojects/monado/build/src/xrt/targets/service/monado-service`. Header-only build
+deps are vendored too — `subprojects/eigen` and `subprojects/vulkan-headers` — leaving only the
+Vulkan ICD loader as a system dependency.
 
-### 3.1 Launch
+**Binary resolution** (`resolveBinary`): `$HYPRTESTER_MONADO_SERVICE` if set → the vendored
+submodule build under `HYPRTESTER_SOURCE_ROOT` → `monado-service` on `PATH`. The env override is
+**authoritative**: if `$HYPRTESTER_MONADO_SERVICE` is set but doesn't resolve to a usable binary,
+resolution fails outright rather than falling through — which is also the supported way to force
+the no-Monado/SKIP leg (point the var at a nonexistent path). If nothing resolves, the
+orchestrator reports unavailable and the suite skips.
 
-Binary resolution order: `$HYPRTESTER_MONADO_SERVICE` (explicit override) →
-`<repo>/subprojects/monado/build/src/xrt/targets/service/monado-service` (the vendored
-submodule build; repo root baked in via the `HYPRTESTER_SOURCE_ROOT` compile definition) →
-`monado-service` in `PATH`. If none exist → orchestrator state `unavailable` (suite SKIPs,
-§2.1). Machine-specific launch knobs stay out of the tracked config: the harness passes a
-generated wrapper config that sources `xr-test.conf`, then an optional untracked
-`hyprtester/xr-test-local.conf`, then `openxr:gpu = $HYPRTESTER_XR_GPU` when that env var is
-set (dual-GPU boxes: Hyprland must use the render node Monado's compositor picks, or
-xrCreateSwapchain crosses GPUs and crashes inside Monado — see §7).
+**Launch environment** (via `CProcess::addEnv`):
 
-**The env override is authoritative, not merely first-priority (as built, WP13
-reconciliation):** if `$HYPRTESTER_MONADO_SERVICE` is set but does not resolve to a usable
-binary, `MonadoOrchestrator::resolveBinary()` does **not** fall through to the build-tree path or
-`PATH` — it fails immediately and the orchestrator reports `unavailable` (suite SKIPs). This is
-deliberate (source comment: "an explicit override is authoritative: if set, we use it exclusively
-— resolve or fail, no silent fallback to a different monado") and is also the supported way to
-force the no-monado/SKIP leg of the suite in development: point the var at a nonexistent path.
-
-Environment for the child (via `CProcess::addEnv`, same API `launchHyprland` uses):
-
-| Env | Value | Why |
+| Env | Value | Purpose |
 |---|---|---|
-| `XRT_COMPOSITOR_NULL` | `true` | headless null compositor — no HMD, no window; still needs a Vulkan device |
-| `P_OVERRIDE_ACTIVE_CONFIG` | `remote` | select the remote driver: devices are scripted over TCP instead of real hardware |
+| `XRT_COMPOSITOR_NULL` | `true` | headless null compositor — no HMD, no window (still needs a Vulkan device) |
+| `P_OVERRIDE_ACTIVE_CONFIG` | `remote` | select the remote driver: devices scripted over TCP instead of real hardware |
 | `XRT_NO_STDIN` | `1` | don't block on the service's interactive stdin |
-| `XDG_RUNTIME_DIR` | `<run-dir>` (isolated-but-shared, below) | where the Monado IPC socket lands; **must equal Hyprland-under-test's `XDG_RUNTIME_DIR`** |
-| `VK_DRIVER_FILES` | *(optional)* lavapipe ICD json, forwarded from `$HYPRTESTER_VK_DRIVER_FILES` if set | force software Vulkan on machines where the real GPU misbehaves; the null compositor is content with lavapipe |
+| `XDG_RUNTIME_DIR` | isolated run dir | where the Monado IPC socket lands; **must equal** Hyprland-under-test's `XDG_RUNTIME_DIR` |
+| `VK_DRIVER_FILES` | *(optional)* forwarded from `$HYPRTESTER_VK_DRIVER_FILES` | force software Vulkan (lavapipe) when the real GPU misbehaves |
 
-**Isolated-but-shared `XDG_RUNTIME_DIR`**: create a fresh directory per run,
-`/tmp/hyprtester-xr-<pid>/` (mode 0700), and set it as `XDG_RUNTIME_DIR` for **both**
-`monado-service` and the launched Hyprland. Shared because the OpenXR client (inside
-Hyprland) finds Monado's IPC socket at `$XDG_RUNTIME_DIR/monado_comp_ipc`; isolated so a
-developer's real session (their own Hyprland socket, possibly their own Monado) is never
-touched and concurrent runs can't collide. Stdout/stderr of the service are redirected to
-`<run-dir>/monado.log` for artifact capture (§5.2).
+The run directory is isolated-but-shared: a fresh per-run dir set as `XDG_RUNTIME_DIR` for both
+`monado-service` and the launched Hyprland (shared so the OpenXR client finds Monado's socket at
+`$XDG_RUNTIME_DIR/monado_comp_ipc`; isolated so a developer's real session is never touched and
+concurrent runs can't collide). The service's stdout/stderr are captured to a log for artifact
+dumps.
 
-### 3.2 Readiness
+**Readiness** (`pollReadiness`, 100 ms poll, 10 s timeout, both conditions): a `connect()` to the
+`monado_comp_ipc` unix socket succeeds, and a TCP `connect()` to `127.0.0.1:4242` — the remote
+driver's scripting port — is accepted (that fd is kept for `RemoteClient`). The manifest handed
+to Hyprland as `XR_RUNTIME_JSON` is Monado's build-tree manifest (`openxr_monado-dev.json` next
+to the built binary, or the installed `share/openxr/1/openxr_monado.json` for an installed
+binary).
 
-Poll every 100 ms, **10 s total timeout**, both conditions:
+**Per-box GPU pin.** Machine-specific launch knobs stay out of the tracked config: the harness
+generates a wrapper config that sources `xr-test.conf`, then an optional untracked
+`hyprtester/xr-test-local.conf`, then `openxr:gpu = $HYPRTESTER_XR_GPU` when that env var is set.
+This matters on dual-GPU boxes — see §8.
 
-1. `connect()` on the unix socket `$XDG_RUNTIME_DIR/monado_comp_ipc` succeeds (then close —
-   this only proves the service is accepting).
-2. A TCP `connect()` to `127.0.0.1:4242` is **accepted** (the remote driver's scripting
-   port; see §4). Keep this one — it becomes the `RemoteClient` connection.
-
-On timeout: kill the service, mark `unavailable` (SKIP path), dump `monado.log` tail to the
-test log. The runtime manifest handed to Hyprland as `XR_RUNTIME_JSON` is Monado's build-tree
-manifest: `<monado-build>/openxr_monado-dev.json` (generated by Monado's build; verify the
-name in the pinned checkout — it points the OpenXR loader's `active_runtime` resolution at
-the just-started service).
-
-### 3.3 Teardown
-
-`SIGTERM` to the service pid → wait up to 3 s → `SIGKILL` + `waitpid`. Remove
-`<run-dir>` unless any test failed (then leave it for inspection and print its path).
-Teardown runs even when tests fail (hook it next to the existing
-`kill(hyprlandProc->pid(), SIGKILL)` in `cleanupAndReport`).
+**Teardown**: `SIGTERM` → wait up to 3 s → `SIGKILL` + reap. The run directory is removed unless a
+test failed (then it is kept, with its path printed, for inspection). Teardown runs even when
+tests fail.
 
 ---
 
 ## 4. RemoteClient and the vendored wire header
 
-### 4.1 What gets vendored, and why
+Scripted device input reaches Monado through its remote driver's TCP wire protocol, defined in
+`subprojects/monado/src/xrt/drivers/remote/r_interface.h`. The suite does **not** link against
+Monado (that would drag its headers/libs into every `hyprtester` build). Instead the POD wire
+structs are vendored into `hyprtester/src/xr/monado_remote_wire.hpp`, pinned to Monado commit
+`c2ddab59dc41366fe520dc4e8abcfea257ecf0b8` — the **same** commit the `subprojects/monado`
+submodule is pinned to. Re-pinning is a deliberate maintenance task: bump the commit, re-copy the
+structs, re-verify the asserts. This header is the only sanctioned vendoring of Monado in the
+tree, lives entirely under `hyprtester/`, and never ships in the compositor.
 
-The remote driver's wire protocol is defined in
-`subprojects/monado/src/xrt/drivers/remote/r_interface.h`. We do **not** link against
-Monado (that would drag its headers/libs into hyprtester's build for everyone). Instead,
-vendor the POD wire structs into `hyprtester/src/xr/monado_remote_wire.hpp`, **pinned to
-Monado commit `c2ddab59dc41366fe520dc4e8abcfea257ecf0b8`** (record the commit hash in the
-header's top comment; re-pin deliberately, never silently).
+The header is self-contained (the handful of `xrt_defines.h` PODs the wire structs embed are
+inlined) and carries the **compile-time half of ABI-drift protection**: `static_assert`s on the
+magic header value and on the exact struct sizes (`r_remote_controller_data == 120`,
+`r_head_data == 128`, `r_remote_data == 376`). If a re-pin changes the layout, the build fails
+loudly.
 
-Vendor, translated to self-contained C++ (no Monado includes — that means also inlining the
-handful of `xrt_defines.h` PODs the wire structs embed):
-
-- `xrt_vec1 {float x;}`, `xrt_vec2 {float x,y;}`, `xrt_vec3 {float x,y,z;}`,
-  `xrt_quat {float x,y,z,w;}`, `xrt_pose {xrt_quat orientation; xrt_vec3 position;}`,
-  `xrt_fov {float angle_left, angle_right, angle_up, angle_down;}`
-- `struct r_remote_controller_data` — exactly as in `r_interface.h:74-107`: `pose`,
-  `linear_velocity`, `angular_velocity`, `float hand_curl[5]`, analogs (`trigger_value`,
-  `squeeze_value`, `squeeze_force`, `thumbstick` (vec2), `trackpad_force`, `trackpad`
-  (vec2)), then the bool block: `hand_tracking_active`, `active`, `system_click`,
-  `system_touch`, `a_click`, `a_touch`, `b_click`, `b_touch`, `trigger_click`,
-  `trigger_touch`, `thumbstick_click`, `thumbstick_touch`, `trackpad_touch`, `_pad0..2`
-  (the comment in the source: "active(2) + bools(11) + pad(3) = 16" — the padding bools are
-  load-bearing for layout, keep them).
-- `struct r_head_data` — `views[2]` of `{xrt_fov fov; xrt_pose pose; uint32_t _pad;}`
-  (48 bytes each per the source comment), then `xrt_pose center` (the OpenXR view space),
-  `bool per_view_data_valid`, `bool _pad0,_pad1,_pad2` ("pose(16+12) bool(1) + pad(3) = 32").
-- `struct r_remote_data` — `uint64_t header; r_head_data head; r_remote_controller_data
-  left, right;` — this is the one struct written per tick.
-- The magic: `#define`d in Monado as `R_HEADER_VALUE (*(uint64_t *)"mndrmt3\0")` — i.e. the
-  little-endian u64 of the bytes `m n d r m t 3 \0`. Vendored as
-  `constexpr uint64_t R_HEADER_VALUE = /* bytes "mndrmt3\0" */ 0x0033746D72646E6DULL;`
-  (verify the constant with a `static_assert(std::bit_cast<...>)`-style check or a memcpy
-  comparison against the string literal at compile/startup — do not hand-trust the hex).
-
-Add `static_assert`s on the expected sizes computed from the pinned layout —
-`sizeof(r_remote_controller_data) == 120`, `sizeof(r_head_data) == 128`,
-`sizeof(r_remote_data) == 376` — **verify these numbers against the pinned checkout when
-implementing** (e.g. a throwaway TU compiled against the real headers, or `pahole`); if they
-differ, the vendored translation has a layout bug, fix it before anything else. These asserts
-are the compile-time half of ABI-drift protection; the runtime half is the handshake below.
-
-### 4.2 Connect handshake and ABI-drift → SKIP
-
-The Monado remote hub (`r_hub.c` in the same directory) exchanges fixed-size
-`r_remote_data` packets over the accepted TCP connection; `r_interface.h` exposes exactly
-`r_remote_connection_read_one` / `r_remote_connection_write_one` (blocking full-struct
-reads/writes). `RemoteClient::connect()`:
-
-1. Take over the accepted TCP socket from the orchestrator (§3.2).
-2. Read one full `r_remote_data` (the hub sends its current state to a new connection —
-   **verify empirically at implementation time**; if it does not, fall back to step 3
-   immediately and validate via the write path + a subsequent read).
-3. Validate: `data.header == R_HEADER_VALUE` and the read delivered exactly
-   `sizeof(r_remote_data)` bytes (a short/misaligned stream means struct-size drift).
-4. **On any mismatch: mark the whole suite SKIP, not FAIL** — the vendored header is pinned
-   to `c2ddab59dc41` and a newer installed Monado may legitimately have evolved the wire
-   struct (plan risk #4). Emit
-   `# SKIP monado remote wire ABI mismatch (vendored @c2ddab59, service reports otherwise)`
-   for each test. A wire mismatch is a maintenance task (re-pin + re-vendor), not a Hyprland
-   regression.
-
-Keep the initial struct from step 2 as the client's current-state template: **usage is
-read-modify-write-one-struct-per-tick** — mutate fields, set `header = R_HEADER_VALUE`,
-`write_one`. Every write is a complete device snapshot; there are no deltas.
-
-### 4.3 Device model and helper methods
+`RemoteClient` takes over the accepted TCP socket and performs the **runtime half** of ABI
+protection: on connect it validates the wire header value and full-struct framing, and on any
+mismatch marks the **whole suite SKIP, not FAIL** — a newer locally-installed Monado may
+legitimately have evolved the wire struct past the pin, which is a maintenance task, not a
+Hyprland regression. Thereafter usage is read-modify-write of one complete device snapshot per
+tick (there are no deltas): setters mutate the current template; a pulse stamps the header and
+writes the struct.
 
 With `P_OVERRIDE_ACTIVE_CONFIG=remote` the devices enumerate as **Valve Index controllers**
-(`valve/index_controller` interaction profile) plus an HMD — which is why `04-input.md`'s
-binding table includes valve/index: it is the profile the test suite exercises. Hand presence
-is emulated via `hand_curl[5]` + `hand_tracking_active`; `active` toggles controller
-presence entirely.
-
-`RemoteClient` sketch (all setters mutate the template; only `pulse()` performs I/O):
-
-```cpp
-class RemoteClient {
-  public:
-    bool  connectAndValidate(int fd);           // §4.2; false => suite SKIP
-    void  setHeadPose(Vec3 pos, Quat q);        // head.center; leave per_view_data_valid=false
-    void  setControllerPose(Side s, Vec3 pos, Quat q);
-    void  setControllerActive(Side s, bool active);
-    void  setTrigger(Side s, float v);          // trigger_value.x (+ trigger_click at >=0.9 for realism)
-    void  setSqueeze(Side s, float v);          // squeeze_value.x
-    void  setThumbstick(Side s, float x, float y);
-    void  setHandCurl(Side s, float curl);      // fills hand_curl[0..4], hand_tracking_active=true
-    void  pulse();                              // header=R_HEADER_VALUE; write_one(struct)
-    // convenience for scripted motion:
-    void  animate(std::function<void(r_remote_data&, float t01)> f, std::chrono::milliseconds dur, int hz = 60);
-};
-```
-
-`animate` is the workhorse for `xr_anchor_transitions` and `xr_grab_move`: it interpolates,
-calling `pulse()` at ~60 Hz so the runtime sees continuous motion (a single teleport-jump
-write is valid too, but leash-spring tests need a time series).
+(`valve/index_controller` interaction profile) plus an HMD — which is why the input document's
+binding table exercises the valve/index profile. `RemoteClient` exposes head/controller pose
+setters, trigger/squeeze/thumbstick analogs, hand-curl (emulated hand tracking), and an
+`animate` helper that interpolates and pulses at ~60 Hz so leash-spring and grab-motion tests see
+continuous motion.
 
 ---
 
 ## 5. xr_helpers — waiting, asserting, artifacts, naming
 
-### 5.1 Wait/assert split (omedora convention)
+`hyprtester/src/xr/xr_helpers.{hpp,cpp}` provide the conventions the cases rely on:
 
-Never assert on asynchronous state directly; wait for it first, then assert. All waits poll
-`getFromSocket()` (hyprtester's IPC channel) — state assertions over IPC, not pixels:
-
-```cpp
-// polls `hyprctl -j openxr` (i.e. getFromSocket("j/openxr")) until predicate or timeout
-bool waitForJson(const std::string& cmd, std::function<bool(const std::string&)> pred,
-                 std::chrono::milliseconds timeout = 5000ms, std::chrono::milliseconds interval = 100ms);
-
-// specialization: state field of the openxr status JSON (05-ipc-config.md §4.3)
-bool waitForXrState(const std::string& state, std::chrono::milliseconds timeout = 10000ms);
-```
-
-Typical use: `ASSERT(waitForXrState("focused"), true);` then `EXPECT_CONTAINS(...)` on the
-settled JSON. Numeric pose assertions parse the JSON and use `EXPECT_MAX_DELTA` (already in
-`shared.hpp`) with generous tolerances (leash convergence: 5 cm / 3°).
-
-### 5.2 Artifact capture on failure
-
-`dumpXrArtifacts(const std::string& testName)` — called by every test on its failure paths
-(wrap in a small RAII guard that checks `this->failed` in its destructor). Writes to
-`hyprtester/artifacts/<run-id>/<testName>/` where `<run-id>` = `xr-<pid>-<unixtime>`:
-
-- `monitors.json` — `getFromSocket("j/monitors")`
-- `openxr.json` — `getFromSocket("j/openxr")`
-- `monado.log` — tail (last 200 lines) of `<run-dir>/monado.log` (§3.1)
-- `hyprland.log` — tail of the Hyprland log
-  (`$XDG_RUNTIME_DIR/hypr/$HIS/hyprland.log` under the run's `XDG_RUNTIME_DIR`)
-
-A green run writes nothing (omedora rule). Print the artifact path in the failure message.
-
-**Known latent gap (as built, WP13 reconciliation):** the compositor's own log filename depends
-on the build type — `src/debug/log/Logger.cpp` writes to `hyprlandd.log` when `HYPRLAND_DEBUG`
-is defined (true CMake `Debug` builds) and `hyprland.log` otherwise. The exact `--xr` build
-command in §7 below does not pass `-DCMAKE_BUILD_TYPE=Debug` (a `build-debug`-named directory is
-not itself a `Debug` build unless you also set that flag), so under that command the filename is
-`hyprland.log` and `dumpXrArtifacts` reads the right file. `dumpXrArtifacts`
-(`hyprtester/src/xr/xr_helpers.cpp`) hard-codes `"/hyprland.log"` unconditionally, though — if
-`--xr` is ever run against a genuine `CMAKE_BUILD_TYPE=Debug` build, the real file is
-`hyprlandd.log` and artifact capture will silently miss the compositor log. This was flagged as a
-"WP6 bug to check" going into WP13 and remains unfixed as of this reconciliation pass: prefer a
-non-Debug (Release/RelWithDebInfo, i.e. the plain `--xr` build command below) build for `--xr`
-runs, or check both filenames by hand when debugging a Debug-build failure.
-
-### 5.3 SKIP handling and TAP
-
-hyprtester's reporting is pass/fail line-based (`runTests` in `main.cpp`). For the XR suite,
-tests that cannot run (orchestrator `unavailable`, or ABI-mismatch §4.2) call a helper that
-logs `SKIP: <name> — <reason>` via `NLog::yellow` and returns without touching `failed` —
-i.e. a SKIP counts as a pass in the summary, with the reason visible in the log. Emit a
-TAP-style line (`ok - <name> # SKIP <reason>`) in the same log call so external harnesses
-can grep it.
-
-### 5.4 Unique per-run names
-
-Every monitor created *by a test at runtime* uses `XR-t<pid>-<n>` (pid of hyprtester,
-`n` = per-test counter). Rationale (omedora): re-runs against a half-torn-down instance, or
-two developers on one machine, must never trip "Name already taken". The two config-declared
-monitors (`XR-conf-a/b`) are exempt — the config file is static, and the instance is
-launched fresh per run.
+- **Wait/assert split.** Never assert on asynchronous state directly; wait for it first.
+  `waitForJson(cmd, pred, …)` polls `getFromSocket()` (hyprtester's IPC channel) until a
+  predicate holds or a timeout expires; `waitForXrState(state, …)` is the specialization over the
+  `hyprctl openxr` status JSON. State assertions go over IPC (`j/openxr`, `j/monitors`), not
+  pixels; numeric pose checks parse the JSON and compare with generous tolerances.
+- **SKIP handling.** `shouldSkip()` reports the skip reason (`monado-service not found`, or the
+  wire ABI-mismatch reason); `logSkip()` emits both a human line and a TAP-style
+  `ok - <name> # SKIP <reason>` line so external harnesses can grep it. A SKIP counts as a pass.
+  The `XR_SKIP_IF_UNAVAILABLE()` macro at the top of each case wires this in.
+- **Artifact capture on failure.** `dumpXrArtifacts(testName)` (called by each case via an RAII
+  guard that checks `this->failed`) writes to `hyprtester/artifacts/<run-id>/<testName>/`:
+  `monitors.json`, `openxr.json`, a tail of the Monado log, and a tail of the Hyprland log. A
+  green run writes nothing.
+- **Unique per-run names.** Monitors created by a test at runtime use a per-pid, per-counter name
+  (`monitorName(n)`), so re-runs and concurrent developers never collide on "name already taken".
+  The two config-declared fixtures (`XR-conf-a/b`) are exempt because the config is static and the
+  instance is launched fresh per run.
 
 ---
 
-## 6. Integration test cases
+## 6. The integration cases
 
-All tests below: group `xr`, `TEST_CASE(<name>)`. Precondition for all but
-`xr_runtime_absent`: orchestrator available (else SKIP §5.3), and an implicit
-`waitForXrState("focused")` gate — **with one caveat**: `xrSyncActions` only returns real
-input when the session reaches FOCUSED (plan risk #3). WP10 must empirically verify the
-remote driver + null compositor drives the session to FOCUSED; if it plateaus at VISIBLE,
-the input-dependent tests (`xr_ray_click_routing`, `xr_grab_move`, `xr_scroll`) gate on
-`waitForXrState("visible")` and are marked expected-SKIP until focused is achievable — the
-non-input tests are unaffected.
+The suite is the `xr` group; all cases skip cleanly when Monado is unavailable, and (except
+`xr_runtime_absent`) gate on the session reaching FOCUSED (or VISIBLE where scripted input isn't
+required). The cases, by file:
 
-Note for any test reading `anchor.pose` from `j/openxr` (tests 4, 6, and any future ones): per
-`05-ipc-config.md` §4.3, head/body/device anchor modes report their **configured offset** over
-JSON in the normal case, and only switch to the **live world-composed pose** while the monitor is
-grabbed (`grabbed: true`) — this applies to all four modes, not just `local`. Assertions on
-`anchor.pose` for a leashed/device monitor that isn't grabbed should expect the stored offset, not
-a pose that tracks the head/body/grip frame-by-frame.
+**Session and graceful degradation** (`session.cpp`)
+- `xr_session_up` — the session reaches focused/visible against Monado's null compositor + remote
+  driver and reports `Monado` as the runtime.
+- `xr_runtime_absent` — Hyprland launched with `openxr:enabled=1` but no `XR_RUNTIME_JSON` reports
+  `state: unavailable`, `enable` returns a clean error (not a crash), and the compositor stays
+  fully functional.
+- `xr_gpu_mismatch_fails_closed` — forcing `openxr:gpu` at a render node that is *not* the one the
+  runtime composites on makes `enable` fail closed (report the runtime unavailable) instead of
+  taking the compositor down on a cross-GPU import. Guarded: it skips unless the runtime-GPU probe
+  succeeded and a second distinct render node exists to force.
 
-| # | Test | Steps | Assertions |
-|---|---|---|---|
-| 1 | `xr_session_up` | Just the gate. | `waitForXrState("focused")` (or `visible`, caveat above); `j/openxr` has non-empty `runtimeName` containing `Monado`; `openxrsessionstate`/`openxractive` events observed if a socket2 listener is attached (optional v1). |
-| 2 | `xr_monitor_create_destroy` | `dispatch xrmonitor create XR-t<pid>-1 1280x720` → wait for it in `j/openxr` monitors[] → `dispatch xrmonitor destroy XR-t<pid>-1` → wait gone. | create returns ok; `j/monitors` contains the headless output; `j/openxr` entry has `size_m` ≈ `openxr:default_size`; after destroy both listings drop it. (Socket2 `xrmonitoradded`/`xrmonitorremoved` assertions optional v1.) |
-| 3 | `xr_config_declared` | Launched config declares `XR-conf-a/b` (§2.1). Then `keyword`-append is not possible for keywords, so reconciliation is tested via `getFromSocket("/reload")` after swapping the config file variant is out of scope v1 — instead: verify initial declare, then `dispatch xrmonitor create XR-t<pid>-2`, then `/reload`. | Both declared monitors exist with correct anchors (`anchor.mode` `local`/`head` in JSON); after reload both still exist (idempotent reconcile, no destroy/create flicker — same `id`); the runtime-created `XR-t<pid>-2` **survives the reload untouched** (reconcile ignores runtime monitors, `05-ipc-config.md` §2.5). |
-| 4 | `xr_anchor_transitions` | Create `XR-t<pid>-3`. `xrmonitor anchor <name> head` → RemoteClient `animate` a 90° head yaw over 2 s → wait 2×`leash_response` → read pose. Then `anchor <name> local`, yaw head back. | After head-yaw: monitor's world pose has re-converged in front of the view (JSON pose within 5 cm/3° of expected leashed target — leash convergence). After `anchor local`: pose frozen (head motion no longer moves it); `anchor.mode` flips in JSON; `xrmonitoranchor` event payload `<name>,local`. |
-| 5 | `xr_ray_click_routing` | Create two monitors side by side (`XR-t<pid>-4/5`, local anchors 1 m apart). Aim right controller ray at a known UV of monitor 5 (compute controller pose from the known quad pose, `03/04` math), `setTrigger(0.8)` pulse, then `setTrigger(0.2)`. | Focused monitor becomes 5's output (`j/monitors` `focused: true`); `hyprctl cursorpos` maps to the expected pixel (UV × mode) within a few px; monitor 4 not focused. Button press/release observed via focus/activation of a test client if one is spawned on that output (optional strengthening). |
-| 6 | `xr_grab_move` | Create `XR-t<pid>-6`. Aim at it, `setSqueeze(0.8)` (grab), `animate` a 0.5 m controller translation, `setSqueeze(0.2)` (release). | During grab: `j/openxr` shows `grabbed: true` (poll mid-animation); after release: `grabbed: false` and the monitor's `anchor.pose.pos` moved by ≈0.5 m (±5 cm) in the translated direction; `xrmonitorgrab` `<name>,1` then `<name>,0`. |
-| 7 | `xr_scroll` | Spawn a scrollable client on an XR monitor (reuse hyprtester's kitty spawn on that output), aim ray at it, `setThumbstick(0, ±0.8)` for N pulses. | Axis events reach the client — assert indirectly: with `openxr:scroll_speed` doubled via `keyword`, the same pulse count produces proportionally more scroll (or v1-minimal: no error + hover monitor stays, plus `j/openxr` hovered flag true; strengthen later with the pointer-scroll test client `hyprtester/clients/pointer-scroll`). |
-| 8 | `xr_idle_inhibit` | Needs a small idle client: add `clientNew("idle-notify" PROTOS "ext-idle-notify-v1")` to `hyprtester/CMakeLists.txt` — requests an idle notification with a 1 s timeout, obeying inhibitors, prints `idled`/`resumed` lines. Run it with XR focused; then `keyword openxr:inhibit_idle 0`; then restore. | With `inhibit_idle=1` + state focused: no `idled` within 3 s. With `inhibit_idle=0`: `idled` arrives (idle not inhibited — no real input flowing). Restore → `resumed` on next XR input pulse (activity-for-free path, `05-ipc-config.md` §6.4). |
-| 9 | `xr_mirror` | Create `XR-t<pid>-7`, then `keyword monitor HEADLESS-2, preferred, auto, 1, mirror, XR-t<pid>-7` (zero-new-code mirroring via `CMonitor::setMirror`, `02-virtual-monitors.md`). | `j/monitors`: HEADLESS-2 reports `mirrorOf` = the XR monitor; unset (`keyword monitor HEADLESS-2, preferred, auto, 1`) restores it. |
-| 10 | `xr_disable_teardown` | `hyprctl openxr disable` → wait `disabled`; then `hyprctl openxr enable` → wait up again. Run with one runtime-created monitor alive and `keyword openxr:destroy_monitors_on_stop 1` set by the test (the option-(a) escape hatch — the default is 0 since research/18 `monitors_follow_session`; the default keep-but-unplug disposition is covered by `xr_plugged_follow_session` / `xr_plugged_create_while_sessionless` in `plugged.cpp`). | After disable: state `disabled`; the XR monitor is gone from `j/monitors` (destroy_monitors_on_stop); Hyprland alive and responsive (no crash on teardown — the whole point of the full state machine, `01-session-graphics.md`). After enable: state returns to `focused`/`visible`; declared monitors re-materialize with quads bound. |
-| 11 | `xr_runtime_absent` | **Runs when the orchestrator is `unavailable` OR in a dedicated sub-invocation without `XR_RUNTIME_JSON`** (§2.1 step 2): Hyprland launched with `openxr:enabled=1` but no runtime manifest. | `waitForXrState("unavailable")`; `hyprctl openxr` returns `state: unavailable` with empty runtime fields; `hyprctl openxr enable` returns a clean error (not a crash); compositor fully functional (run one trivial non-XR IPC assertion). This is the graceful-degradation contract of `00-overview.md`. |
+**Virtual monitors** (`monitors.cpp`)
+- `xr_monitor_create_destroy` — create/destroy a runtime XR monitor via the dispatcher; assert it
+  appears/disappears in `j/openxr` and `j/monitors` with the expected size.
+- `xr_force_linear_realloc` — toggling the `force_linear` swapchain policy reallocates the
+  monitor's swapchains.
+- `xr_config_declared` — the two declared fixtures exist with correct anchors; a config reload
+  reconciles idempotently (declared monitors keep their ids, a runtime-created monitor survives
+  untouched).
+- `xr_mirror` — a normal headless monitor set to `mirror` an XR monitor reports `mirrorOf` and
+  restores on unset (zero-new-code mirroring through the standard monitor path).
 
-**As built, four more tests exist beyond the eleven above (WP13 reconciliation) — the implemented
-suite is 15 tests, not 11:**
+**Anchoring** (`anchors.cpp`, `adaptive.cpp`)
+- `xr_anchor_transitions` — switch a monitor's anchor mode and drive head yaw; the leashed pose
+  re-converges in front of the view, then freezes when switched back to `local`; the anchor event
+  fires.
+- `xr_adaptive_geofence` — the adaptive dock↔follow behavior: walking the head out of the geofence
+  undocks and follows, returning re-docks.
 
-| # | Test | Steps | Assertions |
-|---|---|---|---|
-| 12 | `xr_ray_hover` (WP7, `ray_live.cpp`) | Bounded live smoke test predating the WP12 input suite: activate the left controller, sweep a small bracket of plausible poses aimed at a freshly-created quad. | Hover registers in `j/openxr` (name-scoped, §5.1-style helper — the WP13 fix in this reconciliation pass, see A.2). SKIPs (not fails) if hover never registers within budget — this test proves the pointer *can* work, it is not a strict gate; see the doc's dual-GPU/Monado-interop appendix below. |
-| 13 | `xr_select_hysteresis` (WP12, `input.cpp`) | Doc 04 §4 Schmitt-trigger coverage: drive `trigger_value` across the press (0.7) and release (0.4) thresholds while hovering, using a spawned pointer-scroll test client's button observability (hover alone can't distinguish "hovering" from "clicked"). | Press edge at/above 0.7 registers a button press on the client; release edge at/below 0.4 registers release; jitter between the thresholds does not double-fire. |
-| 14 | `xr_two_hand_pointer` (WP12, `input.cpp`) | Doc 04 §3 two-hand ownership: hover monitor A with the left hand, then produce a hover change with the right hand onto monitor B. | Pointer ownership (and `hovered`) transfers to the last-active hand; A stops being reported hovered once B is; transferring back to the left hand on A re-asserts A. |
-| 15 | `xr_menu_right_click` (WP12, `input.cpp`) | Doc 04 §1.2/§4: the `menu` action (bound to `a/click` on valve/index, the test profile) maps to a `BTN_RIGHT` edge. | A `menu` press/release edge while hovering produces a right-click on the spawned test client, verified via the same button-observability path as `xr_select_hysteresis`. |
+**Monitor plug lifecycle** (`plugged.cpp`)
+- `xr_plugged_follow_session` — the monitor plug state follows the session per policy.
+- `xr_plugged_create_while_sessionless` — creating an XR monitor with no live session behaves per
+  policy.
+- `xr_plugged_survives_monitor_refresh` — a monitor refresh doesn't spuriously unplug.
 
-**A 16th test exists for the overlay/ambient-background integration (WP-P5) — the implemented
-suite is 16 tests:**
+**Input** (`input.cpp`, `ray_live.cpp`)
+- `xr_ray_click_routing` — aim a controller ray at a known UV of one of two side-by-side monitors,
+  press/release the trigger; focus and cursor position land on the expected output and pixel.
+- `xr_select_hysteresis` — the trigger Schmitt threshold (press vs. release) registers exactly one
+  button edge and doesn't double-fire on jitter, verified via a spawned test client.
+- `xr_two_hand_pointer` — pointer ownership transfers to the last-active hand and back.
+- `xr_scroll` — thumbstick scroll reaches a scrollable client on an XR monitor.
+- `xr_menu_right_click` — the `menu` action maps to a right-click edge, verified on a test client.
+- `xr_ray_hover` — a bounded live smoke test that a swept controller ray registers hover on a
+  fresh quad; skips (does not fail) if hover never registers within budget.
 
-| # | Test | Steps | Assertions |
-|---|---|---|---|
-| 16 | `xr_overlay_composition` (WP-P5, `overlay.cpp`) | **Opt-in**, gated on `$HYPRTESTER_HYPXRPAPER` (path to a `hypxrpaper` binary; unset/invalid → SKIP, never fail). Wait for the default (exclusive) session to reach focused, then: `/openxr disable` → launch `hypxrpaper` in gradient-panorama mode (no args, no scene asset) as the **primary** OpenXR session (PID-tracked, same `XR_RUNTIME_JSON`/runtime dir as the suite's Monado, `--gpu $HYPRTESTER_XR_GPU` forwarded) → `keyword openxr:overlay 1` → `/openxr enable`. Restore on exit (RAII guard): `disable` → `keyword openxr:overlay 0` → `enable` → kill hypxrpaper by PID. | HypXRland re-reaches `focused` as an `XR_EXTX_overlay` session; `j/openxr` reports `"overlay": true` and still names `Monado`; the declared fixture monitors are bound (`"monitors": [ ... "name": ...]`). `openxr:overlay` is read in `COpenXRManager::start()` (which `/openxr enable` calls directly), so a plain `keyword`-set before `enable` applies it — **no `parseKeyword` special-case is needed** (unlike the `openxr:enabled`/`inhibit_idle` hot-toggles). All phases are bounded (≤20 s) and SKIP on env flake per suite convention. |
+**Grab: move, region gating, and release latch** (`grab_live.cpp`, `grab_region.cpp`,
+`grab_latch.cpp`)
+- `xr_grab_move` — squeeze-grab a monitor, translate the controller, release; the monitor's anchor
+  pose moves by the translated amount and the grab events fire.
+- `xr_grab_gating_body_vs_bar` — grabbing the chrome bar always moves; grabbing the body follows
+  the grab-anywhere gating.
+- `xr_grab_body_default_regression` — the default body-grab disposition holds.
+- `xr_grab_corner_resize` — grabbing a corner resizes from that corner.
+- `xr_grab_release_latch` — the release pose-latch lands the monitor at its pre-jerk pose (no
+  fist-open lurch).
+- `xr_grab_calm_release_noregress` — a calm release is not rewound.
+- `xr_grab_fast_flick_noregress` — a deliberate fast flick is not falsely rewound as an outlier.
 
-There is no dedicated 16-layer-cap integration test (§2's directory-layout note above) and no
-unit test for the layer-count-limit policy either — a gap, not an oversight to paper over.
-
----
-
-## 7. Environment notes: dual-GPU interop (as built, WP13 reconciliation)
-
-Findings from running the `--xr` suite on a dual-GPU dev box (NVIDIA + AMD), recorded here so
-they aren't re-discovered from scratch. None of this is Hyprland-side application logic — it's
-runtime/driver behavior that shapes how to run and interpret the suite on this class of machine.
-
-- **Monado's null compositor picks a GPU independently of Hyprland.** On a machine with an
-  NVIDIA render node (`renderD128`) and an AMD one (`renderD129`), `monado-service`'s null
-  compositor selects NVIDIA/Vulkan for its `XRT_COMPOSITOR_NULL` device regardless of which GPU
-  Hyprland itself is rendering on.
-- **`openxr:gpu` must be pinned to match Monado's GPU on this class of setup.** `01-session-
-  graphics.md`'s default ("match Hyprland's primary GPU render node") picks the *wrong* device
-  when Hyprland's primary GPU differs from Monado's — the resulting cross-GPU dmabuf import
-  crashes inside Monado/Mesa at `xrCreateSwapchain` (the exact interop risk `01-session-
-  graphics.md`'s "GPU selection" section's historical-rationale comments describe). `xr-test.conf`
-  pins `openxr:gpu = /dev/dri/renderD128` (NVIDIA, matching Monado) specifically for this reason
-  — see the comment in that file.
-- **Known Monado/Mesa defects, runtime-side, not Hyprland bugs:** even with the GPU pinned
-  correctly (no swapchain crash, session reaches FOCUSED, quads render), long-running sessions on
-  this environment have been observed to spam `client_egl_insert_fence Failed` and, eventually, a
-  `corrupted double-linked list` heap-corruption abort during teardown. This is inside
-  Monado/Mesa, not `src/openxr/` — the WP3/WP10 implementation reports gdb-verified valid call
-  inputs (owned GBM display, correct format, correct size) at the crash site. **Practical
-  consequence for testing: keep individual XR sessions short.** The bounded-time, SKIP-not-FAIL
-  posture of `xr_ray_hover`/`xr_grab_move` (§6, tests 12 and 6) and the suite's overall design
-  (short-lived per-test sessions rather than one long-running session) already follow this
-  advice; don't add tests that hold a session open for extended periods on this class of
-  environment.
-- **Debugging tip:** the `hyprctl` binary in a `build-debug` tree can be a stale directory
-  artifact (pre-existing, unrelated build break) rather than the real CLI. Prefer raw socket IPC
-  (`echo -n "j/monitors" | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/hypr/$HIS/.socket.sock`) or the
-  system `hyprctl` for manual debugging outside the test harness.
+**Idle, teardown, overlay** (`idle.cpp`, `teardown.cpp`, `overlay.cpp`)
+- `xr_idle_inhibit` — with `inhibit_idle` on and a focused session, an idle client is not idled;
+  turning it off lets idle fire; restoring resumes on the next XR input.
+- `xr_disable_teardown` — `hyprctl openxr disable`/`enable` round-trips through the full state
+  machine without crashing and restores the declared monitors.
+- `xr_overlay_composition` — **opt-in**, gated on `$HYPRTESTER_HYPXRPAPER` (a path to a
+  `hypxrpaper` binary; unset/invalid → skip). Launches `hypxrpaper` as the primary OpenXR session
+  and re-enters Hyprland as an `XR_EXTX_overlay` session; asserts `overlay: true` in `j/openxr`,
+  that Monado is still the runtime, and that the declared fixtures are bound. It restores state on
+  exit (disable → clear overlay → enable → kill the primary).
 
 ---
 
-## 8. CI posture and local invocation
-
-- **CI**: only the unit tier. `tests/xr/*.cpp` ride the existing `hyprland_gtests` target —
-  zero new CI configuration. The integration tier is **not** wired into CI initially
-  (omedora L4 lesson: a runtime-and-driver-dependent tier becomes a flaky per-PR gate;
-  keep it a local/pre-release gate until it has a stable track record — then consider a
-  self-hosted runner).
-- **Local invocation** (exact):
+## 7. Running the suite locally
 
 ```sh
-# 1. Build Hyprland + hyprtester with the XR suite compiled in
+# 1. Build Hyprland + hyprtester with the XR suite compiled in.
 cmake -B build-debug -DWITH_TESTS=ON -DWITH_XR_TESTS=ON
 cmake --build build-debug --target Hyprland hyprtester
 
-# 2. Have Monado available: build the pinned submodule (one-time)
+# 2. Have Monado available — build the pinned submodule once…
 scripts/build-monado.sh
-#    ...or have monado-service in PATH, or point at one explicitly:
+#    …or point at one explicitly / rely on PATH:
 export HYPRTESTER_MONADO_SERVICE=/path/to/monado-service
-# optional, software Vulkan:
+# optional: force software Vulkan
 export HYPRTESTER_VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-# optional, opt into the overlay/ambient-background test (xr_overlay_composition):
-#   point at a hypxrpaper binary (see hypxrpaper's own README to build it). When unset,
-#   that single test SKIPs (counts as a pass); everything else is unaffected.
+# optional: opt into xr_overlay_composition (else it skips)
 export HYPRTESTER_HYPXRPAPER=/path/to/hypxrpaper
 
-# 3. Run from the hyprtester directory (hyprtester requirement)
+# 3. Run from the hyprtester directory.
 cd hyprtester
 ../build-debug/hyprtester/hyprtester --xr --binary ../build-debug/Hyprland
-# subset:
+# a subset:
 ../build-debug/hyprtester/hyprtester --xr --binary ../build-debug/Hyprland xr_session_up xr_grab_move
 ```
 
-(Adjust the hyprtester binary path to wherever the build places it; `--config` defaults to
-`hyprtester/xr-test.conf` under `--xr`.)
+The unit tier rides the existing `hyprland_gtests` target and needs none of the above — it runs
+on every ordinary test build. The integration tier is not wired into CI as a per-PR gate: it
+depends on a live runtime and a real GPU, so it stays a local / containerized gate.
+
+Only **one** `monado-service` runs per box — its remote driver binds TCP 4242 — so anything that
+binds 4242 (a native host suite run, or a container session publishing the port) must be
+serialized. This is the main reason to prefer the hermetic container runner below.
 
 ---
 
-## 9. Containerized dev/test environment
+## 8. Containerized suite and dev sessions
 
-A rootless-podman Arch+systemd container (`containers/`, driven by
-`scripts/xr-container.sh`) runs the whole XR stack in **full session/input/GPU
-isolation** — no host DBus, no `/dev/input`, one GPU by construction. It boots
-real PID-1 systemd, installs a curated Omarchy desktop, and builds the dev
-Hyprland + hyprtester + vendored Monado into a volume (`/build`) so the host tree
-is never touched. See [`containers/README.md`](../../containers/README.md) for the
-image/build details; this section is the testing-oriented view.
+`scripts/xr-container.sh` drives a rootless-podman Arch + systemd container that boots real PID-1
+systemd, installs a curated Omarchy desktop, and builds Hyprland + hyprtester + the vendored
+Monado into a volume so the host tree is never touched. See
+[`containers/README.md`](../../containers/README.md) for image/build details; this is the
+testing-oriented view.
 
-### Topologies
-
-| Invocation | XR runtime | Nesting host | Host mounts | Use |
-| --- | --- | --- | --- | --- |
-| `test` | vendored Monado **null**, in-container | headless **labwc** (in-container) | **none** (hermetic) | CI-style suite run |
-| `session` (windowed) | vendored **windowed** Monado, in-container | host wayland socket (nested window) | wayland socket only | interactive dev, no headset |
-| `session --wivrn` | **host WiVRn** runtime | host wayland socket | wayland socket + `/usr/lib/wivrn` + manifest + `wivrn/comp_ipc` | real Quest 3 (default `--gpu split`) |
-
-### The three invocations
+### 8.1 Hermetic test run (`test`) — the preferred runner
 
 ```sh
-scripts/xr-container.sh test --gpu amd            # hermetic hyprtester --xr, AMD
-scripts/xr-container.sh test --gpu nvidia         # …on NVIDIA via CDI
-scripts/xr-container.sh session                   # windowed Monado desktop (no headset)
-scripts/xr-container.sh session --env forest      # + hypxrpaper ambient background (overlay mode)
-scripts/xr-container.sh session --wivrn           # real headset (default --gpu split)
-scripts/xr-container.sh check-gpu --gpu nvidia    # eglinfo/vulkaninfo smoke test
+scripts/xr-container.sh test --gpu amd                  # full hyprtester --xr suite
+scripts/xr-container.sh test --gpu amd xr_session_up    # a subset (name filter)
+scripts/xr-container.sh test --gpu nvidia               # …on NVIDIA via CDI
+scripts/xr-container.sh test --gpu amd --keep           # leave the container up to debug
 ```
 
-GPU selection is by **vendor scan** (`scripts/lib/gpu.sh`), not hardcoded node
-names — `--gpu split|amd|nvidia|intel` or an explicit `/dev/dri/renderD*`. The
-node is resolved host-side (for `--device`) and again **inside** the container
-(for the `openxr:gpu` pin), so a CDI-injected NVIDIA node is verified present
-rather than assumed. See [`containers/README.md` § GPU](../../containers/README.md#gpu).
+`test` boots `:session` with **no host wayland/X11/wivrn mounts** — only the `/src` overlay, the
+build/ccache volumes, and one GPU device. It uses its **own network namespace** and the vendored
+Monado null compositor, so it touches no host sockets and can run safely alongside a live host
+session. A headless **labwc** is the nesting host: `runXrSuite` tries the stock headless launch
+(which cannot work in seatless rootless podman) and then nests into labwc — the only light
+compositor advertising both protocols Aquamarine's nested backend requires (`xdg_wm_base >= v6`
+and `zwp_linux_dmabuf_v1`). The real exit code comes from a sentinel file (`machinectl shell`
+always exits 0); on failure the run log and every preserved `/tmp/hyprtester-xr-*` dir are copied
+to `containers/artifacts/<timestamp>/`.
 
-**Split-GPU (`--gpu split`, the dual-GPU `--wivrn` default).** On a machine
-where the host compositor and WiVRn's encoder live on **different** GPUs, no
-single GPU works: the nested compositor must render on the host-compositor GPU
-(`AQ_DRM_DEVICES`) while XR encodes on the other (`openxr:gpu`). `--gpu split`
-exposes both GPUs to the container and plumbs the two roles separately —
-`--nested-gpu` (default `host` = first non-NVIDIA node) and `--xr-gpu`
-(default `nvidia`). This is exactly the native preview's topology (host Hyprland
-on AMD, `openxr:gpu` on the NVIDIA node). It degrades to single-GPU on a
-one-GPU box.
+GPU selection is by **vendor scan** (`scripts/lib/gpu.sh`), not hardcoded node names —
+`--gpu amd|nvidia|intel|split` or an explicit `/dev/dri/renderD*`. The node is resolved host-side
+(for `--device`) and again **inside** the container (to pin `openxr:gpu`), so a CDI-injected
+NVIDIA node is verified present rather than assumed. `--gpu amd` is the default and the reliable
+hermetic GPU; on NVIDIA the nested-into-labwc topology hits an Aquamarine GBM allocation limit
+(`XR24` on the NVIDIA node), which is a driver/GBM constraint, not compositor logic — use
+`--gpu nvidia` mainly to prove the CDI ICDs via `check-gpu`.
 
-### Validation matrix (observed on the dual-GPU dev laptop: AMD 890M iGPU + RTX 5070)
+### 8.2 Interactive sessions (`session`)
 
-| Path | `--gpu amd` | `--gpu nvidia` (CDI) |
-| --- | --- | --- |
-| `check-gpu` | AMD ICD (radv/radeonsi) | NVIDIA ICD (RTX 5070 EGL + Vulkan) — CDI end-to-end |
-| `test` (hermetic suite) | **green** (18/18, ×2) | 1 deterministic fail (`xr_mirror`) + flaky input SKIPs |
-| `session --wivrn` | *(single-GPU pin, kept for experiments)* nested backend up → cross-GPU swapchain SEGV (WP3) | *(single-GPU pin)* nested `CBackend::create()` fails on NVIDIA (see below) |
-| `session --wivrn` (default **`--gpu split`**) | nested compositor on AMD (`AQ_DRM_DEVICES`) + XR encode on NVIDIA (`openxr:gpu`, CDI) — the working dual-GPU topology (see below) ||
+```sh
+scripts/xr-container.sh session                   # windowed Monado desktop, no headset
+scripts/xr-container.sh session --wivrn           # real Quest via host WiVRn (default --gpu split)
+scripts/xr-container.sh session --env forest      # + hypxrpaper ambient background (overlay)
+scripts/xr-container.sh session --passthrough     # openxr:blend_mode = alpha
+```
 
-**NVIDIA hermetic finding.** On NVIDIA the nested-into-labwc topology hits an
-aquamarine GBM limitation — `GBM: Failed to allocate a GBM buffer: bo null …
-format XR24` on the NVIDIA node — so `xr_mirror` (which stands up a `HEADLESS-2`
-mirror output) fails deterministically, and the input tests flake (nested
-compositor buffer pressure). This is an NVIDIA-driver/aquamarine GBM constraint in
-the nested-wlroots-style topology, **not** compositor application logic. **AMD is
-the reliable hermetic GPU** (18/18 twice); use `--gpu nvidia` for `check-gpu`
-(proving the CDI ICDs) but prefer AMD for the suite on this class of machine.
+`session` nests a full Omarchy desktop as a window on the host, with the dev Hyprland's XR
+extension enabled and input isolated (no `/dev/input`). Its topologies:
 
-**`session --wivrn` finding (dual-GPU laptop).** A *single-GPU* `--wivrn` run is
-**blocked by topology, not by WP4**: the nested container Hyprland renders its flat
-window into the host compositor and so must render on the *host's* GPU (AMD 890M
-here) — nesting on NVIDIA fails at `CBackend::create()`. With `--gpu amd` the
-nested backend comes up and reaches WiVRn (as in WP3) but SEGVs at the cross-GPU
-swapchain. No single GPU satisfies both the nested-window path (host GPU) and
-WiVRn's encode path (NVIDIA).
+| Invocation | XR runtime | Nesting host | Host mounts |
+|---|---|---|---|
+| `session` (windowed) | vendored **windowed** Monado, in-container | host Wayland socket | Wayland socket only |
+| `session --wivrn` | **host WiVRn** runtime | host Wayland socket | Wayland socket + WiVRn libs/manifest/socket |
 
-The fix (this WP) is **`--gpu split`**, now the `--wivrn` default: expose both
-GPUs and assign them separately — nested compositor (`AQ_DRM_DEVICES`) on the host
-GPU (AMD), XR encode (`openxr:gpu`) on the encode GPU (NVIDIA, via CDI). This is
-the identical topology the *native* preview already runs (host Hyprland on AMD +
-`openxr:gpu=<NVIDIA node>`), so the cross-GPU XR blit is the proven native path,
-not a new one. Roles are overridable (`--nested-gpu`/`--xr-gpu`); the plumbing
-degrades to single-GPU on a one-GPU machine. A single-GPU `--gpu` pin with
-`--wivrn` is retained for experiments but warns. The NVIDIA CDI plumbing is
-independently proven by `check-gpu` (full RTX 5070 EGL + Vulkan inside the
-container).
+Windowed `session` does **not** publish Monado's remote port by default (a fixed 4242 publish
+once poisoned a concurrent host suite run); opt in with `--publish-remote` for an ephemeral host
+port. `session --wivrn` targets a real headset and defaults to `--gpu split`: on a dual-GPU box
+the nested compositor must render on the host-compositor GPU (`AQ_DRM_DEVICES`) while WiVRn
+encodes on the other (`openxr:gpu`), so both GPUs are exposed and assigned separately
+(`--nested-gpu` / `--xr-gpu`); it degrades to a single node on a one-GPU box.
 
-### Hermetic vs host suite, and the 4242 story
+### 8.3 Dual-GPU interop note
 
-- **Hermetic (`test`)** is the preferred way to run the suite: it uses its **own
-  network namespace** and vendored Monado, touching no host sockets, so it can run
-  alongside a live host session safely. This is the container's reason to exist.
-- **The host suite** (running `hyprtester --xr` natively, §8) and the container's
-  **windowed `session`** both involve a Monado **remote driver on TCP 4242** —
-  and there is only **one** 4242 per box. A container that *publishes*
-  `127.0.0.1:4242` will collide with a host Monado and poison a concurrent host
-  suite run. Therefore windowed `session` **does not publish 4242 by default**;
-  opt in with `--publish-remote` (ephemeral free host port, printed in the banner)
-  or `--publish-remote=PORT`. Rule of thumb: **serialize** anything that binds
-  4242 — a host suite run and a port-publishing container session must not overlap.
+Runtime/driver behavior specific to dual-GPU boxes, recorded so it isn't rediscovered — none of
+it is compositor application logic:
+
+- Monado's null compositor picks a GPU **independently** of Hyprland. If `openxr:gpu` doesn't
+  match the render node Monado composites on, the cross-GPU dmabuf import crashes inside
+  Monado/Mesa at `xrCreateSwapchain` — hence the per-box `openxr:gpu` pin (§3) and the
+  `xr_gpu_mismatch_fails_closed` guard (§6). Whatever runs the OpenXR runtime/encoder dictates the
+  XR GPU.
+- Keep individual XR sessions short. Long-running sessions on some driver stacks have shown
+  Monado/Mesa-side fence-insert spam and teardown heap-corruption aborts inside Monado, not
+  `src/openxr`. The suite's short-lived per-test sessions and the SKIP-not-FAIL posture of the
+  live smoke tests already follow this.
 
 ---
 
-## Context files to read before implementing
+## 9. Preview and fishfood scripts
 
-- `docs/openxr/00-overview.md` — lifecycle states (the strings `waitForXrState` matches), build gating
-- `docs/openxr/04-input.md` — bindings (valve/index = the tested profile), hysteresis values the input tests exercise
-- `docs/openxr/05-ipc-config.md` — the `hyprctl openxr` JSON schema all assertions parse; event names; xr-test.conf keyword syntax
-- `hyprtester/src/main.cpp` — `launchHyprland`, settings parsing (where `--xr` goes), `runTests`, `cleanupAndReport`
-- `hyprtester/src/shared.hpp` — `TEST_CASE` / `EXPECT*` / `ASSERT*` / `OK` macros, group storage mechanism
-- `hyprtester/src/tests/main/tests.hpp` — the group-header pattern to copy for `tests/xr/tests.hpp`
-- `hyprtester/src/hyprctlCompat.hpp` — `getFromSocket`, `instances()`
-- `hyprtester/CMakeLists.txt` + root `CMakeLists.txt` (~line 675–700) — build wiring, where `WITH_XR_TESTS` lands
-- `subprojects/monado/src/xrt/drivers/remote/r_interface.h` @ `c2ddab59dc41366fe520dc4e8abcfea257ecf0b8` (the submodule pin) — the structs to vendor, read it whole before writing `monado_remote_wire.hpp`
-- `/home/ajg/code/omedora-4/omedora/testing.md` — the TAP/wait-assert/artifact conventions this suite adopts
+Beyond the automated suite, several scripts stand the extension up interactively:
+
+- **`scripts/preview-xr.sh`** — a no-headset desktop preview: launches `monado-service` in
+  **windowed** mode with the remote driver (a "Monado" window shows the rendered XR space) and a
+  nested dev Hyprland (`build-debug`) with the XR extension enabled, then lets you drive the fake
+  head/controllers with `monado-gui remote`. `--wivrn` uses the system WiVRn runtime and a real
+  headset instead; `--passthrough` sets `openxr:blend_mode = alpha`; `--env pano|forest|<path>`
+  launches `hypxrpaper` as an ambient background (Hyprland then composites as an overlay);
+  `--conf <file>` swaps the base nested config (e.g. the Omarchy-mirror config from the next
+  script). The nested Hyprland runs under its own private DBus session bus, and the script kills
+  only the PIDs/process group it spawned.
+- **`scripts/gen-omarchy-xr-conf.sh`** — generates a nested-safe config under
+  `~/.config/hypr/xr-nested/` that mirrors the user's Omarchy desktop (keybinds, look-and-feel,
+  theme) but skips anything that mutates global session state or launches daemons, plus a
+  `uwsm-app` shim so keybind-launched apps land in the nested session. Feed the generated
+  `nested.conf` to `preview-xr.sh --conf`.
+- **`scripts/fishfood.sh`** — installs the extension as a real desktop session alongside the
+  distro Hyprland: a sibling git worktree built RelWithDebInfo, launched by a generated
+  wayland-session `.desktop` entry pointing at the built binary with the user's XR front-end
+  config. `setup` / `update` / `gen-session` subcommands; builds serialize through the shared
+  build mutex and the session file install is left for the user to run with root.
+
+---
+
+## 10. Vendored dependencies
+
+The test/runtime dependency chain is vendored as git submodules so the suite pins exactly what it
+validates against:
+
+- `subprojects/monado` — pinned to the same commit as the vendored wire header (§4); built by
+  `scripts/build-monado.sh` into `subprojects/monado/build` (or a `MONADO_BUILD`-redirected tree
+  for read-only source mounts).
+- `subprojects/eigen`, `subprojects/vulkan-headers` — header-only Monado build deps.
+- `subprojects/hypxrpaper` — the ambient-background client used by the optional overlay test and
+  the `--env` preview/session modes.
+
+Re-pinning Monado is a coordinated maintenance step: bump both the submodule and the wire
+header's pin together, re-copy the structs, and re-verify the size `static_assert`s. If an
+installed Monado has drifted past the pin, the suite skips rather than fails.
+
+Design research behind the anchoring, input, grab, and composition behaviors under test lives
+under `docs/openxr/research/`.
