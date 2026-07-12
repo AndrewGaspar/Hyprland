@@ -724,6 +724,26 @@ std::vector<SP<IValue>> Values::getConfigValues() {
         MS<Float>("openxr:leash_deadzone_angle", "head/body leash angular deadzone in degrees", 15.0, {.min = 0.0, .max = 180.0}),
         MS<Float>("openxr:leash_deadzone_distance", "head/body leash positional deadzone in meters", 0.25, {.min = 0.0, .max = 5.0}),
         MS<Bool>("openxr:body_leash_follow_height", "body-leashed monitors also follow vertical head movement", false),
+        // Adaptive anchoring (research/13): an anchor:local monitor picks itself up and head/body-follows
+        // when you walk away from the desk seat, then re-docks when you return, with an eased blend. All
+        // read per-frame (hot-tunable like the leash vars). Enable per-monitor with `adaptive:on` on an
+        // anchor:local xrmonitor line, or the `openxr adaptive on` verb.
+        MS<Float>("openxr:adaptive_leave_radius", "adaptive anchoring: horizontal (XZ) distance from the desk seat, in meters, before a docked monitor undocks and follows (R_out)",
+                  1.5, {.min = 0.1, .max = 10.0}),
+        MS<Float>("openxr:adaptive_return_radius",
+                  "adaptive anchoring: horizontal (XZ) distance back within the desk seat, in meters, before a roaming monitor re-docks (R_in; keep < leave_radius for hysteresis)",
+                  1.0, {.min = 0.1, .max = 10.0}),
+        MS<Int>("openxr:adaptive_leave_dwell_ms", "adaptive anchoring: how long the head must stay beyond leave_radius before undocking, in milliseconds (anti-flap)", 400,
+                {.min = 0, .max = 10000}),
+        MS<Int>("openxr:adaptive_return_dwell_ms", "adaptive anchoring: how long the head must stay within return_radius before re-docking, in milliseconds (anti-flap)", 800,
+                {.min = 0, .max = 10000}),
+        MS<Int>("openxr:adaptive_transition_ms", "adaptive anchoring: dock<->roam eased pose-blend duration, in milliseconds", 700, {.min = 0, .max = 5000}),
+        MS<String>("openxr:adaptive_transition_ease", "adaptive anchoring: easing curve for the dock<->roam blend: smoothstep (default) | linear | ease_out", "smoothstep"),
+        MS<String>("openxr:adaptive_roam_mode", "adaptive anchoring: default follow behavior while roaming: body (yaw-only at a comfortable height, default) | head (pinned to gaze)",
+                   "body"),
+        MS<Bool>("openxr:adaptive_use_height", "adaptive anchoring: include vertical (Y) head movement in the geofence distance, so standing up/lying down can also trigger", false),
+        MS<Bool>("openxr:adaptive_carry_offset", "adaptive anchoring: roam at the head-relative offset captured when undocking, instead of the configured comfortable roam offset",
+                 false),
         MS<Bool>("openxr:pointer", "enable the XR ray pointer device", true),
         MS<Float>("openxr:pointer_trigger_threshold", "trigger analog value that presses the pointer button", 0.7, {.min = 0.0, .max = 1.0}),
         MS<Float>("openxr:pointer_trigger_threshold_release", "trigger analog value that releases the pointer button (hysteresis)", 0.4, {.min = 0.0, .max = 1.0}),

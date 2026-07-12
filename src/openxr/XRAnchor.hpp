@@ -150,6 +150,51 @@ namespace OpenXR {
     // empty (caller should fall back to the release-frame endGrab in that case).
     SXRPose pickReleasePose(const SXRGrabRing& ring, uint32_t nowMs, uint32_t latencyMs, float velRejectRatio);
 
+    // ---- adaptive anchoring (docs/openxr/research/13-adaptive-anchoring.md) ----
+    //
+    // An orthogonal DECORATOR on top of an anchor:local desk pose (§4.1) — NOT a fifth anchor mode.
+    // The persisted mode stays XR_ANCHOR_LOCAL (the desk pose is the persistent identity); this
+    // small config plus a runtime phase machine on CXRAnchor lets the monitor pick itself up and
+    // head/body-follow the user when they walk away from the desk seat, then re-dock when they
+    // return, with a pleasant eased pose blend between the two (§4.3).
+    enum eXRAdaptivePhase : uint8_t {
+        XRAD_DOCKED = 0,  // world-fixed at the desk pose
+        XRAD_UNDOCKING,   // eased blend desk-pose -> live roam target
+        XRAD_ROAMING,     // head/body leash-following the user
+        XRAD_REDOCKING,   // eased blend roam-pose -> saved desk pose
+    };
+
+    inline const char* xrAdaptivePhaseName(eXRAdaptivePhase p) {
+        switch (p) {
+            case XRAD_UNDOCKING: return "undocking";
+            case XRAD_ROAMING: return "roaming";
+            case XRAD_REDOCKING: return "redocking";
+            default: return "docked";
+        }
+    }
+
+    // Persisted adaptive config (serialized in the xrmonitor line). The runtime phase machine lives
+    // on CXRAnchor and is NOT persisted (recaptured on load, like bodyHeight).
+    struct SXRAdaptiveConfig {
+        bool          enabled       = false;
+        eXRAnchorMode roamMode      = XR_ANCHOR_BODY; // head|body only (device is nonsensical here)
+        bool          roamModeSet   = false;          // false => fall back to openxr:adaptive_roam_mode
+        SXRPose       roamOffset;                      // comfortable follow offset in the roam frame
+        bool          hasRoamOffset = false;           // false => derive a comfortable default (§4.4)
+        bool          carryOffset   = false;           // capture the current offset at undock instead
+        bool          carryOverride = false;           // true => this monitor overrides openxr:adaptive_carry_offset
+        // Per-monitor overrides of the global geofence radii (§6.2); <0 => use the global openxr:* value.
+        float         leaveRadius   = -1.F; // R_out
+        float         returnRadius  = -1.F; // R_in
+
+        bool          operator==(const SXRAdaptiveConfig& o) const {
+            return enabled == o.enabled && roamMode == o.roamMode && roamModeSet == o.roamModeSet && hasRoamOffset == o.hasRoamOffset && carryOffset == o.carryOffset && carryOverride == o.carryOverride &&
+                leaveRadius == o.leaveRadius && returnRadius == o.returnRadius && roamOffset.pos.x == o.roamOffset.pos.x && roamOffset.pos.y == o.roamOffset.pos.y &&
+                roamOffset.pos.z == o.roamOffset.pos.z && roamOffset.rot.x == o.roamOffset.rot.x && roamOffset.rot.y == o.roamOffset.rot.y && roamOffset.rot.z == o.roamOffset.rot.z &&
+                roamOffset.rot.w == o.roamOffset.rot.w;
+        }
+    };
+
     // ---- per-layer persistent state (doc 03 §2.1) ----
     struct SXRAnchorState {
         eXRAnchorMode mode   = XR_ANCHOR_LOCAL;
@@ -165,10 +210,13 @@ namespace OpenXR {
         float   bodyHeight  = 0.F;  // BODY only: stored y of the body frame origin (meters)
         float   widthMeters = 1.6F; // quad width; height derived = widthMeters * pxH / pxW
 
+        // Adaptive anchoring decorator (research/13). Persisted alongside the LOCAL desk pose.
+        SXRAdaptiveConfig adaptive;
+
         bool    operator==(const SXRAnchorState& o) const {
             return mode == o.mode && device == o.device && anchorPose.pos.x == o.anchorPose.pos.x && anchorPose.pos.y == o.anchorPose.pos.y &&
                 anchorPose.pos.z == o.anchorPose.pos.z && anchorPose.rot.x == o.anchorPose.rot.x && anchorPose.rot.y == o.anchorPose.rot.y &&
-                anchorPose.rot.z == o.anchorPose.rot.z && anchorPose.rot.w == o.anchorPose.rot.w;
+                anchorPose.rot.z == o.anchorPose.rot.z && anchorPose.rot.w == o.anchorPose.rot.w && adaptive == o.adaptive;
         }
     };
 
@@ -179,6 +227,18 @@ namespace OpenXR {
         float deadzoneDistance = 0.25F;   // openxr:leash_deadzone_distance (m)
         bool  bodyFollowHeight = false;   // openxr:body_leash_follow_height
         float defaultDistance  = 1.5F;    // openxr:default_distance        (m)
+
+        // Adaptive anchoring thresholds (research/13 §6.1). All hot-read per frame from
+        // openxr:adaptive_* by the caller (readAnchorTuning) — same live-tune path as the leash vars.
+        float         adLeaveRadius  = 1.5F;               // R_out (m, XZ from the desk seat)
+        float         adReturnRadius = 1.0F;               // R_in  (m, XZ; < R_out -> hysteresis dead band)
+        float         adLeaveDwell   = 0.4F;               // T_out (s): hold d>R_out this long to undock
+        float         adReturnDwell  = 0.8F;               // T_in  (s): hold d<R_in this long to redock
+        float         adTransition   = 0.7F;               // dock<->roam blend duration (s)
+        eXREase       adEase         = XR_EASE_SMOOTHSTEP; // transition easing
+        eXRAnchorMode adRoamMode     = XR_ANCHOR_BODY;     // global default roam mode (head|body)
+        bool          adUseHeight    = false;              // include y in the geofence distance
+        bool          adCarryOffset  = false;              // roam at the offset captured at undock
     };
 
     struct SXRSolveInput {
@@ -284,6 +344,33 @@ namespace OpenXR {
         bool setMode(eXRAnchorMode newMode, eXRHand hand, const SXRVerbContext& ctx, const SXRAnchorTuning& tune);
         void onReferenceSpaceChanged(const SXRPose& poseInPreviousSpace);
 
+        // ---- adaptive anchoring verbs (research/13 §6.3) — main thread, under the layer mutex ----
+        // Enable/disable the decorator; recaptures the desk seat on enable and resets the machine.
+        void             adaptiveSetEnabled(bool en);
+        // Force a transition now (skip the dwell), for the manual dock/undock verbs + pinch toggle.
+        void             adaptiveForceUndock();
+        void             adaptiveForceDock();
+        // Redefine the desk pose to the current displayed pose and recapture the seat ("dock here").
+        void             adaptiveDockHere();
+        // Change the roam mode (head|body) live; reseeds the leash for the new frame.
+        void             adaptiveSetRoamMode(eXRAnchorMode m);
+        // Accessors for IPC/status (main thread reads under the layer mutex).
+        bool             adaptiveEnabled() const {
+            return m_state.adaptive.enabled;
+        }
+        eXRAdaptivePhase adaptivePhase() const {
+            return m_adPhase;
+        }
+        eXRAnchorMode adaptiveRoamMode() const {
+            return m_state.adaptive.roamMode;
+        }
+        float adaptiveSeatDist() const {
+            return m_adSeatDist;
+        }
+        float adaptiveTransitionT() const {
+            return m_adT;
+        }
+
         // ---- accessors (main thread reads for IPC/status) ----
         const SXRAnchorState& state() const {
             return m_state;
@@ -309,6 +396,30 @@ namespace OpenXR {
         // Re-express a world pose W into the persistent mode's representation and reset the
         // solver runtime state (shared by endGrab §4.4 and setMode §5.6).
         void reanchorFromWorld(const SXRPose& W, const SXRVerbContext& ctx, const SXRAnchorTuning& tune);
+        // The head/body leash solve, lifted out of solve()'s switch so BOTH the normal path (O =
+        // m_state.anchorPose) and the adaptive roam path (O = roamOffset) call it, sharing the one
+        // spring (a monitor is never docked and roaming at once). `mode` is HEAD or BODY;
+        // `seedAtTarget` seeds the spring at the target (not m_lastWorld) on the next reseed so an
+        // undock hand-off has no spring kick (research/13 §4.3). Returns the world pose.
+        SXRPose solveLeash(eXRAnchorMode mode, const SXRPose& O, const SXRSolveInput& in, const SXRAnchorTuning& tune, bool seedAtTarget);
+        // Adaptive decorator pre-step (research/13 §4): run the geofence/phase machine + transition
+        // envelope and return the world pose to submit. Called from solve() when adaptive.enabled.
+        SXRPose adaptiveStep(const SXRSolveInput& in, const SXRAnchorTuning& tune);
+        // Resolve the effective roam offset: the runtime carry offset if captured, else the
+        // configured roamOffset, else a comfortable default straight ahead at defaultDistance.
+        SXRPose adaptiveRoamOffset(const SXRAnchorTuning& tune) const;
+        // The roam mode to use: the per-monitor override if set, else openxr:adaptive_roam_mode.
+        eXRAnchorMode effectiveRoamMode(const SXRAnchorTuning& tune) const {
+            const eXRAnchorMode m = m_state.adaptive.roamModeSet ? m_state.adaptive.roamMode : tune.adRoamMode;
+            return m == XR_ANCHOR_HEAD ? XR_ANCHOR_HEAD : XR_ANCHOR_BODY;
+        }
+        // Capture the current desk pose as a head/body-frame offset (openxr:adaptive_carry_offset).
+        void    captureCarryOffset(const SXRSolveInput& in, const SXRAnchorTuning& tune);
+        // Re-express a released world pose into the roam frame (grab release while roaming, §5.1).
+        void    reanchorRoam(const SXRPose& W, const SXRVerbContext& ctx, const SXRAnchorTuning& tune);
+        // Begin a transition: freeze m_adFrom, reset the envelope + dwell, arm the roam-spring seed.
+        void    beginUndock(const SXRPose& fromPose);
+        void    beginRedock(const SXRPose& fromPose);
         // Body frame from the view (§3.3). updateFilter runs the yaw hysteresis.
         SXRPose computeBodyFrame(const SXRPose& view, const SXRAnchorTuning& tune, bool updateFilter);
         // §5.5 center placement (view forward at defaultDistance, facing the head).
@@ -344,6 +455,22 @@ namespace OpenXR {
         float   m_resizeAspect = 1.F;                // contentH/contentW, fixed for the grab
         SXRPose m_resizeGrip0;                        // grip world pose at grab start
         Quat    m_resizeRot;                          // content orientation held during the resize
+        // adaptive anchoring runtime (research/13 §4.1) — frame-thread, all POD, zero refcount ops.
+        eXRAdaptivePhase m_adPhase          = XRAD_DOCKED;
+        Vec3             m_dockHeadPos;                  // the "desk seat": head pos captured when DOCKED
+        bool             m_dockSeatCaptured = false;
+        float            m_outDwell         = 0.F;       // §3.2 leave-dwell accumulator (s)
+        float            m_inDwell          = 0.F;       // §3.2 return-dwell accumulator (s)
+        float            m_adT              = 0.F;       // transition envelope parameter [0,1]
+        SXRPose          m_adFrom;                       // frozen `from` world pose for the transition
+        bool             m_seedLeashAtTarget = false;    // seed the roam spring at its target (no kick)
+        bool             m_adLeftSinceDock   = false;    // the head crossed R_out since the last dock —
+                                                          // gates auto-redock so a forced/manual undock at
+                                                          // the desk stays roaming until you actually leave
+        float            m_adSeatDist        = 0.F;      // cached geofence distance (status)
+        SXRPose          m_adRoamOffset;                 // runtime carry offset (openxr:adaptive_carry_offset)
+        bool             m_adRoamRuntimeSet  = false;
+
         // last composed world pose (LOCAL_FLOOR)
         SXRPose m_lastWorld;
         bool    m_hasLastWorld = false;

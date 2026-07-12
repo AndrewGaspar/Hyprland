@@ -252,3 +252,66 @@ TEST(XRLayoutRoundTrip, Device) {
     EXPECT_NEAR(reparsed->m_anchor.anchorPose.pos.y, pose.pos.y, 1e-3f);
     EXPECT_FLOAT_EQ(*reparsed->m_sizeMeters, 0.25f);
 }
+
+// Adaptive anchoring (research/13 §6.2/§6.4): the decorator tokens on an anchor:local line survive
+// a serialize -> parse round-trip. serializeXRMonitorLine is fed the SAVED dock pose (as layoutDump
+// does for an adaptive monitor), so the desk pose is what round-trips — not any live roam pose.
+TEST(XRLayoutRoundTrip, AdaptiveLocal) {
+    SXRAnchorState anchor;
+    anchor.mode                   = XR_ANCHOR_LOCAL;
+    anchor.adaptive.enabled       = true;
+    anchor.adaptive.roamMode      = XR_ANCHOR_HEAD;
+    anchor.adaptive.roamModeSet   = true;
+    anchor.adaptive.roamOffset    = SXRPose{Vec3{0.f, 1.35f, -1.2f}, Quat{}};
+    anchor.adaptive.hasRoamOffset = true;
+    anchor.adaptive.leaveRadius   = 2.0f;
+    anchor.adaptive.returnRadius  = 1.2f;
+    anchor.adaptive.carryOverride = true;
+    anchor.adaptive.carryOffset   = true;
+    SXRPose pose;
+    pose.pos = Vec3{0.3f, 1.05f, -1.2f}; // the desk pose
+    pose.rot = Quat{};
+
+    const std::string line = serializeXRMonitorLine("XR-rt-adaptive", Vector2D(1920, 1080), 60.f, anchor, pose, 1.8f);
+
+    auto reparsed = parseXRMonitorLine(line.substr(std::string("xrmonitor = ").size()));
+    ASSERT_TRUE(reparsed.has_value()) << reparsed.error() << " (line was: " << line << ")";
+    const auto& ad = reparsed->m_anchor.adaptive;
+    EXPECT_TRUE(ad.enabled);
+    EXPECT_EQ(ad.roamMode, XR_ANCHOR_HEAD);
+    EXPECT_TRUE(ad.roamModeSet);
+    EXPECT_TRUE(ad.hasRoamOffset);
+    EXPECT_NEAR(ad.roamOffset.pos.y, 1.35f, 1e-3f);
+    EXPECT_NEAR(ad.roamOffset.pos.z, -1.2f, 1e-3f);
+    EXPECT_NEAR(ad.leaveRadius, 2.0f, 1e-3f);
+    EXPECT_NEAR(ad.returnRadius, 1.2f, 1e-3f);
+    EXPECT_TRUE(ad.carryOverride);
+    EXPECT_TRUE(ad.carryOffset);
+    // The saved desk pose (not a roam pose) round-trips.
+    EXPECT_NEAR(reparsed->m_anchor.anchorPose.pos.x, 0.3f, 1e-3f);
+    EXPECT_NEAR(reparsed->m_anchor.anchorPose.pos.z, -1.2f, 1e-3f);
+}
+
+// The global roam-mode default is respected: an `adaptive:on` line with no `roam:` token leaves
+// roamModeSet false so the runtime defers to openxr:adaptive_roam_mode, and re-serializes without a
+// roam token (so a save/reload keeps deferring).
+TEST(XRLayoutRoundTrip, AdaptiveDefersRoamMode) {
+    auto p = parseXRMonitorLine("XR-defadapt, 1920x1080, anchor:local pos:0,1.4,-1.5 adaptive:on");
+    ASSERT_TRUE(p.has_value()) << p.error();
+    EXPECT_TRUE(p->m_anchor.adaptive.enabled);
+    EXPECT_FALSE(p->m_anchor.adaptive.roamModeSet);
+
+    const std::string line = serializeXRMonitorLine("XR-defadapt", Vector2D(1920, 1080), std::nullopt, p->m_anchor, p->m_anchor.anchorPose, 1.6f);
+    EXPECT_EQ(line.find("roam:"), std::string::npos) << line;
+    EXPECT_NE(line.find("adaptive:on"), std::string::npos) << line;
+}
+
+// Adaptive tokens are rejected on non-local anchors (the decorator sits on the desk pose).
+TEST(XRParser, AdaptiveRejectedOnHead) {
+    EXPECT_FALSE(parseXRMonitorLine("XR-x, 640x480, anchor:head offset:0,0,-1 adaptive:on").has_value());
+}
+
+// return radius must be < leave radius (hysteresis) when both are given per-monitor.
+TEST(XRParser, AdaptiveRejectsInvertedRadii) {
+    EXPECT_FALSE(parseXRMonitorLine("XR-x, 640x480, anchor:local pos:0,0,-1 adaptive:on leave:1.0 return:1.5").has_value());
+}

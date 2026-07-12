@@ -743,4 +743,82 @@ namespace OpenXR {
             return std::min(target, cur + step);
         return std::max(target, cur - step);
     }
+
+    // ---- adaptive anchoring: geofence + transition envelope (docs/openxr/research/13-adaptive-anchoring.md) ----
+    //
+    // Pure, unconditional (gtest-covered in tests/xr/adaptive.cpp): the geofence hysteresis/dwell
+    // and the dock<->roam transition envelope for adaptive anchoring. Everything is POD + dt (no
+    // clocks), so the whole trigger is deterministic and headless-testable and runs on the frame
+    // thread with ZERO hyprutils refcount ops (XRMonitorLayer.hpp rule).
+
+    // Easing curve for the transition envelope parameter (§4.3 / §6.1 openxr:adaptive_transition_ease).
+    enum eXREase : uint8_t {
+        XR_EASE_LINEAR = 0,
+        XR_EASE_SMOOTHSTEP, // t*t*(3-2t) — default
+        XR_EASE_OUT,        // 1-(1-t)^2
+    };
+
+    inline eXREase xrParseEase(const std::string& s) {
+        if (s == "linear")
+            return XR_EASE_LINEAR;
+        if (s == "ease_out" || s == "easeout")
+            return XR_EASE_OUT;
+        return XR_EASE_SMOOTHSTEP; // default + explicit "smoothstep"
+    }
+
+    inline const char* xrEaseName(eXREase e) {
+        switch (e) {
+            case XR_EASE_LINEAR: return "linear";
+            case XR_EASE_OUT: return "ease_out";
+            default: return "smoothstep";
+        }
+    }
+
+    // Apply an easing curve to a linear parameter t. All three curves fix f(0)=0, f(1)=1 and are
+    // monotone non-decreasing on [0,1]; t is clamped so out-of-range inputs stay well-defined.
+    inline float easeApply(eXREase e, float t) {
+        t = std::clamp(t, 0.F, 1.F);
+        switch (e) {
+            case XR_EASE_SMOOTHSTEP: return t * t * (3.F - 2.F * t);
+            case XR_EASE_OUT: return 1.F - (1.F - t) * (1.F - t);
+            default: return t; // linear
+        }
+    }
+
+    // Advance a transition envelope parameter one frame toward 1 (the chromeFadeAdvance shape with
+    // the grace/hide terms dropped, §4.3): ramp at dt/durationSec, snap to 1 if durationSec<=0, hold
+    // if dt<=0. The parameter stays LINEAR (easing is applied at sample time) so a reversed
+    // transition can remap it as 1-t without distortion (§4.2).
+    inline float envAdvance(float t, float dtSec, float durationSec) {
+        if (durationSec <= 0.F)
+            return 1.F; // no duration -> snap complete
+        if (dtSec <= 0.F)
+            return std::clamp(t, 0.F, 1.F); // no time elapsed -> hold
+        return std::min(1.F, std::clamp(t, 0.F, 1.F) + dtSec / durationSec);
+    }
+
+    // Horizontal (XZ-plane) distance between two positions — the DEFAULT geofence metric so that
+    // standing up (a change in y only) does not count as walking away (§3.1).
+    inline float horizDistXZ(const Vec3& a, const Vec3& b) {
+        const float dx = a.x - b.x, dz = a.z - b.z;
+        return std::sqrt(dx * dx + dz * dz);
+    }
+
+    // Full 3D distance — the geofence metric when openxr:adaptive_use_height is set.
+    inline float dist3(const Vec3& a, const Vec3& b) {
+        return (a - b).length();
+    }
+
+    // One dwell-accumulator step (§3.2 anti-flap core). While `condition` holds, add dt to the
+    // accumulator; the instant it is false, reset to 0 — so a single spurious sample can never
+    // advance the timer. Returns true once the accumulator reaches dwellSec (the condition has held
+    // continuously for at least that long). Pure; the caller owns the accumulator.
+    inline bool dwellStep(bool condition, float& accumSec, float dtSec, float dwellSec) {
+        if (!condition) {
+            accumSec = 0.F;
+            return false;
+        }
+        accumSec += std::max(0.F, dtSec);
+        return accumSec >= dwellSec;
+    }
 }
