@@ -238,6 +238,17 @@ namespace OpenXR {
         return {-qRotate(ci, p.pos), ci};
     }
 
+    // hypxrvoice GAP 2: the LOCAL_FLOOR quad pose for `place <name> at x,y,z`. The quad center sits at
+    // `point`; orientation faces the head (yaw+pitch toward `headPos`, no roll). When head tracking is
+    // invalid, or the head is directly above/below `point` (degenerate lookAt), it keeps `fallbackRot`
+    // (the quad's current facing). Pure so it is unit-testable without a live runtime.
+    inline SXRPose placeAtFacing(const Vec3& point, const Vec3& headPos, bool headValid, const Quat& fallbackRot) {
+        SXRPose W;
+        W.pos = point;
+        W.rot = headValid ? lookAtNoRoll(point, headPos, fallbackRot) : fallbackRot;
+        return W;
+    }
+
     // ---- 1€ filter (grabbable-borders WP-G6, research 04-grabbable-borders.md §4/§5.4) ----
     //
     // Casiez, Roussel & Vogel, "1€ Filter: A Simple Speed-based Low-pass Filter for Noisy Input in
