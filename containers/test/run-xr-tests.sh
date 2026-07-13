@@ -47,6 +47,12 @@ fi
 BUILD="${BUILD_DIR:-/build}"
 SRC="${SRC_DIR:-/src}"
 MONADO_SERVICE="${MONADO_SERVICE:-$BUILD/monado/src/xrt/targets/service/monado-service}"
+# hypxrpaper (ambient-background primary XR client) — build-in-ctr.sh builds it to
+# $BUILD/hypxrpaper. Auto-wire it so xr_overlay_composition actually EXERCISES the
+# overlay path instead of SKIPping. Honor a caller-provided value if already set.
+if [[ -z ${HYPRTESTER_HYPXRPAPER:-} && -x "$BUILD/hypxrpaper/hypxrpaper" ]]; then
+    export HYPRTESTER_HYPXRPAPER="$BUILD/hypxrpaper/hypxrpaper"
+fi
 SENTINEL="${XR_TEST_SENTINEL:-/tmp/hypxrland-xr-tests.exit}"
 RUN_LOG="${XR_TEST_LOG:-/tmp/hypxrland-xr-tests.log}"
 LABWC_UNIT="hypxrland-labwc"

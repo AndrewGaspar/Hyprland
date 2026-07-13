@@ -18,6 +18,11 @@ set -euo pipefail
 SRC=/src
 BUILD=/build
 
+# Build discipline (this box froze under uncoordinated heavy load): cap parallel
+# jobs. Override with HYPXRLAND_BUILD_JOBS. Exported so build-monado.sh sees it.
+_np=$(nproc); JOBS=${HYPXRLAND_BUILD_JOBS:-8}; [[ $JOBS -gt $_np ]] && JOBS=$_np
+export HYPXRLAND_BUILD_JOBS="$JOBS"
+
 command -v ccache >/dev/null && export CMAKE_C_COMPILER_LAUNCHER=ccache CMAKE_CXX_COMPILER_LAUNCHER=ccache
 export CCACHE_DIR="${CCACHE_DIR:-$HOME/.cache/ccache}"
 
@@ -49,7 +54,7 @@ cmake -S "$SRC" -B "$BUILD" -G Ninja \
     -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
 echo "==> Building targets: Hyprland hyprtester"
-cmake --build "$BUILD" --target Hyprland hyprtester -j"$(nproc)"
+cmake --build "$BUILD" --target Hyprland hyprtester -j"$JOBS"
 
 echo "==> Building vendored Monado into $BUILD/monado (redirected out of read-only source)"
 MONADO_BUILD="$BUILD/monado" EIGEN_BUILD="$BUILD/eigen" bash "$SRC/scripts/build-monado.sh"
@@ -72,7 +77,7 @@ if [[ -f $HYPXRPAPER_SRC/CMakeLists.txt ]]; then
         -DCMAKE_C_COMPILER_LAUNCHER=ccache \
         -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
     echo "==> Building hypxrpaper"
-    cmake --build "$HYPXRPAPER_BUILD" --target hypxrpaper -j"$(nproc)"
+    cmake --build "$HYPXRPAPER_BUILD" --target hypxrpaper -j"$JOBS"
 else
     echo "!! hypxrpaper submodule not checked out at $HYPXRPAPER_SRC — run:" >&2
     echo "     git submodule update --init subprojects/hypxrpaper" >&2

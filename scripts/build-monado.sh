@@ -70,7 +70,8 @@ EOF
 fi
 
 echo ">> building monado (service + OpenXR client library + gui)..."
-cmake --build "$MONADO_BUILD" --target monado-service openxr_monado gui -j"$(nproc)"
+_mj=$(nproc); _mj=${HYPXRLAND_BUILD_JOBS:-$_mj}
+cmake --build "$MONADO_BUILD" --target monado-service openxr_monado gui -j"$_mj"
 
 for f in src/xrt/targets/service/monado-service src/xrt/targets/gui/monado-gui openxr_monado-dev.json; do
     [[ -e $MONADO_BUILD/$f ]] || { echo "expected artifact missing: $MONADO_BUILD/$f" >&2; exit 1; }
