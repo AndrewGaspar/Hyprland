@@ -30,6 +30,14 @@ build() {
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         -DCMAKE_C_COMPILER_LAUNCHER=ccache \
         -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+    # The main build treats OpenXR as optional and silently compiles it out
+    # when the loader is missing — a fishfood build without XR is never what
+    # we want, so fail loudly here instead of shipping a vanilla Hyprland.
+    if ! grep -q '^openxr_dep_FOUND:INTERNAL=1$' "$BUILD/CMakeCache.txt"; then
+        echo "ERROR: OpenXR loader not found — this build would have NO openxr support." >&2
+        echo "       Install it (Arch: sudo pacman -S openxr vulkan-headers) and re-run." >&2
+        exit 1
+    fi
     # Shared build mutex: all HypXRland builds on this box serialize through it.
     flock -w 7200 /tmp/hypxrland-build.lock \
         cmake --build "$BUILD" --target Hyprland hyprctl -j"$JOBS"
