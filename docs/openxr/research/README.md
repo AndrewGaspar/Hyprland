@@ -23,10 +23,18 @@ archived originals.
 | [VISUALS.md](VISUALS.md) | premium chrome, transparency, view-bounding | archive 07, 09, 10 |
 | [PLATFORM-LIFECYCLE-PERFORMANCE.md](PLATFORM-LIFECYCLE-PERFORMANCE.md) | lifecycle & perf remainders, SteamVR backend | archive 17 (L4/L5), 19 (direct-scanout), 01 (OpenVR) |
 | [05-xr-screenkey.md](05-xr-screenkey.md) | head-locked keystroke/command display (`hypxrkeys`) | standalone — unimplemented, does not cluster |
+| [VOICE-CONTROL.md](VOICE-CONTROL.md) | cascaded voice control of XR monitors + app launch (`hypxrvoice`) | standalone — unimplemented, does not cluster |
 
 `05-xr-screenkey.md` is a standalone design for a new companion tool (a sibling to
 `hypxrpaper`). Nothing is implemented; it is kept live in place because it does not overlap
 the four clusters above. Its WPs are K1–K12.
+
+`VOICE-CONTROL.md` is a standalone design for a new companion daemon `hypxrvoice` (another
+`hypxrpaper`/`hypxrkeys` sibling): natural-language voice control over the existing
+`hyprctl openxr`/dispatcher IPC, with a four-tier cascaded activation architecture
+(contextual/presence gate → local wake word → local ASR + intent gate → local-or-cloud
+reasoning) to keep the mic closed and the cloud bill near zero. Nothing is implemented. Its
+WPs are V1–V12.
 
 ---
 
