@@ -112,6 +112,15 @@ namespace {
         return XR::parseFloatArray(XR::fieldAfter(json, p, "pos"));
     }
 
+    // report 14: the sticky-hover-stabilized ray region a monitor currently reports ("body"|"bar"|
+    // "corner-*"|"margin"|"none"), from `hyprctl openxr status` JSON.
+    std::string scopedRegion(const std::string& json, const std::string& monName) {
+        const auto p = XR::findAfter(json, "\"name\": \"" + monName + "\"");
+        if (p == std::string::npos)
+            return "";
+        return XR::fieldAfter(json, p, "region");
+    }
+
     // RAII: dump artifacts on failure, always destroy every monitor we created, always park the
     // shared RemoteClient's controllers back at inactive/identity so later tests don't inherit
     // stray state (same convention as anchors.cpp/grab_live.cpp).
@@ -361,6 +370,81 @@ TEST_CASE(xr_select_hysteresis) {
     ASSERT(settleAndQuery(0.3f), std::string("272:0"));
 
     NLog::green("xr_select_hysteresis: 0.5 (no edge) / 0.75 (press) / 0.5 (held) / 0.3 (release) all matched the Schmitt trigger");
+}
+
+// xr_hover_region_stability — report 14 Stage A2/B. The status `region` field (published from the
+// sticky-hover Schmitt + aim 1€ filter) must stay STABLE under a static aim and under sub-degree
+// aim jitter — it must not flicker (e.g. body <-> margin <-> none) frame to frame, which is the
+// felt "hard to tell what I'm pointing at" failure the aim assist targets. The exact sticky-handle
+// truth table is gtest-covered (tests/xr/ray_assist.cpp); this asserts the live pipeline reports a
+// steady region. SKIP-tolerant like the rest of the suite (needs a focused session + a hover).
+TEST_CASE(xr_hover_region_stability) {
+    XR_SKIP_IF_UNAVAILABLE();
+
+    const std::string mon = XR::monitorName(48);
+    SArtifactGuard     guard{this->failed, name(), {mon}};
+
+    if (!gateUp()) {
+        XR::logSkip(name(), "session never reached focused (known env instability)");
+        return;
+    }
+    auto* remote = XR::g_ctx.remote;
+    if (!remote) {
+        XR::logSkip(name(), "no remote client available");
+        return;
+    }
+
+    ASSERT(getFromSocket("/openxr create " + mon + " 1280x720 anchor:local pos:0,0,-1.5 yaw:0 size:1.5"), std::string("ok"));
+    ASSERT(XR::waitForJson(
+               "j/openxr", [&](const std::string& r) { return r.contains("\"name\": \"" + mon + "\""); }, std::chrono::milliseconds(10000)),
+           true);
+
+    using namespace MonadoWire;
+    remote->setControllerActive(CRemoteClient::SIDE_LEFT, true);
+    remote->setTrigger(CRemoteClient::SIDE_LEFT, 0.f);
+
+    if (!waitHoverScoped(remote, CRemoteClient::SIDE_LEFT, 0.f, mon, std::chrono::seconds(15))) {
+        XR::logSkip(name(), "ray never hovered the monitor within budget (known env instability)");
+        return;
+    }
+
+    // Park a fixed identity aim from the monitor's x that we know hovers its body, let it settle.
+    remote->setControllerPose(CRemoteClient::SIDE_LEFT, xrt_vec3{0.f, 0.f, 0.f}, xrt_quat{0.f, 0.f, 0.f, 1.f});
+    remote->pulse();
+    if (!XR::waitForJson(
+            "j/openxr", [&](const std::string& r) { return scopedRegion(r, mon) == "body"; }, std::chrono::milliseconds(3000))) {
+        XR::logSkip(name(), "region never settled to body (known env instability)");
+        return;
+    }
+
+    // 1) Static aim: region must stay "body" across repeated samples (no flicker).
+    for (int i = 0; i < 12; ++i) {
+        remote->pulse();
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        const std::string reg = scopedRegion(getFromSocket("j/openxr"), mon);
+        ASSERT(reg, std::string("body"));
+    }
+    NLog::green("xr_hover_region_stability: static aim held region 'body' across 12 samples");
+
+    // 2) Sub-degree yaw jitter around the same point: still steadily "body" (aim filter + sticky
+    //    reporting absorb the tracking noise instead of flickering the region).
+    int bodyCount = 0, total = 0;
+    for (int i = 0; i < 20; ++i) {
+        const float yaw = ((i % 2) ? 1.f : -1.f) * 0.25f * (float)M_PI / 180.f; // +-0.25 degrees
+        remote->setControllerPose(CRemoteClient::SIDE_LEFT, xrt_vec3{0.f, 0.f, 0.f}, xrt_quat{0.f, std::sin(yaw * 0.5f), 0.f, std::cos(yaw * 0.5f)});
+        remote->pulse();
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        const std::string reg = scopedRegion(getFromSocket("j/openxr"), mon);
+        // A sub-degree jitter at a 1.5 m-wide monitor stays deep in the body — never NONE/MARGIN.
+        ASSERT(reg != "none" && reg != "margin", true);
+        if (reg == "body")
+            ++bodyCount;
+        ++total;
+    }
+    // The overwhelming majority must remain "body" (allow a rare boundary sample if the fixture is
+    // small in the env, but no flicker to off-quad).
+    ASSERT(bodyCount >= total - 1, true);
+    NLog::green("xr_hover_region_stability: sub-degree jitter kept region on-quad (body) with no flicker");
 }
 
 // xr_two_hand_pointer — WP12 (doc 04 §3: "last-active hand owns the single pointer", ownership

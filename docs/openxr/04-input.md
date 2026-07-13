@@ -243,6 +243,42 @@ per-frame hover region and grabbed state are published to each layer via plain a
 (the predicted-display-time delta, not a wall clock), holding at 1 while the quad is hovered or
 grabbed and for `chrome_hide_delay_ms` after, then fading to 0.
 
+### 6.1 Ray aim assist: cursor, magnetism, sticky hover, aim filter
+
+A ray you cannot see is hard to aim, and sub-2° chrome handles are hard to hit, so the aim path
+adds four forgiveness/feedback layers (all pure math in `XRMath.hpp`, gtested in
+`tests/xr/ray_assist.cpp`; the felt-quality work is the stabilization, not the hit test):
+
+- **Endpoint cursor** (`openxr:cursor`, default on). A small opaque dot is drawn where each hand's
+  aim ray hits a quad, in the same `drawCursor` pass that follows `drawChrome`, at the raw hit
+  `(u,v)`. Its state colors the dot — `openxr:cursor_col_idle` over content/margin,
+  `cursor_col_grabbable` over a move-bar/corner (a squeeze would grab), `cursor_col_press` while a
+  button/pinch is pressed (the dot also grows by `cursor_press_scale`). Size is a constant physical
+  diameter (`openxr:cursor_size`, meters) computed against the layer's cached quad meters, so it
+  looks the same on any monitor. `openxr:cursor_per_hand_tint` (default on) shifts the left hand's
+  cursor cooler so two rays are distinguishable. The cursor is opaque (alpha 1) so it never punches
+  an alpha hole under passthrough; drawing over content is corrected by the next content blit, and
+  the animation-only redraw path (snapshot/restore, §6) covers a moving cursor over a static desktop
+  — zero cost when the cursor does not move. The per-hand sample crosses frame→frame on one packed
+  atomic per hand on the layer (`m_cursorPacked`, extending the `m_hoverRegion` visual-state
+  contract): present(1) state(3) u(14) v(14).
+- **Chrome magnetism** (`openxr:magnet`, default on; `openxr:magnet_angle`, 2°). When the ray
+  narrowly misses a grab handle, `classifyQuadRegionForgiving` snaps the *region* (not the cursor)
+  to the nearest handle within the cone — so the highlight and grab eligibility turn on exactly when
+  a squeeze (which already forgives the same cone, §7) would grab. Content is **never** magnetized:
+  an exact body hit stays body, keeping desktop clicks pixel-precise.
+- **Sticky hover** (`openxr:hover_hysteresis`, 0.03 m; `openxr:hover_dropout_frames`, 2). Once the
+  ray lands a handle, `stepHoverStick` (a region Schmitt) holds that region until the ray leaves the
+  handle expanded by the hysteresis margin, or lands a *different* handle (which wins instantly),
+  tolerating a short tracking dropout — so the highlight/grab-eligibility does not flicker at
+  boundaries. The stabilized region is what `m_hoverRegion` (and `hyprctl openxr status`'s per-quad
+  `region` field) publishes.
+- **Aim filter** (`openxr:aim_filter`, default on; `aim_filter_min_cutoff` 1.5, `aim_filter_beta`
+  0.01). The aim pose is 1€-filtered before hit-testing (reusing `oneEuroStepPose`), for controllers
+  and hands. `openxr:aim_pinch_damping` (0.4) lowers the min-cutoff while a press/pinch is ramping up
+  (below the trigger threshold) so committing a click/grab does not yank the aim off-target on the
+  commit frame. The filter is reset when the aim goes invalid so a re-acquire does not jump.
+
 ## 7. Grab state machine
 
 Grab is per hand, with at most one grab per monitor and one grab per hand. On the grab rising edge
@@ -324,9 +360,12 @@ and whether the carry is filtered.
 
 ### 7.3 Haptics
 
-A short tick (`xrApplyHapticFeedback`, 10 ms, amplitude 0.5, unspecified frequency) fires on grab
-enter, grab release, and select press (not release). It is fire-and-forget from the frame thread; a
-profile with no haptic binding (hands) simply returns an error that is ignored.
+A short tick (`xrApplyHapticFeedback`, 10 ms, `openxr:haptic_amplitude` default 0.5, unspecified
+frequency) fires on grab enter, grab release, select press (not release), and — when
+`openxr:haptic_hover` is set — the moment the ray first enters a grab handle (the tactile "you are on
+the handle" cue). The master `openxr:haptics` (default on) gates all of them. It is fire-and-forget
+from the frame thread; a profile with no haptic binding (hands) simply returns an error that is
+ignored, so hands get no haptics and lose nothing.
 
 ## 8. Frame → main event queue
 
