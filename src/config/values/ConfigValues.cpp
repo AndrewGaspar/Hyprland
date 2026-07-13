@@ -845,6 +845,11 @@ std::vector<SP<IValue>> Values::getConfigValues() {
         MS<Color>("openxr:cursor_col_press", "endpoint cursor color while a button/pinch is pressed", 0xffffffff),
         MS<Color>("openxr:cursor_col_grab", "endpoint cursor color reserved for an active grab (the ray is normally suppressed while grabbing)", 0xff66aaff),
         MS<Bool>("openxr:cursor_per_hand_tint", "tint the LEFT hand's cursor cooler (red down / blue up) so two simultaneous rays are distinguishable", true),
+        MS<Float>("openxr:cursor_redraw_epsilon",
+                  "endpoint-cursor movement dead-band in uv units: a hover redraws (and so re-encodes) the swapchain only once the cursor moves this far. Absorbs at-rest hand "
+                  "tremor so holding still over a static desktop costs zero re-encode instead of a full-frame redraw every runtime frame (report 14 live: idle-hover IDR-drop storm). "
+                  "Read per-frame (hot-toggle); 0 disables the dead-band",
+                  0.0015, {.min = 0.0, .max = 0.05}),
         MS<Float>("openxr:hover_hysteresis",
                   "sticky-hover exit margin in meters (report 14 Stage A2): once the ray lands a grab handle, keep it highlighted/grab-eligible until the ray leaves the handle "
                   "expanded by this margin (or lands a different handle). Stops highlight flicker at handle boundaries. 0 disables stickiness. Read per-frame (hot-toggles)",

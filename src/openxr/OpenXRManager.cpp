@@ -930,6 +930,7 @@ void COpenXRManager::frameThread() {
             static auto   PFADEMS    = CConfigValue<Hyprlang::INT>("openxr:chrome_fade_ms");
             static auto   PHIDEMS    = CConfigValue<Hyprlang::INT>("openxr:chrome_hide_delay_ms");
             static auto   PCURSOREN  = CConfigValue<Hyprlang::INT>("openxr:cursor");
+            static auto   PCUREPS    = CConfigValue<Hyprlang::FLOAT>("openxr:cursor_redraw_epsilon");
             const uint8_t hoverReg   = l->m_hoverRegion.load(std::memory_order_acquire);
             const bool    grabbedNow = l->m_grabbedNow.load(std::memory_order_acquire);
             const bool    activeNow  = grabbedNow || hoverReg != OpenXR::XR_REGION_NONE;
@@ -939,7 +940,13 @@ void COpenXRManager::frameThread() {
             const bool     cursorEnabled = *PCURSOREN != 0;
             const uint32_t curL          = l->m_cursorPacked[0].load(std::memory_order_acquire);
             const uint32_t curR          = l->m_cursorPacked[1].load(std::memory_order_acquire);
-            const bool     cursorChanged = curL != l->m_cursorDrawn[0] || curR != l->m_cursorDrawn[1];
+            // Damage dead-band: sub-pixel tremor must NOT force a full-swapchain restore + re-encode
+            // every runtime frame while a ray hovers a static desktop (live: dropped-IDR / macroblock
+            // storm that clusters in hover windows). A genuine cursor move past the band still redraws;
+            // note m_cursorDrawn holds the LAST DRAWN word so slow drift accumulates across frames.
+            const float    curEps       = (float)*PCUREPS;
+            const bool     cursorChanged = OpenXR::xrCursorRedrawNeeded(l->m_cursorDrawn[0], curL, curEps) ||
+                OpenXR::xrCursorRedrawNeeded(l->m_cursorDrawn[1], curR, curEps);
             // Snapshot the clean content whenever chrome OR the cursor may draw over it, so an
             // animation-only frame (chrome fade or a moving cursor with no new desktop buffer) can
             // restore the content before re-drawing the overlay.
