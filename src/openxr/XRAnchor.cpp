@@ -268,10 +268,34 @@ SXRSolveResult CXRAnchor::solve(const SXRSolveInput& in, const SXRAnchorTuning& 
         return res;
     }
 
+    // Gaze carry override (research/16 §4.1): place the quad on the gaze ray at m_gazeDist, facing
+    // the viewer, refreshed every frame. Placed AFTER the hand-grab override so a hand grab wins if
+    // both somehow fire (the hand is the more explicit gesture); the manager also enforces mutual
+    // exclusion at begin (a gaze grab is refused on a hand-grabbed monitor and vice-versa). The gaze
+    // source is in.gaze when present (future eye path, §2.4) else the VIEW forward vector. Submitted
+    // in LOCAL_FLOOR (no controller action space to late-latch — like the WP-G6 filtered branch).
+    if (m_gazeGrabbed) {
+        const SXRPose gazePose = in.gaze.value_or(in.view);
+        Vec3          dir      = m_gazeFollow ? poseForward(gazePose.rot) : m_gazeFrozenDir;
+        const float   dl       = dir.length();
+        dir                    = dl > 1e-5F ? dir / dl : Vec3{0.F, 0.F, -1.F};
+        const Vec3 origin      = m_gazeFollow ? gazePose.pos : m_gazeFrozenOrigin;
+        const Vec3 P           = origin + dir * m_gazeDist;
+        const Quat R           = lookAtNoRoll(P, in.view.pos, m_lastWorld.rot);
+
+        res.space      = XR_SPACE_LOCAL_FLOOR;
+        res.pose       = SXRPose{P, R};
+        res.worldPose  = res.pose;
+        m_lastWorld    = res.pose;
+        m_hasLastWorld = true;
+        return res;
+    }
+
     // Adaptive anchoring decorator (research/13 §4.1): a LOCAL anchor that adaptively picks up and
     // follows the head, then re-docks. Runs only when enabled and not grabbed (the grab override
     // above returned first — a grab always wins over adaptive, §5.1). Short-circuits the mode switch;
-    // it always submits a LOCAL_FLOOR world pose.
+    // it always submits a LOCAL_FLOOR world pose. A gaze carry (above) also short-circuits it, so a
+    // gaze-carried adaptive monitor is never geofenced mid-carry (research/16 §4.5).
     if (m_state.adaptive.enabled) {
         const SXRPose W = adaptiveStep(in, tune);
         res.space       = XR_SPACE_LOCAL_FLOOR;
@@ -723,6 +747,55 @@ void CXRAnchor::endGrab(const SXRPose& releaseWorld, const SXRSolveInput& in, co
     ctx.gripLeft  = in.gripLeft;
     ctx.gripRight = in.gripRight;
     reanchorFromWorld(releaseWorld, ctx, tune);
+}
+
+// ---- gaze carry (research/16 §4) ----
+
+void CXRAnchor::beginGazeGrab(const SXRPose& view, bool follow) {
+    // Snapshot the distance head->quad so the quad does not jump on grab (research/16 §4.2). Use
+    // m_lastWorld (the displayed pose) rather than the raw gaze ray so it grabs exactly where the
+    // monitor currently sits even if the ray is a hair off-centre.
+    const Vec3  toQuad = m_lastWorld.pos - view.pos;
+    const float d      = toQuad.length();
+    m_gazeDist         = std::clamp(d, XR_DISTANCE_MIN, XR_DISTANCE_MAX);
+    m_gazeFrozenOrigin = view.pos;
+    m_gazeFrozenDir    = d > 1e-5F ? toQuad / d : poseForward(view.rot);
+    m_gazeFollow       = follow;
+    m_gazeGrabbed      = true;
+
+    // Adaptive: a gaze carry suspends the geofence (the override returns before adaptiveStep). Settle
+    // any mid-flight transition to the nearer endpoint + reset the dwell timers, exactly as a hand
+    // grab does (research/13 §5.1), so release resolves into a stable DOCKED/ROAMING representation.
+    if (m_state.adaptive.enabled) {
+        if (m_adPhase == XRAD_UNDOCKING)
+            m_adPhase = m_adT >= 0.5F ? XRAD_ROAMING : XRAD_DOCKED;
+        else if (m_adPhase == XRAD_REDOCKING)
+            m_adPhase = m_adT >= 0.5F ? XRAD_DOCKED : XRAD_ROAMING;
+        m_adT      = 0.F;
+        m_outDwell = 0.F;
+        m_inDwell  = 0.F;
+    }
+}
+
+void CXRAnchor::gazePushPull(float deltaMeters) {
+    m_gazeDist = std::clamp(m_gazeDist + deltaMeters, XR_DISTANCE_MIN, XR_DISTANCE_MAX);
+}
+
+void CXRAnchor::gazeSetDist(float absMeters) {
+    m_gazeDist = std::clamp(absMeters, XR_DISTANCE_MIN, XR_DISTANCE_MAX);
+}
+
+void CXRAnchor::endGazeGrab(const SXRSolveInput& in, const SXRAnchorTuning& tune) {
+    m_gazeGrabbed = false;
+
+    SXRVerbContext ctx;
+    ctx.view      = in.view;
+    ctx.viewValid = true;
+    ctx.gripLeft  = in.gripLeft;
+    ctx.gripRight = in.gripRight;
+    // Quad stays exactly where the user let it go, re-expressed into its persistent mode + spring
+    // reseeded (identical to endGrab; no release-latch ring — keyboard release, no lurch, §4.2).
+    reanchorFromWorld(m_lastWorld, ctx, tune);
 }
 
 void CXRAnchor::reanchorRoam(const SXRPose& W, const SXRVerbContext& ctx, const SXRAnchorTuning& tune) {

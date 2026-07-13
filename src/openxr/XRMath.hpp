@@ -158,6 +158,12 @@ namespace OpenXR {
         return {std::sin(h), 0.F, 0.F, std::cos(h)};
     }
 
+    // Forward (aim) vector of a pose/orientation: OpenXR forward is -Z. Used by the gaze ray
+    // (VIEW-space head-forward, research/16 §2.1) and any other "which way is this facing" query.
+    inline Vec3 poseForward(const Quat& q) {
+        return qRotate(q, Vec3{0.F, 0.F, -1.F});
+    }
+
     // yaw about +Y such that yaw 0 faces -Z; returns fallback near vertical (doc 03 §1.5).
     inline float qYawOf(const Quat& q, float fallback) {
         const Vec3 f = qRotate(q, Vec3{0.F, 0.F, -1.F});
@@ -330,6 +336,91 @@ namespace OpenXR {
         f.w     = oneEuroStep(s.qw, q.w, dt, minCutoff, beta, dCutoff);
         out.rot = qNormalize(f);
         return out;
+    }
+
+    // ---- gaze-vector monitor selection (docs/openxr/research/archive/16-gaze-grab.md §3) ----
+    //
+    // A raw head/eye ray jitters, so the instantaneous nearest-hit monitor is NOT a safe grab
+    // target: a saccade/head-flick at the keypress frame would grab the wrong monitor. The fix
+    // (research/16 §3.1, lifted from research/14) is DWELL + HYSTERESIS: a monitor becomes the
+    // "dwell-stable candidate" only after the gaze has rested on it continuously for gaze_dwell_ms,
+    // and switching to a different monitor (or losing the target to passthrough) likewise requires
+    // that new state to persist for the dwell. This dwell-to-switch machine IS the hysteresis: an
+    // adjacent-boundary flicker never accumulates enough continuous dwell to flip the selection.
+    // Pure POD + one float accumulator (gtested in tests/xr/gaze_select.cpp); the 1€ pre-filter on
+    // the gaze POSE (research/16 §3.1 stage B) lives on the caller (frame thread), applied before
+    // the ray cast — this only consumes the resulting per-frame nearest-hit id.
+    struct SXRGazeSelect {
+        int64_t stable  = -1;   // the published dwell-stable candidate (-1 = none / looking at passthrough)
+        int64_t pending = -1;   // the id currently accumulating dwell toward becoming `stable`
+        float   dwell   = 0.F;  // seconds `pending` has been the continuous nearest hit
+
+        void    reset() {
+            stable  = -1;
+            pending = -1;
+            dwell   = 0.F;
+        }
+    };
+
+    // Advance the gaze selection. `rawHit` is this frame's nearest-hit monitor id (-1 = the gaze
+    // ray missed every quad), `dt` seconds since the last step, `dwellSec` the required rest time.
+    // Returns the new dwell-stable selection. Semantics:
+    //   - rawHit == stable  -> reaffirm (clear any pending switch); stays selected with no dwell.
+    //   - rawHit != stable  -> accumulate dwell toward rawHit (incl. rawHit == -1, i.e. looking
+    //                          away must also persist dwellSec before the selection clears). When
+    //                          the accumulator reaches dwellSec, commit: stable = rawHit.
+    // dwellSec <= 0 makes selection instantaneous (stable = rawHit every frame).
+    inline int64_t stepGazeSelect(SXRGazeSelect& s, int64_t rawHit, float dt, float dwellSec) {
+        if (rawHit == s.stable) {
+            s.pending = s.stable;
+            s.dwell   = 0.F;
+            return s.stable;
+        }
+        if (dwellSec <= 0.F) {
+            s.stable  = rawHit;
+            s.pending = rawHit;
+            s.dwell   = 0.F;
+            return s.stable;
+        }
+        if (rawHit != s.pending) {
+            s.pending = rawHit;
+            s.dwell   = 0.F;
+        }
+        s.dwell += dt > 0.F ? dt : 0.F;
+        if (s.dwell >= dwellSec) {
+            s.stable = s.pending;
+            s.dwell  = 0.F;
+        }
+        return s.stable;
+    }
+
+    // ---- conditional hand-input gate (research/16 Part A) ----
+    //
+    // Pure decision for whether hand input is live, so the truth table is gtestable
+    // (tests/xr/gaze_select.cpp) apart from the manager's atomics/clock plumbing.
+    enum eXRHandPolicyV : uint8_t { XR_HANDPOL_AUTO = 0, XR_HANDPOL_ON, XR_HANDPOL_OFF };
+    enum eXRHandForceV : uint8_t { XR_HANDFORCE_NONE = 0, XR_HANDFORCE_ON, XR_HANDFORCE_OFF };
+    enum eXRHandGate : uint8_t {
+        XR_HANDGATE_ACTIVE = 0, // hands live
+        XR_HANDGATE_KBD,        // AUTO, gated because the user is typing (keyboard active)
+        XR_HANDGATE_MANUAL,     // AUTO, forced off by the manual toggle latch
+        XR_HANDGATE_OFF,        // policy off
+    };
+
+    // policy/force are eXRHandPolicyV/eXRHandForceV. awayFromKbd = keyboard has been idle >= the
+    // threshold; roaming = the head is beyond the adaptive seat geofence; roamEnables = the
+    // openxr:hand_input_roam_enables OR-term is on. force is consulted only in AUTO.
+    inline eXRHandGate handInputGate(uint8_t policy, uint8_t force, bool awayFromKbd, bool roaming, bool roamEnables) {
+        if (policy == XR_HANDPOL_ON)
+            return XR_HANDGATE_ACTIVE;
+        if (policy == XR_HANDPOL_OFF)
+            return XR_HANDGATE_OFF;
+        // AUTO
+        if (force == XR_HANDFORCE_ON)
+            return XR_HANDGATE_ACTIVE;
+        if (force == XR_HANDFORCE_OFF)
+            return XR_HANDGATE_MANUAL;
+        return (awayFromKbd || (roamEnables && roaming)) ? XR_HANDGATE_ACTIVE : XR_HANDGATE_KBD;
     }
 
     // ---- ray -> quad intersection (docs/openxr/04-input.md §3) ----
