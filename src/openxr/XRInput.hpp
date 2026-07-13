@@ -164,7 +164,12 @@ class CXRInput {
     // hand grab is ended via the normal release latch. CONTROLLERS are never gated (handActive is
     // false for them), so a controller session behaves identically regardless. Computed by the
     // manager's conditional-hand-input gate (keyboard recency / roam / manual override).
-    void processPointer(const std::vector<SXRPointerTarget>& targets, uint32_t timeMs, const OpenXR::SXRSolveInput& solveIn, const OpenXR::SXRAnchorTuning& tune, bool handsEnabled = true);
+    // handGrabMode / handGrabAnyMode (openxr:hand_grab / hand_grab_anywhere) are passed in already
+    // parsed: the frame thread must never deref those CConfigValue<std::string>s (a concurrent reload
+    // frees the backing store under it -> heap corruption, task #25). The manager reads them from
+    // atomics (publishGrabStringTuning) and hands them down here.
+    void processPointer(const std::vector<SXRPointerTarget>& targets, uint32_t timeMs, const OpenXR::SXRSolveInput& solveIn, const OpenXR::SXRAnchorTuning& tune,
+                        OpenXR::eXRHandGrab handGrabMode, OpenXR::eXRHandGrabAnywhere handGrabAnyMode, bool handsEnabled = true);
 
     // Frame-thread reads of the latest sample:
     const SXRHandState& hand(OpenXR::eXRHand h) const {

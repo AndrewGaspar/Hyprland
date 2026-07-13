@@ -230,6 +230,7 @@ void COpenXRManager::start() {
     // reads a CConfigValue<const char*>. Must happen before the frame thread launches below.
     publishAdaptiveStringTuning();
     publishHandInputPolicy(); // research/16 Part A: seed the hand-input policy from openxr:hand_input
+    publishGrabStringTuning(); // task #25: seed hand_grab / hand_grab_anywhere / grab_filter_scope enums
 
     m_session  = makeUnique<CXRSession>();
     m_graphics = makeUnique<CXRGraphics>();
@@ -1071,12 +1072,14 @@ void COpenXRManager::frameThread() {
         // WP-G6: 1€ hand-grab carry filter parameters, read per-frame (hot-toggles). Only a hand
         // MOVE grab with grabFilter set is filtered (see CXRAnchor::solve grab override).
         static auto     PGRABFILTER   = CConfigValue<Hyprlang::INT>("openxr:grab_filter");
-        static auto     PGRABFILTERSC = CConfigValue<std::string>("openxr:grab_filter_scope");
         static auto     PGRABFILTERMC = CConfigValue<Hyprlang::FLOAT>("openxr:grab_filter_min_cutoff");
         static auto     PGRABFILTERB  = CConfigValue<Hyprlang::FLOAT>("openxr:grab_filter_beta");
         const bool      grabFilter    = *PGRABFILTER != 0;
         // scope=all (default) filters controllers too; anything else (e.g. "hands") = hands only.
-        const bool      grabFilterAll = *PGRABFILTERSC != "hands";
+        // Read the parsed atomic — NEVER deref openxr:grab_filter_scope (a std::string) on this thread:
+        // a concurrent reload rebuilds/frees its backing store -> heap corruption (task #25). Published
+        // by publishGrabStringTuning() on the main thread.
+        const bool      grabFilterAll = m_grabFilterScopeAll.load(std::memory_order_relaxed);
         const float     grabFilterMc  = (float)*PGRABFILTERMC;
         const float     grabFilterB   = (float)*PGRABFILTERB;
         OpenXR::SXRPose viewPose;
@@ -1350,7 +1353,9 @@ void COpenXRManager::frameThread() {
             // all frame-thread-safe. Controllers are never affected (handActive is false for them).
             const bool handsEnabled = handInputEnabled();
             std::scoped_lock lock(m_layersMu);
-            m_input->processPointer(pointerTargets, (uint32_t)Time::millis(Time::steadyNow()), pointerSolveIn, tune, handsEnabled);
+            m_input->processPointer(pointerTargets, (uint32_t)Time::millis(Time::steadyNow()), pointerSolveIn, tune,
+                                    (OpenXR::eXRHandGrab)m_handGrabMode.load(std::memory_order_relaxed), (OpenXR::eXRHandGrabAnywhere)m_handGrabAnyMode.load(std::memory_order_relaxed),
+                                    handsEnabled);
 
             // research/16 Part B: gaze-hover selection + gaze-cursor pass. Runs after processPointer so
             // the chrome publish below can OR the gaze-selected highlight, and it reuses the same quad
@@ -2311,6 +2316,9 @@ void COpenXRManager::onConfigReload() {
     // research/16 Part A: re-apply openxr:hand_input with change detection (a runtime `handinput`
     // dispatcher change survives an unrelated reload; an actual config change wins + clears the latch).
     publishHandInputPolicy();
+    // task #25: re-parse hand_grab / hand_grab_anywhere / grab_filter_scope so a hot re-tune applies
+    // live AND the frame thread never derefs the backing strings (the corrupted-heap-at-teardown crash).
+    publishGrabStringTuning();
 
     static auto PENABLED = CConfigValue<Hyprlang::INT>("openxr:enabled");
     const bool  enabled  = *PENABLED;
@@ -2396,6 +2404,21 @@ void COpenXRManager::publishAdaptiveStringTuning() {
     static auto PADROAM = CConfigValue<std::string>("openxr:adaptive_roam_mode");
     m_adEase.store(OpenXR::xrParseEase(*PADEASE), std::memory_order_relaxed);
     m_adRoamMode.store(*PADROAM == "head" ? OpenXR::XR_ANCHOR_HEAD : OpenXR::XR_ANCHOR_BODY, std::memory_order_relaxed);
+}
+
+void COpenXRManager::publishGrabStringTuning() {
+    // MAIN-THREAD ONLY. Parse the grab STRING options to enums the frame thread reads as atomics.
+    // Same rationale + legacy-manager null-m_p caveat as publishAdaptiveStringTuning (must be
+    // CConfigValue<std::string>, never <Hyprlang::STRING>). See the atomic decls in the header:
+    // the frame thread MUST NOT deref these strings (a reload rebuilds/frees the backing store
+    // under it -> heap corruption, task #25). Called from start() + onConfigReload().
+    static auto PHANDGRAB    = CConfigValue<std::string>("openxr:hand_grab");
+    static auto PHANDGRABANY = CConfigValue<std::string>("openxr:hand_grab_anywhere");
+    static auto PGRABFILTSC  = CConfigValue<std::string>("openxr:grab_filter_scope");
+    m_handGrabMode.store((uint8_t)OpenXR::xrParseHandGrab(*PHANDGRAB), std::memory_order_relaxed);
+    m_handGrabAnyMode.store((uint8_t)OpenXR::xrParseHandGrabAnywhere(*PHANDGRABANY), std::memory_order_relaxed);
+    // scope=all (default) filters controllers too; anything else (e.g. "hands") = hands only.
+    m_grabFilterScopeAll.store(*PGRABFILTSC != "hands", std::memory_order_relaxed);
 }
 
 // ---- conditional hand input (research/16 Part A) ---------------------------------------------
