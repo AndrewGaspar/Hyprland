@@ -141,6 +141,37 @@ you walk away, and re-docks when you return — see the anchoring doc. All hot-l
 | `chrome_col_hover` | color | `0xcc66aaff` | Chrome color for the element (bar or corner) the ray points at. |
 | `chrome_col_grab` | color | `0xff66aaff` | Chrome color while the quad is grabbed. |
 
+### Ray aim assist (cursor, magnetism, sticky hover, aim filter)
+
+See [`04-input.md` §6.1](04-input.md). All hot (read per-frame).
+
+| Variable | Type | Default | Meaning |
+|---|---|---|---|
+| `cursor` | bool | `true` | Draw a small endpoint cursor where each hand's aim ray hits a monitor. Zero cost when no ray hovers a quad. |
+| `cursor_size` | float (m) | `0.02` | Cursor diameter — a constant physical size, so it looks the same on any monitor. |
+| `cursor_press_scale` | float | `1.6` | Cursor growth factor while a button/pinch is pressed. |
+| `cursor_col_idle` | color | `0x80ffffff` | Cursor color over content/margin. |
+| `cursor_col_grabbable` | color | `0xcc66aaff` | Cursor color over a grab handle (move-bar or corner). |
+| `cursor_col_press` | color | `0xffffffff` | Cursor color while a button/pinch is pressed. |
+| `cursor_col_grab` | color | `0xff66aaff` | Cursor color reserved for an active grab. |
+| `cursor_per_hand_tint` | bool | `true` | Tint the left hand's cursor cooler so two rays are distinguishable. |
+| `magnet` | bool | `true` | Chrome-only aim magnetism: a near-miss of a grab handle still highlights/grab-enables it (never magnetizes content — desktop clicks stay pixel-precise). |
+| `magnet_angle` | float (°) | `2.0` | Magnetism cone half-angle: how far off a handle the ray may point and still snap to it. |
+| `hover_hysteresis` | float (m) | `0.03` | Sticky-hover exit margin: once the ray lands a handle, keep it highlighted/grab-eligible until the ray leaves the handle expanded by this much. `0` disables stickiness. |
+| `hover_dropout_frames` | int | `2` | Hold the highlighted handle across up to this many frames where the ray misses every quad. |
+| `aim_filter` | bool | `true` | 1-euro filter the aim pose before hit-testing (controllers **and** hands); ~1 frame latency, steadier ray/cursor. |
+| `aim_filter_min_cutoff` | float (Hz) | `1.5` | Aim 1-euro minimum cutoff. Lower = steadier when aiming slowly (more lag). |
+| `aim_filter_beta` | float | `0.01` | Aim 1-euro speed coefficient. Higher = fast sweeps lag less (jitter returns sooner). |
+| `aim_pinch_damping` | float | `0.4` | Aim min-cutoff multiplier while a press/pinch is ramping up, so committing a click/grab doesn't yank the aim on the commit frame. `1` disables onset damping. |
+
+### Haptics
+
+| Variable | Type | Default | Meaning |
+|---|---|---|---|
+| `haptics` | bool | `true` | Master controller-haptics toggle (grab/press ticks + the hover tick). Hands have no actuator and are unaffected. |
+| `haptic_hover` | bool | `true` | Fire a short controller tick when the ray first enters a grab handle. |
+| `haptic_amplitude` | float | `0.5` | Controller haptic tick amplitude (0–1). |
+
 ---
 
 ## 3. The `xrmonitor` keyword
@@ -301,7 +332,7 @@ visible: yes
 presence: yes
 idle inhibited: yes
 input: left controllers, right hands (pinch, filtered)
-monitor XR-code (ID 3): 2560x1440@90.00 size 1.80m anchor local pos [0.00, 1.40, -1.50] grabbed: no (none) hovered: yes plugged: yes content: <path>
+monitor XR-code (ID 3): 2560x1440@90.00 size 1.80m anchor local pos [0.00, 1.40, -1.50] grabbed: no (none) hovered: yes (body) plugged: yes content: <path>
 ```
 
 While dormant the state line carries the reprobe hint, e.g.
@@ -338,6 +369,7 @@ JSON (`hyprctl -j openxr`) — all keys always present:
             "grabbed": false,
             "grabKind": "none",
             "hovered": true,
+            "region": "body",
             "plugged": true,
             "contentPath": "",
             "linear": false,

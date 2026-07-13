@@ -100,20 +100,30 @@ selection/hover state.
 Three tracks that share the grab engine and the `XRMath` pure-function + gtest discipline.
 Most logic is headless-testable via the Monado remote-driver scripted-pose approach; items
 marked **LIVE** need a Quest 3 (`preview-xr.sh --wivrn`) for feel/latency. Tracks are
-independent; **start with the aiming cursor (A1) — it is the highest-impact, lowest-cost
-item and de-risks every other target-acquisition story.**
+independent. **Track A (ray aim & cursor) has shipped** — the endpoint cursor, sticky hover, hover
+haptic, aim 1€ filter, and chrome-only magnetism all landed (see the Track A table below); Tracks D
+(near-field) and Z (gaze) remain.
 
-### Track A — Ray aim & cursor (report 14)
-| WP | What | Headless? |
-|----|------|-----------|
-| A1 | Endpoint cursor draw (`drawCursor` in `XRGraphics`); export per-hand hit-uv from `processPointer` | uv pure/gtest; GL draw LIVE |
-| A2 | Hover hysteresis / sticky region Schmitt | Yes — pure truth table |
-| A3 | Hover haptic tick on grabbable-enter + `openxr:haptics` gate | edge logic yes; actuator LIVE |
-| A4 | Align hover test with the grab cone (surface slack in the highlight) | Yes |
-| B  | 1€ aim-pose filter + pinch-onset damping | Yes (`oneEuroStepPose` reuse) |
-| C  | Chrome-only magnetism cone (promote grab cone to per-frame hover snap; never BODY) | Yes |
-| D  | Optional straight beam (2 quad layers) or defer to a `hypxrchrome` companion | LIVE — recommend deferring |
-| E  | Fold the live size bump into defaults; document corner↔margin clamp coupling | Yes |
+### Track A — Ray aim & cursor (report 14) — **A1–A4, B, C, E SHIPPED**
+Endpoint cursor + sticky hover + hover haptic + aim 1€ filter + chrome-only magnetism landed
+together. Pure logic (`classifyQuadRegionForgiving`, `stepHoverStick`, `aimFilterMinCutoff`, cursor
+pack/color/tint/size in `XRMath.hpp`) is gtested in `tests/xr/ray_assist.cpp` (+12 gtests); the GL
+`drawCursor` pass rides the existing `drawChrome`/snapshot infra; live feel remains to be tuned on a
+headset. Config surface: `openxr:cursor*`, `openxr:magnet*`, `openxr:hover_hysteresis`/
+`hover_dropout_frames`, `openxr:aim_filter*`/`aim_pinch_damping`, `openxr:haptics`/`haptic_hover`/
+`haptic_amplitude` (see `04-input.md` §6.1 / `05-configuration.md`). `hyprctl openxr status` now
+reports the sticky-stabilized per-quad `region` (scriptable — `hyprtester` `xr_hover_region_stability`).
+
+| WP | What | Status |
+|----|------|--------|
+| A1 | Endpoint cursor draw (`drawCursor` in `XRGraphics`); export per-hand hit-uv from `processPointer` | **SHIPPED** (live feel TODO) |
+| A2 | Hover hysteresis / sticky region Schmitt | **SHIPPED** |
+| A3 | Hover haptic tick on grabbable-enter + `openxr:haptics` gate | **SHIPPED** (actuator LIVE) |
+| A4 | Align hover test with the grab cone (surface slack in the highlight) | **SHIPPED** (folded into C) |
+| B  | 1€ aim-pose filter + pinch-onset damping | **SHIPPED** |
+| C  | Chrome-only magnetism cone (promote grab cone to per-frame hover snap; never BODY) | **SHIPPED** |
+| D  | Optional straight beam (2 quad layers) or defer to a `hypxrchrome` companion | **DEFERRED** — cursor first (report 14 recommendation); revisit only if the laser look is missed |
+| E  | Fold the live size bump into defaults; document corner↔margin clamp coupling | **SHIPPED** (was already the defaults; documented in `04-input.md` §6) |
 
 ### Track D — Direct / near-field pinch & poke (report 15)
 | WP | What | Headless? |
