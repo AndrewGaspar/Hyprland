@@ -1022,6 +1022,34 @@ namespace OpenXR {
         v       = (float)(w & 0x3FFFu) / 16383.F;
     }
 
+    // Damage dead-band for the endpoint cursor. Returns true iff the cursor's on-screen appearance
+    // changed enough to warrant re-compositing the swapchain image. The 14-bit uv packing resolves
+    // ~0.15px on a 2560px quad, so at-rest hand/controller tremor (the 1€ aim filter smooths velocity
+    // but leaves no dead-band at rest) flips the packed word EVERY frame. Without this gate a bare
+    // hover over a static desktop takes the full-swapchain restoreSnapshot + re-release path at the
+    // runtime's 90Hz — WiVRn then re-encodes an essentially-static frame every frame, a sustained
+    // NVENC/network burst that shows up live as dropped IDR keyframes and macroblock corruption
+    // (report: IDR drops cluster exactly in hover windows, silent when the ray leaves the quad).
+    //
+    // prevDrawn is the packed word we LAST actually drew (compare against it, not the last sample, so
+    // slow drift accumulates until it crosses the band instead of being lost). epsilonUV is the
+    // per-axis movement dead-band in uv units. Appearance/disappearance and state (color/size) changes
+    // always redraw; two hidden cursors never do.
+    inline bool xrCursorRedrawNeeded(uint32_t prevDrawn, uint32_t cur, float epsilonUV) {
+        bool           pp = false, cp = false;
+        eXRCursorState ps = XR_CURSOR_HIDDEN, cs = XR_CURSOR_HIDDEN;
+        float          pu = 0.F, pv = 0.F, cu = 0.F, cv = 0.F;
+        xrUnpackCursor(prevDrawn, pp, ps, pu, pv);
+        xrUnpackCursor(cur, cp, cs, cu, cv);
+        if (pp != cp)  // appeared or disappeared -> must draw the dot or erase it
+            return true;
+        if (!cp)  // both hidden -> nothing on screen either way
+            return false;
+        if (ps != cs)  // state drives color and press-size -> visible change
+            return true;
+        return std::fabs(cu - pu) > epsilonUV || std::fabs(cv - pv) > epsilonUV;
+    }
+
     // Endpoint-cursor color for a state, from the openxr:cursor_col_* palette.
     inline uint32_t xrCursorColorFor(eXRCursorState st, uint32_t idle, uint32_t grabbable, uint32_t press, uint32_t grab) {
         switch (st) {
