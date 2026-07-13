@@ -1,0 +1,7 @@
+{
+	"encoder": {
+		"encoder": "nvenc",
+		"codec": "h265"
+	},
+	"bit-depth": 8
+}
