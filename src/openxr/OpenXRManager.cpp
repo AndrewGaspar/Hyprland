@@ -929,10 +929,21 @@ void COpenXRManager::frameThread() {
             // hide delay. Advanced every frame regardless of whether we redraw. ----
             static auto   PFADEMS    = CConfigValue<Hyprlang::INT>("openxr:chrome_fade_ms");
             static auto   PHIDEMS    = CConfigValue<Hyprlang::INT>("openxr:chrome_hide_delay_ms");
+            static auto   PCURSOREN  = CConfigValue<Hyprlang::INT>("openxr:cursor");
             const uint8_t hoverReg   = l->m_hoverRegion.load(std::memory_order_acquire);
             const bool    grabbedNow = l->m_grabbedNow.load(std::memory_order_acquire);
             const bool    activeNow  = grabbedNow || hoverReg != OpenXR::XR_REGION_NONE;
             const bool    chromeOn   = l->m_chrome.hasChrome();
+            // report 14 Stage A1: per-hand endpoint cursor. Drawn (like chrome) into the swapchain
+            // over content; its packed word was published last frame by processPointer's plumbing.
+            const bool     cursorEnabled = *PCURSOREN != 0;
+            const uint32_t curL          = l->m_cursorPacked[0].load(std::memory_order_acquire);
+            const uint32_t curR          = l->m_cursorPacked[1].load(std::memory_order_acquire);
+            const bool     cursorChanged = curL != l->m_cursorDrawn[0] || curR != l->m_cursorDrawn[1];
+            // Snapshot the clean content whenever chrome OR the cursor may draw over it, so an
+            // animation-only frame (chrome fade or a moving cursor with no new desktop buffer) can
+            // restore the content before re-drawing the overlay.
+            const bool     snapOn = chromeOn || cursorEnabled;
 
             const int64_t nowNs = fs.predictedDisplayTime;
             if (activeNow)
@@ -953,7 +964,7 @@ void COpenXRManager::frameThread() {
             // This is what keeps a static desktop with hidden chrome at zero GPU cost — the quad
             // re-presents the most recently released image every runtime frame (doc 01).
             const bool chromeVisualChanged = newAlpha != l->m_chromeDrawnAlpha || hoverReg != l->m_chromeDrawnRegion || grabbedNow != l->m_chromeDrawnGrab;
-            const bool wantAnimTick        = chromeOn && l->m_hasContent && chromeVisualChanged && (newAlpha > 0.f || l->m_chromeDrawnAlpha > 0.f);
+            const bool wantAnimTick        = l->m_hasContent && ((chromeOn && chromeVisualChanged && (newAlpha > 0.f || l->m_chromeDrawnAlpha > 0.f)) || (cursorEnabled && cursorChanged));
 
             if (!buf && !wantAnimTick && l->m_hasContent)
                 continue;
@@ -984,14 +995,14 @@ void COpenXRManager::frameThread() {
                         Log::logger->log(Log::DEBUG, "[OPENXR] first blit landed for XR monitor '{}' ({}x{})", l->m_monitorName, (int)l->m_swapchainSize.x,
                                          (int)l->m_swapchainSize.y);
                     l->m_hasContent = true;
-                    // Snapshot the fresh content (WITHOUT chrome) so an animation-only frame can
-                    // restore it into a different acquired image (WP-G2). Only when chrome is
-                    // enabled — the extra copy is pure overhead otherwise (zero-cost disabled path).
-                    if (chromeOn)
+                    // Snapshot the fresh content (WITHOUT chrome/cursor) so an animation-only frame
+                    // can restore it into a different acquired image (WP-G2 / report 14). Only when
+                    // chrome or the cursor may draw over it — pure overhead otherwise (zero-cost path).
+                    if (snapOn)
                         m_graphics->snapshotSwapchain(*l, dst);
                 } else if (l->m_hasContent) {
-                    // Animation-only frame: no new desktop buffer, chrome fading — restore the last
-                    // content into this (possibly different) image, then draw chrome over it.
+                    // Animation-only frame: no new desktop buffer, chrome fading or the cursor moved —
+                    // restore the last content into this (possibly different) image, then re-overlay.
                     m_graphics->restoreSnapshot(*l, dst);
                 } else
                     m_graphics->clearTex(dst, l->m_swapchainSize, 0.0f, 0.0f, 0.0f);
@@ -1004,6 +1015,14 @@ void COpenXRManager::frameThread() {
                     l->m_chromeDrawnAlpha  = newAlpha;
                     l->m_chromeDrawnRegion = hoverReg;
                     l->m_chromeDrawnGrab   = grabbedNow;
+                }
+
+                // Endpoint-cursor pass (report 14 Stage A1): draw each hand's cursor at its ray-hit
+                // uv, over content + chrome. No-op when disabled or no cursor present.
+                if (cursorEnabled && l->m_hasContent) {
+                    m_graphics->drawCursor(*l, dst, curL, curR);
+                    l->m_cursorDrawn[0] = curL;
+                    l->m_cursorDrawn[1] = curR;
                 }
             }
 
@@ -1235,6 +1254,9 @@ void COpenXRManager::frameThread() {
             const float                      quadW  = res.widthMeters / (chrome.contentFracW() > 0.f ? chrome.contentFracW() : 1.f);
             const float                      quadH  = res.heightMeters / (chrome.contentFracH() > 0.f ? chrome.contentFracH() : 1.f);
             const OpenXR::SXRPose            quadCenterPose = OpenXR::contentPoseToQuadCenter(quadPose, chrome, quadW, quadH);
+            // Cache the full quad meters for next frame's drawCursor (metric cursor sizing, report 14).
+            l->m_quadWMeters = quadW;
+            l->m_quadHMeters = quadH;
 
             XrCompositionLayerQuad quad   = {XR_TYPE_COMPOSITION_LAYER_QUAD};
             quad.layerFlags               = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
@@ -1301,6 +1323,18 @@ void COpenXRManager::frameThread() {
                 const auto reg = mid >= 0 ? m_input->chromeHoverRegion(mid) : OpenXR::XR_REGION_NONE;
                 l->m_hoverRegion.store((uint8_t)reg, std::memory_order_release);
                 l->m_grabbedNow.store(mid >= 0 && m_input->isMonitorGrabbed(mid), std::memory_order_release);
+                // report 14 Stage A1: publish each hand's endpoint-cursor sample onto this layer for
+                // next frame's drawCursor (present iff that hand's ray hit THIS monitor). Same plain-
+                // atomic frame->frame contract as m_hoverRegion (no hyprutils refcount op).
+                for (int hand = 0; hand < 2; ++hand) {
+                    const auto h = (OpenXR::eXRHand)hand;
+                    uint32_t   packed = 0; // present=false
+                    if (mid >= 0 && m_input->cursorMon(h) == mid) {
+                        const Vector2D uv = m_input->cursorUV(h);
+                        packed            = OpenXR::xrPackCursor(true, m_input->cursorState(h), (float)uv.x, (float)uv.y);
+                    }
+                    l->m_cursorPacked[hand].store(packed, std::memory_order_release);
+                }
             }
         }
 
@@ -2610,6 +2644,7 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
             default: info.grabKind = "none"; break;
         }
         info.hovered                     = l->m_hovered;          // WP7
+        info.region                      = OpenXR::xrRegionName((OpenXR::eXRQuadRegion)l->m_hoverRegion.load(std::memory_order_relaxed)); // report 14
         info.contentPath                 = OpenXR::xrContentPathName(l->m_contentPath.load(std::memory_order_relaxed)); // WP-L2
         // Adaptive anchoring (research/13 §6.4).
         info.adaptiveEnabled  = l->m_anchor.adaptiveEnabled();
