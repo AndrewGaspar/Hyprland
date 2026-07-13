@@ -142,12 +142,21 @@ requests:
     scale <factor|size:M> → Resize the quad
     distance <±M|M>  → Push/pull along the anchor ray
     center           → Recenter in front of the current view
+    place <name> at <x,y,z>
+                     → Re-anchor <name> to local, MOVING its center to the given
+                       LOCAL_FLOOR point (metres), facing the headset. The point
+                       is what 'openxr gaze' returns — drop a monitor where the
+                       user was looking (voice: 'place it here')
 
     adaptive <on|off|toggle> → Adaptive dock<->follow on the selected monitor
     dock [here]      → Force-dock (optionally at the current pose)
     undock           → Force-undock into the roam leash
     roam <head|body> → Roam-follow mode while undocked
 
+    gazegrab         → Toggle a gaze carry on the dwell-stable gazed-at monitor
+    gazegrab <name>  → Begin a gaze carry on the NAMED monitor (voice-targeted,
+                       ignores the live dwell candidate)
+    gazerelease      → Release the active gaze carry
     gaze             → Current head ray + dwell-stable gaze candidate (-j)
     gaze at <ms>     → Same, resolved from the rolling head-pose ring at a
     gaze --at-ms <ms>  monotonic-clock timestamp (CLOCK_MONOTONIC ms); adds

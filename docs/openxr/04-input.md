@@ -387,6 +387,16 @@ A gaze carry (research/16 Part B, driven by the manager, not `CXRInput`) owns a 
 the grab machine refuses to begin a hand grab on a monitor whose anchor reports `gazeGrabbed()`
 (alongside the existing `grabbed()` check), so the two never fight — first grab wins.
 
+A carry can be started two ways, both funnelling through `COpenXRManager::beginGazeCarry()` (main
+thread): `gazegrab` with no arg grabs the live dwell-stable candidate (`m_gazeHoveredId`), while
+`gazegrab <name>` targets a *named* monitor regardless of the current dwell — the name→layer
+resolution happens on the main thread (`layerByName`), only the resolved layer reaches the shared
+begin path, and only POD ids/poses ever cross to the frame thread. The targeted form exists so a
+voice/script layer can carry the monitor it resolved from the gaze ring *seconds earlier*, not
+whatever the head points at when the command finally executes. Companion `place <name> at x,y,z`
+(`CXRAnchor::placeLocalAt`) teleports a monitor to a resolved `LOCAL_FLOOR` point facing the
+headset — the "drop it **here**" half of the same voice interaction.
+
 The same dwell-stable gaze candidate — plus the raw head ray — is also exposed read-only for
 companion tooling: the frame thread appends each frame's head pose + gaze candidate to a rolling
 ~91 s ring (`COpenXRManager::m_poseRing`, `recordPoseSample()`), queryable by monotonic timestamp
