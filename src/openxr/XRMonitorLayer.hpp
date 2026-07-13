@@ -163,6 +163,22 @@ class CXRMonitorLayer {
     std::atomic<uint8_t> m_hoverRegion{0 /* OpenXR::XR_REGION_NONE */}; // region the ray last classified on THIS quad (any hand)
     std::atomic<bool>    m_grabbedNow{false};                          // this quad has an active MOVE or RESIZE grab
 
+    // ---- gaze-selection visual-state contract (research/16 §3.3) — extends the WP-G2 contract ----
+    // m_gazeSelected: this quad is the dwell-stable gazed-at candidate (whole-quad highlight —
+    // "look here to grab"). m_gazeCarried: this quad is being gaze-carried right now. WRITTEN by the
+    // frame loop's gazeSelectPass (right after processPointer), READ by the chrome draw pass at the
+    // top of the next frame's blit loop — the same one-frame-latency plain-atomic discipline as
+    // m_hoverRegion (never a hyprutils refcount op). They light the chrome fade envelope (hover color
+    // for a candidate, grab color while carried) so the whole monitor glows as the gaze feedback,
+    // since a gaze ray has no cursor of its own for pre-grab selection.
+    std::atomic<bool>    m_gazeSelected{false};
+    std::atomic<bool>    m_gazeCarried{false};
+    // Gaze cursor: one packed word (OpenXR::xrPackCursor) for the gaze point on the CARRIED quad,
+    // written by gazeSelectPass and drawn by drawCursor over content + chrome (distinct color). Same
+    // one-frame-latency contract; m_gazeCursorDrawn is the redraw-diff of what was last drawn.
+    std::atomic<uint32_t> m_gazeCursorPacked{0};
+    uint32_t              m_gazeCursorDrawn = 0; // frame-thread only (redraw diff)
+
     // ---- endpoint-cursor visual-state contract (report 14 Stage A1) — extends the WP-G2 contract ----
     // One packed word per hand (OpenXR::xrPackCursor: present(1) state(3) u(14) v(14)), WRITTEN by the
     // frame loop right after processPointer (from CXRInput::cursorMon/cursorUV/cursorState, matched by

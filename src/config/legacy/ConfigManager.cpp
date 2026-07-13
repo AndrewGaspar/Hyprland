@@ -1158,6 +1158,13 @@ std::string CConfigManager::parseKeyword(const std::string& COMMAND, const std::
     // neither reloaded nor props_refreshed, so re-publish the enums explicitly here.
     if (COMMAND.starts_with("openxr:adaptive_") && g_pOpenXRManager)
         g_pOpenXRManager->onConfigReload();
+
+    // openxr:hand_input (research/16 Part A) is a STRING policy parsed to an atomic enum on the main
+    // thread in onConfigReload()->publishHandInputPolicy() (change-detected so a runtime `handinput`
+    // dispatcher change survives an unrelated reload). Same legacy-keyword gap as adaptive_ above: a
+    // bare `hyprctl keyword openxr:hand_input ...` fires neither reloaded nor props_refreshed.
+    if (COMMAND == "openxr:hand_input" && g_pOpenXRManager)
+        g_pOpenXRManager->onConfigReload();
 #endif
 
     // Update window border colors

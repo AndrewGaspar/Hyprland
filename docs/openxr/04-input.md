@@ -367,6 +367,26 @@ the handle" cue). The master `openxr:haptics` (default on) gates all of them. It
 from the frame thread; a profile with no haptic binding (hands) simply returns an error that is
 ignored, so hands get no haptics and lose nothing.
 
+### 7.4 Conditional hand-input gating (research/16 Part A)
+
+`processPointer` takes a `handsEnabled` flag (resolved per frame by the manager from
+`openxr:hand_input`, the physical-keyboard recency signal, the roam state, and the manual toggle
+latch — the pure decision is `OpenXR::handInputGate`, gtested). When it is false, **each hand whose
+active device is hand tracking** (`handActive(h)` — i.e. the `ext/hand_interaction` profile) is made
+fully inert for that frame: its hover/cursor/chrome exports are cleared, its grab gesture value is
+forced to 0 (so an in-progress grab falls straight through the release-latch edge — no mid-air
+freeze — and no new grab can begin), and its select/menu analogs are forced to 0 (a held button
+releases, no new press). **Controllers are never gated** (`handActive` is false for them), so a
+controller session is byte-for-byte unchanged. The keyboard-recency signal is a lock-free
+`CInputManager::lastPhysicalKeyEventMs()` static atomic, updated on physical key press; the XR frame
+thread reads it without touching `g_pInputManager` or any hyprutils refcount.
+
+### 7.5 Gaze carry vs a hand grab
+
+A gaze carry (research/16 Part B, driven by the manager, not `CXRInput`) owns a monitor exclusively:
+the grab machine refuses to begin a hand grab on a monitor whose anchor reports `gazeGrabbed()`
+(alongside the existing `grabbed()` check), so the two never fight — first grab wins.
+
 ## 8. Frame → main event queue
 
 Two event families cross the queue:

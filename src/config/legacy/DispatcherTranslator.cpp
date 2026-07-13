@@ -849,6 +849,17 @@ static SDispatchResult xrmonitorDispatch(const std::string& args) {
     if (verb == "roam")
         return wrapExp(g_pOpenXRManager->cmdRoam(rest));
 
+    // Gaze grab + conditional hand input (research/16). gazegrab TOGGLES (grab/release); gazepush is
+    // designed for `binde` stepped repeats; handinput toggles hand input on/off at the keyboard.
+    if (verb == "gazegrab")
+        return wrapExp(g_pOpenXRManager->cmdGazeGrab());
+    if (verb == "gazerelease")
+        return wrapExp(g_pOpenXRManager->cmdGazeRelease());
+    if (verb == "gazepush")
+        return wrapExp(g_pOpenXRManager->cmdGazePush(rest));
+    if (verb == "handinput")
+        return wrapExp(g_pOpenXRManager->cmdHandInput(rest));
+
     return {.success = false, .error = "unknown xrmonitor verb '" + verb + "'"};
 #endif
 }
