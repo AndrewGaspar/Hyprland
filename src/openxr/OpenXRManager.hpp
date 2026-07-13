@@ -226,6 +226,33 @@ class COpenXRManager {
     };
     SXRGazeStatus gazeStatus();
 
+    // hypxrvoice WP-V1 (docs/openxr/research/VOICE-CONTROL.md): a timestamped head-pose + gaze
+    // candidate resolved from the rolling ring (m_poseRing). `gazeSampleNow()` returns the newest
+    // sample; `gazeSampleAt(ms)` returns the nearest sample to a monotonic-clock timestamp so a
+    // voice daemon can ask "where was the head pointed when the user started speaking?" (speech
+    // recognition latency means pose-at-parse-time is a systematic bug). Names are resolved from
+    // the stored MONITORID on THIS (main) thread. `ok` is false only when the ring is empty (no XR
+    // frame has run). See the CLOCK CONTRACT comment on SXRPoseRing in XRMath.hpp.
+    struct SXRGazeSample {
+        bool        ok        = false; // a sample exists
+        int64_t     timestampMs = 0;   // capture time (CLOCK_MONOTONIC ms)
+        bool        viewValid = false; // head pose was locatable at capture
+        OpenXR::Vec3 headPos;          // LOCAL_FLOOR meters
+        OpenXR::Quat headRot;
+        OpenXR::Vec3 headForward;      // -Z of headRot, unit
+        int64_t     gazeMonitorId = -1;
+        std::string gazeName;          // resolved name of gazeMonitorId ("" if none/gone)
+        bool        selected = false;  // a dwell-stable monitor is currently gazed at
+        float       dwell    = 0.F;    // seconds toward the pending dwell switch
+        // Only meaningful for gazeSampleAt(): how the query resolved against the ring.
+        bool        matched          = false; // resolved via a timestamp query (vs "now")
+        int64_t     requestedTimestampMs = 0;
+        int64_t     matchedTimestampMs   = 0; // the ring entry actually returned
+        int64_t     ageMs                = 0; // requested - matched (>0 = matched sample is older)
+    };
+    SXRGazeSample gazeSampleNow();
+    SXRGazeSample gazeSampleAt(int64_t requestedTimestampMs);
+
     // `hyprctl openxr layout`: paste-ready `xrmonitor = ...` lines for every live XR monitor.
     std::string layoutDump();
 
@@ -442,6 +469,22 @@ class COpenXRManager {
     // per-layer m_gazeSelected highlight, and packs the gaze cursor onto the carried layer. `active`
     // is the frame's visible-layer snapshot (same vector processPointer consumed).
     void gazeSelectPass(const std::vector<SXRPointerTarget>& targets, const std::vector<PXRLAYER>& active, const OpenXR::SXRPose& view, bool viewValid, float dt);
+
+    // hypxrvoice WP-V1: the rolling head-pose + gaze-candidate ring. ~5.7s at 90Hz (512 * 1/90s).
+    // Written once per frame by the frame thread (recordPoseSample), read by main-thread IPC
+    // queries (gazeSampleNow/At), both under m_poseRingMu — a plain std::mutex, deliberately NOT
+    // m_layersMu (a status query must not contend with the solve/grab critical section). The
+    // sample is a plain POD (no strings, no refcounts) so the frame-thread write is refcount- and
+    // string-free (XRMonitorLayer.hpp rules). Capacity is a power of two (mask indexing).
+    static constexpr size_t         XR_POSE_RING_CAP = 512;
+    OpenXR::SXRPoseRing<XR_POSE_RING_CAP> m_poseRing;
+    std::mutex                      m_poseRingMu;
+    // Frame thread, called once per frame after gazeSelectPass. Stamps Time::steadyNow() and packs
+    // the current head pose + the dwell-selector state into the ring. viewValid propagates so a
+    // query can tell head-tracked frames from dropouts. Reads m_gazeHoveredId (its own atomic) and
+    // the frame-thread-only m_gazeSel/m_gazeHitId (same thread) — no config, no refcount.
+    void recordPoseSample(const OpenXR::SXRPose& view, bool viewValid);
+
     // Copy of the most recent frame-thread solve inputs, so verbs (main thread) get a view/grip
     // context without blocking the frame thread. Written by the frame thread under m_layersMu.
     OpenXR::SXRVerbContext currentVerbContext();

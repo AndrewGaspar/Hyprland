@@ -17,6 +17,8 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstddef>
+#include <array>
 #include <algorithm>
 #include <string>
 
@@ -392,6 +394,103 @@ namespace OpenXR {
             s.dwell  = 0.F;
         }
         return s.stable;
+    }
+
+    // ---- timestamped head-pose / gaze history ring (hypxrvoice WP-V1) ----
+    //
+    // A voice daemon (docs/openxr/research/VOICE-CONTROL.md) resolves deixis like "drop this
+    // monitor HERE" against where the user's head was pointed AT THE MOMENT THEY SPOKE — speech
+    // recognition takes 1-3s, so by parse time the head has moved on (often to the feedback HUD),
+    // and pose-at-parse-time is a systematic bug. The compositor therefore keeps a short rolling
+    // ring of per-frame head poses + gaze candidates that the daemon queries by monotonic
+    // timestamp (`hyprctl openxr gaze at <ms>`).
+    //
+    // CLOCK CONTRACT: `timestampMs` is milliseconds on the SAME monotonic clock the daemon reads
+    // with clock_gettime(CLOCK_MONOTONIC) — the compositor stamps it via Time::millis(
+    // Time::steadyNow()), and std::chrono::steady_clock == CLOCK_MONOTONIC on Linux/libstdc++
+    // (see the note in src/helpers/time/Time.cpp). So a daemon can capture `clock_gettime(
+    // CLOCK_MONOTONIC)` at the instant speech begins, convert to ms, and pass it straight to
+    // `gaze at <ms>` with no clock-domain translation.
+    //
+    // The struct is a plain POD (no strings, no refcounts) so the single writer (the XR frame
+    // thread) can push it under a plain mutex without touching hyprutils refcounts or config
+    // strings (the frame-thread rules in XRMonitorLayer.hpp). Names are resolved from the stored
+    // MONITORID on the MAIN thread at query time.
+    struct SXRPoseSample {
+        int64_t timestampMs   = 0;     // CLOCK_MONOTONIC ms at capture (see CLOCK CONTRACT above)
+        bool    viewValid     = false; // the head/view pose was locatable this frame
+        Vec3    headPos;               // head position in LOCAL_FLOOR space (meters)
+        Quat    headRot;               // head orientation ([x,y,z,w])
+        int64_t gazeMonitorId = -1;    // dwell-stable gazed-at monitor id (-1 = passthrough / none)
+        int64_t gazeRawId     = -1;    // instantaneous nearest-hit monitor id this frame (pre-dwell)
+        float   gazeDwell     = 0.F;   // seconds accumulated toward the pending dwell switch
+    };
+
+    // Fixed-capacity single-writer ring. Power-of-two capacity so the index math is a mask.
+    // `count` is the monotonic total pushed; the live window is the last min(count,N) samples in
+    // nondecreasing-timestamp order. Pure POD + index math (no threading here — the manager owns
+    // the mutex), so it is gtestable with no runtime (tests/xr/pose_ring.cpp).
+    template <size_t N>
+    struct SXRPoseRing {
+        static_assert(N > 0 && (N & (N - 1)) == 0, "SXRPoseRing capacity must be a power of two");
+
+        std::array<SXRPoseSample, N> buf{};
+        uint64_t                     count = 0;
+
+        void   push(const SXRPoseSample& s) {
+            buf[count & (N - 1)] = s;
+            ++count;
+        }
+        bool   empty() const {
+            return count == 0;
+        }
+        size_t size() const {
+            return count < N ? (size_t)count : N;
+        }
+        // Logical index i in [0,size): 0 == oldest live sample, size-1 == newest.
+        const SXRPoseSample& at(size_t i) const {
+            const uint64_t start = count - size(); // first live absolute index
+            return buf[(start + i) & (N - 1)];
+        }
+        const SXRPoseSample& newest() const {
+            return buf[(count - 1) & (N - 1)];
+        }
+    };
+
+    // Nearest-in-time lookup. Returns false (and leaves `out` untouched) iff the ring is empty.
+    // Otherwise `out` is the sample whose timestamp is closest to `targetMs`, CLAMPED to the
+    // retained range: a target older than the oldest sample returns the oldest, newer than the
+    // newest returns the newest. The caller detects staleness / clamping by comparing
+    // out.timestampMs to targetMs (the IPC surface reports matchedTimestampMs + ageMs). Ties
+    // (equidistant) resolve to the NEWER sample. Timestamps are nondecreasing (one writer, a
+    // monotonic clock), so this is a binary search over the logical window.
+    template <size_t N>
+    inline bool poseRingNearest(const SXRPoseRing<N>& ring, int64_t targetMs, SXRPoseSample& out) {
+        const size_t sz = ring.size();
+        if (sz == 0)
+            return false;
+        // lower_bound: first index whose timestamp >= targetMs.
+        size_t lo = 0, hi = sz;
+        while (lo < hi) {
+            const size_t mid = lo + (hi - lo) / 2;
+            if (ring.at(mid).timestampMs < targetMs)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo == 0) {
+            out = ring.at(0); // target at/older than oldest -> clamp to oldest
+            return true;
+        }
+        if (lo == sz) {
+            out = ring.at(sz - 1); // target newer than newest -> clamp to newest
+            return true;
+        }
+        const SXRPoseSample& hiS = ring.at(lo);     // timestamp >= target
+        const SXRPoseSample& loS = ring.at(lo - 1); // timestamp <  target
+        // Tie -> newer (hiS). |hi - target| <= |target - lo| picks hiS on equality.
+        out = (hiS.timestampMs - targetMs) <= (targetMs - loS.timestampMs) ? hiS : loS;
+        return true;
     }
 
     // ---- conditional hand-input gate (research/16 Part A) ----

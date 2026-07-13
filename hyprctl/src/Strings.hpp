@@ -148,6 +148,12 @@ requests:
     undock           → Force-undock into the roam leash
     roam <head|body> → Roam-follow mode while undocked
 
+    gaze             → Current head ray + dwell-stable gaze candidate (-j)
+    gaze at <ms>     → Same, resolved from the rolling head-pose ring at a
+    gaze --at-ms <ms>  monotonic-clock timestamp (CLOCK_MONOTONIC ms); adds
+                       matchedTimestampMs + ageMs. Lets a voice daemon target
+                       where the head pointed AT SPEECH ONSET, not at parse time
+
 flags:
     See 'hyprctl --help')#";
 

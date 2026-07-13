@@ -1387,6 +1387,13 @@ void COpenXRManager::frameThread() {
             }
         }
 
+        // hypxrvoice WP-V1: append this frame's head pose + gaze candidate to the rolling ring so a
+        // voice daemon can resolve deixis ("drop this monitor HERE") against where the head was
+        // pointed at speech-onset, not at parse time (VOICE-CONTROL.md). Unconditional (even with
+        // no input configured we still log the head pose); reads m_gazeHoveredId + the frame-thread
+        // gaze selector state, no config/refcount. Pushes under its own small mutex.
+        recordPoseSample(viewPose, viewValid);
+
         // xrEndFrame with zero layers is valid (nothing composited yet) — doc 01.
         XrFrameEndInfo endInfo       = {XR_TYPE_FRAME_END_INFO};
         endInfo.displayTime          = fs.predictedDisplayTime;
@@ -3373,6 +3380,78 @@ COpenXRManager::SXRGazeStatus COpenXRManager::gazeStatus() {
         }
     }
     return s;
+}
+
+// hypxrvoice WP-V1 — FRAME THREAD. Append the current head pose + gaze candidate to the ring.
+void COpenXRManager::recordPoseSample(const OpenXR::SXRPose& view, bool viewValid) {
+    OpenXR::SXRPoseSample s;
+    // Time::steadyNow() == std::chrono::steady_clock == CLOCK_MONOTONIC on Linux (Time.cpp) — the
+    // exact clock the daemon queries with clock_gettime(CLOCK_MONOTONIC). See SXRPoseRing's CLOCK
+    // CONTRACT. processPointer stamps its input events off the same source (frameThread above).
+    s.timestampMs   = (int64_t)Time::millis(Time::steadyNow());
+    s.viewValid     = viewValid;
+    s.headPos       = view.pos;
+    s.headRot       = view.rot;
+    s.gazeMonitorId = m_gazeHoveredId.load(std::memory_order_acquire); // dwell-stable id (frame->main atomic)
+    s.gazeRawId     = m_gazeHitId;                                     // frame-thread-only, same thread
+    s.gazeDwell     = m_gazeSel.dwell;                                 // frame-thread-only, same thread
+
+    std::scoped_lock lock(m_poseRingMu);
+    m_poseRing.push(s);
+}
+
+// Shared body for the `gaze` / `gaze at <ms>` verbs: turn a ring sample into an SXRGazeSample,
+// resolving the stored MONITORID -> name on THIS (main) thread. `sample` must be a copy taken
+// under m_poseRingMu by the caller.
+COpenXRManager::SXRGazeSample COpenXRManager::gazeSampleNow() {
+    SXRGazeSample out;
+    OpenXR::SXRPoseSample s;
+    {
+        std::scoped_lock lock(m_poseRingMu);
+        if (m_poseRing.empty())
+            return out; // ok = false
+        s = m_poseRing.newest();
+    }
+    out.ok               = true;
+    out.timestampMs      = s.timestampMs;
+    out.viewValid        = s.viewValid;
+    out.headPos          = s.headPos;
+    out.headRot          = s.headRot;
+    out.headForward      = OpenXR::poseForward(s.headRot);
+    out.gazeMonitorId    = s.gazeMonitorId;
+    out.selected         = s.gazeMonitorId >= 0;
+    out.dwell            = s.gazeDwell;
+    if (s.gazeMonitorId >= 0)
+        if (auto l = layerByMonitorID((MONITORID)s.gazeMonitorId))
+            out.gazeName = l->m_monitorName;
+    return out;
+}
+
+COpenXRManager::SXRGazeSample COpenXRManager::gazeSampleAt(int64_t requestedTimestampMs) {
+    SXRGazeSample out;
+    OpenXR::SXRPoseSample s;
+    {
+        std::scoped_lock lock(m_poseRingMu);
+        if (!OpenXR::poseRingNearest(m_poseRing, requestedTimestampMs, s))
+            return out; // ok = false (ring empty)
+    }
+    out.ok                   = true;
+    out.matched              = true;
+    out.requestedTimestampMs = requestedTimestampMs;
+    out.matchedTimestampMs   = s.timestampMs;
+    out.ageMs                = requestedTimestampMs - s.timestampMs; // >0: matched sample is older than asked
+    out.timestampMs          = s.timestampMs;
+    out.viewValid            = s.viewValid;
+    out.headPos              = s.headPos;
+    out.headRot              = s.headRot;
+    out.headForward          = OpenXR::poseForward(s.headRot);
+    out.gazeMonitorId        = s.gazeMonitorId;
+    out.selected             = s.gazeMonitorId >= 0;
+    out.dwell                = s.gazeDwell;
+    if (s.gazeMonitorId >= 0)
+        if (auto l = layerByMonitorID((MONITORID)s.gazeMonitorId))
+            out.gazeName = l->m_monitorName;
+    return out;
 }
 
 #endif
