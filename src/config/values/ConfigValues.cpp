@@ -910,6 +910,31 @@ std::vector<SP<IValue>> Values::getConfigValues() {
         MS<Int>("openxr:overlay_z", "overlay composition placement (XR_EXTX_overlay sessionLayersPlacement); higher composites later / on top. Read at session start", 1,
                 {.min = 0, .max = 1000000}),
 
+        // ---- conditional hand input (research/16 Part A). Controllers are NEVER gated by this. ----
+        MS<String>("openxr:hand_input",
+                   "when hand tracking drives the XR pointer/grabs: on (always) | off (never; controllers still work) | auto (default). auto enables hands only when you are "
+                   "AWAY from the keyboard (openxr:hand_input_idle_s of keyboard silence, or roaming if hand_input_roam_enables) — so typing never fires false hand gestures. Use "
+                   "the `xrmonitor handinput toggle` dispatcher (bind a key-chord) to force hands on while at the keyboard. Hot-applies.",
+                   "auto"),
+        MS<Float>("openxr:hand_input_idle_s", "hand_input=auto: seconds of physical-keyboard silence before hands re-enable; any keypress re-gates them immediately", 15.0,
+                  {.min = 0.0, .max = 600.0}),
+        MS<Bool>("openxr:hand_input_roam_enables",
+                 "hand_input=auto: also enable hands whenever the head is beyond the adaptive seat geofence (roaming), so wandering the house always has hands even mid-typing-timeout", true),
+
+        // ---- gaze grab: keyboard-driven monitor manipulation steered by head gaze (research/16 Part B) ----
+        MS<String>("openxr:gaze_source", "gaze ray source: view (center-FOV head-forward vector, the only source on eye-tracking-less HMDs like Quest 3) | eye (reserved; auto-falls-back to view)", "view"),
+        MS<Bool>("openxr:gaze_filter", "1€ low-pass the gaze pose before hit-testing, to steady the dwell selection (research/16 §3.1)", true),
+        MS<Float>("openxr:gaze_filter_min_cutoff", "gaze 1€ filter minimum cutoff frequency (Hz); lower = steadier when looking slowly (more lag)", 1.5, {.min = 0.01, .max = 10.0}),
+        MS<Float>("openxr:gaze_filter_beta", "gaze 1€ filter speed coefficient; higher = the cutoff rises faster with head motion so fast looks lag less", 0.01, {.min = 0.0, .max = 1.0}),
+        MS<Int>("openxr:gaze_dwell_ms", "how long the gaze must rest on a monitor before it becomes the grab-eligible candidate (anti-saccade; also the selection hysteresis)", 200,
+                {.min = 0, .max = 2000}),
+        MS<Float>("openxr:gaze_hysteresis_deg", "sticky-selection exit margin in degrees: the currently-selected monitor is hit-tested with this much extra angular slack so adjacent boundaries don't flicker", 3.0,
+                  {.min = 0.0, .max = 15.0}),
+        MS<Bool>("openxr:gaze_follow", "while gaze-grabbed the monitor rides the live gaze ray (default). false = it detaches at grab and only the push/pull keys move it along the grab-time ray", true),
+        MS<Float>("openxr:gaze_dist_step", "default push/pull step for `xrmonitor gazepush` with no argument, in meters (bind with binde for stepped repeats)", 0.1, {.min = 0.01, .max = 1.0}),
+        MS<Bool>("openxr:gaze_cursor", "draw a distinct cursor dot at the gaze point on the carried monitor while a gaze carry is active (the dwell candidate is shown via the chrome highlight)", true),
+        MS<Color>("openxr:gaze_cursor_col", "color of the gaze cursor dot (premultiplied over the quad)", 0xffcc66ff),
+
         /*
          * experimental:
          */

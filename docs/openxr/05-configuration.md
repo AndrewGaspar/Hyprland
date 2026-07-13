@@ -172,6 +172,46 @@ See [`04-input.md` §6.1](04-input.md). All hot (read per-frame).
 | `haptic_hover` | bool | `true` | Fire a short controller tick when the ray first enters a grab handle. |
 | `haptic_amplitude` | float | `0.5` | Controller haptic tick amplitude (0–1). |
 
+### Conditional hand input (research/16 Part A)
+
+Stops accidental hand-tracking gestures (pinch/grab clicks) while you type. **Controllers are never
+gated by this** — only hand tracking. The gate is resolved every frame; a gated-off hand is fully
+inert (no ray/hover/cursor/click/grab; an in-progress hand grab is ended via the release latch).
+
+| Variable | Type | Default | Meaning |
+|---|---|---|---|
+| `hand_input` | string | `auto` | `on` (hands always) / `off` (never; controllers still work) / `auto`. `auto` enables hands only when you're **away from the keyboard** (`hand_input_idle_s` of silence) or **roaming** (`hand_input_roam_enables`). Hot-applies (special-cased in `parseKeyword`, change-detected so a runtime `handinput` dispatcher change survives an unrelated reload). |
+| `hand_input_idle_s` | float | `15` | `auto`: seconds of physical-keyboard silence before hands re-enable; any keypress re-gates instantly. |
+| `hand_input_roam_enables` | bool | `true` | `auto`: also enable hands whenever the head is beyond the adaptive seat geofence (roaming), so wandering the house always has hands even mid-typing-timeout. |
+
+The `xrmonitor handinput on|off|auto|toggle` dispatcher overrides the policy at runtime; **`toggle`**
+is the key-chord you bind to flip hands on/off while at the keyboard (it lands in `auto` + a manual
+latch, so a later `handinput auto` returns to the pure keyboard/roam gate). `hyprctl openxr status`
+shows `hand input: active | gated (keyboard) | gated (manual) | off`.
+
+### Gaze grab (research/16 Part B)
+
+Keyboard-driven monitor manipulation steered by where you **look** (VIEW = head-forward center-FOV
+ray; no eye tracking needed). Look at a monitor, tap the grab key (it follows your gaze), tap keys
+to push/pull it, tap again to drop it. See the `gaze*` dispatcher verbs in §4.
+
+| Variable | Type | Default | Meaning |
+|---|---|---|---|
+| `gaze_source` | string | `view` | `view` (head forward) / `eye` (reserved; auto-falls-back to `view` — no eye HW on Quest 3). |
+| `gaze_dwell_ms` | int | `200` | Rest this long on a monitor before it becomes the grab-eligible candidate (anti-saccade; also the selection hysteresis). | hot |
+| `gaze_hysteresis_deg` | float | `3.0` | Sticky-selection exit margin: the selected monitor is hit-tested with this much extra angular slack so adjacent boundaries don't flicker. | hot |
+| `gaze_follow` | bool | `true` | `true`: the monitor rides the live gaze ray while held. `false`: it detaches at grab and only the push/pull keys move it (deliberate reposition). | hot |
+| `gaze_dist_step` | float | `0.1` | Default push/pull step (m) for `gazepush` with no argument (bind with `binde` for stepped repeats). | hot |
+| `gaze_filter` | bool | `true` | 1€-filter the gaze pose before hit-testing so the selection is steady. | hot |
+| `gaze_filter_min_cutoff` | float | `1.5` | Gaze 1€ filter min cutoff (Hz); lower = steadier when looking slowly. | hot |
+| `gaze_filter_beta` | float | `0.01` | Gaze 1€ filter speed coefficient; higher = the cutoff rises faster with head motion. | hot |
+| `gaze_cursor` | bool | `true` | Draw a distinct cursor dot at the gaze point on the carried monitor (the candidate is shown via the chrome highlight). | hot |
+| `gaze_cursor_col` | color | `0xffcc66ff` | Gaze cursor dot color. | hot |
+
+Feedback: the dwell-stable monitor you're looking at is highlighted via the normal chrome (its
+move-bar lights up in the hover color); a gaze-carried monitor glows in the grab color and shows the
+gaze cursor. A gaze carry and a hand/controller grab can't fight over one monitor — first wins.
+
 ---
 
 ## 3. The `xrmonitor` keyword
@@ -275,6 +315,10 @@ transports, one implementation.
 | `undock` | *(none)* | Force the selected adaptive monitor to pick up and follow now (skips the geofence dwell). |
 | `dock` | `[here]` | Force it back to the saved desk pose now; `dock here` redefines the desk pose to where it is now and recaptures the seat. |
 | `roam` | `head\|body` | Change the follow behavior live. |
+| `gazegrab` | *(none)* | **Toggle**: grab the monitor you're looking at (dwell-stable candidate) so it follows your gaze; if a gaze carry is active, release it. Errors cleanly if you're not looking at a monitor, or it's already grabbed by a hand/controller. |
+| `gazerelease` | *(none)* | Explicit release of the gaze carry (no-op if none). For a `bindr` hold-to-carry pattern. |
+| `gazepush` | `<±m>` | Push/pull the gaze-carried monitor along the gaze ray (or, when not carrying, the gaze-selected monitor along the view ray). No arg = `openxr:gaze_dist_step`. Designed for `binde` repeats. |
+| `handinput` | `on\|off\|auto\|toggle` | Set the conditional hand-input policy (§2). `toggle` is the key-chord to flip hands on/off at the keyboard. |
 
 **Selected-target resolution** (for `active` / omitted targets): explicit `select` > last
 ray-hovered monitor > focused-monitor-if-XR — else the verb errors with "no XR monitor
@@ -305,6 +349,7 @@ hyprctl -j openxr              # JSON
 hyprctl openxr enable|disable  # start/stop the session (does not touch openxr:enabled)
 hyprctl openxr <verb> …        # the §4 verbs: create destroy select anchor move rotate
                                #   scale distance center adaptive dock undock roam
+                               #   gazegrab gazerelease gazepush handinput
 hyprctl openxr layout          # dump the CURRENT live layout as paste-ready xrmonitor= lines
 ```
 
