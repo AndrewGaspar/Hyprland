@@ -156,6 +156,42 @@ TEST(XRRayAssist, CursorPackRoundTrip) {
     EXPECT_NEAR(v, 1.f, 1e-3f);
 }
 
+// ---- cursor redraw damage dead-band (idle-hover re-encode storm fix) ----
+
+TEST(XRRayAssist, CursorRedrawDeadBand) {
+    const float    eps  = 0.0015f;
+    const uint32_t base = xrPackCursor(true, XR_CURSOR_IDLE, 0.500f, 0.500f);
+
+    // Sub-band tremor: below the dead-band on both axes -> no redraw.
+    EXPECT_FALSE(xrCursorRedrawNeeded(base, xrPackCursor(true, XR_CURSOR_IDLE, 0.5005f, 0.4995f), eps));
+    // A move past the band on one axis -> redraw.
+    EXPECT_TRUE(xrCursorRedrawNeeded(base, xrPackCursor(true, XR_CURSOR_IDLE, 0.505f, 0.500f), eps));
+    EXPECT_TRUE(xrCursorRedrawNeeded(base, xrPackCursor(true, XR_CURSOR_IDLE, 0.500f, 0.510f), eps));
+
+    // Appearance / disappearance always redraws (draw the dot / erase it).
+    EXPECT_TRUE(xrCursorRedrawNeeded(xrPackCursor(false, XR_CURSOR_IDLE, 0.f, 0.f), base, eps));
+    EXPECT_TRUE(xrCursorRedrawNeeded(base, xrPackCursor(false, XR_CURSOR_IDLE, 0.5f, 0.5f), eps));
+
+    // Two hidden cursors: nothing on screen -> never redraw, even with different stale uv bits.
+    EXPECT_FALSE(xrCursorRedrawNeeded(xrPackCursor(false, XR_CURSOR_IDLE, 0.1f, 0.2f),
+                                      xrPackCursor(false, XR_CURSOR_PRESS, 0.9f, 0.8f), eps));
+
+    // State change at the same spot (color/press-size differs) always redraws.
+    EXPECT_TRUE(xrCursorRedrawNeeded(base, xrPackCursor(true, XR_CURSOR_PRESS, 0.500f, 0.500f), eps));
+    EXPECT_TRUE(xrCursorRedrawNeeded(base, xrPackCursor(true, XR_CURSOR_GRABBABLE, 0.500f, 0.500f), eps));
+
+    // eps == 0 restores exact-equality behaviour: any packed-word delta redraws, identical does not.
+    EXPECT_FALSE(xrCursorRedrawNeeded(base, base, 0.f));
+    EXPECT_TRUE(xrCursorRedrawNeeded(base, xrPackCursor(true, XR_CURSOR_IDLE, 0.5005f, 0.500f), 0.f));
+
+    // Accumulated drift: repeated sub-band steps measured against the SAME last-drawn word eventually
+    // cross the band (this is why the caller compares against last-DRAWN, not last-sampled).
+    uint32_t drifted = xrPackCursor(true, XR_CURSOR_IDLE, 0.5010f, 0.500f); // ~0.0010 < eps from base
+    EXPECT_FALSE(xrCursorRedrawNeeded(base, drifted, eps));
+    drifted = xrPackCursor(true, XR_CURSOR_IDLE, 0.5030f, 0.500f); // ~0.0031 > eps from base
+    EXPECT_TRUE(xrCursorRedrawNeeded(base, drifted, eps));
+}
+
 // ---- cursor color / tint ----
 
 TEST(XRRayAssist, CursorColorSelection) {
