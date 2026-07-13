@@ -470,13 +470,16 @@ class COpenXRManager {
     // is the frame's visible-layer snapshot (same vector processPointer consumed).
     void gazeSelectPass(const std::vector<SXRPointerTarget>& targets, const std::vector<PXRLAYER>& active, const OpenXR::SXRPose& view, bool viewValid, float dt);
 
-    // hypxrvoice WP-V1: the rolling head-pose + gaze-candidate ring. ~5.7s at 90Hz (512 * 1/90s).
+    // hypxrvoice WP-V1: the rolling head-pose + gaze-candidate ring. ~91s at 90Hz (8192 * 1/90s;
+    // longer at lower refresh) — sized so the earliest deictic word of a long utterance is still
+    // in the window after ASR + intent latency, at full frame-rate resolution (~512KB; a `gaze at`
+    // older than the window clamps to the oldest sample SILENTLY, so generosity beats a knob here).
     // Written once per frame by the frame thread (recordPoseSample), read by main-thread IPC
     // queries (gazeSampleNow/At), both under m_poseRingMu — a plain std::mutex, deliberately NOT
     // m_layersMu (a status query must not contend with the solve/grab critical section). The
     // sample is a plain POD (no strings, no refcounts) so the frame-thread write is refcount- and
     // string-free (XRMonitorLayer.hpp rules). Capacity is a power of two (mask indexing).
-    static constexpr size_t         XR_POSE_RING_CAP = 512;
+    static constexpr size_t         XR_POSE_RING_CAP = 8192;
     OpenXR::SXRPoseRing<XR_POSE_RING_CAP> m_poseRing;
     std::mutex                      m_poseRingMu;
     // Frame thread, called once per frame after gazeSelectPass. Stamps Time::steadyNow() and packs

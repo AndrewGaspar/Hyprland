@@ -389,7 +389,7 @@ the grab machine refuses to begin a hand grab on a monitor whose anchor reports 
 
 The same dwell-stable gaze candidate — plus the raw head ray — is also exposed read-only for
 companion tooling: the frame thread appends each frame's head pose + gaze candidate to a rolling
-~5.7 s ring (`COpenXRManager::m_poseRing`, `recordPoseSample()`), queryable by monotonic timestamp
+~91 s ring (`COpenXRManager::m_poseRing`, `recordPoseSample()`), queryable by monotonic timestamp
 via `hyprctl openxr gaze [at <ms>]` (docs 05 §5). This lets a voice daemon resolve "drop this
 monitor **here**" against where the head pointed at *speech onset* rather than at parse time
 (`research/VOICE-CONTROL.md`). Pure ring + nearest-lookup math lives in `XRMath.hpp`
