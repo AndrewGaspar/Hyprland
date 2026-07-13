@@ -664,6 +664,79 @@ void CXRGraphics::drawChrome(CXRMonitorLayer& layer, XR_GLuint dstTex, float alp
     glDeleteFramebuffers(1, &fbo);
 }
 
+void CXRGraphics::drawCursor(CXRMonitorLayer& layer, XR_GLuint dstTex, uint32_t packedL, uint32_t packedR) {
+    static auto PCURSOR = CConfigValue<Hyprlang::INT>("openxr:cursor");
+    if (*PCURSOR == 0)
+        return;
+
+    const int W = (int)layer.m_swapchainSize.x;
+    const int H = (int)layer.m_swapchainSize.y;
+    if (W <= 0 || H <= 0)
+        return;
+
+    static auto PSIZE  = CConfigValue<Hyprlang::FLOAT>("openxr:cursor_size");
+    static auto PPRESS = CConfigValue<Hyprlang::FLOAT>("openxr:cursor_press_scale");
+    static auto PTINT  = CConfigValue<Hyprlang::INT>("openxr:cursor_per_hand_tint");
+    static auto PCIDLE = CConfigValue<Config::INTEGER>("openxr:cursor_col_idle");
+    static auto PCGRAB = CConfigValue<Config::INTEGER>("openxr:cursor_col_grabbable");
+    static auto PCPRES = CConfigValue<Config::INTEGER>("openxr:cursor_col_press");
+    static auto PCGRB2 = CConfigValue<Config::INTEGER>("openxr:cursor_col_grab");
+
+    const float    diamM      = (float)*PSIZE;
+    const float    pressScale = (float)*PPRESS;
+    const bool     tint       = *PTINT != 0;
+    const uint32_t colIdle    = (uint32_t)(int64_t)*PCIDLE;
+    const uint32_t colGrab    = (uint32_t)(int64_t)*PCGRAB;
+    const uint32_t colPress   = (uint32_t)(int64_t)*PCPRES;
+    const uint32_t colGrb2    = (uint32_t)(int64_t)*PCGRB2;
+
+    GLuint fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glEnable(GL_SCISSOR_TEST);
+
+    const uint32_t packed[2] = {packedL, packedR};
+    for (int hand = 0; hand < 2; ++hand) {
+        bool                   present = false;
+        OpenXR::eXRCursorState st      = OpenXR::XR_CURSOR_HIDDEN;
+        float                  u = 0.f, v = 0.f;
+        OpenXR::xrUnpackCursor(packed[hand], present, st, u, v);
+        if (!present || st == OpenXR::XR_CURSOR_HIDDEN)
+            continue;
+
+        float ru = 0.f, rv = 0.f;
+        OpenXR::xrCursorRadiusUV(diamM, layer.m_quadWMeters, layer.m_quadHMeters, st == OpenXR::XR_CURSOR_PRESS, pressScale, ru, rv);
+        if (ru <= 0.f || rv <= 0.f)
+            continue;
+
+        const uint32_t argb = OpenXR::xrCursorTint(OpenXR::xrCursorColorFor(st, colIdle, colGrab, colPress, colGrb2), hand, tint);
+        // Opaque dot: rgb dimmed by the color's alpha (so a low-alpha config color reads dimmer) but
+        // written at alpha 1 so it never punches an alpha hole under passthrough (same rule as clearTex).
+        const float ca = ((argb >> 24) & 0xff) / 255.f;
+        const float cr = ((argb >> 16) & 0xff) / 255.f * ca;
+        const float cg = ((argb >> 8) & 0xff) / 255.f * ca;
+        const float cb = (argb & 0xff) / 255.f * ca;
+
+        // uv rect (top-left origin, v down) clamped to the quad; flip v -> GL y (bottom-left origin).
+        const float fu0 = std::clamp(u - ru, 0.f, 1.f), fu1 = std::clamp(u + ru, 0.f, 1.f);
+        const float fv0 = std::clamp(v - rv, 0.f, 1.f), fv1 = std::clamp(v + rv, 0.f, 1.f);
+        const int   x0   = (int)std::lround(fu0 * W);
+        const int   x1   = (int)std::lround(fu1 * W);
+        const int   glY0 = (int)std::lround((1.f - fv1) * H);
+        const int   glY1 = (int)std::lround((1.f - fv0) * H);
+        if (x1 <= x0 || glY1 <= glY0)
+            continue;
+        glScissor(x0, glY0, x1 - x0, glY1 - glY0);
+        glClearColor(cr, cg, cb, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
+
+    glDisable(GL_SCISSOR_TEST);
+    glDeleteFramebuffers(1, &fbo);
+}
+
 void CXRGraphics::destroyLayerGL(XR_EGLImageKHR img, XR_GLuint cpuTex, XR_GLuint contentTex) {
     if (img != nullptr && s_eglDestroyImage)
         s_eglDestroyImage(m_eglDisplay, img);

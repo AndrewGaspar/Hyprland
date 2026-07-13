@@ -77,6 +77,16 @@ class CXRGraphics {
     // composites TEXTURE_SOURCE_ALPHA). Only touches margin pixels — never the content rect.
     void drawChrome(CXRMonitorLayer& layer, XR_GLuint dstTex, float alpha, uint8_t hoverRegion, bool grabbed);
 
+    // ---- report 14 Stage A1: endpoint cursor draw (frame thread, in a CScopedGLContext) ----
+    // Draw each hand's endpoint cursor (a small opaque dot) into dstTex at its packed ray-hit uv.
+    // packedL/packedR are OpenXR::xrPackCursor words (present/state/u/v) from the layer's per-hand
+    // atomics. Cursor size is metric (openxr:cursor_size) sized against the layer's cached quad
+    // meters so it stays a constant physical diameter; state picks the openxr:cursor_col_* color
+    // (left hand tinted cooler when openxr:cursor_per_hand_tint). Opaque (alpha 1) so it never
+    // punches an alpha hole under passthrough. No-op for an absent/hidden cursor or with openxr:cursor
+    // off. May draw over content pixels (restored by the next content blit) — draw AFTER drawChrome.
+    void drawCursor(CXRMonitorLayer& layer, XR_GLuint dstTex, uint32_t packedL, uint32_t packedR);
+
     // RAII guard for an XR GL burst. ctor makes the XR context current; dtor RESTORES whatever
     // EGL binding was current before the burst (WP-L1, research doc 17 §5) instead of blindly
     // dropping to EGL_NO_CONTEXT. The old unconditional unbind left Hyprland's renderer to lazily

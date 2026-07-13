@@ -168,6 +168,9 @@ class COpenXRManager {
         bool        grabbed  = false;
         std::string grabKind = "none"; // WP-G3: "none" | "move" | "resize" (which grab owns it)
         bool        hovered  = false;
+        // report 14: the ray-hover REGION the frame thread last published for this quad — "none" |
+        // "body" | "bar" | "corner-*" | "margin". Sticky-hover-stabilized; scriptable for tests.
+        std::string region   = "none";
         bool        plugged  = false; // research/18: the headless output is currently enabled
         // WP-L2: which blit path last filled this layer's swapchain — "none" | "dmabuf" | "cpu" |
         // "black". "black" flags a silent black-quad session (e.g. cross-GPU import failure).

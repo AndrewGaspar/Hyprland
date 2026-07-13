@@ -70,6 +70,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
             "grabbed": {},
             "grabKind": "{}",
             "hovered": {},
+            "region": "{}",
             "plugged": {},
             "contentPath": "{}",
             "linear": {},
@@ -82,7 +83,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
             }}
         }})#",
                                 m.name, m.id, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.quatX, m.quatY, m.quatZ, m.quatW, m.grabbed ? "true" : "false",
-                                m.grabKind, m.hovered ? "true" : "false", m.plugged ? "true" : "false", m.contentPath, m.linear ? "true" : "false", m.adaptiveEnabled ? "true" : "false", m.adaptivePhase,
+                                m.grabKind, m.hovered ? "true" : "false", m.region, m.plugged ? "true" : "false", m.contentPath, m.linear ? "true" : "false", m.adaptiveEnabled ? "true" : "false", m.adaptivePhase,
                                 m.adaptiveRoamMode, m.adaptiveSeatDist, m.adaptiveT);
             if (i + 1 < MONS.size())
                 mons += ",\n";
@@ -126,8 +127,8 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
         STATELINE, RUNTIME, SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, BLEND, OVERLAY ? "yes" : "no", FOLLOWLINE, VISIBLE, PRESENCE, INHIBITING_IDLE ? "yes" : "no",
         handLabel(HANDS[0]), handLabel(HANDS[1]));
     for (const auto& m : MONS) {
-        out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} ({}) hovered: {} plugged: {} content: {}{}", m.name,
-                           m.id, m.w, m.h, m.refresh, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.grabbed ? "yes" : "no", m.grabKind, m.hovered ? "yes" : "no",
+        out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} ({}) hovered: {} ({}) plugged: {} content: {}{}", m.name,
+                           m.id, m.w, m.h, m.refresh, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.grabbed ? "yes" : "no", m.grabKind, m.hovered ? "yes" : "no", m.region,
                            m.plugged ? "yes" : "no", m.contentPath, m.linear ? " (linear)" : "");
         if (m.adaptiveEnabled)
             out += std::format(" adaptive: {} (roam {}, seat {:.2f}m)", m.adaptivePhase, m.adaptiveRoamMode, m.adaptiveSeatDist);
