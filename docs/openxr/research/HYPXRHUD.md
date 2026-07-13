@@ -58,10 +58,12 @@ multi-overlay support + D-Bus monitoring privileges (URLs cited inline).
    the notification daemon while the headset is doffed and hypxrhud taking over
    only while **donned**.) mako owns `org.freedesktop.Notifications`
    permanently; hypxrhud watches the bus via **BecomeMonitor** and, on the
-   presence edge (donned), renders mirror toasts in-headset while suppressing
-   mako's 2D popups via `makoctl mode`; on doff it stands down and mako resumes.
-   Action/dismiss round-trips go **through** mako (`makoctl invoke/dismiss -n
-   <id>`), so no ownership churn ever happens. Recommend: **(b′)** — the
+   presence edge (donned), renders mirror toasts in-headset that ALWAYS time out
+   (even critical urgency — no comfortable head-locked dismiss exists), while
+   mako's popups stay visible on the monitor quads as the persistent,
+   addressable surface (XR pointer clicks them like any quad content; resolved
+   open question 4 — no suppression by default). No ownership churn, no
+   round-trip machinery in the default path. Recommend: **(b′)** — the
    spec only when configured as the session daemon.
 6. **Recommend a new standalone repo** `~/code/hypxrhud` (BSD-3, hypxrpaper/
    hypxrvoice conventions). The render core lifts *out* of hypxrvoice into
@@ -642,18 +644,21 @@ migration) after H4. H9 (keys) after H5. H10 (Notifications) after H7.
   pushes rendered lane text via `CreatePanel`/`UpdatePanel` (slots `keys`,
   `status`). *Accept:* keys + voice + a toast coexist in one hypxrhud session
   with correct slotting; killing hypxrkeys auto-dismisses its lanes.
-- **WP-H10 `[M]` — presence-gated Notifications mirror (mako keeps the name).**
-  Step 0: VERIFY BecomeMonitor under dbus-broker (narrow match rule +
-  method-return delivery) — everything else gates on this. Then: monitor
-  connection correlating Notify replies→ids; donned-edge activation from
-  compositor presence (1 Hz status poll, socket2 event as follow-up);
-  configurable mako suppression (`makoctl mode -a do-not-disturb`) applied on
-  don / removed on doff; toast interaction round-trip via `makoctl invoke/
-  dismiss -n <id>`; `own` mode kept as a non-default config for headset-primary
-  setups. *Accept:* with headset donned, `notify-send "hi"` shows a headset
-  toast and NO mako 2D popup; doffing restores mako popups within one presence
-  poll; invoking a toast action fires the app's `ActionInvoked` handler; mako
-  history intact across don/doff cycles.
+- **WP-H10 `[M→S/M]` — presence-gated Notifications mirror (mako keeps the name,
+  no suppression by default).** Step 0: VERIFY BecomeMonitor under dbus-broker
+  (narrow match rule + method-return delivery) — everything else gates on this.
+  Then: monitor connection mirroring `Notify` into always-timeout toasts (a
+  hard cap applies even to `critical` urgency — the mako popup on the quad
+  remains the persistent, addressable surface, per the resolved open question
+  4); donned-edge activation from compositor presence (1 Hz status poll,
+  socket2 event as follow-up); OPTIONAL config `notifications_suppress_2d`
+  (makoctl mode on don/off + `makoctl invoke/dismiss -n <id>` round-trips —
+  only for headset-primary users) and `own` mode, both off by default; optional
+  `status`-slot pending-critical badge. *Accept:* with headset donned,
+  `notify-send "hi"` shows a headset toast that fades on its own AND the normal
+  mako popup on the quad; a `critical` toast also fades while its mako popup
+  persists until addressed; doffed → no toasts, mako unchanged; mako history
+  intact across don/doff cycles.
 
 ---
 
@@ -724,10 +729,20 @@ The SPOF is real but smaller than the status quo's triplicated fragility.
    actions/dismissals through `makoctl invoke/dismiss`? (Per your one-session
    constraint; `own` mode kept as non-default config. dbus-broker monitor
    verification is step 0.)
-4. **Suppression scope while donned:** default `do-not-disturb` mode hides ALL
-   mako popups in-headset (hypxrhud's toasts replace them). Alternative: leave
-   mako visible too (popups appear on the monitor quads) and skip suppression —
-   redundant but zero-risk. Default to suppress?
+4. **Suppression scope while donned — RESOLVED (user, 2026-07-13): do NOT
+   suppress by default.** mako popups stay visible on the monitor quads; the
+   hypxrhud toast is a purely ephemeral awareness layer that ALWAYS times out
+   (even `critical` urgency — there is no comfortable head-locked dismiss
+   interaction), while the mako popup remains the persistent, addressable
+   surface (the XR pointer already clicks/dismisses/invokes on quad content).
+   Demands-attention notifications therefore never evaporate: the toast fades,
+   the mako popup persists until addressed. Consequences: the `makoctl
+   invoke/dismiss` round-trip and `makoctl mode` suppression drop from the
+   default path to OPTIONAL config (`notifications_suppress_2d = true`, for
+   headset-primary users who accept toast-only). Optional refinement worth
+   prototyping: a tiny persistent "N pending" badge in the `status` slot for
+   unexpired-critical mako notifications — addressability signal without
+   permanent head-locked real estate.
 5. **Slots:** are the four default slots (`voice`/`keys`/`toast`/`status`) and
    their poses the right starting set? Any others (e.g. a `media` now-playing
    widget, a `battery`/headset-status pinned corner)?
