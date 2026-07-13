@@ -818,3 +818,33 @@ login, sources hyprland.conf, own session bus).
   https://discourse.gnome.org/t/use-gdbus-to-eavesdrop-notifications-using-becomemonitor/22952 ,
   https://dbus.freedesktop.org/doc/dbus-monitor.1.html ,
   https://github.com/bus1/dbus-broker/issues/210 (broker filtering caveat).
+
+---
+
+## Triage resolutions (user, 2026-07-13)
+
+All nine open questions are now resolved; this section is authoritative where it
+differs from the discussion above.
+
+1. **Repo:** new standalone `~/code/hypxrhud` (BSD-3, family conventions). The
+   render core moves out of hypxrvoice, which becomes a pure D-Bus client.
+2. **Bus name:** `io.github.andrewgaspar.hypxrhud`.
+3. **Notifications:** (b′) presence-gated BecomeMonitor mirror; mako keeps the
+   name AND stays visible on the quads (§3, resolved earlier — toasts always
+   time out, mako popup is the persistent addressable surface; suppression +
+   makoctl round-trips optional, off by default).
+4. **Suppression default:** do not suppress (resolved earlier, see §3).
+5. **Slots:** SIX from day one — `voice` (bottom-center), `keys` (above voice),
+   `toast` (top-center), `status` (bottom-right corner), `media` (top-left,
+   now-playing), `battery` (bottom-left, headset battery). All re-posable in
+   config.
+6. **Config:** TOML now (reuse hypxrvoice's conventions/parser; keep the config
+   layer thin — one loader, one struct). **Lua is the eventual direction** for
+   the whole family once Hyprland/Omarchy's Lua story stabilizes; a Lua
+   front-end swaps in behind the same struct, and hypxrvoice migrates at the
+   same time so the family converges.
+7. **Theme live-reload:** inotify on the `~/.config/omarchy/current/theme`
+   symlink (zero user wiring; stock Omarchy unchanged).
+8. **Milestone:** WP-H1–H8 (core through the hypxrvoice migration). hypxrkeys
+   (H9) and the Notifications mirror (H10) follow as their own milestones.
+9. **Per-client panel cap:** default 4 stands.
