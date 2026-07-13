@@ -6,6 +6,7 @@
 // macros needed) and uses the WIP forward-declaration trick for the GL/EGL types (doc 01).
 #include <openxr/openxr.h>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -161,6 +162,20 @@ class CXRMonitorLayer {
     // the chrome visible for the duration of the manipulation.
     std::atomic<uint8_t> m_hoverRegion{0 /* OpenXR::XR_REGION_NONE */}; // region the ray last classified on THIS quad (any hand)
     std::atomic<bool>    m_grabbedNow{false};                          // this quad has an active MOVE or RESIZE grab
+
+    // ---- endpoint-cursor visual-state contract (report 14 Stage A1) — extends the WP-G2 contract ----
+    // One packed word per hand (OpenXR::xrPackCursor: present(1) state(3) u(14) v(14)), WRITTEN by the
+    // frame loop right after processPointer (from CXRInput::cursorMon/cursorUV/cursorState, matched by
+    // monitor id) and READ by the drawCursor pass at the TOP of the next frame's blit loop — the same
+    // deliberate one-frame latency + plain-atomic discipline as m_hoverRegion (never a refcount op).
+    std::array<std::atomic<uint32_t>, 2> m_cursorPacked{}; // per-hand [L,R]
+    // Full quad meters, cached frame-thread during the quad build for next frame's drawCursor to size
+    // the cursor to a constant physical diameter (openxr:cursor_size). Frame-thread only.
+    float                m_quadWMeters = 0.f;
+    float                m_quadHMeters = 0.f;
+    // What drawCursor last rendered per hand (redraw diff — an animation-only frame redraws when the
+    // cursor changed even with no new desktop buffer). Frame-thread only.
+    std::array<uint32_t, 2> m_cursorDrawn{0, 0};
 
     // Adaptive anchoring (research/13 §5): the last adaptive phase PUBLISHED by the frame thread —
     // both the "previous" value the frame thread edge-detects against (to emit the terminal
