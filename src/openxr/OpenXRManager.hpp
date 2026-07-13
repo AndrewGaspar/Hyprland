@@ -384,6 +384,21 @@ class COpenXRManager {
     std::atomic<int>  m_adRoamMode{OpenXR::XR_ANCHOR_BODY};
     std::atomic<int>  m_adEase{OpenXR::XR_EASE_SMOOTHSTEP};
 
+    // ---- grab STRING options parsed to atomics for the frame thread (task #25 latent-crash fix) ----
+    // openxr:hand_grab / openxr:hand_grab_anywhere (read in CXRInput::processPointer) and openxr:grab_filter_scope
+    // (read in frameThread's per-frame solve) are STRING config values. Dereferencing a
+    // CConfigValue<std::string> on the frame thread races a concurrent main-thread config reload that
+    // rebuilds/frees the backing std::string — a use-after-free / torn read of heap-allocated string
+    // storage that corrupts the allocator's metadata and aborts ("corrupted double-linked list") at a
+    // later, unrelated free (typically compositor teardown). Parse them to enums on the main thread here
+    // and read these atomics on the frame thread instead — identical to publishAdaptiveStringTuning /
+    // publishHandInputPolicy. Refreshed from start() + onConfigReload() (+ the legacy-keyword special-
+    // cases in ConfigManager.cpp, which fire neither reloaded nor props_refreshed).
+    void                 publishGrabStringTuning();        // main thread only
+    std::atomic<uint8_t> m_handGrabMode{OpenXR::XR_HANDGRAB_BOTH};            // openxr:hand_grab (shipped default "both")
+    std::atomic<uint8_t> m_handGrabAnyMode{OpenXR::XR_HANDGRAB_ANY_GRASP};    // openxr:hand_grab_anywhere (default "grasp")
+    std::atomic<bool>    m_grabFilterScopeAll{true};                         // openxr:grab_filter_scope != "hands" (default "all")
+
     // ---- conditional hand input (research/16 Part A) ----
     // m_handPolicy is the openxr:hand_input baseline (config + `handinput on|off|auto`); m_handForce
     // is a runtime manual latch set ONLY by `handinput toggle` and consulted ONLY in AUTO. Both are

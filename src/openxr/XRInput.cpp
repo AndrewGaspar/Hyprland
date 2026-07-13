@@ -423,7 +423,8 @@ bool CXRInput::isMonitorGrabbed(MONITORID id) const {
     return m_grabbedMon[OpenXR::XR_HAND_LEFT] == id || m_grabbedMon[OpenXR::XR_HAND_RIGHT] == id;
 }
 
-void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint32_t timeMs, const OpenXR::SXRSolveInput& solveIn, const OpenXR::SXRAnchorTuning& tune, bool handsEnabled) {
+void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint32_t timeMs, const OpenXR::SXRSolveInput& solveIn, const OpenXR::SXRAnchorTuning& tune,
+                              OpenXR::eXRHandGrab handGrabMode, OpenXR::eXRHandGrabAnywhere handGrabAnyMode, bool handsEnabled) {
     if (!m_emit)
         return;
 
@@ -441,8 +442,9 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
     static auto PRELLATENCY = CConfigValue<Hyprlang::INT>("openxr:grab_release_latency_ms");
     static auto PRELVELREJ  = CConfigValue<Hyprlang::FLOAT>("openxr:grab_release_velocity_reject");
     static auto PGRABANY    = CConfigValue<Hyprlang::INT>("openxr:grab_anywhere");
-    static auto PHANDGRAB    = CConfigValue<std::string>("openxr:hand_grab");
-    static auto PHANDGRABANY  = CConfigValue<std::string>("openxr:hand_grab_anywhere");
+    // openxr:hand_grab / hand_grab_anywhere arrive as pre-parsed enums (handGrabMode / handGrabAnyMode) —
+    // the frame thread must NOT deref those std::string config values (reload-rebuild race -> heap
+    // corruption, task #25). Parsed on the main thread in COpenXRManager::publishGrabStringTuning().
     // ---- ray aim / cursor / hover assist (report 14; all numeric -> benign per-frame reads) ----
     static auto PAIMFILTER    = CConfigValue<Hyprlang::INT>("openxr:aim_filter");
     static auto PAIMFILTERMC  = CConfigValue<Hyprlang::FLOAT>("openxr:aim_filter_min_cutoff");
@@ -467,8 +469,8 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
     const bool   hapticHover  = haptics && *PHAPTICHOVER != 0;
     const float  hapticAmp    = (float)*PHAPTICAMP;
     const bool  grabAnywhere = *PGRABANY != 0;
-    const OpenXR::eXRHandGrab handGrabMode = OpenXR::xrParseHandGrab(*PHANDGRAB); // hot-toggles (read per-frame)
-    const OpenXR::eXRHandGrabAnywhere handGrabAnyMode = OpenXR::xrParseHandGrabAnywhere(*PHANDGRABANY); // hot-toggles (read per-frame)
+    // handGrabMode / handGrabAnyMode are parameters (pre-parsed by the manager from atomics) — see the
+    // processPointer() header comment. Deref-of-string on the frame thread was the task #25 heap crash.
     const float onT         = (float)*PSELON;
     const float offT        = (float)*PSELOFF;
     const float grabOnT     = (float)*PGRABON;

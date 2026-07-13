@@ -1165,6 +1165,14 @@ std::string CConfigManager::parseKeyword(const std::string& COMMAND, const std::
     // bare `hyprctl keyword openxr:hand_input ...` fires neither reloaded nor props_refreshed.
     if (COMMAND == "openxr:hand_input" && g_pOpenXRManager)
         g_pOpenXRManager->onConfigReload();
+
+    // openxr:hand_grab / hand_grab_anywhere / grab_filter_scope (task #25) are STRING options parsed to
+    // atomic enums on the main thread in onConfigReload()->publishGrabStringTuning(); the frame thread
+    // reads the atomics (dereferencing the strings there races a reload's rebuild -> heap corruption).
+    // Same legacy-keyword gap as adaptive_ / hand_input above: a bare `hyprctl keyword` fires neither
+    // reloaded nor props_refreshed, so re-publish explicitly here.
+    if ((COMMAND == "openxr:hand_grab" || COMMAND == "openxr:hand_grab_anywhere" || COMMAND == "openxr:grab_filter_scope") && g_pOpenXRManager)
+        g_pOpenXRManager->onConfigReload();
 #endif
 
     // Update window border colors
