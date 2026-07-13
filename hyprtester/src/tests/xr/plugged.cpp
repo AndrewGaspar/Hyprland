@@ -247,7 +247,23 @@ TEST_CASE(xr_plugged_follow_session) {
         EXPECT(XR::fieldAfter(status, posA, "plugged"), std::string("true"));
         // Anchor state survived the whole unplug/replug cycle (research/18 §6.2: option (b)
         // keeps the layer, so the verb-moved pose — NOT the declared one — must still be live).
-        EXPECT(XR::fieldAfter(status, posA, "pos"), posMoved);
+        // Poll instead of a single read: right on the replug edge the status pose can lag the
+        // plug by a beat (the in-container full-suite run read the declared pose once and failed
+        // while the surviving pose landed moments later under session churn).
+        const bool posSurvived = XR::waitForJson(
+            "j/openxr",
+            [&](const std::string& r) {
+                const auto p = XR::findAfter(r, "\"name\": \"XR-conf-a\"");
+                return p != std::string::npos && XR::fieldAfter(r, p, "pos") == posMoved;
+            },
+            std::chrono::milliseconds(10000));
+        if (!posSurvived) {
+            const std::string fin = getFromSocket("j/openxr");
+            const auto        p   = XR::findAfter(fin, "\"name\": \"XR-conf-a\"");
+            NLog::red("xr_plugged_follow_session diag: pose never returned to the verb-moved value; final pos = {}",
+                      p != std::string::npos ? XR::fieldAfter(fin, p, "pos") : std::string("<gone>"));
+        }
+        EXPECT(posSurvived, true);
     }
 
     // report-20 issue E: the DECLARED pixel mode (xr-test.conf declares XR-conf-a as 1280x720@60)

@@ -153,6 +153,13 @@ TEST_CASE(xr_force_linear_realloc) {
         ASSERT(XR::waitForJson(
                    "j/openxr", [&](const std::string& r) { return r.contains(nameMarker); }, std::chrono::milliseconds(10000)),
                true);
+        // A monitor created inside the first-plug settle window (report-20 issue D) or across a
+        // session bounce starts UNPLUGGED — no composite, so the forced re-allocation may not fire
+        // until the plug edge (bindExistingLayers' cross-GPU pass). Wait for the plug so the poll
+        // below observes a deterministic trigger instead of racing the settle guard (the in-container
+        // full-suite failure mode: the realloc pair landed in the log a few KB past the poll budget).
+        (void)XR::waitForJson(
+            "j/monitors", [&](const std::string& r) { return r.contains(nameMarker); }, std::chrono::milliseconds(15000));
         // Poll: the forced swapchain re-allocates once the monitor's mode is applied + first rendered.
         for (int i = 0; i < 100 && !(sawRealloc && sawStatus); ++i) {
             sawRealloc = reallocatedLinear(readHyprlandLog());
@@ -496,6 +503,21 @@ TEST_CASE(xr_mirror) {
     ASSERT(XR::waitForJson(
                "j/openxr", [&](const std::string& r) { return r.contains("\"name\": \"" + mon + "\""); }, std::chrono::milliseconds(10000)),
            true);
+
+    // The mirror keyword resolves its target through the LIVE monitor list at apply time, and
+    // CMonitor::setMirror() silently no-ops when the name isn't found — nothing re-resolves the
+    // rule when the target appears later. An XR monitor created inside the first-plug settle
+    // window (report-20 issue D: monitors_follow_session=visible defers the first plug of a
+    // session ~1.5s past the session-start visibility blip) starts life UNPLUGGED and only
+    // enters that list on the plug edge — exactly the window this test used to race in-container
+    // (the preceding test's reload bounces the session, re-arming the guard). Wait for the plug
+    // before touching the mirror keyword; if the plug never comes the env gate isn't satisfied,
+    // which is the same environmental class the other tests SKIP on.
+    if (!XR::waitForJson(
+            "j/monitors", [&](const std::string& r) { return r.contains("\"name\": \"" + mon + "\""); }, std::chrono::milliseconds(15000))) {
+        XR::logSkip(name(), "XR monitor never got plugged (monitors_follow_session gate never satisfied in this environment)");
+        return;
+    }
 
     const std::string xrStatus = getFromSocket("j/openxr");
     const std::string xrId     = XR::fieldAfter(xrStatus, XR::findAfter(xrStatus, "\"name\": \"" + mon + "\""), "id");
