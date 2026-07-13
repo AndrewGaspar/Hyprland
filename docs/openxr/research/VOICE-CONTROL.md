@@ -7,6 +7,14 @@ phone-sized monitor", "drop this monitor here", "open Apple TV"), with a **casca
 activation architecture** whose whole point is to keep the microphone shut and the cloud
 bill near zero until a real command is actually spoken.
 
+> **Hard constraint (user directive):** the voice system lives as a **separate
+> utility/daemon** — never inside Hyprland/HypXRland. There is no in-compositor deployment
+> option in this proposal space; every proposal in §10 is a shape of a standalone
+> `hypxrvoice` (its own repo, like `hypxrpaper`). Compositor-side involvement is limited to
+> what the daemon consumes over the **existing** IPC surface, plus the short list of small,
+> optional, read-only-or-event-only enablers in **§8a (compositor touchpoints)** — no daemon
+> logic (audio, models, dialogue state, arming policy) ever enters the compositor.
+
 Evidence base: the existing HypXRland IPC surface (`docs/openxr/05-configuration.md`,
 `src/openxr/XRIpc.cpp`, `src/config/legacy/DispatcherTranslator.cpp`); the sibling
 companion-tool precedents `hypxrpaper` and the `hypxrkeys` design memo
@@ -51,9 +59,11 @@ ASR / wake-word / local-LLM landscape (URLs cited in §12).
    `docs/openxr/05-configuration.md` §6). This is a privacy feature, not just ergonomics:
    "in-headset-only" is a hard, queryable invariant.
 
-6. **Recommended shape:** a standalone BSD-3 daemon `hypxrvoice` (sibling to `hypxrpaper` /
-   `hypxrkeys`), single-purpose, speaking PipeWire on one side and the Hyprland sockets on the
-   other, launched as a systemd user service or `exec-once`. It learns the command surface from
+6. **Shape (hard constraint, per user directive):** a standalone BSD-3 daemon `hypxrvoice`
+   (sibling to `hypxrpaper` / `hypxrkeys`), single-purpose, speaking PipeWire on one side and
+   the Hyprland sockets on the other, launched as a systemd user service or `exec-once`.
+   In-compositor deployment is out of the proposal space entirely; the only compositor-side
+   items are the optional S-effort touchpoints in §8a. It learns the command surface from
    a **static schema** (versioned with the compositor), tracks a small **deixis/dialogue
    state** for "the other one" / "here", and gives visual + optional audio feedback. WPs
    V1–V12 in §11.
@@ -165,7 +175,7 @@ compositor resolves "this" the same way a controller grab does. For richer targe
   I'm pointing" would want the **head-ray target** designed in the archived gaze memo
   (`research/archive/16-gaze-grab.md`) — **reference, do not redesign**; it already worked out
   head-ray → monitor selection and is the right substrate if pointing-deixis is wanted later.
-- **NICE-TO-HAVE compositor addition (read-only):** a `hyprctl openxr gaze` that returns the
+- **NICE-TO-HAVE compositor touchpoint (read-only; WP-T1 in §8a):** a `hyprctl openxr gaze` that returns the
   monitor currently under the head-ray (or the ray hit-point in `LOCAL_FLOOR` coords) would let
   `hypxrvoice` resolve "that one over there" and "put it here" precisely without re-implementing
   ray math. It's a pure read, gated behind the same `HAVE_OPENXR` compile guard, and would ride
@@ -480,6 +490,28 @@ recommended **hybrid**.
 
 ---
 
+## 8a. Compositor touchpoints (the ONLY compositor-side items)
+
+Per the hard constraint (§0 callout): no daemon logic enters the compositor. The daemon runs
+entirely on the existing IPC surface today — **zero compositor changes are required for v1.**
+The items below are small, optional enablers that would materially help the daemon; each is a
+read-only query, a status field, or a socket2 event — never audio, model, dialogue, or arming
+logic. All are S-effort, `HAVE_OPENXR`-guarded where applicable, and ride the hypxrland branch.
+
+| WP | Touchpoint | What / why | Effort |
+|---|---|---|---|
+| **WP-T1** | `hyprctl openxr gaze` (read-only query) | Returns the monitor under the head-ray (and/or the ray hit-point in `LOCAL_FLOOR`), building on `research/archive/16-gaze-grab.md` ray math. Enables true point-and-place deixis ("put it here", "that one over there"). Same as WP-V12; deferred past v1 unless OQ #5 wants it. | S |
+| **WP-T2** | `selected` field in `openxr status` JSON (`src/openxr/XRIpc.cpp`) | Expose the explicit selection target (what `active` will resolve to) so the daemon can name the target in confirmation prompts ("close **XR-chat**?") without replicating the dispatcher's resolution order. Pure status addition. | S |
+| **WP-T3** | socket2 event `xrmonitorselect>><name>` | The `select` verb currently fires no event (`docs/openxr/05-configuration.md` §6 has no selection event), so the deixis resolver must poll after every select. An event keeps the daemon's dialogue state push-driven like the rest of its socket2 feed. | S |
+
+**Considered and rejected — "arm listening" dispatcher.** The directive floated a dispatcher
+so binds can trigger the daemon's armed state. Not needed: `bind = MODS, KEY, exec, hypxrvoice ptt`
+already reaches the daemon's control socket with zero compositor change, and putting an
+"arm voice" verb in the compositor would bake voice-awareness (arming policy) into it —
+exactly what the constraint forbids. Binds stay on the `exec` path.
+
+---
+
 ## 9. Open questions for the user
 
 1. **Cloud posture:** is a cloud reasoning tier acceptable at all, or is **local-only** a hard
@@ -610,7 +642,7 @@ reviewable with a crisp acceptance test, sized like the HypXRland/hypxrkeys WPs.
   (tiers, engines, aliases, presets, provider keys); `systemctl --user stop` hard-kills the mic.
   *Accept:* survives reload, restarts on crash, has its own log; config changes apply on restart.
 
-- **WP-V12 — (optional, compositor repo) read-only `hyprctl openxr gaze`.** Returns the monitor under
+- **WP-V12 (= WP-T1, §8a) — (optional, compositor repo) read-only `hyprctl openxr gaze`.** Returns the monitor under
   the head-ray / the ray hit-point in `LOCAL_FLOOR`, building on `research/archive/16-gaze-grab.md`,
   behind `HAVE_OPENXR`. Enables true point-and-place "put it here / that one over there." *Accept:*
   the verb returns the correct monitor for a known head pose; `hypxrvoice` uses it to resolve
