@@ -146,6 +146,79 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     return out;
 }
 
+// hypxrvoice WP-V1: `hyprctl openxr gaze [at <ms> | --at-ms <ms>]`. Returns the current head ray +
+// dwell-stable gaze candidate, OR — with a monotonic-clock timestamp — the nearest ring entry to
+// that instant, so a voice daemon can resolve "drop this monitor HERE" against where the head was
+// pointed AT SPEECH ONSET, not at parse time (docs/openxr/research/VOICE-CONTROL.md). The timestamp
+// is CLOCK_MONOTONIC ms — the same clock the daemon reads via clock_gettime(CLOCK_MONOTONIC); see
+// the CLOCK CONTRACT comment on SXRPoseRing in XRMath.hpp.
+static std::string openxrGaze(eHyprCtlOutputFormat format, const std::string& args) {
+    // Parse an optional target timestamp: "at <ms>" or "--at-ms <ms>" (also bare "<ms>").
+    CVarList    gv(args, 0, ' ');
+    bool        haveAt = false;
+    int64_t     atMs   = 0;
+    std::string tok0   = gv[0];
+    std::string tsStr;
+    if (tok0 == "at" || tok0 == "--at-ms")
+        tsStr = gv[1];
+    else if (!tok0.empty())
+        tsStr = tok0; // bare number
+
+    if (!tsStr.empty()) {
+        try {
+            atMs   = (int64_t)std::stoll(tsStr);
+            haveAt = true;
+        } catch (...) {
+            return std::format("invalid timestamp '{}' — expected monotonic-clock milliseconds (CLOCK_MONOTONIC)", tsStr);
+        }
+    }
+
+    const auto G = haveAt ? g_pOpenXRManager->gazeSampleAt(atMs) : g_pOpenXRManager->gazeSampleNow();
+
+    if (format == FORMAT_JSON) {
+        if (!G.ok)
+            return "{\n    \"ok\": false,\n    \"reason\": \"no XR frame recorded yet\"\n}\n";
+        std::string query;
+        if (G.matched)
+            query = std::format(R"#(,
+    "query": {{
+        "requestedTimestampMs": {},
+        "matchedTimestampMs": {},
+        "ageMs": {}
+    }})#",
+                                G.requestedTimestampMs, G.matchedTimestampMs, G.ageMs);
+        return std::format(R"#({{
+    "ok": true,
+    "timestampMs": {},
+    "viewValid": {},
+    "head": {{
+        "pos": [{:.4f}, {:.4f}, {:.4f}],
+        "quat": [{:.5f}, {:.5f}, {:.5f}, {:.5f}],
+        "forward": [{:.4f}, {:.4f}, {:.4f}]
+    }},
+    "gaze": {{
+        "monitorId": {},
+        "name": "{}",
+        "selected": {},
+        "dwellSec": {:.3f}
+    }}{}
+}}
+)#",
+                           G.timestampMs, G.viewValid ? "true" : "false", G.headPos.x, G.headPos.y, G.headPos.z, G.headRot.x, G.headRot.y, G.headRot.z, G.headRot.w, G.headForward.x,
+                           G.headForward.y, G.headForward.z, G.gazeMonitorId, G.gazeName, G.selected ? "true" : "false", G.dwell, query);
+    }
+
+    if (!G.ok)
+        return "gaze: no XR frame recorded yet\n";
+    const std::string GAZELINE = G.selected ? std::format("looking at {} (id {}, dwell {:.2f}s)", G.gazeName.empty() ? "?" : G.gazeName, G.gazeMonitorId, G.dwell)
+                                            : "looking at passthrough (no monitor)";
+    std::string       out       = std::format("gaze: {}\n  timestampMs: {}  viewValid: {}\n  head pos [{:.3f}, {:.3f}, {:.3f}]  forward [{:.3f}, {:.3f}, {:.3f}]\n", GAZELINE,
+                                              G.timestampMs, G.viewValid ? "yes" : "no", G.headPos.x, G.headPos.y, G.headPos.z, G.headForward.x, G.headForward.y, G.headForward.z);
+    if (G.matched)
+        out += std::format("  query: requested {}  matched {}  age {}ms\n", G.requestedTimestampMs, G.matchedTimestampMs, G.ageMs);
+    return out;
+}
+
 static std::string openxrRequest(eHyprCtlOutputFormat format, std::string request) {
     if (!g_pOpenXRManager)
         return "OpenXR manager not initialized";
@@ -249,8 +322,12 @@ static std::string openxrRequest(eHyprCtlOutputFormat format, std::string reques
         return r ? "ok" : r.error();
     }
 
+    // hypxrvoice WP-V1: read-only head-ray + timestamped gaze history query.
+    if (SUBCOMMAND == "gaze")
+        return openxrGaze(format, ARGS);
+
     return std::format("unknown openxr subcommand '{}'. Valid: status, enable, disable, create, destroy, select, anchor, move, rotate, scale, distance, center, adaptive, dock, "
-                       "undock, roam, gazegrab, gazerelease, gazepush, handinput, layout",
+                       "undock, roam, gazegrab, gazerelease, gazepush, handinput, gaze, layout",
                        SUBCOMMAND);
 }
 

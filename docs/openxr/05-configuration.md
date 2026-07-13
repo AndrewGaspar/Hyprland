@@ -350,6 +350,7 @@ hyprctl openxr enable|disable  # start/stop the session (does not touch openxr:e
 hyprctl openxr <verb> …        # the §4 verbs: create destroy select anchor move rotate
                                #   scale distance center adaptive dock undock roam
                                #   gazegrab gazerelease gazepush handinput
+hyprctl openxr gaze [at <ms>]  # read-only head ray + timestamped gaze history (see below)
 hyprctl openxr layout          # dump the CURRENT live layout as paste-ready xrmonitor= lines
 ```
 
@@ -360,6 +361,77 @@ lines reflect the live world pose; `head`/`body`/`device` lines reflect the conf
 for that mode (their live position tracks you by design, so freezing it into a config line
 wouldn't mean what you'd expect). Roll is not representable in the serialization (yaw + pitch
 only).
+
+### `gaze` — head ray & timestamped gaze history
+
+`hyprctl openxr gaze` is a **read-only** query that returns the current head pose (position +
+orientation + forward ray) and the dwell-stable gaze candidate — the monitor you're looking at,
+as computed by the same gaze-selection machine `gazegrab` uses (§2 "Gaze grab"). It exists so a
+companion voice daemon (`hypxrvoice`,
+[research/VOICE-CONTROL.md](research/VOICE-CONTROL.md)) can resolve pointing-deixis like "drop
+this monitor **here**" or "that one over there."
+
+The interesting part is the **timestamped** form:
+
+```
+hyprctl openxr gaze               # newest sample (current head ray + gaze candidate)
+hyprctl -j openxr gaze            # JSON
+hyprctl openxr gaze at <ms>       # nearest sample to a CLOCK_MONOTONIC millisecond timestamp
+hyprctl openxr gaze --at-ms <ms>  # same (explicit flag form)
+```
+
+The compositor keeps a rolling ~5.7-second ring (512 samples, one per XR frame) of head poses +
+gaze candidates. Speech recognition takes 1–3 s, so by the time an utterance is parsed the head
+has usually moved on (often to a feedback HUD) — querying the pose *now* would be a systematic
+bug. Instead the daemon captures a monotonic timestamp at **speech onset** (`clock_gettime(
+CLOCK_MONOTONIC)` → milliseconds) and asks `gaze at <that ms>`; the reply carries
+`matchedTimestampMs` and `ageMs` (`requested − matched`) so the caller sees exactly how stale the
+match is, and whether the request clamped to the ends of the retained window.
+
+**Clock contract (for the daemon team):** `timestampMs` is milliseconds on **`CLOCK_MONOTONIC`**.
+The compositor stamps samples via `Time::steadyNow()`, and `std::chrono::steady_clock ==
+CLOCK_MONOTONIC` on Linux/libstdc++, so a daemon reading `clock_gettime(CLOCK_MONOTONIC)` and
+dividing to milliseconds is in the same clock domain — no conversion, no epoch translation.
+Targets older/newer than the retained window clamp to the oldest/newest sample (never an error);
+ties resolve to the newer sample. `ok:false` is returned only before any XR frame has run.
+
+JSON (`gaze at` adds the `query` block; a bare `gaze` omits it):
+
+```json
+{
+    "ok": true,
+    "timestampMs": 84213765,
+    "viewValid": true,
+    "head": {
+        "pos": [0.0120, 1.4300, -0.0050],
+        "quat": [0.00000, 0.38268, 0.00000, 0.92388],
+        "forward": [0.7071, 0.0000, -0.7071]
+    },
+    "gaze": {
+        "monitorId": 3,
+        "name": "XR-1",
+        "selected": true,
+        "dwellSec": 0.000
+    },
+    "query": {
+        "requestedTimestampMs": 84212300,
+        "matchedTimestampMs": 84213765,
+        "ageMs": -1465
+    }
+}
+```
+
+Text form:
+
+```
+gaze: looking at XR-1 (id 3, dwell 0.00s)
+  timestampMs: 84213765  viewValid: yes
+  head pos [0.012, 1.430, -0.005]  forward [0.707, 0.000, -0.707]
+  query: requested 84212300  matched 84213765  age -1465ms
+```
+
+`monitorId` is `-1` (`selected:false`, text "looking at passthrough") when the gaze ray misses
+every quad. `pos`/`forward` are in `LOCAL_FLOOR` space (meters); `quat` is `[x,y,z,w]`.
 
 ### `status` output
 
