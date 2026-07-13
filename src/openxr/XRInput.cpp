@@ -388,13 +388,13 @@ void CXRInput::sample(XrTime predictedDisplayTime, XrSpace refSpace) {
 // processPointer: ray cast, hover/owner arbitration, hysteresis, scroll (frame thread, §3-§5).
 // ---------------------------------------------------------------------------------------------
 
-void CXRInput::hapticTick(OpenXR::eXRHand hand) {
+void CXRInput::hapticTick(OpenXR::eXRHand hand, float amplitude) {
     if (m_hapticAction == XR_NULL_HANDLE)
         return;
     XrHapticVibration vib  = {XR_TYPE_HAPTIC_VIBRATION};
     vib.duration           = 10'000'000; // XR_HAPTIC_TICK_NS = 10 ms (doc 04 §6.3)
     vib.frequency          = XR_FREQUENCY_UNSPECIFIED;
-    vib.amplitude          = 0.5f;
+    vib.amplitude          = std::clamp(amplitude, 0.f, 1.f);
     XrHapticActionInfo hai = {XR_TYPE_HAPTIC_ACTION_INFO};
     hai.action             = m_hapticAction;
     hai.subactionPath      = m_handPath[hand];
@@ -437,6 +437,29 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
     static auto PGRABANY    = CConfigValue<Hyprlang::INT>("openxr:grab_anywhere");
     static auto PHANDGRAB    = CConfigValue<std::string>("openxr:hand_grab");
     static auto PHANDGRABANY  = CConfigValue<std::string>("openxr:hand_grab_anywhere");
+    // ---- ray aim / cursor / hover assist (report 14; all numeric -> benign per-frame reads) ----
+    static auto PAIMFILTER    = CConfigValue<Hyprlang::INT>("openxr:aim_filter");
+    static auto PAIMFILTERMC  = CConfigValue<Hyprlang::FLOAT>("openxr:aim_filter_min_cutoff");
+    static auto PAIMFILTERB   = CConfigValue<Hyprlang::FLOAT>("openxr:aim_filter_beta");
+    static auto PAIMPINCHDAMP = CConfigValue<Hyprlang::FLOAT>("openxr:aim_pinch_damping");
+    static auto PMAGNET       = CConfigValue<Hyprlang::INT>("openxr:magnet");
+    static auto PMAGNETANG    = CConfigValue<Hyprlang::FLOAT>("openxr:magnet_angle");
+    static auto PHYST         = CConfigValue<Hyprlang::FLOAT>("openxr:hover_hysteresis");
+    static auto PDROPOUT      = CConfigValue<Hyprlang::INT>("openxr:hover_dropout_frames");
+    static auto PHAPTICS      = CConfigValue<Hyprlang::INT>("openxr:haptics");
+    static auto PHAPTICHOVER  = CConfigValue<Hyprlang::INT>("openxr:haptic_hover");
+    static auto PHAPTICAMP    = CConfigValue<Hyprlang::FLOAT>("openxr:haptic_amplitude");
+    const bool   aimFilter    = *PAIMFILTER != 0;
+    const float  aimFilterMc  = (float)*PAIMFILTERMC;
+    const float  aimFilterB   = (float)*PAIMFILTERB;
+    const float  aimPinchDamp = (float)*PAIMPINCHDAMP;
+    const bool   magnet       = *PMAGNET != 0;
+    const float  magnetSlackTan = magnet ? std::tan(std::clamp((float)*PMAGNETANG, 0.f, 89.f) * (float)M_PI / 180.f) : 0.f;
+    const float  hoverHystM   = (float)*PHYST;
+    const int    dropoutMax   = (int)*PDROPOUT;
+    const bool   haptics      = *PHAPTICS != 0;
+    const bool   hapticHover  = haptics && *PHAPTICHOVER != 0;
+    const float  hapticAmp    = (float)*PHAPTICAMP;
     const bool  grabAnywhere = *PGRABANY != 0;
     const OpenXR::eXRHandGrab handGrabMode = OpenXR::xrParseHandGrab(*PHANDGRAB); // hot-toggles (read per-frame)
     const OpenXR::eXRHandGrabAnywhere handGrabAnyMode = OpenXR::xrParseHandGrabAnywhere(*PHANDGRABANY); // hot-toggles (read per-frame)
@@ -489,29 +512,61 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
     for (auto hand : {XR_HAND_LEFT, XR_HAND_RIGHT}) {
         MONITORID            newBodyMon = -1; // BODY hover (drives pointer); remapped content uv
         Vector2D             newBodyUV;
-        MONITORID            newChromeMon = -1;                     // whichever quad the ray hit (any region)
-        OpenXR::eXRQuadRegion newRegion   = OpenXR::XR_REGION_NONE; // its region
+        MONITORID            newChromeMon = -1;                     // whichever quad the ray actually hit
+        OpenXR::eXRQuadRegion rawRegion   = OpenXR::XR_REGION_NONE; // its FORGIVING region (Stage A4/C)
+        Vector2D             newCursorUV;                           // raw full-quad hit uv (cursor)
+        const SXRChromeGeometry* stickGeom = nullptr;               // chrome of the actually-hit quad (hysteresis)
+        float                hitW = 0.f, hitH = 0.f;                // hit quad meters (uv<->meters for hysteresis)
 
         if (!m_grabbing[hand] && m_hands[hand].aim) {
-            const OpenXR::SXRPose& aim    = *m_hands[hand].aim;
-            const OpenXR::Vec3     origin = aim.pos;
-            const OpenXR::Vec3     dir    = OpenXR::qRotate(aim.rot, OpenXR::Vec3{0.f, 0.f, -1.f});
+            // Stage B: 1€-filter the aim pose before hit-testing (openxr:aim_filter), with pinch-onset
+            // damping so committing a press/grab doesn't yank the aim on the commit frame. Applies to
+            // controllers AND hands; reset on an invalid aim so a re-acquire doesn't jump.
+            OpenXR::SXRPose aim = *m_hands[hand].aim;
+            if (aimFilter && solveIn.dt > 0.f) {
+                const float analog = std::max(m_hands[hand].select, std::max(m_hands[hand].grab, m_hands[hand].pinchValue));
+                const float mc     = OpenXR::aimFilterMinCutoff(aimFilterMc, aimPinchDamp, analog, 0.1f, onT);
+                aim                = OpenXR::oneEuroStepPose(m_aimFilter[hand], aim, solveIn.dt, mc, aimFilterB);
+            } else
+                m_aimFilter[hand].reset();
 
-            float                        bestT   = std::numeric_limits<float>::max();
-            const SXRPointerTarget*      bestTgt = nullptr;
-            OpenXR::SXRQuadHit           bestHit;
+            const OpenXR::Vec3 origin = aim.pos;
+            const OpenXR::Vec3 dir    = OpenXR::qRotate(aim.rot, OpenXR::Vec3{0.f, 0.f, -1.f});
+
+            float                   bestT      = std::numeric_limits<float>::max();
+            const SXRPointerTarget* bestTgt    = nullptr;
+            OpenXR::SXRQuadHit      bestHit;
+            float                   bestSlackU = 0.f, bestSlackV = 0.f;
             for (const auto& t : targets) {
-                const OpenXR::SXRQuadHit hit = OpenXR::rayQuadIntersect(t.worldPose, origin, dir, t.w, t.h);
+                // Cone magnetism (Stage C, chrome-only): expand each quad's bounds by slack =
+                // tan(magnet_angle)*t so a near-miss still registers; classifyQuadRegionForgiving then
+                // snaps ONLY to a grab handle (never BODY). slack 0 (magnet off) == the old exact test.
+                const OpenXR::Quat qi = OpenXR::qInverse(t.worldPose.rot);
+                const OpenXR::Vec3 lo = OpenXR::qRotate(qi, origin - t.worldPose.pos);
+                const OpenXR::Vec3 ld = OpenXR::qRotate(qi, dir);
+                float              slack = 0.f;
+                if (magnetSlackTan > 0.f && std::fabs(ld.z) >= 1e-6f) {
+                    const float tp = -lo.z / ld.z;
+                    if (tp > 0.f)
+                        slack = magnetSlackTan * tp;
+                }
+                const OpenXR::SXRQuadHit hit = OpenXR::rayQuadIntersect(t.worldPose, origin, dir, t.w, t.h, slack);
                 if (hit.hit && hit.t < bestT) {
-                    bestT   = hit.t;
-                    bestTgt = &t;
-                    bestHit = hit;
+                    bestT      = hit.t;
+                    bestTgt    = &t;
+                    bestHit    = hit;
+                    bestSlackU = t.w > 0.f ? slack / t.w : 0.f;
+                    bestSlackV = t.h > 0.f ? slack / t.h : 0.f;
                 }
             }
             if (bestTgt) {
                 newChromeMon = bestTgt->id;
-                newRegion    = OpenXR::classifyQuadHit(bestHit.u, bestHit.v, bestTgt->chrome);
-                if (newRegion == OpenXR::XR_REGION_BODY) {
+                stickGeom    = &bestTgt->chrome;
+                hitW         = bestTgt->w;
+                hitH         = bestTgt->h;
+                rawRegion    = OpenXR::classifyQuadRegionForgiving(bestHit.u, bestHit.v, bestTgt->chrome, bestSlackU, bestSlackV);
+                newCursorUV  = Vector2D{std::clamp(bestHit.u, 0.f, 1.f), std::clamp(bestHit.v, 0.f, 1.f)};
+                if (rawRegion == OpenXR::XR_REGION_BODY) {
                     float cu = 0.f, cv = 0.f;
                     if (OpenXR::remapToContentUV(bestHit.u, bestHit.v, bestTgt->chrome, cu, cv)) {
                         newBodyMon = bestTgt->id;
@@ -520,6 +575,17 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                 }
             }
         }
+
+        // Sticky hover (Stage A2): stabilize the published region so the highlight + grab eligibility
+        // don't flicker at handle boundaries / across brief tracking dropouts. Hysteresis + magnet
+        // angle are meters/degrees -> per-axis uv via the hit quad's meters (fall back to none when
+        // the ray missed all quads). The BODY pointer path stays on the RAW hit (no stickiness).
+        static const SXRChromeGeometry EMPTY_GEOM{};
+        const SXRChromeGeometry&       hg    = stickGeom ? *stickGeom : EMPTY_GEOM;
+        const float                    exitU = hitW > 0.f ? hoverHystM / hitW : 0.f;
+        const float                    exitV = hitH > 0.f ? hoverHystM / hitH : 0.f;
+        const OpenXR::eXRQuadRegion    stickRegion = OpenXR::stepHoverStick(m_hoverStick[hand], rawRegion, (int64_t)newChromeMon, newCursorUV.x, newCursorUV.y, hg, exitU, exitV, dropoutMax);
+        const MONITORID                stickMon    = (stickRegion != OpenXR::XR_REGION_NONE && m_hoverStick[hand].mon >= 0) ? (MONITORID)m_hoverStick[hand].mon : newChromeMon;
 
         // Body hover (pointer). Ownership transfers on a body-hover change, exactly as before.
         if (newBodyMon != m_hoverMon[hand]) {
@@ -530,13 +596,35 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
         m_hoverMon[hand] = newBodyMon;
         m_hoverUV[hand]  = newBodyUV;
 
-        // Chrome region transition (hover-only; aids WP-G2 chrome visuals / WP-G3 grab gating).
-        if (newChromeMon != m_hoverChromeMon[hand] || newRegion != m_hoverRegion[hand]) {
+        // Chrome region transition (hover-only; aids chrome visuals / grab gating).
+        if (stickMon != m_hoverChromeMon[hand] || stickRegion != m_hoverRegion[hand]) {
             Log::logger->log(Log::DEBUG, "[OPENXR] hand {} region {}@{} -> {}@{}", hand == XR_HAND_LEFT ? "L" : "R", OpenXR::xrRegionName(m_hoverRegion[hand]),
-                             (long long)m_hoverChromeMon[hand], OpenXR::xrRegionName(newRegion), (long long)newChromeMon);
+                             (long long)m_hoverChromeMon[hand], OpenXR::xrRegionName(stickRegion), (long long)stickMon);
         }
-        m_hoverChromeMon[hand] = newChromeMon;
-        m_hoverRegion[hand]    = newRegion;
+        m_hoverChromeMon[hand] = stickMon;
+        m_hoverRegion[hand]    = stickRegion;
+
+        // Stage A3: hover-enter haptic on the grabbable edge (NONE/body/margin -> bar/corner).
+        const bool nowGrabbable = OpenXR::xrRegionIsGrabbable(stickRegion);
+        if (nowGrabbable && !m_prevHoverGrabbable[hand] && hapticHover)
+            hapticTick(hand, hapticAmp);
+        m_prevHoverGrabbable[hand] = nowGrabbable;
+
+        // Stage A1: endpoint-cursor export. Show the cursor only where the ray actually hit a quad
+        // this frame (bestTgt); a grabbing hand casts no ray -> no cursor. State: press wins, else
+        // grabbable over a handle, else idle over content/margin.
+        if (newChromeMon >= 0 && !m_grabbing[hand]) {
+            const bool pressed = m_hands[hand].select >= onT;
+            OpenXR::eXRCursorState cs = nowGrabbable ? OpenXR::XR_CURSOR_GRABBABLE : OpenXR::XR_CURSOR_IDLE;
+            if (pressed)
+                cs = OpenXR::XR_CURSOR_PRESS;
+            m_cursorMon[hand]   = newChromeMon;
+            m_cursorUV[hand]    = newCursorUV;
+            m_cursorState[hand] = cs;
+        } else {
+            m_cursorMon[hand]   = -1;
+            m_cursorState[hand] = OpenXR::XR_CURSOR_HIDDEN;
+        }
     }
 
     // 2. Grab state machine (doc 04 §6 / doc 03 §4). Uses this frame's just-updated hover (step
@@ -636,7 +724,8 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                     m_grabRing[hand].reset(); // start a fresh carry history (WP-G4)
                     if (m_owner == (int)hand)
                         m_owner = -1; // pointer ownership free-for-take by the other hand (§6)
-                    hapticTick(hand);
+                    if (haptics)
+                        hapticTick(hand, hapticAmp);
                     emitGrabState(target->id, target->name, true);
                 }
                 // else: the region isn't grabbable (margin / body without grab_anywhere), no target
@@ -672,7 +761,8 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                         target->anchor->endGrab(solveIn, tune);
                 }
                 // else: the layer is gone (destroyed mid-grab) -> force release, no re-anchor.
-                hapticTick(hand);
+                if (haptics)
+                    hapticTick(hand, hapticAmp);
                 emitGrabState(m_grabbedMon[hand], m_grabbedMonName[hand], false);
                 m_grabbing[hand]   = false;
                 m_grabbedMon[hand] = -1;
@@ -769,7 +859,8 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                     ev.button    = BTN_LEFT;
                     ev.pressed   = true;
                     emit(ev);
-                    hapticTick(hand); // press only (doc 04 §6.3)
+                    if (haptics)
+                        hapticTick(hand, hapticAmp); // press only (doc 04 §6.3)
                 }
             } else if (m_leftHolder == hand) {
                 m_leftHolder = -1;

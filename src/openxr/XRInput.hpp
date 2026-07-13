@@ -212,6 +212,21 @@ class CXRInput {
     OpenXR::eXRQuadRegion chromeHoverRegion(MONITORID id) const;
     bool                  isMonitorGrabbed(MONITORID id) const;
 
+    // Frame-thread READ-ONLY endpoint-cursor exports (report 14 Stage A1). processPointer resolves,
+    // per hand, which quad the ray hit (cursorMon, -1 = none), the RAW full-quad hit uv (cursorUV),
+    // and the cursor STATE (idle/grabbable/press/grab). The frame loop packs these onto the hovered
+    // layer's per-hand atomic (XRMonitorLayer m_cursorPacked) for next frame's drawCursor pass —
+    // the same one-frame-latency contract as chromeHoverRegion. Read right after processPointer.
+    MONITORID            cursorMon(OpenXR::eXRHand h) const {
+        return m_cursorMon[h];
+    }
+    Vector2D             cursorUV(OpenXR::eXRHand h) const {
+        return m_cursorUV[h];
+    }
+    OpenXR::eXRCursorState cursorState(OpenXR::eXRHand h) const {
+        return m_cursorState[h];
+    }
+
     // Frame thread (set on the main thread before the frame thread starts). Producer sink for
     // frame->main events (queue push + eventfd wake, owned by COpenXRManager).
     void setEmitter(std::function<void(XRQueueItem)> emit) {
@@ -226,8 +241,9 @@ class CXRInput {
     // update m_handActive + the status atomic. Called from sample() when m_profileDirty.
     void refreshHandProfiles();
     // Fire-and-forget haptic tick on a hand (doc 04 §6.3). No-op / ignored if the current
-    // profile has no haptic binding.
-    void                             hapticTick(OpenXR::eXRHand hand);
+    // profile has no haptic binding (hands have no actuator — graceful). `amplitude` is 0-1
+    // (openxr:haptic_amplitude); the master openxr:haptics gate is checked at the call site.
+    void                             hapticTick(OpenXR::eXRHand hand, float amplitude);
 
     std::function<void(XRQueueItem)> m_emit;
 
@@ -279,6 +295,18 @@ class CXRInput {
     // While a hand grabs, it casts no ray, drives no pointer, and its stick feeds the grab
     // machine instead of scroll (doc 04 §2/§6).
     std::array<bool, 2> m_grabbing{false, false};
+
+    // ---- ray aim / cursor / hover assist (report 14, frame thread) ----
+    // Aim-pose 1€ filter per hand (openxr:aim_filter, Stage B); reset when the aim goes invalid so a
+    // re-acquire doesn't jump. Sticky-hover Schmitt per hand (Stage A2); the region it publishes is
+    // what m_hoverRegion carries (so chrome highlight + grab eligibility are both stabilized).
+    std::array<OpenXR::SXROneEuroPose, 2> m_aimFilter;
+    std::array<OpenXR::SXRHoverStick, 2>  m_hoverStick;
+    std::array<bool, 2>                   m_prevHoverGrabbable{false, false}; // hover-enter haptic edge
+    // Endpoint-cursor export (read by the frame loop, published onto the hovered layer's atomics).
+    std::array<MONITORID, 2>              m_cursorMon{-1, -1};
+    std::array<Vector2D, 2>               m_cursorUV;
+    std::array<OpenXR::eXRCursorState, 2> m_cursorState{OpenXR::XR_CURSOR_HIDDEN, OpenXR::XR_CURSOR_HIDDEN};
 
     // ---- grab state machine (frame thread, doc 04 §6, WP8) ----
     std::array<SXRSchmitt, 2>  m_grabTrig;           // per-hand grab (squeeze) hysteresis
