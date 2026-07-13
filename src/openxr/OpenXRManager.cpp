@@ -2637,6 +2637,13 @@ PXRLAYER COpenXRManager::resolveSelected() {
     return nullptr;
 }
 
+std::string COpenXRManager::selectedName() {
+    // GAP 3: the concrete monitor `active` resolves to right now ("" if none), so a status consumer
+    // (hypxrvoice) can name the target without replicating the resolution order.
+    auto l = resolveSelected();
+    return l ? l->m_monitorName : std::string{};
+}
+
 void COpenXRManager::reconcileDeclaredMonitors() {
     // doc 05 §2.5: D = declared set (this parse), L = live layers created BY config
     // (m_declaredByConfig). Runtime-created layers are never touched.
@@ -2810,12 +2817,17 @@ std::expected<void, std::string> COpenXRManager::cmdSelect(const std::string& ar
             }
         const size_t next = arg == "next" ? (cur + 1) % ordered.size() : (cur + ordered.size() - 1) % ordered.size();
         m_selectedMonitor = ordered[next]->m_monitorName;
+        // GAP 3: fire a socket2 event so a voice daemon's dialogue state is push-driven (no poll).
+        if (g_pEventManager)
+            g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitorselect", m_selectedMonitor});
         return {};
     }
 
     if (!layerByName(arg))
         return std::unexpected<std::string>("no XR monitor named '" + arg + "'");
     m_selectedMonitor = arg;
+    if (g_pEventManager)
+        g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitorselect", m_selectedMonitor});
     return {};
 }
 
@@ -3152,6 +3164,43 @@ std::expected<void, std::string> COpenXRManager::cmdCenter() {
     return {};
 }
 
+std::expected<void, std::string> COpenXRManager::cmdPlace(const std::string& args) {
+    // hypxrvoice GAP 2. Syntax: <name|active> at <x>,<y>,<z>  (the "at" keyword is optional/lenient).
+    const auto tokens = splitWs(args);
+    if (tokens.size() < 2)
+        return std::unexpected<std::string>("place: expected <name|active> at <x>,<y>,<z>");
+
+    const std::string target = tokens[0];
+    PXRLAYER          layer  = target == "active" ? resolveSelected() : layerByName(target);
+    if (!layer)
+        return std::unexpected<std::string>(target == "active" ? "no XR monitor selected" : "no XR monitor named '" + target + "'");
+
+    const size_t ci = tokens[1] == "at" ? 2 : 1; // skip the optional "at"
+    if (ci >= tokens.size())
+        return std::unexpected<std::string>("place: expected <x>,<y>,<z> after 'at'");
+    if (ci + 1 != tokens.size())
+        return std::unexpected<std::string>("place: unexpected token '" + tokens[ci + 1] + "' (expected a single x,y,z point)");
+    auto pt = parseVec3Arg(tokens[ci]);
+    if (!pt)
+        return std::unexpected<std::string>("place: bad point '" + tokens[ci] + "' (expected x,y,z meters in LOCAL_FLOOR)");
+
+    const auto ctx = currentVerbContext();
+    {
+        std::scoped_lock lock(m_layersMu);
+        // Face the headset by default (like `center`); with no head tracking, keep the quad's current
+        // facing (its live world rot if placed, else its stored anchor rot). placeAtFacing is pure.
+        const OpenXR::Quat curRot = layer->m_anchor.hasLastWorld() ? layer->m_anchor.lastWorld().rot : layer->m_anchor.state().anchorPose.rot;
+        const OpenXR::SXRPose W   = OpenXR::placeAtFacing(*pt, ctx.view.pos, ctx.viewValid, curRot);
+        layer->m_anchor.placeLocalAt(W);
+    }
+
+    // Placing re-anchors to local: fire the same event as an anchor-mode change so a status consumer
+    // (and any bar) sees the mode transition.
+    if (g_pEventManager)
+        g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitoranchor", layer->m_monitorName + ",local"});
+    return {};
+}
+
 // ---- adaptive anchoring verbs (research/13 §6.3) --------------------------------------------
 
 std::expected<void, std::string> COpenXRManager::cmdAdaptive(const std::string& args) {
@@ -3229,13 +3278,56 @@ std::expected<void, std::string> COpenXRManager::cmdRoam(const std::string& args
 
 // ---- gaze grab + conditional hand input verbs (research/16) ----------------------------------
 
-std::expected<void, std::string> COpenXRManager::cmdGazeGrab() {
-    const auto ctx  = currentVerbContext();
-    const auto tune = readAnchorTuning();
+// Shared begin-a-gaze-carry tail (research/16 §3.2), used by both the argument-less dwell grab and
+// the targeted `gazegrab <name>` (hypxrvoice GAP 1). The layer is resolved by the caller (from the
+// live dwell id, or by name on the MAIN thread — only the resolved layer crosses no thread here).
+std::expected<void, std::string> COpenXRManager::beginGazeCarry(PXRLAYER layer) {
+    if (!layer)
+        return std::unexpected<std::string>("gazegrab: monitor is gone");
+    // Idempotent: a begin on the monitor already being carried is a no-op success (deterministic for
+    // a voice executor that may re-issue). A begin on a DIFFERENT monitor errors — only one gaze
+    // carry exists at a time (m_gazeCarryMonitor); the daemon must gazerelease first.
+    if (m_gazeCarryMonitor == layer->m_monitorName)
+        return {};
+    if (!m_gazeCarryMonitor.empty())
+        return std::unexpected<std::string>("gazegrab: already carrying '" + m_gazeCarryMonitor + "' (release it first)");
+
+    const auto ctx = currentVerbContext();
+    if (!ctx.viewValid)
+        return std::unexpected<std::string>("gazegrab: head tracking unavailable");
+
+    static auto      PFOLLOW = CConfigValue<Hyprlang::INT>("openxr:gaze_follow");
+    std::scoped_lock lock(m_layersMu);
+    // Mutual exclusion (§4.6): a hand/controller grab owns it -> the gaze grab no-ops with a message.
+    if (layer->m_anchor.grabbed())
+        return std::unexpected<std::string>("gazegrab: that monitor is already grabbed by a hand/controller");
+    if (!layer->m_anchor.hasLastWorld())
+        return std::unexpected<std::string>("gazegrab: monitor not placed yet");
+    layer->m_anchor.beginGazeGrab(ctx.view, *PFOLLOW != 0);
+    m_gazeCarryMonitor = layer->m_monitorName;
+    return {};
+}
+
+std::expected<void, std::string> COpenXRManager::cmdGazeGrab(const std::string& arg) {
+    const auto tokens = splitWs(arg);
+    if (tokens.size() > 1)
+        return std::unexpected<std::string>("gazegrab: expected an optional monitor name (<name>|active), or no arg to toggle");
+
+    // TARGETED (hypxrvoice GAP 1): begin a carry on the NAMED monitor regardless of the live dwell
+    // candidate. Deterministic — no dependence on where the head happens to point at execution time.
+    if (!tokens.empty()) {
+        const std::string& name  = tokens[0];
+        PXRLAYER           layer = name == "active" ? resolveSelected() : layerByName(name);
+        if (!layer)
+            return std::unexpected<std::string>(name == "active" ? "gazegrab: no XR monitor selected" : "gazegrab: no XR monitor named '" + name + "'");
+        return beginGazeCarry(layer);
+    }
 
     // TOGGLE: a gaze carry is active -> release it (reanchor via endGazeGrab), like a keyboard-up.
     if (!m_gazeCarryMonitor.empty()) {
-        auto layer = layerByName(m_gazeCarryMonitor);
+        const auto ctx   = currentVerbContext();
+        const auto tune  = readAnchorTuning();
+        auto       layer = layerByName(m_gazeCarryMonitor);
         m_gazeCarryMonitor.clear();
         if (layer) {
             OpenXR::SXRSolveInput in;
@@ -3249,27 +3341,12 @@ std::expected<void, std::string> COpenXRManager::cmdGazeGrab() {
         return {};
     }
 
-    // Grab the dwell-stable gazed-at monitor (research/16 §3.2). Fail cleanly if not looking at one —
-    // NEVER fall back to the sticky selection (that would grab a monitor behind you).
+    // Grab the dwell-stable gazed-at monitor. Fail cleanly if not looking at one — NEVER fall back to
+    // the sticky selection (that would grab a monitor behind you).
     const int64_t id = m_gazeHoveredId.load(std::memory_order_acquire);
     if (id < 0)
         return std::unexpected<std::string>("gazegrab: not looking at a monitor");
-    if (!ctx.viewValid)
-        return std::unexpected<std::string>("gazegrab: head tracking unavailable");
-    auto layer = layerByMonitorID((MONITORID)id);
-    if (!layer)
-        return std::unexpected<std::string>("gazegrab: gazed-at monitor is gone");
-
-    static auto PFOLLOW = CConfigValue<Hyprlang::INT>("openxr:gaze_follow");
-    std::scoped_lock lock(m_layersMu);
-    // Mutual exclusion (§4.6): a hand/controller grab owns it -> the gaze grab no-ops with a message.
-    if (layer->m_anchor.grabbed())
-        return std::unexpected<std::string>("gazegrab: that monitor is already grabbed by a hand/controller");
-    if (!layer->m_anchor.hasLastWorld())
-        return std::unexpected<std::string>("gazegrab: monitor not placed yet");
-    layer->m_anchor.beginGazeGrab(ctx.view, *PFOLLOW != 0);
-    m_gazeCarryMonitor = layer->m_monitorName;
-    return {};
+    return beginGazeCarry(layerByMonitorID((MONITORID)id));
 }
 
 std::expected<void, std::string> COpenXRManager::cmdGazeRelease() {

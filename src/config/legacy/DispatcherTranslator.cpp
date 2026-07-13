@@ -842,6 +842,9 @@ static SDispatchResult xrmonitorDispatch(const std::string& args) {
         return wrapExp(g_pOpenXRManager->cmdDistance(rest));
     if (verb == "center")
         return wrapExp(g_pOpenXRManager->cmdCenter());
+    // hypxrvoice GAP 2: drop a named monitor at a resolved LOCAL_FLOOR point (facing the headset).
+    if (verb == "place")
+        return wrapExp(g_pOpenXRManager->cmdPlace(rest));
 
     // Adaptive anchoring verbs (research/13 §6.3).
     if (verb == "adaptive")
@@ -853,10 +856,11 @@ static SDispatchResult xrmonitorDispatch(const std::string& args) {
     if (verb == "roam")
         return wrapExp(g_pOpenXRManager->cmdRoam(rest));
 
-    // Gaze grab + conditional hand input (research/16). gazegrab TOGGLES (grab/release); gazepush is
-    // designed for `binde` stepped repeats; handinput toggles hand input on/off at the keyboard.
+    // Gaze grab + conditional hand input (research/16). gazegrab with no arg TOGGLES (grab/release);
+    // with a <name> (hypxrvoice GAP 1) it begins a carry on the NAMED monitor. gazepush is designed
+    // for `binde` stepped repeats; handinput toggles hand input on/off at the keyboard.
     if (verb == "gazegrab")
-        return wrapExp(g_pOpenXRManager->cmdGazeGrab());
+        return wrapExp(g_pOpenXRManager->cmdGazeGrab(rest));
     if (verb == "gazerelease")
         return wrapExp(g_pOpenXRManager->cmdGazeRelease());
     if (verb == "gazepush")
