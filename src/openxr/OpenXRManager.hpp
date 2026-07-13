@@ -147,6 +147,11 @@ class COpenXRManager {
     std::expected<void, std::string> cmdScale(const std::string& args);    // <f|+d|-d>
     std::expected<void, std::string> cmdDistance(const std::string& args); // <±m>
     std::expected<void, std::string> cmdCenter();                          // (none)
+    // hypxrvoice GAP 2: place a named monitor at a resolved LOCAL_FLOOR point, re-anchoring to
+    // `local` and MOVING the quad so its center sits at that point (facing the headset by default).
+    // The point is exactly what `hyprctl openxr gaze` returns, so a voice daemon can drop a monitor
+    // where the user was looking when they said "here". Syntax: <name|active> at <x>,<y>,<z>.
+    std::expected<void, std::string> cmdPlace(const std::string& args);
 
     // --- adaptive anchoring verbs (research/13 §6.3). Main thread; take m_layersMu. Operate on the
     // selected monitor (like move/center). ---
@@ -156,8 +161,11 @@ class COpenXRManager {
     std::expected<void, std::string> cmdRoam(const std::string& args);     // head|body
 
     // --- gaze grab + conditional hand input (research/16). Main thread; take m_layersMu. ---
-    // gazegrab TOGGLES: grabs the dwell-stable gazed-at monitor, or releases the current gaze carry.
-    std::expected<void, std::string> cmdGazeGrab();                        // (none) — toggle
+    // gazegrab with NO arg TOGGLES: grabs the dwell-stable gazed-at monitor, or releases the current
+    // gaze carry. With a monitor name (hypxrvoice GAP 1) it begins a carry on the NAMED monitor
+    // regardless of the live dwell candidate — a voice daemon resolves "this" at the WORD's timestamp
+    // and grabs the correct monitor seconds later. "active" resolves the selected monitor.
+    std::expected<void, std::string> cmdGazeGrab(const std::string& arg = ""); // (none) toggle | <name> targeted
     std::expected<void, std::string> cmdGazeRelease();                     // (none) — explicit release
     std::expected<void, std::string> cmdGazePush(const std::string& args); // <±m> (default gaze_dist_step)
     std::expected<void, std::string> cmdHandInput(const std::string& args); // on|off|auto|toggle
@@ -225,6 +233,11 @@ class COpenXRManager {
         float       dist = 0.f;             // carry distance in meters (0 when not carrying)
     };
     SXRGazeStatus gazeStatus();
+
+    // hypxrvoice GAP 3: the concrete monitor `active` resolves to right now — explicit select > last
+    // ray-hovered > focused-if-XR (resolveSelected()->m_monitorName), or "" if none. Lets a voice
+    // daemon name the target in feedback without replicating the resolution order. Main thread.
+    std::string   selectedName();
 
     // hypxrvoice WP-V1 (docs/openxr/research/VOICE-CONTROL.md): a timestamped head-pose + gaze
     // candidate resolved from the rolling ring (m_poseRing). `gazeSampleNow()` returns the newest
@@ -458,6 +471,11 @@ class COpenXRManager {
     // The monitor currently gaze-carried (main-thread string; "" = none). Set by cmdGazeGrab, cleared
     // by cmdGazeRelease/toggle + on that monitor's destroy. O(1) toggle/release + status.
     std::string          m_gazeCarryMonitor;
+    // Shared "begin a gaze carry on this layer" tail for both the argument-less dwell grab and the
+    // targeted `gazegrab <name>` (hypxrvoice GAP 1). Acquires the frame context, takes m_layersMu, and
+    // enforces the mutual-exclusion + placed-yet gates. Idempotent when already carrying that exact
+    // monitor; errors cleanly when a DIFFERENT monitor is already carried. Main thread.
+    std::expected<void, std::string> beginGazeCarry(PXRLAYER layer);
     // Frame-thread-only gaze state: the 1€ pose pre-filter, the dwell/hysteresis selector, and the
     // most recent nearest-hit id + uv (for the gaze cursor). Touched only on the frame thread.
     OpenXR::SXROneEuroPose m_gazeFilter;

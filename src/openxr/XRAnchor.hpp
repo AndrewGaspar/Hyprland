@@ -374,6 +374,13 @@ namespace OpenXR {
         bool applyDistance(float dMeters, const SXRVerbContext& ctx);
         bool applyCenter(const SXRVerbContext& ctx, float defaultDistance);
 
+        // hypxrvoice GAP 2: drop the quad at an explicit LOCAL_FLOOR world pose `W`. Re-anchors to
+        // XR_ANCHOR_LOCAL and WARPS there (a deliberate teleport, not a glide) — the next solve places
+        // the quad exactly at W with no chase. Ends any active grab/carry and resets the adaptive phase
+        // to docked (W becomes the new desk pose). Unlike applyCenter, the position is caller-supplied
+        // (from a resolved gaze point) rather than derived from the view forward.
+        void placeLocalAt(const SXRPose& W);
+
         // ---- mode transitions (§5.6) + recentering (§6) ----
         bool setMode(eXRAnchorMode newMode, eXRHand hand, const SXRVerbContext& ctx, const SXRAnchorTuning& tune);
         void onReferenceSpaceChanged(const SXRPose& poseInPreviousSpace);

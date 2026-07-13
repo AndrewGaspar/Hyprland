@@ -311,11 +311,13 @@ transports, one implementation.
 | `scale` | `<f\|+d\|-d>` | Bare number multiplies the width; signed number adds/subtracts meters. Clamped 0.2–4.0 m. |
 | `distance` | `<±m>` | Push/pull along the view ray. Clamped 0.3–5.0 m. |
 | `center` | *(none)* | Re-place centered in view at `openxr:default_distance` (anchor mode preserved). |
+| `place` | `<name\|active> at <x>,<y>,<z>` | Re-anchor `<name>` to `local`, **moving** its center to the given `LOCAL_FLOOR` point (meters), facing the headset. Unlike `anchor local` (which freezes the quad at its current pose), `place` teleports it to a supplied point — exactly the point `hyprctl openxr gaze` returns, so a voice/script layer can drop a monitor where the user was looking. |
 | `adaptive` | `on\|off\|toggle` | Enable/disable the adaptive decorator on the selected monitor (recaptures the desk seat on enable). |
 | `undock` | *(none)* | Force the selected adaptive monitor to pick up and follow now (skips the geofence dwell). |
 | `dock` | `[here]` | Force it back to the saved desk pose now; `dock here` redefines the desk pose to where it is now and recaptures the seat. |
 | `roam` | `head\|body` | Change the follow behavior live. |
 | `gazegrab` | *(none)* | **Toggle**: grab the monitor you're looking at (dwell-stable candidate) so it follows your gaze; if a gaze carry is active, release it. Errors cleanly if you're not looking at a monitor, or it's already grabbed by a hand/controller. |
+| `gazegrab` | `<name\|active>` | **Targeted**: begin a gaze carry on the *named* monitor regardless of the live dwell candidate (so a voice/script layer can carry the monitor it resolved seconds earlier, not whatever the head happens to point at now). Idempotent when already carrying that monitor; errors cleanly if a *different* carry is active, the name is unknown, head tracking is unavailable, the monitor isn't placed yet, or it's already hand/controller-grabbed. |
 | `gazerelease` | *(none)* | Explicit release of the gaze carry (no-op if none). For a `bindr` hold-to-carry pattern. |
 | `gazepush` | `<±m>` | Push/pull the gaze-carried monitor along the gaze ray (or, when not carrying, the gaze-selected monitor along the view ray). No arg = `openxr:gaze_dist_step`. Designed for `binde` repeats. |
 | `handinput` | `on\|off\|auto\|toggle` | Set the conditional hand-input policy (§2). `toggle` is the key-chord to flip hands on/off at the keyboard. |
@@ -348,7 +350,7 @@ hyprctl openxr [status]        # default subcommand
 hyprctl -j openxr              # JSON
 hyprctl openxr enable|disable  # start/stop the session (does not touch openxr:enabled)
 hyprctl openxr <verb> …        # the §4 verbs: create destroy select anchor move rotate
-                               #   scale distance center adaptive dock undock roam
+                               #   scale distance center place adaptive dock undock roam
                                #   gazegrab gazerelease gazepush handinput
 hyprctl openxr gaze [at <ms>]  # read-only head ray + timestamped gaze history (see below)
 hyprctl openxr layout          # dump the CURRENT live layout as paste-ready xrmonitor= lines
@@ -446,6 +448,7 @@ system: Simulated HMD
 runtime gpu: AMD Radeon Graphics (drm 226:128)
 blend mode: opaque
 overlay: no
+selected: XR-code
 monitors follow session: visible
 visible: yes
 presence: yes
@@ -468,6 +471,7 @@ JSON (`hyprctl -j openxr`) — all keys always present:
     "runtimeGpu": "AMD Radeon Graphics (drm 226:128)",
     "blendMode": "opaque",
     "overlay": false,
+    "selected": "XR-code",
     "monitorsFollowSession": "visible",
     "monitorUnplugPendingMs": -1,
     "userPresence": "yes",
@@ -508,6 +512,9 @@ Field notes:
 - `blendMode` — the active environment blend mode (`opaque` when there is no session).
 - `overlay` — the **actual** session type, not the config request: `false` with no session, or
   when an overlay request was downgraded to exclusive.
+- `selected` — the concrete monitor an `active`/omitted target resolves to right now (explicit
+  `select` > last ray-hovered > focused-if-XR), or `""` (text form: `(none)`) when none
+  resolves. Lets a consumer name the verb target without replicating the resolution order.
 - `monitorsFollowSession` / `monitorUnplugPendingMs` — the active follow mode, and ms until a
   pending grace-period unplug fires (`-1` when none pending).
 - `userPresence` — the `XR_EXT_user_presence` signal driving the `visible`-mode plug gate:
@@ -543,6 +550,7 @@ Posted on the compositor's socket2 (`.socket2.sock`), standard `EVENT>>DATA` wir
 | `openxractive` | `1` / `0` | Derived: active ⇔ state ∈ {`visible`, `focused`}. Posted only on flip — the "is someone in the headset" signal for bars. |
 | `xrmonitoradded` | `<name>` | An XR monitor finished creation (any origin). The stock `monitoradded` also fires for the underlying output. |
 | `xrmonitorremoved` | `<name>` | An XR monitor was destroyed (any origin). |
+| `xrmonitorselect` | `<name>` | The explicit selection changed via the `select` verb (`select <name>`/`next`/`prev`). Lets a consumer keep its notion of "the selected monitor" push-driven instead of polling `status` after every selection. |
 | `xrmonitoranchor` | `<name>,<mode>` | The anchor **mode** changed — the `anchor` verb, or a reload that changed a declared mode. A plain grab/release with an unchanged mode does not fire this. |
 | `xrmonitorgrab` | `<name>,1` / `<name>,0` | A grab began / ended on a monitor. |
 | `xrmonitorquad` | `<name>,1` / `<name>,0` | A monitor's quad was reactivated / suspended under the runtime layer cap (the monitor keeps rendering as a headless output). |

@@ -47,6 +47,9 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     // research/16 Part A/B: conditional hand-input gate + gaze grab state.
     const auto        HANDIN = g_pOpenXRManager->handInputStatus();
     const auto        GAZE   = g_pOpenXRManager->gazeStatus();
+    // hypxrvoice GAP 3: the concrete monitor `active` resolves to (explicit select > last hovered >
+    // focused-if-XR), so a voice daemon can name the target in feedback without replicating the order.
+    const std::string SELECTED = g_pOpenXRManager->selectedName();
     // WP-G5: per-hand active input device (hands vs controllers) + the hand grab gesture.
     const auto        HANDS = g_pOpenXRManager->handInputInfos();
     auto              handLabel = [](const COpenXRManager::SXRHandInputInfo& hi) -> std::string {
@@ -101,6 +104,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "runtimeGpu": "{}",
     "blendMode": "{}",
     "overlay": {},
+    "selected": "{}",
     "monitorsFollowSession": "{}",
     "monitorUnplugPendingMs": {},
     "userPresence": "{}",
@@ -117,7 +121,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "monitors": [{}{}]
 }}
 )#",
-                           STATE, RUNTIME, SYSTEM, RTGPU, BLEND, OVERLAY ? "true" : "false", FOLLOW, UNPLUG_PEND, PRESENCE, VISIBLE, REPROBE_WAIT, REPROBE_MS, INHIBITING_IDLE ? "true" : "false",
+                           STATE, RUNTIME, SYSTEM, RTGPU, BLEND, OVERLAY ? "true" : "false", SELECTED, FOLLOW, UNPLUG_PEND, PRESENCE, VISIBLE, REPROBE_WAIT, REPROBE_MS, INHIBITING_IDLE ? "true" : "false",
                            HANDIN.mode, HANDIN.state, GAZE.source, GAZE.hoveredMonitor, GAZE.hoveredName, GAZE.carrying ? "true" : "false", GAZE.carryMonitor, GAZE.dist,
                            HANDS[0].hands ? "hands" : "controllers", HANDS[0].gesture,
                            HANDS[0].filtered ? "true" : "false", HANDS[1].hands ? "hands" : "controllers", HANDS[1].gesture, HANDS[1].filtered ? "true" : "false",
@@ -131,10 +135,10 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     const std::string GAZELINE = GAZE.carrying ? std::format("carrying {} at {:.2f}m", GAZE.carryMonitor, GAZE.dist)
                                                 : (GAZE.hoveredMonitor >= 0 ? std::format("looking at {}", GAZE.hoveredName) : "idle");
     std::string       out = std::format(
-        "state: {}\nruntime: {}\nsystem: {}\nruntime gpu: {}\nblend mode: {}\noverlay: {}\nmonitors follow session: {}\nvisible: {}\npresence: {}\nidle inhibited: {}\nhand input: {} "
+        "state: {}\nruntime: {}\nsystem: {}\nruntime gpu: {}\nblend mode: {}\noverlay: {}\nselected: {}\nmonitors follow session: {}\nvisible: {}\npresence: {}\nidle inhibited: {}\nhand input: {} "
         "({})\ngaze ({}): {}\ninput: left {}, right {}\n",
-        STATELINE, RUNTIME, SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, BLEND, OVERLAY ? "yes" : "no", FOLLOWLINE, VISIBLE, PRESENCE, INHIBITING_IDLE ? "yes" : "no",
-        HANDIN.state, HANDIN.mode, GAZE.source, GAZELINE, handLabel(HANDS[0]), handLabel(HANDS[1]));
+        STATELINE, RUNTIME, SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, BLEND, OVERLAY ? "yes" : "no", SELECTED.empty() ? "(none)" : SELECTED, FOLLOWLINE, VISIBLE, PRESENCE,
+        INHIBITING_IDLE ? "yes" : "no", HANDIN.state, HANDIN.mode, GAZE.source, GAZELINE, handLabel(HANDS[0]), handLabel(HANDS[1]));
     for (const auto& m : MONS) {
         out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} ({}) hovered: {} ({}) plugged: {} content: {}{}", m.name,
                            m.id, m.w, m.h, m.refresh, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.grabbed ? "yes" : "no", m.grabKind, m.hovered ? "yes" : "no", m.region,
@@ -285,6 +289,11 @@ static std::string openxrRequest(eHyprCtlOutputFormat format, std::string reques
         auto r = g_pOpenXRManager->cmdCenter();
         return r ? "ok" : r.error();
     }
+    // hypxrvoice GAP 2: drop a named monitor at a resolved LOCAL_FLOOR point (facing the headset).
+    if (SUBCOMMAND == "place") {
+        auto r = g_pOpenXRManager->cmdPlace(ARGS);
+        return r ? "ok" : r.error();
+    }
 
     // Adaptive anchoring verbs (research/13 §6.3).
     if (SUBCOMMAND == "adaptive") {
@@ -304,9 +313,10 @@ static std::string openxrRequest(eHyprCtlOutputFormat format, std::string reques
         return r ? "ok" : r.error();
     }
 
-    // Gaze grab + conditional hand input (research/16).
+    // Gaze grab + conditional hand input (research/16). gazegrab with no arg toggles on the dwell
+    // candidate; with a <name> (hypxrvoice GAP 1) it begins a carry on the NAMED monitor.
     if (SUBCOMMAND == "gazegrab") {
-        auto r = g_pOpenXRManager->cmdGazeGrab();
+        auto r = g_pOpenXRManager->cmdGazeGrab(ARGS);
         return r ? "ok" : r.error();
     }
     if (SUBCOMMAND == "gazerelease") {
@@ -326,7 +336,7 @@ static std::string openxrRequest(eHyprCtlOutputFormat format, std::string reques
     if (SUBCOMMAND == "gaze")
         return openxrGaze(format, ARGS);
 
-    return std::format("unknown openxr subcommand '{}'. Valid: status, enable, disable, create, destroy, select, anchor, move, rotate, scale, distance, center, adaptive, dock, "
+    return std::format("unknown openxr subcommand '{}'. Valid: status, enable, disable, create, destroy, select, anchor, move, rotate, scale, distance, center, place, adaptive, dock, "
                        "undock, roam, gazegrab, gazerelease, gazepush, handinput, gaze, layout",
                        SUBCOMMAND);
 }
