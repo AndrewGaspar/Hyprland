@@ -252,6 +252,12 @@ namespace OpenXR {
         // session simply leaves them empty with no behavior change.
         std::optional<SXRPose> pinchLeft;
         std::optional<SXRPose> pinchRight;
+        // Gaze ray source for the gaze-carry override (research/16). v1 leaves this empty and the
+        // carry falls back to the VIEW forward vector (center-FOV head gaze) — `view` above. It is a
+        // std::optional so a future eye-gaze source (XR_EXT_eye_gaze_interaction, research/16 §2.2,
+        // WP-Z6) can inject a better ray with ONE code path and transparent VIEW fallback; every
+        // non-gaze path ignores it. Floor-shifted like the grips when set.
+        std::optional<SXRPose> gaze;
         uint32_t               pxW = 1, pxH = 1; // current monitor mode, for aspect
         // Optional 1€ carry filter (WP-G6), read per-frame from config by the caller. When
         // grabFilter is set, solve() runs the carried world pose through a 1€ low-pass and submits
@@ -331,6 +337,34 @@ namespace OpenXR {
         void beginResize(eXRHand hand, eXRQuadRegion corner, const SXRPose& gripWorld, float aspectHW);
         void grabResizeCorner(const SXRPose& gripWorld, const SXRSolveInput& in, const SXRAnchorTuning& tune);
         void endResize(const SXRPose& gripWorldLatched, const SXRSolveInput& in, const SXRAnchorTuning& tune);
+
+        // ---- gaze carry (research/16 §4) — main thread verbs mutate, frame-thread solve reads ----
+        // A gaze grab is a fourth solve() override (placed AFTER the hand-grab override, so a hand
+        // grab wins if both somehow fire — research/16 §4.1): "place the quad on the gaze ray at
+        // m_gazeDist metres, billboarded to face the viewer, updated every frame." It never touches
+        // the persistent m_state.mode (the desk/head/body identity the monitor returns to on
+        // release); it is pure runtime state, all POD, touched only under COpenXRManager::m_layersMu
+        // (verbs write, solve reads) — zero refcount ops (XRMonitorLayer.hpp rule) by construction.
+        //
+        // beginGazeGrab snapshots the CURRENT distance head->quad (so the quad does not jump on grab)
+        // and, for freeze mode, the current head->quad direction. `follow` (openxr:gaze_follow): true
+        // = the quad rides the live gaze ray while held; false = it detaches at grab and only the
+        // push/pull keys move it along the grab-time ray. Requires hasLastWorld() (the caller gates).
+        void  beginGazeGrab(const SXRPose& view, bool follow);
+        // Pull nearer / push farther along the gaze ray (research/16 §4.2). Clamped to the shared
+        // [XR_DISTANCE_MIN, XR_DISTANCE_MAX] (== the grabPushPull / distance-verb clamp).
+        void  gazePushPull(float deltaMeters);
+        void  gazeSetDist(float absMeters);
+        // Release: reanchor from the last carried world pose into the persistent mode + reseed the
+        // spring (identical to endGrab; NO release-latch ring needed — a keyboard release does not
+        // perturb the head pose, so there is no release lurch, research/16 §4.2).
+        void  endGazeGrab(const SXRSolveInput& in, const SXRAnchorTuning& tune);
+        bool  gazeGrabbed() const {
+            return m_gazeGrabbed;
+        }
+        float gazeDist() const {
+            return m_gazeDist;
+        }
 
         // ---- verbs (§5) — main thread, under the layer mutex ----
         // d = (dx, dy, dz) as given by the user; the solver forms view -Z for dz.
@@ -456,6 +490,12 @@ namespace OpenXR {
         SXROneEuroPose m_carryFilter;        // WP-G6: 1€ carry filter state, reset at beginGrab
         SXRPose m_grabOffset;                // in the grabbing hand's device (grip OR pinch) space
         bool    m_deviceOffsetDirty = false; // DEVICE: recompute offset on first valid grip
+        // gaze carry (research/16 §4) — runtime, POD, under COpenXRManager::m_layersMu.
+        bool    m_gazeGrabbed   = false;
+        float   m_gazeDist      = 1.5F;  // metres along the gaze ray (clamped XR_DISTANCE_MIN..MAX)
+        bool    m_gazeFollow    = true;  // true = quad rides the live gaze ray; false = frozen at grab
+        Vec3    m_gazeFrozenOrigin;      // freeze mode: head pos captured at grab (ray origin held)
+        Vec3    m_gazeFrozenDir{0.F, 0.F, -1.F}; // freeze mode: head->quad direction captured at grab
         // corner resize grab (WP-G3): begin-snapshot of the pinned corner + diagonal in WORLD
         // (LOCAL_FLOOR), so every frame derives width from the grip's projection onto that fixed
         // diagonal and pins the opposite corner exactly (no per-frame drift).
