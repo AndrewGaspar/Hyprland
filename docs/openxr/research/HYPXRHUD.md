@@ -52,14 +52,16 @@ multi-overlay support + D-Bus monitoring privileges (URLs cited inline).
    pacing — a fourth fd, no threads, the Monado fence contract stays satisfied by
    construction. High-frequency updates (per-word transcript) use
    `NO_REPLY_EXPECTED` → fire-and-forget, no round-trip, thousands/sec headroom.
-5. **Notifications: make it a clean per-session choice.** The XR desktop is a
-   **separate SDDM login** (`hyprland-xr.conf` sources `hyprland.conf` →
-   Omarchy autostart's `exec-once = uwsm-app -- mako`), so it has its **own
-   session bus**. In that session, run **hypxrhud in place of mako** and let it
-   own `org.freedesktop.Notifications` and render toasts in-headset. On the 2D
-   host session, mako stays. For the nested/shared-bus preview case, hypxrhud
-   falls back to a **BecomeMonitor mirror** (permitted for the session owner) or
-   its own custom `Toast` API. Recommend: **(c)** — implement the freedesktop
+5. **Notifications: presence-gated mirror, mako keeps the name.** (Revised per
+   user 2026-07-13: the separate XR SDDM login is a *temporary artifact* of not
+   being upstreamed — the design must assume ONE session long-term, with mako
+   the notification daemon while the headset is doffed and hypxrhud taking over
+   only while **donned**.) mako owns `org.freedesktop.Notifications`
+   permanently; hypxrhud watches the bus via **BecomeMonitor** and, on the
+   presence edge (donned), renders mirror toasts in-headset while suppressing
+   mako's 2D popups via `makoctl mode`; on doff it stands down and mako resumes.
+   Action/dismiss round-trips go **through** mako (`makoctl invoke/dismiss -n
+   <id>`), so no ownership churn ever happens. Recommend: **(b′)** — the
    spec only when configured as the session daemon.
 6. **Recommend a new standalone repo** `~/code/hypxrhud` (BSD-3, hypxrpaper/
    hypxrvoice conventions). The render core lifts *out* of hypxrvoice into
@@ -314,9 +316,18 @@ via `exec-once = uwsm-app -- mako`
 autostart. So today the XR session *also* launches mako, and mako owns the name
 there.
 
-**Key enabling fact:** the XR desktop is a **separate SDDM login session**
-(`hyprland-xr.conf:1-6` — "pick it at the SDDM login screen"), therefore a
-**separate D-Bus session bus**. Daemon choice is per-session and clean.
+**Constraint revision (user, 2026-07-13).** An earlier draft leaned on the XR
+desktop being a separate SDDM login (its own session bus → per-session daemon
+choice). The user corrected this: the separate login is a **temporary artifact
+of HypXRland not being upstreamed** (kept so a stock 0.55.4 Hyprland remains
+available for stability), and the required behavior is **dynamic, within one
+session**: mako is the notification daemon while the headset is **doffed**;
+hypxrhud takes over the in-headset notification experience only while
+**donned**. Any design that assumes two session buses is scaffolding-dependent
+and rejected. Note that D-Bus name juggling on the presence edge is NOT viable
+as the mechanism: mako does not request the name with `ALLOW_REPLACEMENT` and
+has no release verb, so trading ownership would mean killing/restarting mako on
+every don/doff — fragile, racy, and it churns notification history.
 
 Options:
 
@@ -353,13 +364,47 @@ Options:
   `Toast` method covers the in-house clients. But third-party apps
   (`notify-send`, browser notifications) wouldn't reach the headset.
 
-**Recommendation: (c), shipping (d)'s `Toast` first and (a)'s spec surface as a
-follow-up (WP-H10); (b) documented as the nested/shared-bus fallback.** In the
-headset-primary SDDM session, replacing mako with hypxrhud is the *cleanest*
-outcome — no eavesdropping, full action/close round-trips, one renderer. On the
-2D host session mako is untouched. The Omarchy integration is a one-line
-autostart swap gated behind the XR-session config, exactly the kind of override
-the omarchy skill handles.
+**Recommendation (revised): (b′) — presence-gated mirror with makoctl
+round-trip. mako keeps the name permanently; there is no handover of ownership,
+only of *rendering*.**
+
+The (b) caveats dissolve one by one under the single-session/donned-gate
+constraint:
+
+1. **Read-only monitor → no action/close round-trip.** Solved by going *through*
+   mako instead of around it: a monitor connection sees both the `Notify` method
+   call **and its method-return** (monitors receive replies), so hypxrhud
+   correlates the reply serial to learn each notification's **id**. A toast
+   interaction then shells `makoctl invoke -n <id> [action]` / `makoctl dismiss
+   -n <id>` — mako emits the authoritative `ActionInvoked`/`NotificationClosed`
+   signals itself, and the sending app sees exactly the daemon it expects.
+2. **Double render.** On the donned edge hypxrhud applies a configurable
+   suppression command (default `makoctl mode -a do-not-disturb`; Omarchy
+   already defines the mode and `omarchy-toggle-notifications` toggles it) so
+   mako stops popping 2D surfaces onto the monitor quads while the mirror
+   renders head-locked toasts; on doff it removes the mode and stands down.
+   Notifications continue to land in mako's history the whole time — nothing is
+   lost across the transition, and dnd-suppressed `Notify` calls are still fully
+   visible to the monitor connection.
+3. **Presence edge.** The compositor already tracks `XR_EXT_user_presence` (the
+   plugged-state gate). v1: hypxrhud polls `hyprctl -j openxr status` at 1 Hz
+   (the hypxrvoice pattern); follow-up: a tiny compositor addition emitting a
+   socket2 `openxrpresence>>yes|no` event makes the handover edge-triggered —
+   worth bundling into whichever compositor WP touches XRIpc next.
+
+**The dbus-broker BecomeMonitor caveat is now load-bearing and must be verified
+STEP ZERO of WP-H10** (`busctl monitor` working on this box is strong evidence —
+it uses the same interface — but confirm the narrow
+`interface='org.freedesktop.Notifications',member='Notify'` match rule and that
+method-returns are delivered under dbus-broker before building on it). If
+monitoring fails verification, the fallback is (c) *static* ownership with its
+acknowledged regression (hypxrhud would own the name always and render doffed
+notifications onto a 2D fallback surface or via mako-as-history only) — a
+clearly worse shape, which is why the verification comes first.
+
+(a)/(c)-style ownership remains the right answer only for a true
+headset-primary session with no 2D use; keep it as a config mode
+(`notifications = mirror | own | off`, default `mirror`), not the default.
 
 ---
 
@@ -597,13 +642,18 @@ migration) after H4. H9 (keys) after H5. H10 (Notifications) after H7.
   pushes rendered lane text via `CreatePanel`/`UpdatePanel` (slots `keys`,
   `status`). *Accept:* keys + voice + a toast coexist in one hypxrhud session
   with correct slotting; killing hypxrkeys auto-dismisses its lanes.
-- **WP-H10 `[S/M]` — `org.freedesktop.Notifications` owner + mirror.** `own`
-  mode implements the spec (Notify→toast slot, urgency, expire, replaces_id,
-  actions best-effort, `NotificationClosed`); `mirror` mode uses BecomeMonitor;
-  Omarchy XR-session autostart swaps `mako`→`hypxrhud` behind the config knob.
-  *Accept:* in the XR SDDM session, `notify-send "hi"` shows a headset toast;
-  `mirror` mode shows mako's notifications in-headset on a shared bus (or SKIPs
-  with a clear message if dbus-broker refuses the monitor).
+- **WP-H10 `[M]` — presence-gated Notifications mirror (mako keeps the name).**
+  Step 0: VERIFY BecomeMonitor under dbus-broker (narrow match rule +
+  method-return delivery) — everything else gates on this. Then: monitor
+  connection correlating Notify replies→ids; donned-edge activation from
+  compositor presence (1 Hz status poll, socket2 event as follow-up);
+  configurable mako suppression (`makoctl mode -a do-not-disturb`) applied on
+  don / removed on doff; toast interaction round-trip via `makoctl invoke/
+  dismiss -n <id>`; `own` mode kept as a non-default config for headset-primary
+  setups. *Accept:* with headset donned, `notify-send "hi"` shows a headset
+  toast and NO mako 2D popup; doffing restores mako popups within one presence
+  poll; invoking a toast action fires the app's `ActionInvoked` handler; mako
+  history intact across don/doff cycles.
 
 ---
 
@@ -668,15 +718,16 @@ The SPOF is real but smaller than the status quo's triplicated fragility.
    inside hypxrvoice. The migration deletes the render core from hypxrvoice — OK?
 2. **Bus name:** `dev.hypxr.Hud` vs `org.hypxrland.Hud` vs
    `io.github.andrewgaspar.hypxrhud` — which reverse-DNS do you want to own?
-3. **Notifications strategy:** accept **(c)** — hypxrhud owns
-   `org.freedesktop.Notifications` **in the XR SDDM session** (replacing mako
-   there, one autostart-line swap), custom `Toast` first, spec surface as WP-H10,
-   BecomeMonitor `mirror` as the nested-preview fallback? Or keep mako everywhere
-   and go `Toast`-only (d)?
-4. **Replace mako in the XR session, or run both?** Running both means one owns
-   Notifications and the other is idle; replacing mako is cleaner but you lose
-   mako's 2D surface if you ever glance at a flat monitor without the headset.
-   Preference?
+3. **Notifications strategy (revised):** accept **(b′)** — mako owns the name
+   permanently; hypxrhud mirrors via BecomeMonitor only while DONNED, suppresses
+   mako's 2D popups via `makoctl mode` for the duration, and round-trips
+   actions/dismissals through `makoctl invoke/dismiss`? (Per your one-session
+   constraint; `own` mode kept as non-default config. dbus-broker monitor
+   verification is step 0.)
+4. **Suppression scope while donned:** default `do-not-disturb` mode hides ALL
+   mako popups in-headset (hypxrhud's toasts replace them). Alternative: leave
+   mako visible too (popups appear on the monitor quads) and skip suppression —
+   redundant but zero-risk. Default to suppress?
 5. **Slots:** are the four default slots (`voice`/`keys`/`toast`/`status`) and
    their poses the right starting set? Any others (e.g. a `media` now-playing
    widget, a `battery`/headset-status pinned corner)?
