@@ -1,6 +1,8 @@
 #pragma once
 
 #include "../../defines.hpp"
+#include <atomic>
+#include <cstdint>
 #include <list>
 #include <any>
 #include "../../helpers/WLClasses.hpp"
@@ -96,6 +98,16 @@ class CInputManager {
     void               onKeyboardKey(const IKeyboard::SKeyEvent&, SP<IKeyboard>);
     void               onMouseFrame();
     void               onKeyboardMod(SP<IKeyboard>);
+
+    // Monotonic timestamp (steady-clock ms) of the last PHYSICAL keyboard key PRESS. Published from
+    // onKeyboardKey (non-virtual keyboards only) so out-of-tree consumers can tell "is the user
+    // typing right now?" without touching the input path. Used by the OpenXR conditional hand-input
+    // gating (research/16 Part A): hands re-enable after openxr:hand_input_idle_s of keyboard
+    // silence. Static + atomic so it is readable lock-free from the XR frame thread (which must not
+    // touch g_pInputManager / hyprutils refcounts). 0 = no key pressed since boot.
+    static uint64_t    lastPhysicalKeyEventMs() {
+        return s_lastPhysicalKeyEventMs.load(std::memory_order_relaxed);
+    }
 
     void               newKeyboard(SP<IKeyboard>);
     void               newKeyboard(SP<Aquamarine::IKeyboard>);
@@ -304,6 +316,10 @@ class CInputManager {
     uint32_t              shareModsFromAllKBs(uint32_t depressed);
     std::vector<uint32_t> m_pressed;
     uint32_t              m_lastMods = 0;
+
+    // research/16 Part A: last physical-keyboard press time (steady ms), lock-free for the XR frame
+    // thread. Defined in InputManager.cpp; written in onKeyboardKey for non-virtual keyboards.
+    static std::atomic<uint64_t> s_lastPhysicalKeyEventMs;
 
     friend class CKeybindManager;
     friend class Desktop::View::CWLSurface;

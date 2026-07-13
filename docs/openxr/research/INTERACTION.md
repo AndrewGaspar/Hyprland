@@ -138,17 +138,25 @@ reports the sticky-stabilized per-quad `region` (scriptable — `hyprtester` `xr
 
 Order: D1 → D2 → D3 (v1 ships here) → D4 → D5; D6 parallel after D1; D7 last. D6 has no deps.
 
-### Track Z — Gaze grab (report 16)
-| WP | What | Headless? |
-|----|------|-----------|
-| Z1 | VIEW-space gaze-hover pass + selection publish (`m_gazeHoveredId`, per-layer `m_gazeSelected`) | Yes — scripted pose gtests |
-| Z2 | Gaze stabilization: 1€ filter + dwell + selection hysteresis. **The felt-quality WP.** | Yes |
-| Z3 | `CXRAnchor` gaze-carry state + `solve()` override + begin/pushPull/setDist/end | Yes — deterministic |
-| Z4 | Dispatchers + `cmd*` funnel + main↔frame handoff; hold-pair + toggle; status JSON `gaze:{}` | partly; key-flag feel LIVE |
-| Z5 | Selection + carry highlight via the chrome-fade envelope; `openxr:gaze_col_*` | state logic seam; visual LIVE |
-| Z6 | Eye-gaze source (`XR_EXT_eye_gaze_interaction`), auto-fallback to VIEW | blocked on Quest-Pro-class HW |
+### Track Z — Gaze grab (report 16) — **Z1–Z5 SHIPPED** (2026-07-12)
+| WP | What | Headless? | Status |
+|----|------|-----------|--------|
+| Z1 | VIEW-space gaze-hover pass + selection publish (`m_gazeHoveredId`, per-layer `m_gazeSelected`) | Yes — scripted pose gtests | **shipped** — `gazeSelectPass` |
+| Z2 | Gaze stabilization: 1€ filter + dwell + selection hysteresis. **The felt-quality WP.** | Yes | **shipped** — `SXRGazeSelect`/`stepGazeSelect` + `gaze_filter`/`gaze_dwell_ms`/`gaze_hysteresis_deg` |
+| Z3 | `CXRAnchor` gaze-carry state + `solve()` override + begin/pushPull/setDist/end | Yes — deterministic | **shipped** — solve gaze branch after the hand-grab override |
+| Z4 | Dispatchers + `cmd*` funnel + main↔frame handoff; toggle + gazepush/gazerelease; status JSON `gaze:{}` | partly; key-flag feel LIVE | **shipped** — `gazegrab`(toggle)/`gazerelease`/`gazepush` |
+| Z5 | Selection + carry highlight via the chrome-fade envelope + a gaze cursor dot; `openxr:gaze_cursor_col` | state logic seam; visual LIVE | **shipped** — candidate lights the move-bar; carry glows grab-color + gaze cursor |
+| Z6 | Eye-gaze source (`XR_EXT_eye_gaze_interaction`), auto-fallback to VIEW | blocked on Quest-Pro-class HW | **deferred** — `SXRSolveInput::gaze` field + `gaze_source=view\|eye` scaffold in place |
 
-Order: Z1 → Z2 → (Z3 parallel) → Z4 → Z5; Z6 last, hardware-gated. Z1-Z4 fully headless.
+Shipped decisions (locked with the user): gaze grab is a **TOGGLE** (tap grab / tap release); while
+grabbed the monitor **follows the head ray** at grab-time distance (`gaze_follow`, freeze available);
+push/pull is **stepped repeats** via `binde` + `gazepush`. Feedback = chrome highlight (no permanent
+reticle) + a gaze cursor on the carried monitor. Conditional hand-input gating (Part A, `hand_input =
+on|off|auto`) shipped alongside — the user's live pain was false hand gestures while typing.
+
+**Live-check backlog (Z4 key-flag feel + Z5 visuals, need a Quest 3):** confirm the toggle/`binde`
+feel on a real keyboard; judge the dwell time (200ms) + hysteresis (3°) + gaze-cursor size/color;
+confirm the candidate highlight (move-bar hover) reads clearly at typical monitor distances.
 
 ### Cross-track dependencies & de-dup
 - **1€ stabilization** appears in A-B, D (carry), and Z2 — all reuse the shipped

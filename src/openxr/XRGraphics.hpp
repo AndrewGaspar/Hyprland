@@ -85,7 +85,10 @@ class CXRGraphics {
     // (left hand tinted cooler when openxr:cursor_per_hand_tint). Opaque (alpha 1) so it never
     // punches an alpha hole under passthrough. No-op for an absent/hidden cursor or with openxr:cursor
     // off. May draw over content pixels (restored by the next content blit) — draw AFTER drawChrome.
-    void drawCursor(CXRMonitorLayer& layer, XR_GLuint dstTex, uint32_t packedL, uint32_t packedR);
+    // packedGaze (research/16 §3.3) is the gaze cursor word for the CARRIED monitor — drawn in a
+    // single distinct color (openxr:gaze_cursor_col) regardless of state, so the gaze point is
+    // visible while carrying. 0 = no gaze cursor. Draw AFTER the hand cursors.
+    void drawCursor(CXRMonitorLayer& layer, XR_GLuint dstTex, uint32_t packedL, uint32_t packedR, uint32_t packedGaze = 0);
 
     // RAII guard for an XR GL burst. ctor makes the XR context current; dtor RESTORES whatever
     // EGL binding was current before the burst (WP-L1, research doc 17 §5) instead of blindly

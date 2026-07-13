@@ -63,6 +63,9 @@
 
 using namespace Hyprutils::String;
 
+// research/16 Part A: physical-keyboard activity recency for OpenXR conditional hand-input gating.
+std::atomic<uint64_t> CInputManager::s_lastPhysicalKeyEventMs{0};
+
 CInputManager::CInputManager() {
     m_listeners.setCursorShape = PROTO::cursorShape->m_events.setShape.listen([this](const CCursorShapeProtocol::SSetShapeEvent& event) {
         if (!g_pSeatManager->m_state.pointerFocusResource)
@@ -1619,6 +1622,14 @@ void CInputManager::updateKeyboardsLeds(SP<IKeyboard> pKeyboard) {
 void CInputManager::onKeyboardKey(const IKeyboard::SKeyEvent& event, SP<IKeyboard> pKeyboard) {
     if (!pKeyboard->m_enabled || !pKeyboard->m_allowed)
         return;
+
+    // research/16 Part A: publish physical-keyboard activity recency for OpenXR hand-input gating.
+    // Physical keyboards only (virtual/IME keyboards are not "the user typing at their desk"); on
+    // key PRESS (the activity edge). Read lock-free from the XR frame thread. NOTE: an openxr
+    // handinput key-chord press also updates this — harmless, since that chord puts hand input in
+    // an explicit on/off mode that ignores the idle timer (only hand_input=auto consults it).
+    if (!pKeyboard->isVirtual() && event.state == WL_KEYBOARD_KEY_STATE_PRESSED)
+        s_lastPhysicalKeyEventMs.store(Time::millis(Time::steadyNow()), std::memory_order_relaxed);
 
     const bool           DISALLOWACTION = pKeyboard->isVirtual() && shouldIgnoreVirtualKeyboard(pKeyboard);
 
