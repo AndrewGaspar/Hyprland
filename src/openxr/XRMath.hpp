@@ -821,4 +821,237 @@ namespace OpenXR {
         accumSec += std::max(0.F, dtSec);
         return accumSec >= dwellSec;
     }
+
+    // ---- ray aim / cursor / hover assist (docs/openxr/research/INTERACTION.md "Aiming", report 14) ----
+    //
+    // Pure, unconditional (gtest-covered in tests/xr/ray_assist.cpp): everything the ray-aim
+    // pipeline needs that is not already an OpenXR call — the "is this a grab handle" predicate, a
+    // per-region uv rect, forgiving (cone-magnetized) classification, the sticky-hover Schmitt, the
+    // aim-filter pinch-onset damping, and the endpoint-cursor pack/state/size/tint helpers. All POD
+    // + scalars (no clocks, no OpenXR headers), so the frame thread runs them with ZERO hyprutils
+    // refcount ops (XRMonitorLayer.hpp rule) and the gtests exercise the full truth tables.
+
+    // A grab HANDLE region — the move-bar or any corner. Body/margin/none are not handles. The
+    // endpoint cursor + hover haptic + magnetism all key on this ("you are on something grabbable").
+    inline bool xrRegionIsGrabbable(eXRQuadRegion r) {
+        return r == XR_REGION_BAR || xrRegionIsCorner(r);
+    }
+
+    // The uv rect (top-left origin, v down) of a chrome region within the full quad. Returns false
+    // for regions with no rect (body/margin/none). Corner rects match classifyQuadHit's bands
+    // exactly (the square just OUTSIDE the content corner), so hysteresis + magnetism agree with the
+    // hit test and the drawChrome fills.
+    inline bool xrRegionRect(const SXRChromeGeometry& g, eXRQuadRegion r, float& u0, float& v0, float& u1, float& v1) {
+        switch (r) {
+            case XR_REGION_BAR:
+                if (!(g.barU1 > g.barU0 && g.barV1 > g.barV0))
+                    return false;
+                u0 = g.barU0;
+                v0 = g.barV0;
+                u1 = g.barU1;
+                v1 = g.barV1;
+                return true;
+            case XR_REGION_CORNER_TL:
+                u0 = g.contentU0 - g.cornerU;
+                v0 = g.contentV0 - g.cornerV;
+                u1 = g.contentU0;
+                v1 = g.contentV0;
+                break;
+            case XR_REGION_CORNER_TR:
+                u0 = g.contentU1;
+                v0 = g.contentV0 - g.cornerV;
+                u1 = g.contentU1 + g.cornerU;
+                v1 = g.contentV0;
+                break;
+            case XR_REGION_CORNER_BL:
+                u0 = g.contentU0 - g.cornerU;
+                v0 = g.contentV1;
+                u1 = g.contentU0;
+                v1 = g.contentV1 + g.cornerV;
+                break;
+            case XR_REGION_CORNER_BR:
+                u0 = g.contentU1;
+                v0 = g.contentV1;
+                u1 = g.contentU1 + g.cornerU;
+                v1 = g.contentV1 + g.cornerV;
+                break;
+            default: return false;
+        }
+        return g.cornerU > 0.F && g.cornerV > 0.F;
+    }
+
+    // Distance from (u,v) to the rect [u0,v0,u1,v1], measured in SLACK units per axis (0 inside).
+    // Used to rank magnetism candidates and to test hysteresis exit bounds. A zero slack on an axis
+    // makes any outside offset on that axis "infinitely far" (never snaps/holds along a collapsed
+    // axis), which is the correct degenerate behavior.
+    inline float xrRectSlackDist(float u, float v, float u0, float v0, float u1, float v1, float sU, float sV) {
+        const float du = std::max(std::max(u0 - u, u - u1), 0.F);
+        const float dv = std::max(std::max(v0 - v, v - v1), 0.F);
+        const float nu = du <= 0.F ? 0.F : (sU > 0.F ? du / sU : 1e9F);
+        const float nv = dv <= 0.F ? 0.F : (sV > 0.F ? dv / sV : 1e9F);
+        return std::sqrt(nu * nu + nv * nv);
+    }
+
+    // Forgiving classification (report 14 §4 Stage A4 + Stage C, chrome-only magnetism). Start from
+    // the exact classify; an exact BODY / BAR / CORNER hit is returned verbatim so content precision
+    // is preserved (BODY is NEVER magnetized) and an exact handle wins. Only a MARGIN hit is upgraded:
+    // if a grab HANDLE lies within (slackU,slackV) uv, snap to the NEAREST handle so the highlight
+    // (and grab eligibility) turns on exactly when a squeeze — which already forgives the same cone —
+    // would grab. slackU/slackV are the cone slack in uv (tan(cone)*t / quadMeters per axis); pass 0
+    // to disable magnetism (pure alignment then reduces to the exact classify). The cursor stays at
+    // the RAW uv (only the region is forgiven), so the user still sees precisely where they point.
+    inline eXRQuadRegion classifyQuadRegionForgiving(float u, float v, const SXRChromeGeometry& g, float slackU, float slackV) {
+        const eXRQuadRegion base = classifyQuadHit(u, v, g);
+        if (base != XR_REGION_MARGIN)
+            return base; // BODY (precision) / BAR / CORNER — never override an exact hit
+        if (slackU <= 0.F && slackV <= 0.F)
+            return base;
+
+        eXRQuadRegion       best     = XR_REGION_MARGIN;
+        float               bestDist = 1.F + 1e-4F; // must be within one slack unit to snap
+        const eXRQuadRegion handles[] = {XR_REGION_BAR, XR_REGION_CORNER_TL, XR_REGION_CORNER_TR, XR_REGION_CORNER_BL, XR_REGION_CORNER_BR};
+        for (const eXRQuadRegion r : handles) {
+            float u0, v0, u1, v1;
+            if (!xrRegionRect(g, r, u0, v0, u1, v1))
+                continue;
+            const float d = xrRectSlackDist(u, v, u0, v0, u1, v1, slackU, slackV);
+            if (d < bestDist) {
+                bestDist = d;
+                best     = r;
+            }
+        }
+        return best;
+    }
+
+    // ---- sticky hover (report 14 §4 Stage A2) ----
+    //
+    // Region transitions are otherwise instantaneous, so the highlight/grab-eligibility flickers at
+    // handle boundaries and across brief tracking dropouts — a large part of "hard to grab." This is
+    // the region analog of SXRSchmitt: once the ray lands a grab HANDLE, hold that region until the
+    // ray leaves the handle rect expanded by a hysteresis margin (or lands a DIFFERENT handle, which
+    // wins immediately), tolerating up to `maxMiss` frames where the ray misses every quad.
+    struct SXRHoverStick {
+        eXRQuadRegion region = XR_REGION_NONE; // published sticky region
+        int64_t       mon    = -1;             // MONITORID owning the sticky region (-1 = none)
+        int           miss   = 0;              // consecutive frames the ray fell off the sticky target
+    };
+
+    // One sticky-hover step. rawRegion/rawMon = this frame's (forgiving) classification on the quad
+    // the ray hit (rawMon < 0 ⇒ the ray missed every quad this frame). (u,v) is the raw hit uv on
+    // rawMon; g is rawMon's chrome (or the sticky monitor's when holding across a same-monitor
+    // non-handle hover). exitU/exitV are the hysteresis exit margins in uv; maxMiss is the dropout
+    // tolerance. Returns the region to publish and advances `s`.
+    inline eXRQuadRegion stepHoverStick(SXRHoverStick& s, eXRQuadRegion rawRegion, int64_t rawMon, float u, float v, const SXRChromeGeometry& g, float exitU, float exitV,
+                                        int maxMiss) {
+        // A fresh grab handle always wins immediately (snappy acquisition, no lag on entry).
+        if (rawMon >= 0 && xrRegionIsGrabbable(rawRegion)) {
+            s.region = rawRegion;
+            s.mon    = rawMon;
+            s.miss   = 0;
+            return s.region;
+        }
+
+        // Holding a handle: decide whether to keep it.
+        if (xrRegionIsGrabbable(s.region) && s.mon >= 0) {
+            if (rawMon == s.mon) {
+                // The ray still hits the sticky monitor but on a non-handle region (body/margin).
+                // Hold while it is within the handle rect expanded by the exit margin.
+                float u0, v0, u1, v1;
+                if (xrRegionRect(g, s.region, u0, v0, u1, v1)) {
+                    const float d = xrRectSlackDist(u, v, u0, v0, u1, v1, exitU, exitV);
+                    if (d <= 1.F) {
+                        s.miss = 0;
+                        return s.region; // still within the sticky exit bound -> hold
+                    }
+                }
+                // Left the exit bound -> release to the raw region below.
+            } else if (rawMon < 0) {
+                // The ray missed everything: tolerate a short dropout so a 1-2 frame tracking gap
+                // does not drop the highlight.
+                if (++s.miss <= maxMiss)
+                    return s.region;
+            }
+            // else: a different monitor -> release below.
+        }
+
+        s.region = rawRegion;
+        s.mon    = rawMon;
+        s.miss   = 0;
+        return s.region;
+    }
+
+    // ---- aim-pose 1€ filter helpers (report 14 §4 Stage B) ----
+    //
+    // The aim pose is 1€-filtered before hit-testing (openxr:aim_filter) via the existing
+    // oneEuroStepPose. The only extra decision is pinch-onset damping: while a press/pinch is
+    // RAMPING UP (analog in the onset band, below the trigger-on threshold), lower the min-cutoff so
+    // the commit gesture does not yank the aim off-target on the exact frame the user commits (the
+    // documented Meta behavior). Outside the band the base cutoff is used.
+    inline float aimFilterMinCutoff(float base, float damping, float analog, float onsetLo, float triggerOn) {
+        if (analog > onsetLo && analog < triggerOn)
+            return base * std::clamp(damping, 0.F, 1.F);
+        return base;
+    }
+
+    // ---- endpoint cursor (report 14 §4 Stage A1) ----
+    //
+    // The cursor is drawn into the hovered quad's own swapchain image at the ray-hit uv (the same
+    // pass as drawChrome). Its per-hand sample crosses frame->frame on ONE atomic word per hand on
+    // the layer (the XRMonitorLayer.hpp visual-state contract, extended): present(1) state(3) u(14)
+    // v(14). u/v are the RAW hit uv clamped to [0,1] (full quad, so the cursor can sit over content,
+    // margin, or a handle).
+    enum eXRCursorState : uint8_t {
+        XR_CURSOR_HIDDEN = 0,
+        XR_CURSOR_IDLE,      // over body / margin
+        XR_CURSOR_GRABBABLE, // over the move-bar or a corner (a squeeze would grab)
+        XR_CURSOR_PRESS,     // a button / pinch is pressed (cursor grows)
+        XR_CURSOR_GRAB,      // actively grabbing (ray suppressed; reserved)
+    };
+
+    inline uint32_t xrPackCursor(bool present, eXRCursorState st, float u, float v) {
+        const uint32_t uq = (uint32_t)std::lround(std::clamp(u, 0.F, 1.F) * 16383.F) & 0x3FFF;
+        const uint32_t vq = (uint32_t)std::lround(std::clamp(v, 0.F, 1.F) * 16383.F) & 0x3FFF;
+        const uint32_t sp = present ? 1u : 0u;
+        return (sp << 31) | (((uint32_t)st & 0x7u) << 28) | (uq << 14) | vq;
+    }
+
+    inline void xrUnpackCursor(uint32_t w, bool& present, eXRCursorState& st, float& u, float& v) {
+        present = (w >> 31) & 0x1u;
+        st      = (eXRCursorState)((w >> 28) & 0x7u);
+        u       = (float)((w >> 14) & 0x3FFFu) / 16383.F;
+        v       = (float)(w & 0x3FFFu) / 16383.F;
+    }
+
+    // Endpoint-cursor color for a state, from the openxr:cursor_col_* palette.
+    inline uint32_t xrCursorColorFor(eXRCursorState st, uint32_t idle, uint32_t grabbable, uint32_t press, uint32_t grab) {
+        switch (st) {
+            case XR_CURSOR_GRABBABLE: return grabbable;
+            case XR_CURSOR_PRESS: return press;
+            case XR_CURSOR_GRAB: return grab;
+            default: return idle;
+        }
+    }
+
+    // Per-hand cursor tint so two simultaneous rays are distinguishable (openxr:cursor_per_hand_tint).
+    // The right hand keeps the palette color; the left hand is shifted COOLER (red pulled down, blue
+    // pushed up) with alpha + green preserved. Deterministic (gtested); enable=false is identity.
+    inline uint32_t xrCursorTint(uint32_t argb, int hand /* 0 = left, 1 = right */, bool enable) {
+        if (!enable || hand != 0)
+            return argb;
+        const uint32_t a = (argb >> 24) & 0xFF;
+        const uint32_t r = (argb >> 16) & 0xFF;
+        const uint32_t g = (argb >> 8) & 0xFF;
+        const uint32_t b = argb & 0xFF;
+        const uint32_t rr = (uint32_t)std::lround(r * 0.40F);
+        const uint32_t bb = b + (uint32_t)std::lround((255.F - b) * 0.50F);
+        return (a << 24) | (rr << 16) | (g << 8) | (bb & 0xFF);
+    }
+
+    // Endpoint-cursor uv half-extents from a metric diameter and the FULL quad meters (per-axis so
+    // the dot stays metrically round across the quad aspect); grown by pressScale while pressed.
+    inline void xrCursorRadiusUV(float diamM, float quadWm, float quadHm, bool pressed, float pressScale, float& ru, float& rv) {
+        const float scale = pressed ? std::max(1.F, pressScale) : 1.F;
+        ru                = quadWm > 0.F ? 0.5F * diamM * scale / quadWm : 0.F;
+        rv                = quadHm > 0.F ? 0.5F * diamM * scale / quadHm : 0.F;
+    }
 }
