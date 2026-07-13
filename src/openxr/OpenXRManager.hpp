@@ -155,6 +155,13 @@ class COpenXRManager {
     std::expected<void, std::string> cmdUndock();                          // (none)
     std::expected<void, std::string> cmdRoam(const std::string& args);     // head|body
 
+    // --- gaze grab + conditional hand input (research/16). Main thread; take m_layersMu. ---
+    // gazegrab TOGGLES: grabs the dwell-stable gazed-at monitor, or releases the current gaze carry.
+    std::expected<void, std::string> cmdGazeGrab();                        // (none) — toggle
+    std::expected<void, std::string> cmdGazeRelease();                     // (none) — explicit release
+    std::expected<void, std::string> cmdGazePush(const std::string& args); // <±m> (default gaze_dist_step)
+    std::expected<void, std::string> cmdHandInput(const std::string& args); // on|off|auto|toggle
+
     // Snapshot of one XR monitor for `hyprctl openxr status` (doc 05 §4.3). Main thread.
     struct SXRMonitorInfo {
         std::string name;
@@ -198,6 +205,26 @@ class COpenXRManager {
                                       // (openxr:grab_filter on AND hands active)
     };
     std::array<SXRHandInputInfo, 2> handInputInfos() const;
+
+    // research/16 Part A: conditional hand-input policy state for `hyprctl openxr status`. `mode` is
+    // the openxr:hand_input policy (on|off|auto, live-mutable via `xrmonitor handinput`); `state` is
+    // the resolved gate: active | gated (keyboard) | gated (manual) | off. Readable on either thread.
+    struct SXRHandInputStatus {
+        std::string mode  = "auto";
+        std::string state = "off";
+    };
+    SXRHandInputStatus handInputStatus() const;
+
+    // research/16 Part B: gaze grab status for `hyprctl openxr status`.
+    struct SXRGazeStatus {
+        std::string source        = "view"; // openxr:gaze_source
+        int64_t     hoveredMonitor = -1;    // dwell-stable candidate id (-1 = looking at passthrough)
+        std::string hoveredName;            // resolved name of hoveredMonitor ("" if none)
+        bool        carrying = false;       // a gaze carry is active
+        std::string carryMonitor;           // its monitor name ("" if none)
+        float       dist = 0.f;             // carry distance in meters (0 when not carrying)
+    };
+    SXRGazeStatus gazeStatus();
 
     // `hyprctl openxr layout`: paste-ready `xrmonitor = ...` lines for every live XR monitor.
     std::string layoutDump();
@@ -356,6 +383,50 @@ class COpenXRManager {
     void              publishAdaptiveStringTuning();      // main thread only
     std::atomic<int>  m_adRoamMode{OpenXR::XR_ANCHOR_BODY};
     std::atomic<int>  m_adEase{OpenXR::XR_EASE_SMOOTHSTEP};
+
+    // ---- conditional hand input (research/16 Part A) ----
+    // m_handPolicy is the openxr:hand_input baseline (config + `handinput on|off|auto`); m_handForce
+    // is a runtime manual latch set ONLY by `handinput toggle` and consulted ONLY in AUTO. Both are
+    // atomics: the main-thread dispatcher/config writes, the frame thread (gating gate before
+    // processPointer) and either thread (status) read. m_handPolicyConfigStr caches the last config
+    // string so a reload that did NOT change openxr:hand_input preserves a runtime dispatcher change.
+    enum eXRHandPolicy : uint8_t { HANDPOL_AUTO = 0, HANDPOL_ON, HANDPOL_OFF };
+    enum eXRHandForce : uint8_t { HANDFORCE_NONE = 0, HANDFORCE_ON, HANDFORCE_OFF };
+    enum eXRHandInputState : uint8_t { HANDIN_ACTIVE = 0, HANDIN_GATED_KBD, HANDIN_GATED_MANUAL, HANDIN_OFF };
+    std::atomic<uint8_t> m_handPolicy{HANDPOL_AUTO};
+    std::atomic<uint8_t> m_handForce{HANDFORCE_NONE};
+    std::string          m_handPolicyConfigStr; // main thread; last openxr:hand_input value applied
+    // Any layer currently roaming (adaptive phase != DOCKED): the "away from the seat" OR-term of the
+    // AUTO gate. Written frame-thread each solve, read main-thread (status) + frame-thread (gate).
+    std::atomic<bool>    m_anyRoaming{false};
+    // Re-read openxr:hand_input into m_handPolicy with change detection (main thread). Called from
+    // start() + onConfigReload(); an actual change resets the manual force latch.
+    void                 publishHandInputPolicy();
+    // Resolve the effective hand-input gate (usable on either thread — reads atomics + the static
+    // keyboard-recency signal + config numerics). handInputEnabled() == (state == HANDIN_ACTIVE).
+    eXRHandInputState    handInputState() const;
+    bool                 handInputEnabled() const {
+        return handInputState() == HANDIN_ACTIVE;
+    }
+
+    // ---- gaze grab (research/16 Part B) ----
+    // frame -> main: the dwell-stable gazed-at monitor id (the m_monitorId atomic pattern). Written
+    // release-store after the gaze pass; read acquire-load in the dispatchers + status.
+    std::atomic<int64_t> m_gazeHoveredId{-1};
+    // The monitor currently gaze-carried (main-thread string; "" = none). Set by cmdGazeGrab, cleared
+    // by cmdGazeRelease/toggle + on that monitor's destroy. O(1) toggle/release + status.
+    std::string          m_gazeCarryMonitor;
+    // Frame-thread-only gaze state: the 1€ pose pre-filter, the dwell/hysteresis selector, and the
+    // most recent nearest-hit id + uv (for the gaze cursor). Touched only on the frame thread.
+    OpenXR::SXROneEuroPose m_gazeFilter;
+    OpenXR::SXRGazeSelect  m_gazeSel;
+    int64_t                m_gazeHitId = -1;
+    Vector2D               m_gazeHitUV;
+    // The gaze-hover + selection + gaze-cursor pass (frame thread). Casts the (optionally filtered)
+    // gaze ray over the pointer targets, advances the dwell selector, publishes m_gazeHoveredId + the
+    // per-layer m_gazeSelected highlight, and packs the gaze cursor onto the carried layer. `active`
+    // is the frame's visible-layer snapshot (same vector processPointer consumed).
+    void gazeSelectPass(const std::vector<SXRPointerTarget>& targets, const std::vector<PXRLAYER>& active, const OpenXR::SXRPose& view, bool viewValid, float dt);
     // Copy of the most recent frame-thread solve inputs, so verbs (main thread) get a view/grip
     // context without blocking the frame thread. Written by the frame thread under m_layersMu.
     OpenXR::SXRVerbContext currentVerbContext();
