@@ -989,6 +989,35 @@ bool CXRAnchor::applyCenter(const SXRVerbContext& ctx, float defaultDistance) {
     return true;
 }
 
+// ---- explicit local placement (hypxrvoice GAP 2) ----
+
+void CXRAnchor::placeLocalAt(const SXRPose& W) {
+    m_state.mode       = XR_ANCHOR_LOCAL;
+    m_state.anchorPose = W;
+
+    // A teleport ends any active grab/carry (their overrides live in separate state that would
+    // otherwise fight the new pose) and resets the adaptive phase — W is the new docked desk pose.
+    m_grabbed          = false;
+    m_grabPinch        = false;
+    m_grabHandActive   = false;
+    m_gazeGrabbed      = false;
+    m_resizing         = false;
+    m_carryFilter.reset();
+    m_adPhase          = XRAD_DOCKED;
+    m_dockSeatCaptured = false;
+    m_outDwell         = 0.F;
+    m_inDwell          = 0.F;
+    m_adT              = 0.F;
+
+    // Warp: reseed the spring + last-world so the next solve lands exactly at W with no one-frame
+    // chase from the old pose (same seeding as recenterLocalToHead's re-seat tail).
+    m_springInit   = false;
+    m_chasing      = false;
+    m_springVel    = Vec3{};
+    m_lastWorld    = W;
+    m_hasLastWorld = true;
+}
+
 // ---- mode transition (§5.6) ----
 
 bool CXRAnchor::setMode(eXRAnchorMode newMode, eXRHand hand, const SXRVerbContext& ctx, const SXRAnchorTuning& tune) {
