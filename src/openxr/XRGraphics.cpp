@@ -664,9 +664,12 @@ void CXRGraphics::drawChrome(CXRMonitorLayer& layer, XR_GLuint dstTex, float alp
     glDeleteFramebuffers(1, &fbo);
 }
 
-void CXRGraphics::drawCursor(CXRMonitorLayer& layer, XR_GLuint dstTex, uint32_t packedL, uint32_t packedR) {
-    static auto PCURSOR = CConfigValue<Hyprlang::INT>("openxr:cursor");
-    if (*PCURSOR == 0)
+void CXRGraphics::drawCursor(CXRMonitorLayer& layer, XR_GLuint dstTex, uint32_t packedL, uint32_t packedR, uint32_t packedGaze) {
+    static auto PCURSOR   = CConfigValue<Hyprlang::INT>("openxr:cursor");
+    static auto PGAZECUR  = CConfigValue<Hyprlang::INT>("openxr:gaze_cursor");
+    const bool  handsOn   = *PCURSOR != 0;
+    const bool  gazeOn    = *PGAZECUR != 0 && packedGaze != 0;
+    if (!handsOn && !gazeOn)
         return;
 
     const int W = (int)layer.m_swapchainSize.x;
@@ -681,6 +684,7 @@ void CXRGraphics::drawCursor(CXRMonitorLayer& layer, XR_GLuint dstTex, uint32_t 
     static auto PCGRAB = CConfigValue<Config::INTEGER>("openxr:cursor_col_grabbable");
     static auto PCPRES = CConfigValue<Config::INTEGER>("openxr:cursor_col_press");
     static auto PCGRB2 = CConfigValue<Config::INTEGER>("openxr:cursor_col_grab");
+    static auto PGAZECOL = CConfigValue<Config::INTEGER>("openxr:gaze_cursor_col");
 
     const float    diamM      = (float)*PSIZE;
     const float    pressScale = (float)*PPRESS;
@@ -697,23 +701,22 @@ void CXRGraphics::drawCursor(CXRMonitorLayer& layer, XR_GLuint dstTex, uint32_t 
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glEnable(GL_SCISSOR_TEST);
 
-    const uint32_t packed[2] = {packedL, packedR};
-    for (int hand = 0; hand < 2; ++hand) {
+    // Draw one dot from a packed cursor word with an explicit ARGB color. Opaque (alpha 1) so it
+    // never punches an alpha hole under passthrough; rgb dimmed by the color's alpha so a low-alpha
+    // config color reads dimmer (same rule as clearTex). The press-grow scale only applies to hands.
+    auto drawDot = [&](uint32_t packed, uint32_t argb, bool allowPressGrow) {
         bool                   present = false;
         OpenXR::eXRCursorState st      = OpenXR::XR_CURSOR_HIDDEN;
         float                  u = 0.f, v = 0.f;
-        OpenXR::xrUnpackCursor(packed[hand], present, st, u, v);
+        OpenXR::xrUnpackCursor(packed, present, st, u, v);
         if (!present || st == OpenXR::XR_CURSOR_HIDDEN)
-            continue;
+            return;
 
         float ru = 0.f, rv = 0.f;
-        OpenXR::xrCursorRadiusUV(diamM, layer.m_quadWMeters, layer.m_quadHMeters, st == OpenXR::XR_CURSOR_PRESS, pressScale, ru, rv);
+        OpenXR::xrCursorRadiusUV(diamM, layer.m_quadWMeters, layer.m_quadHMeters, allowPressGrow && st == OpenXR::XR_CURSOR_PRESS, pressScale, ru, rv);
         if (ru <= 0.f || rv <= 0.f)
-            continue;
+            return;
 
-        const uint32_t argb = OpenXR::xrCursorTint(OpenXR::xrCursorColorFor(st, colIdle, colGrab, colPress, colGrb2), hand, tint);
-        // Opaque dot: rgb dimmed by the color's alpha (so a low-alpha config color reads dimmer) but
-        // written at alpha 1 so it never punches an alpha hole under passthrough (same rule as clearTex).
         const float ca = ((argb >> 24) & 0xff) / 255.f;
         const float cr = ((argb >> 16) & 0xff) / 255.f * ca;
         const float cg = ((argb >> 8) & 0xff) / 255.f * ca;
@@ -727,11 +730,28 @@ void CXRGraphics::drawCursor(CXRMonitorLayer& layer, XR_GLuint dstTex, uint32_t 
         const int   glY0 = (int)std::lround((1.f - fv1) * H);
         const int   glY1 = (int)std::lround((1.f - fv0) * H);
         if (x1 <= x0 || glY1 <= glY0)
-            continue;
+            return;
         glScissor(x0, glY0, x1 - x0, glY1 - glY0);
         glClearColor(cr, cg, cb, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
+    };
+
+    if (handsOn) {
+        const uint32_t packed[2] = {packedL, packedR};
+        for (int hand = 0; hand < 2; ++hand) {
+            bool                   present = false;
+            OpenXR::eXRCursorState st      = OpenXR::XR_CURSOR_HIDDEN;
+            float                  u = 0.f, v = 0.f;
+            OpenXR::xrUnpackCursor(packed[hand], present, st, u, v);
+            if (!present || st == OpenXR::XR_CURSOR_HIDDEN)
+                continue;
+            const uint32_t argb = OpenXR::xrCursorTint(OpenXR::xrCursorColorFor(st, colIdle, colGrab, colPress, colGrb2), hand, tint);
+            drawDot(packed[hand], argb, /*allowPressGrow=*/true);
+        }
     }
+    // Gaze cursor (research/16 §3.3): a single fixed color, drawn last so it reads on top.
+    if (gazeOn)
+        drawDot(packedGaze, (uint32_t)(int64_t)*PGAZECOL, /*allowPressGrow=*/false);
 
     glDisable(GL_SCISSOR_TEST);
     glDeleteFramebuffers(1, &fbo);

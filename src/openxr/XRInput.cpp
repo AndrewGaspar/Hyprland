@@ -423,9 +423,15 @@ bool CXRInput::isMonitorGrabbed(MONITORID id) const {
     return m_grabbedMon[OpenXR::XR_HAND_LEFT] == id || m_grabbedMon[OpenXR::XR_HAND_RIGHT] == id;
 }
 
-void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint32_t timeMs, const OpenXR::SXRSolveInput& solveIn, const OpenXR::SXRAnchorTuning& tune) {
+void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint32_t timeMs, const OpenXR::SXRSolveInput& solveIn, const OpenXR::SXRAnchorTuning& tune, bool handsEnabled) {
     if (!m_emit)
         return;
+
+    // research/16 Part A: is THIS hand's input gated off right now? Only ever true for a hand-tracked
+    // device (handActive) — controllers are never gated. A gated hand casts no ray, drives no cursor/
+    // click, and any in-progress grab is released (the grab machine sees its gesture value forced to
+    // 0 -> the falling-edge release-latch path runs, so there is no mid-air freeze).
+    auto handGated = [&](OpenXR::eXRHand h) { return !handsEnabled && handActive(h); };
 
     static auto PSELON      = CConfigValue<Hyprlang::FLOAT>("openxr:pointer_trigger_threshold");
     static auto PSELOFF     = CConfigValue<Hyprlang::FLOAT>("openxr:pointer_trigger_threshold_release");
@@ -510,6 +516,24 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
     //    pointer events — chrome visuals come in WP-G2). BODY-hover changes (incl. none<->some)
     //    transfer pointer ownership (§3), preserving today's click/scroll semantics exactly.
     for (auto hand : {XR_HAND_LEFT, XR_HAND_RIGHT}) {
+        // research/16 Part A: a gated hand is fully inert — clear all its hover/cursor exports (so no
+        // stale highlight lingers), reset the aim/hover filters, and drop pointer ownership. Its grab
+        // (if any) is released by the grab machine below (gesture forced to 0). Controllers unaffected.
+        if (handGated(hand)) {
+            m_hoverMon[hand]       = -1;
+            m_hoverUV[hand]        = Vector2D{};
+            m_hoverChromeMon[hand] = -1;
+            m_hoverRegion[hand]    = OpenXR::XR_REGION_NONE;
+            m_hoverStick[hand]     = OpenXR::SXRHoverStick{};
+            m_prevHoverGrabbable[hand] = false;
+            m_cursorMon[hand]      = -1;
+            m_cursorState[hand]    = OpenXR::XR_CURSOR_HIDDEN;
+            m_aimFilter[hand].reset();
+            if (m_owner == (int)hand)
+                m_owner = -1;
+            continue;
+        }
+
         MONITORID            newBodyMon = -1; // BODY hover (drives pointer); remapped content uv
         Vector2D             newBodyUV;
         MONITORID            newChromeMon = -1;                     // whichever quad the ray actually hit
@@ -640,7 +664,9 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
         const bool                            handIsHands = handActive(hand);
         const float                           pinchVal    = m_hands[hand].pinchValue;
         const float                           graspVal    = m_hands[hand].grab;
-        const float                           grabVal     = handIsHands ? OpenXR::xrHandGrabValue(handGrabMode, pinchVal, graspVal) : graspVal;
+        // research/16 Part A: force the grab gesture to 0 for a gated hand so an in-progress grab
+        // falls through the release-latch edge below and no new grab can begin.
+        const float                           grabVal     = handGated(hand) ? 0.f : (handIsHands ? OpenXR::xrHandGrabValue(handGrabMode, pinchVal, graspVal) : graspVal);
         const std::optional<OpenXR::SXRPose>& pinchPose   = hand == XR_HAND_LEFT ? solveIn.pinchLeft : solveIn.pinchRight;
         const bool                            gestureIsPinch = OpenXR::xrHandGrabUsesPinch(handGrabMode, pinchVal, graspVal);
         const bool                            wantPinch   = handIsHands && gestureIsPinch && pinchPose.has_value();
@@ -699,7 +725,9 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                     }
                 }
 
-                if (target && target->anchor && !target->anchor->grabbed() && newDevPose && action != OpenXR::XR_GRAB_ACTION_NONE) {
+                // research/16 §4.6: a gaze carry owns the monitor too — a hand grab no-ops on it
+                // (first grab wins), just as it does for a hand grab by the other hand.
+                if (target && target->anchor && !target->anchor->grabbed() && !target->anchor->gazeGrabbed() && newDevPose && action != OpenXR::XR_GRAB_ACTION_NONE) {
                     // WP-G5: anchor a hand grab to the pinch pose (wantPinch), a controller/grasp
                     // grab to the grip pose. m_grabDevicePinch remembers the choice so every carry/
                     // resize/latch frame feeds the SAME device pose.
@@ -846,8 +874,14 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
         if (m_grabbing[hand])
             continue;
 
+        // research/16 Part A: a gated hand's button analogs are forced to 0 — a held button releases
+        // (never sticks) and no new press starts.
+        const bool  gated       = handGated(hand);
+        const float selectVal   = gated ? 0.f : m_hands[hand].select;
+        const bool  menuVal     = gated ? false : m_hands[hand].menu;
+
         // select -> BTN_LEFT
-        if (m_selectTrig[hand].update(m_hands[hand].select, onT, offT)) {
+        if (m_selectTrig[hand].update(selectVal, onT, offT)) {
             if (m_selectTrig[hand].state) {
                 m_owner = hand; // press owns the pointer (§4)
                 emitOwnerMotion();
@@ -874,7 +908,7 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
         }
 
         // menu -> BTN_RIGHT (bool via a 0.5 threshold Schmitt)
-        if (m_menuTrig[hand].update(m_hands[hand].menu ? 1.f : 0.f, 0.5f, 0.5f)) {
+        if (m_menuTrig[hand].update(menuVal ? 1.f : 0.f, 0.5f, 0.5f)) {
             if (m_menuTrig[hand].state) {
                 m_owner = hand;
                 emitOwnerMotion();

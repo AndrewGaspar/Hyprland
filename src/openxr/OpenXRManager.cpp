@@ -21,6 +21,7 @@
 #include <numeric>
 #include <cstdint>
 #include <chrono>
+#include <limits>
 #include <thread>
 #include <cmath>
 #include <format>
@@ -228,6 +229,7 @@ void COpenXRManager::start() {
     // Parse the adaptive STRING options to enums up front (main thread) so the frame thread never
     // reads a CConfigValue<const char*>. Must happen before the frame thread launches below.
     publishAdaptiveStringTuning();
+    publishHandInputPolicy(); // research/16 Part A: seed the hand-input policy from openxr:hand_input
 
     m_session  = makeUnique<CXRSession>();
     m_graphics = makeUnique<CXRGraphics>();
@@ -931,26 +933,43 @@ void COpenXRManager::frameThread() {
             static auto   PHIDEMS    = CConfigValue<Hyprlang::INT>("openxr:chrome_hide_delay_ms");
             static auto   PCURSOREN  = CConfigValue<Hyprlang::INT>("openxr:cursor");
             static auto   PCUREPS    = CConfigValue<Hyprlang::FLOAT>("openxr:cursor_redraw_epsilon");
-            const uint8_t hoverReg   = l->m_hoverRegion.load(std::memory_order_acquire);
-            const bool    grabbedNow = l->m_grabbedNow.load(std::memory_order_acquire);
+            const uint8_t hoverRegRaw   = l->m_hoverRegion.load(std::memory_order_acquire);
+            const bool    grabbedRaw    = l->m_grabbedNow.load(std::memory_order_acquire);
+            // research/16 §3.3: fold the gaze-selection state into the chrome so the whole monitor
+            // glows as the gaze feedback (a gaze ray has no cursor for pre-grab selection). A gaze
+            // CARRY reads like a grab (grab color, whole chrome); a dwell-stable CANDIDATE lights the
+            // move-bar in hover color ("look here to grab") when the hand ray isn't already on a region.
+            const bool    gazeSel       = l->m_gazeSelected.load(std::memory_order_acquire);
+            const bool    gazeCar       = l->m_gazeCarried.load(std::memory_order_acquire);
+            uint8_t       hoverReg      = hoverRegRaw;
+            bool          grabbedNow    = grabbedRaw;
+            if (gazeCar)
+                grabbedNow = true;
+            else if (gazeSel && hoverReg == OpenXR::XR_REGION_NONE)
+                hoverReg = OpenXR::XR_REGION_BAR;
             const bool    activeNow  = grabbedNow || hoverReg != OpenXR::XR_REGION_NONE;
             const bool    chromeOn   = l->m_chrome.hasChrome();
             // report 14 Stage A1: per-hand endpoint cursor. Drawn (like chrome) into the swapchain
             // over content; its packed word was published last frame by processPointer's plumbing.
+            static auto    PGAZECUR      = CConfigValue<Hyprlang::INT>("openxr:gaze_cursor");
             const bool     cursorEnabled = *PCURSOREN != 0;
+            const bool     gazeCurEnabled = *PGAZECUR != 0;
             const uint32_t curL          = l->m_cursorPacked[0].load(std::memory_order_acquire);
             const uint32_t curR          = l->m_cursorPacked[1].load(std::memory_order_acquire);
+            // research/16 §3.3: distinct gaze cursor on the carried monitor (packed by gazeSelectPass).
+            const uint32_t curGaze       = gazeCurEnabled ? l->m_gazeCursorPacked.load(std::memory_order_acquire) : 0;
             // Damage dead-band: sub-pixel tremor must NOT force a full-swapchain restore + re-encode
             // every runtime frame while a ray hovers a static desktop (live: dropped-IDR / macroblock
             // storm that clusters in hover windows). A genuine cursor move past the band still redraws;
             // note m_cursorDrawn holds the LAST DRAWN word so slow drift accumulates across frames.
             const float    curEps       = (float)*PCUREPS;
             const bool     cursorChanged = OpenXR::xrCursorRedrawNeeded(l->m_cursorDrawn[0], curL, curEps) ||
-                OpenXR::xrCursorRedrawNeeded(l->m_cursorDrawn[1], curR, curEps);
-            // Snapshot the clean content whenever chrome OR the cursor may draw over it, so an
+                OpenXR::xrCursorRedrawNeeded(l->m_cursorDrawn[1], curR, curEps) ||
+                OpenXR::xrCursorRedrawNeeded(l->m_gazeCursorDrawn, curGaze, curEps);
+            // Snapshot the clean content whenever chrome OR any cursor may draw over it, so an
             // animation-only frame (chrome fade or a moving cursor with no new desktop buffer) can
             // restore the content before re-drawing the overlay.
-            const bool     snapOn = chromeOn || cursorEnabled;
+            const bool     snapOn = chromeOn || cursorEnabled || gazeCurEnabled;
 
             const int64_t nowNs = fs.predictedDisplayTime;
             if (activeNow)
@@ -971,7 +990,7 @@ void COpenXRManager::frameThread() {
             // This is what keeps a static desktop with hidden chrome at zero GPU cost — the quad
             // re-presents the most recently released image every runtime frame (doc 01).
             const bool chromeVisualChanged = newAlpha != l->m_chromeDrawnAlpha || hoverReg != l->m_chromeDrawnRegion || grabbedNow != l->m_chromeDrawnGrab;
-            const bool wantAnimTick        = l->m_hasContent && ((chromeOn && chromeVisualChanged && (newAlpha > 0.f || l->m_chromeDrawnAlpha > 0.f)) || (cursorEnabled && cursorChanged));
+            const bool wantAnimTick        = l->m_hasContent && ((chromeOn && chromeVisualChanged && (newAlpha > 0.f || l->m_chromeDrawnAlpha > 0.f)) || ((cursorEnabled || gazeCurEnabled) && cursorChanged));
 
             if (!buf && !wantAnimTick && l->m_hasContent)
                 continue;
@@ -1025,11 +1044,13 @@ void COpenXRManager::frameThread() {
                 }
 
                 // Endpoint-cursor pass (report 14 Stage A1): draw each hand's cursor at its ray-hit
-                // uv, over content + chrome. No-op when disabled or no cursor present.
-                if (cursorEnabled && l->m_hasContent) {
-                    m_graphics->drawCursor(*l, dst, curL, curR);
-                    l->m_cursorDrawn[0] = curL;
-                    l->m_cursorDrawn[1] = curR;
+                // uv, over content + chrome. Plus the gaze cursor (research/16 §3.3) on the carried
+                // monitor. No-op when disabled or no cursor present.
+                if ((cursorEnabled || gazeCurEnabled) && l->m_hasContent) {
+                    m_graphics->drawCursor(*l, dst, cursorEnabled ? curL : 0, cursorEnabled ? curR : 0, curGaze);
+                    l->m_cursorDrawn[0]   = cursorEnabled ? curL : 0;
+                    l->m_cursorDrawn[1]   = cursorEnabled ? curR : 0;
+                    l->m_gazeCursorDrawn  = curGaze;
                 }
             }
 
@@ -1111,6 +1132,7 @@ void COpenXRManager::frameThread() {
 
         std::vector<OpenXR::SXRSolveResult> results(active.size());
         std::vector<bool>                   solved(active.size(), false);
+        bool                                anyRoaming = false; // research/16 Part A: AUTO gate OR-term
         {
             std::scoped_lock lock(m_layersMu);
             m_lastVerbCtx = OpenXR::SXRVerbContext{viewPose, viewValid, gripLeft, gripRight};
@@ -1136,7 +1158,7 @@ void COpenXRManager::frameThread() {
                 // Adaptive anchoring needs the head pose for the geofence even though its persistent
                 // mode is LOCAL. When the view is invalid (tracking loss) it falls to the hold-at-
                 // lastWorld branch, which freezes the phase machine + envelope (research/13 §4.2).
-                const bool needsView = l->m_anchor.state().mode != OpenXR::XR_ANCHOR_LOCAL || l->m_anchor.adaptiveEnabled();
+                const bool needsView = l->m_anchor.state().mode != OpenXR::XR_ANCHOR_LOCAL || l->m_anchor.adaptiveEnabled() || l->m_anchor.gazeGrabbed();
                 if (viewValid || !needsView) {
                     OpenXR::SXRSolveInput in;
                     in.view       = viewPose;
@@ -1162,6 +1184,8 @@ void COpenXRManager::frameThread() {
                     // begin edge, so a reversed/aborted transition emits nothing). Frame thread →
                     // main via the SPSC queue, mirroring the GRAB event path.
                     const auto newPhase = (uint8_t)l->m_anchor.adaptivePhase();
+                    if (l->m_anchor.adaptiveEnabled() && newPhase != (uint8_t)OpenXR::XRAD_DOCKED)
+                        anyRoaming = true;
                     const auto oldPhase = l->m_adPhase.exchange(newPhase, std::memory_order_acq_rel);
                     if (newPhase != oldPhase && (newPhase == (uint8_t)OpenXR::XRAD_ROAMING || newPhase == (uint8_t)OpenXR::XRAD_DOCKED)) {
                         SXRStateEvent ev;
@@ -1181,6 +1205,9 @@ void COpenXRManager::frameThread() {
                 }
             }
         }
+        // research/16 Part A: publish "any monitor roaming" for the AUTO hand-input gate (main-thread
+        // status reads it too). Plain atomic — never a refcount op.
+        m_anyRoaming.store(anyRoaming, std::memory_order_release);
 
         std::vector<XrCompositionLayerQuad>              quads;
         std::vector<const XrCompositionLayerBaseHeader*> layerPtrs;
@@ -1318,8 +1345,18 @@ void COpenXRManager::frameThread() {
             pointerSolveIn.gripRight  = gripRight;
             pointerSolveIn.pinchLeft  = pinchLeft; // WP-G5: pinch grab begin/carry/latch device pose
             pointerSolveIn.pinchRight = pinchRight;
+            // research/16 Part A: resolve the conditional hand-input gate for this frame (keyboard
+            // recency / roam / manual). Reads atomics + the static keyboard signal + numeric config —
+            // all frame-thread-safe. Controllers are never affected (handActive is false for them).
+            const bool handsEnabled = handInputEnabled();
             std::scoped_lock lock(m_layersMu);
-            m_input->processPointer(pointerTargets, (uint32_t)Time::millis(Time::steadyNow()), pointerSolveIn, tune);
+            m_input->processPointer(pointerTargets, (uint32_t)Time::millis(Time::steadyNow()), pointerSolveIn, tune, handsEnabled);
+
+            // research/16 Part B: gaze-hover selection + gaze-cursor pass. Runs after processPointer so
+            // the chrome publish below can OR the gaze-selected highlight, and it reuses the same quad
+            // targets. Under m_layersMu (mutates the carried anchor's runtime state is NOT done here —
+            // it only reads gazeGrabbed() + publishes atomics; the carry itself is driven by the solve).
+            gazeSelectPass(pointerTargets, active, viewPose, viewValid, dt);
 
             // WP-G2 chrome visual-state plumbing: publish each active quad's current ray-hover
             // region + grab flag onto the layer for the NEXT frame's chrome draw pass (frame
@@ -1690,6 +1727,9 @@ void COpenXRManager::finalizeLayerRemoval(const std::string& name) {
         m_selectedMonitor.clear();
     if (m_lastHoveredMonitor == name)
         m_lastHoveredMonitor.clear();
+    // research/16 Part B: drop a gaze carry that pointed at this monitor (the anchor is gone with it).
+    if (m_gazeCarryMonitor == name)
+        m_gazeCarryMonitor.clear();
 
     // Freeing capacity may re-activate a suspended quad (doc 02 recency policy).
     recomputeQuadActive();
@@ -2268,6 +2308,9 @@ void COpenXRManager::onConfigReload() {
     // + unconditional so hot re-tuning (openxr:adaptive_roam_mode / adaptive_transition_ease) applies
     // live on both /reload and the keyword special-cases below.
     publishAdaptiveStringTuning();
+    // research/16 Part A: re-apply openxr:hand_input with change detection (a runtime `handinput`
+    // dispatcher change survives an unrelated reload; an actual config change wins + clears the latch).
+    publishHandInputPolicy();
 
     static auto PENABLED = CConfigValue<Hyprlang::INT>("openxr:enabled");
     const bool  enabled  = *PENABLED;
@@ -2353,6 +2396,140 @@ void COpenXRManager::publishAdaptiveStringTuning() {
     static auto PADROAM = CConfigValue<std::string>("openxr:adaptive_roam_mode");
     m_adEase.store(OpenXR::xrParseEase(*PADEASE), std::memory_order_relaxed);
     m_adRoamMode.store(*PADROAM == "head" ? OpenXR::XR_ANCHOR_HEAD : OpenXR::XR_ANCHOR_BODY, std::memory_order_relaxed);
+}
+
+// ---- conditional hand input (research/16 Part A) ---------------------------------------------
+
+void COpenXRManager::publishHandInputPolicy() {
+    // MAIN-THREAD. Re-read openxr:hand_input into m_handPolicy with CHANGE DETECTION: a reload that
+    // did NOT alter the config value preserves any runtime `xrmonitor handinput` change; an actual
+    // change (or first apply at start()) resets the manual force latch. (CConfigValue<std::string>,
+    // never <Hyprlang::STRING> — same legacy-manager null-m_p caveat as publishAdaptiveStringTuning.)
+    static auto PHANDIN = CConfigValue<std::string>("openxr:hand_input");
+    const std::string v = *PHANDIN;
+    if (v == m_handPolicyConfigStr)
+        return; // unchanged since last apply -> keep the runtime policy/force as the dispatcher left it
+    m_handPolicyConfigStr = v;
+    const uint8_t pol = v == "on" ? HANDPOL_ON : (v == "off" ? HANDPOL_OFF : HANDPOL_AUTO);
+    m_handPolicy.store(pol, std::memory_order_relaxed);
+    m_handForce.store(HANDFORCE_NONE, std::memory_order_relaxed);
+}
+
+COpenXRManager::eXRHandInputState COpenXRManager::handInputState() const {
+    // Away-from-keyboard: openxr:hand_input_idle_s of physical-keyboard silence.
+    static auto    PIDLE     = CConfigValue<Hyprlang::FLOAT>("openxr:hand_input_idle_s");
+    static auto    PROAM     = CConfigValue<Hyprlang::INT>("openxr:hand_input_roam_enables");
+    const uint64_t lastKeyMs = CInputManager::lastPhysicalKeyEventMs();
+    const uint64_t nowMs     = Time::millis(Time::steadyNow());
+    const uint64_t idleMs    = (uint64_t)std::max(0.0, (double)*PIDLE * 1000.0);
+    const bool     awayFromKbd = lastKeyMs == 0 || (nowMs >= lastKeyMs && (nowMs - lastKeyMs) >= idleMs);
+    const bool     roaming     = m_anyRoaming.load(std::memory_order_acquire);
+    // The gate DECISION is the pure OpenXR::handInputGate (gtested); map its 4-state to ours 1:1.
+    switch (OpenXR::handInputGate(m_handPolicy.load(std::memory_order_relaxed), m_handForce.load(std::memory_order_relaxed), awayFromKbd, roaming, *PROAM != 0)) {
+        case OpenXR::XR_HANDGATE_ACTIVE: return HANDIN_ACTIVE;
+        case OpenXR::XR_HANDGATE_KBD: return HANDIN_GATED_KBD;
+        case OpenXR::XR_HANDGATE_MANUAL: return HANDIN_GATED_MANUAL;
+        default: return HANDIN_OFF;
+    }
+}
+
+COpenXRManager::SXRHandInputStatus COpenXRManager::handInputStatus() const {
+    SXRHandInputStatus s;
+    switch (m_handPolicy.load(std::memory_order_relaxed)) {
+        case HANDPOL_ON: s.mode = "on"; break;
+        case HANDPOL_OFF: s.mode = "off"; break;
+        default: s.mode = "auto"; break;
+    }
+    switch (handInputState()) {
+        case HANDIN_ACTIVE: s.state = "active"; break;
+        case HANDIN_GATED_KBD: s.state = "gated (keyboard)"; break;
+        case HANDIN_GATED_MANUAL: s.state = "gated (manual)"; break;
+        default: s.state = "off"; break;
+    }
+    return s;
+}
+
+// ---- gaze grab (research/16 Part B) ----------------------------------------------------------
+
+void COpenXRManager::gazeSelectPass(const std::vector<SXRPointerTarget>& targets, const std::vector<PXRLAYER>& active, const OpenXR::SXRPose& view, bool viewValid, float dt) {
+    // FRAME THREAD, under m_layersMu (caller holds it). NUMERIC config reads only (frame-thread safe;
+    // never a STRING config here — openxr:gaze_source is main-thread-only and v1 is always "view").
+    static auto PGFILT  = CConfigValue<Hyprlang::INT>("openxr:gaze_filter");
+    static auto PGFMC   = CConfigValue<Hyprlang::FLOAT>("openxr:gaze_filter_min_cutoff");
+    static auto PGFB    = CConfigValue<Hyprlang::FLOAT>("openxr:gaze_filter_beta");
+    static auto PGDWELL = CConfigValue<Hyprlang::INT>("openxr:gaze_dwell_ms");
+    static auto PGHYST  = CConfigValue<Hyprlang::FLOAT>("openxr:gaze_hysteresis_deg");
+
+    // A gaze carry may be active even while the head pose is momentarily invalid; find the carried
+    // layer regardless so its m_gazeCarried highlight holds.
+    auto publishClear = [&](bool keepCarry) {
+        for (auto& l : active) {
+            const bool carried = keepCarry && l->m_anchor.gazeGrabbed();
+            l->m_gazeSelected.store(false, std::memory_order_release);
+            l->m_gazeCarried.store(carried, std::memory_order_release);
+            l->m_gazeCursorPacked.store(0, std::memory_order_release);
+        }
+    };
+
+    if (!viewValid) {
+        m_gazeSel.reset();
+        m_gazeFilter.reset();
+        m_gazeHitId = -1;
+        m_gazeHoveredId.store(-1, std::memory_order_release);
+        publishClear(/*keepCarry=*/true);
+        return;
+    }
+
+    // 1€-filter the gaze pose before hit-testing (research/16 §3.1 stage B).
+    OpenXR::SXRPose g = view;
+    if (*PGFILT != 0 && dt > 0.f)
+        g = OpenXR::oneEuroStepPose(m_gazeFilter, view, dt, (float)*PGFMC, (float)*PGFB);
+    else
+        m_gazeFilter.reset();
+    const OpenXR::Vec3 origin = g.pos;
+    const OpenXR::Vec3 dir    = OpenXR::poseForward(g.rot);
+    const float        hystTan = std::tan(std::clamp((float)*PGHYST, 0.f, 15.f) * (float)M_PI / 180.f);
+
+    // Nearest-hit monitor; the currently-stable target gets extra angular slack (sticky selection).
+    int64_t  rawHit = -1;
+    float    bestT  = std::numeric_limits<float>::max();
+    Vector2D hitUV;
+    for (const auto& t : targets) {
+        float slack = 0.f;
+        if (t.id == m_gazeSel.stable && hystTan > 0.f) {
+            const float d = (t.worldPose.pos - origin).length();
+            slack         = hystTan * d;
+        }
+        const OpenXR::SXRQuadHit hit = OpenXR::rayQuadIntersect(t.worldPose, origin, dir, t.w, t.h, slack);
+        if (hit.hit && hit.t < bestT) {
+            bestT  = hit.t;
+            rawHit = t.id;
+            hitUV  = Vector2D{std::clamp(hit.u, 0.f, 1.f), std::clamp(hit.v, 0.f, 1.f)};
+        }
+    }
+
+    const float   dwellSec = (float)std::max(0, (int)*PGDWELL) / 1000.f;
+    const int64_t stable   = OpenXR::stepGazeSelect(m_gazeSel, rawHit, dt, dwellSec);
+    m_gazeHitId            = rawHit;
+    m_gazeHitUV           = hitUV;
+    m_gazeHoveredId.store(stable, std::memory_order_release);
+
+    // Publish per-layer highlight + gaze cursor.
+    static auto PGCUR = CConfigValue<Hyprlang::INT>("openxr:gaze_cursor");
+    const bool  gazeCursorOn = *PGCUR != 0;
+    for (auto& l : active) {
+        const MONITORID mid     = l->m_monitorId.load(std::memory_order_acquire);
+        const bool      carried = l->m_anchor.gazeGrabbed();
+        l->m_gazeSelected.store(mid >= 0 && mid == stable, std::memory_order_release);
+        l->m_gazeCarried.store(carried, std::memory_order_release);
+        // Gaze cursor: only on the carried monitor, at the gaze hit uv (center if the ray isn't on it).
+        uint32_t packed = 0;
+        if (gazeCursorOn && carried) {
+            const Vector2D uv = (mid >= 0 && mid == rawHit) ? hitUV : Vector2D{0.5, 0.5};
+            packed            = OpenXR::xrPackCursor(true, OpenXR::XR_CURSOR_GRAB, (float)uv.x, (float)uv.y);
+        }
+        l->m_gazeCursorPacked.store(packed, std::memory_order_release);
+    }
 }
 
 OpenXR::SXRAnchorTuning COpenXRManager::readAnchorTuning() const {
@@ -2635,7 +2812,9 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
         // Adaptive: while roaming/transitioning the live world pose (lastWorld) is the follow pose,
         // not the desk pose — report it so a status consumer sees where the monitor actually is
         // (research/13 §6.4); a docked adaptive monitor reports its desk pose like any local one.
-        const bool            reportLive = l->m_anchor.hasLastWorld() && (l->m_anchor.grabbed() || (l->m_anchor.adaptiveEnabled() && l->m_anchor.adaptivePhase() != OpenXR::XRAD_DOCKED));
+        // research/16: a gaze carry also submits a live world pose (grab override), so report it live
+        // like a hand grab — the status/layout tracks where the monitor actually is mid-carry.
+        const bool            reportLive = l->m_anchor.hasLastWorld() && (l->m_anchor.grabbed() || l->m_anchor.gazeGrabbed() || (l->m_anchor.adaptiveEnabled() && l->m_anchor.adaptivePhase() != OpenXR::XRAD_DOCKED));
         const OpenXR::SXRPose reportPose = reportLive ? l->m_anchor.lastWorld() : st.anchorPose;
         info.posX                        = reportPose.pos.x;
         info.posY                        = reportPose.pos.y;
@@ -3016,6 +3195,161 @@ std::expected<void, std::string> COpenXRManager::cmdRoam(const std::string& args
     std::scoped_lock lock(m_layersMu);
     layer->m_anchor.adaptiveSetRoamMode(tokens[0] == "head" ? OpenXR::XR_ANCHOR_HEAD : OpenXR::XR_ANCHOR_BODY);
     return {};
+}
+
+// ---- gaze grab + conditional hand input verbs (research/16) ----------------------------------
+
+std::expected<void, std::string> COpenXRManager::cmdGazeGrab() {
+    const auto ctx  = currentVerbContext();
+    const auto tune = readAnchorTuning();
+
+    // TOGGLE: a gaze carry is active -> release it (reanchor via endGazeGrab), like a keyboard-up.
+    if (!m_gazeCarryMonitor.empty()) {
+        auto layer = layerByName(m_gazeCarryMonitor);
+        m_gazeCarryMonitor.clear();
+        if (layer) {
+            OpenXR::SXRSolveInput in;
+            in.view      = ctx.view;
+            in.gripLeft  = ctx.gripLeft;
+            in.gripRight = ctx.gripRight;
+            std::scoped_lock lock(m_layersMu);
+            if (layer->m_anchor.gazeGrabbed())
+                layer->m_anchor.endGazeGrab(in, tune);
+        }
+        return {};
+    }
+
+    // Grab the dwell-stable gazed-at monitor (research/16 §3.2). Fail cleanly if not looking at one —
+    // NEVER fall back to the sticky selection (that would grab a monitor behind you).
+    const int64_t id = m_gazeHoveredId.load(std::memory_order_acquire);
+    if (id < 0)
+        return std::unexpected<std::string>("gazegrab: not looking at a monitor");
+    if (!ctx.viewValid)
+        return std::unexpected<std::string>("gazegrab: head tracking unavailable");
+    auto layer = layerByMonitorID((MONITORID)id);
+    if (!layer)
+        return std::unexpected<std::string>("gazegrab: gazed-at monitor is gone");
+
+    static auto PFOLLOW = CConfigValue<Hyprlang::INT>("openxr:gaze_follow");
+    std::scoped_lock lock(m_layersMu);
+    // Mutual exclusion (§4.6): a hand/controller grab owns it -> the gaze grab no-ops with a message.
+    if (layer->m_anchor.grabbed())
+        return std::unexpected<std::string>("gazegrab: that monitor is already grabbed by a hand/controller");
+    if (!layer->m_anchor.hasLastWorld())
+        return std::unexpected<std::string>("gazegrab: monitor not placed yet");
+    layer->m_anchor.beginGazeGrab(ctx.view, *PFOLLOW != 0);
+    m_gazeCarryMonitor = layer->m_monitorName;
+    return {};
+}
+
+std::expected<void, std::string> COpenXRManager::cmdGazeRelease() {
+    // Explicit release (for a bindr): a no-op when nothing is gaze-carried, so it never error-spams.
+    if (m_gazeCarryMonitor.empty())
+        return {};
+    const auto ctx  = currentVerbContext();
+    const auto tune = readAnchorTuning();
+    auto       layer = layerByName(m_gazeCarryMonitor);
+    m_gazeCarryMonitor.clear();
+    if (layer) {
+        OpenXR::SXRSolveInput in;
+        in.view      = ctx.view;
+        in.gripLeft  = ctx.gripLeft;
+        in.gripRight = ctx.gripRight;
+        std::scoped_lock lock(m_layersMu);
+        if (layer->m_anchor.gazeGrabbed())
+            layer->m_anchor.endGazeGrab(in, tune);
+    }
+    return {};
+}
+
+std::expected<void, std::string> COpenXRManager::cmdGazePush(const std::string& args) {
+    const auto tokens = splitWs(args);
+    if (tokens.size() > 1)
+        return std::unexpected<std::string>("gazepush: expected <±m> (or no arg for the default step)");
+    float delta;
+    if (tokens.empty()) {
+        static auto PSTEP = CConfigValue<Hyprlang::FLOAT>("openxr:gaze_dist_step");
+        delta             = (float)*PSTEP; // default: push farther by one step
+    } else {
+        auto d = parseFloatArg(tokens[0]);
+        if (!d)
+            return std::unexpected<std::string>("gazepush: argument must be a number");
+        delta = *d;
+    }
+
+    // While carrying -> move the carry along the gaze ray. Otherwise -> nudge the gaze-selected
+    // monitor along the view->quad ray (research/16 §4.3), reusing the shipped distance math.
+    if (!m_gazeCarryMonitor.empty()) {
+        auto layer = layerByName(m_gazeCarryMonitor);
+        if (!layer)
+            return std::unexpected<std::string>("gazepush: carried monitor is gone");
+        std::scoped_lock lock(m_layersMu);
+        if (!layer->m_anchor.gazeGrabbed()) {
+            m_gazeCarryMonitor.clear();
+            return std::unexpected<std::string>("gazepush: no active gaze carry");
+        }
+        layer->m_anchor.gazePushPull(delta);
+        return {};
+    }
+
+    const int64_t id = m_gazeHoveredId.load(std::memory_order_acquire);
+    if (id < 0)
+        return std::unexpected<std::string>("gazepush: not carrying and not looking at a monitor");
+    auto layer = layerByMonitorID((MONITORID)id);
+    if (!layer)
+        return std::unexpected<std::string>("gazepush: gazed-at monitor is gone");
+    const auto       ctx = currentVerbContext();
+    std::scoped_lock lock(m_layersMu);
+    if (!layer->m_anchor.applyDistance(delta, ctx))
+        return std::unexpected<std::string>("gazepush: head tracking unavailable or no current pose");
+    return {};
+}
+
+std::expected<void, std::string> COpenXRManager::cmdHandInput(const std::string& args) {
+    const auto tokens = splitWs(args);
+    if (tokens.size() != 1)
+        return std::unexpected<std::string>("handinput: expected on|off|auto|toggle");
+    const std::string& a = tokens[0];
+    if (a == "on") {
+        m_handPolicy.store(HANDPOL_ON, std::memory_order_relaxed);
+        m_handForce.store(HANDFORCE_NONE, std::memory_order_relaxed);
+    } else if (a == "off") {
+        m_handPolicy.store(HANDPOL_OFF, std::memory_order_relaxed);
+        m_handForce.store(HANDFORCE_NONE, std::memory_order_relaxed);
+    } else if (a == "auto") {
+        m_handPolicy.store(HANDPOL_AUTO, std::memory_order_relaxed);
+        m_handForce.store(HANDFORCE_NONE, std::memory_order_relaxed);
+    } else if (a == "toggle") {
+        // The key-chord: flip the effective gate regardless of the prior policy, landing in AUTO +
+        // a manual force latch (so a later `handinput auto` returns to the pure keyboard/roam gate).
+        const bool wasOn = handInputEnabled();
+        m_handPolicy.store(HANDPOL_AUTO, std::memory_order_relaxed);
+        m_handForce.store(wasOn ? HANDFORCE_OFF : HANDFORCE_ON, std::memory_order_relaxed);
+    } else
+        return std::unexpected<std::string>("handinput: expected on|off|auto|toggle");
+    return {};
+}
+
+COpenXRManager::SXRGazeStatus COpenXRManager::gazeStatus() {
+    SXRGazeStatus s;
+    static auto   PGSRC = CConfigValue<std::string>("openxr:gaze_source");
+    s.source            = *PGSRC == "eye" ? "view (eye requested; unsupported HW -> view)" : "view";
+    const int64_t id    = m_gazeHoveredId.load(std::memory_order_acquire);
+    s.hoveredMonitor    = id;
+    if (id >= 0)
+        if (auto l = layerByMonitorID((MONITORID)id))
+            s.hoveredName = l->m_monitorName;
+    if (!m_gazeCarryMonitor.empty()) {
+        if (auto l = layerByName(m_gazeCarryMonitor)) {
+            std::scoped_lock lock(m_layersMu);
+            if (l->m_anchor.gazeGrabbed()) {
+                s.carrying     = true;
+                s.carryMonitor = m_gazeCarryMonitor;
+                s.dist         = l->m_anchor.gazeDist();
+            }
+        }
+    }
+    return s;
 }
 
 #endif

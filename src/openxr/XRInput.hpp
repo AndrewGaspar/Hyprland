@@ -159,7 +159,12 @@ class CXRInput {
     // grab machine mutates layer anchor state, same discipline as the solve loop). `timeMs` is
     // the sample-time stamp; `solveIn` carries this frame's view/grip poses (already shifted into
     // the same space the anchor solve used) and `tune` the anchor tuning, both needed by endGrab.
-    void processPointer(const std::vector<SXRPointerTarget>& targets, uint32_t timeMs, const OpenXR::SXRSolveInput& solveIn, const OpenXR::SXRAnchorTuning& tune);
+    // `handsEnabled` (research/16 Part A): when false, any hand whose active device is HAND tracking
+    // (handActive(hand)) is fully inert — no ray/hover/cursor, no clicks, no grabs; an in-progress
+    // hand grab is ended via the normal release latch. CONTROLLERS are never gated (handActive is
+    // false for them), so a controller session behaves identically regardless. Computed by the
+    // manager's conditional-hand-input gate (keyboard recency / roam / manual override).
+    void processPointer(const std::vector<SXRPointerTarget>& targets, uint32_t timeMs, const OpenXR::SXRSolveInput& solveIn, const OpenXR::SXRAnchorTuning& tune, bool handsEnabled = true);
 
     // Frame-thread reads of the latest sample:
     const SXRHandState& hand(OpenXR::eXRHand h) const {
