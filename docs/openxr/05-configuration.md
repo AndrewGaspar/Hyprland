@@ -380,7 +380,9 @@ hyprctl openxr gaze at <ms>       # nearest sample to a CLOCK_MONOTONIC millisec
 hyprctl openxr gaze --at-ms <ms>  # same (explicit flag form)
 ```
 
-The compositor keeps a rolling ~5.7-second ring (512 samples, one per XR frame) of head poses +
+The compositor keeps a rolling ~91-second ring (8192 samples, one per XR frame at 90 Hz; longer
+at lower refresh rates — sized so even a long utterance plus ASR/intent latency never falls off
+the retained window at full frame-rate resolution, for ~512 KB) of head poses +
 gaze candidates. Speech recognition takes 1–3 s, so by the time an utterance is parsed the head
 has usually moved on (often to a feedback HUD) — querying the pose *now* would be a systematic
 bug. Instead the daemon captures a monotonic timestamp at **speech onset** (`clock_gettime(
