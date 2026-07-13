@@ -1,0 +1,8 @@
+{
+	"encoder": {
+		"encoder": "nvenc",
+		"codec": "h265"
+	},
+	"bit-depth": 8,
+	"tcp-only": true
+}
