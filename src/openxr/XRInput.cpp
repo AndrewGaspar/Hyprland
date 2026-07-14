@@ -244,24 +244,30 @@ bool CXRInput::createActionSpaces() {
     return true;
 }
 
-void CXRInput::destroy() {
+void CXRInput::destroy(bool runtimeLost) {
+    // runtimeLost => skip the xr destroy calls; the handles are session/instance children that
+    // xrDestroyInstance reaps. Nulling them locally is all that's needed (avoids the IPC spam/block).
     for (auto& s : m_aimSpace)
         if (s != XR_NULL_HANDLE) {
-            xrDestroySpace(s);
+            if (!runtimeLost)
+                xrDestroySpace(s);
             s = XR_NULL_HANDLE;
         }
     for (auto& s : m_gripSpace)
         if (s != XR_NULL_HANDLE) {
-            xrDestroySpace(s);
+            if (!runtimeLost)
+                xrDestroySpace(s);
             s = XR_NULL_HANDLE;
         }
     for (auto& s : m_pinchSpace)
         if (s != XR_NULL_HANDLE) {
-            xrDestroySpace(s);
+            if (!runtimeLost)
+                xrDestroySpace(s);
             s = XR_NULL_HANDLE;
         }
     if (m_actionSet != XR_NULL_HANDLE) {
-        xrDestroyActionSet(m_actionSet); // also destroys child actions
+        if (!runtimeLost)
+            xrDestroyActionSet(m_actionSet); // also destroys child actions
         m_actionSet = XR_NULL_HANDLE;
     }
     m_aimAction = m_gripAction = m_selectAction = m_grabAction = m_scrollAction = m_menuAction = m_hapticAction = XR_NULL_HANDLE;
