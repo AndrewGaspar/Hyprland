@@ -112,6 +112,45 @@ namespace OpenXR {
     // (which reads config + owns the CEventLoopTimer) can rely on it. HEADSET-wait (runtime up, headset
     // undonned) uses a fixed gentle cadence instead and does not consult this.
     int64_t xrReprobeBackoffMs(int attempt, int64_t baseMs, int64_t capMs);
+
+    // ---- event-driven re-probe: inotify watch-path derivation (don-the-headset dead-air fix) ----
+    // The problem: WiVRn only becomes a connectable runtime at the instant the headset client
+    // connects — its IPC socket appears in $XDG_RUNTIME_DIR only then. So after login the timer
+    // backoff (xrReprobeBackoffMs) has already grown toward 30s and donning stalls for up to that
+    // long. The fix is to inotify-watch the directory the socket lands in and probe the moment it
+    // appears; the timer stays as fallback.
+    //
+    // A single directory to inotify-watch, plus the basenames whose creation there means something.
+    // socketNames: creating one of these IS the runtime socket appearing -> probe immediately.
+    // subdirNames: creating one of these is a nested socket directory appearing -> start watching it
+    //   too (its own socket lands inside a moment later; see xrReprobeWatchDirs for the pairing).
+    struct SXRReprobeWatch {
+        std::string              dir;         // absolute directory to watch (IN_CREATE / IN_MOVED_TO)
+        std::vector<std::string> socketNames; // basenames whose creation here triggers an immediate probe
+        std::vector<std::string> subdirNames; // basenames whose creation here means "also watch dir/<name>"
+    };
+
+    // Derive the watch set from the value of $XDG_RUNTIME_DIR (pass the raw env string; may be empty).
+    // Returns {} when runtimeDir is empty — without XDG_RUNTIME_DIR the socket location is unknown and
+    // the caller falls back to the timer alone. Otherwise returns, in order:
+    //   [0] $XDG_RUNTIME_DIR         socketNames={monado default "monado_comp_ipc"}, subdirNames={"wivrn"}
+    //   [1] $XDG_RUNTIME_DIR/wivrn   socketNames={"comp_ipc"}
+    // Evidence (both resolve the socket via monado u_file_get_runtime_dir == $XDG_RUNTIME_DIR):
+    //   - monado  CMakeLists.txt: XRT_IPC_MSG_SOCK_FILENAME default "monado_comp_ipc"
+    //   - WiVRn   server/CMakeLists.txt: XRT_IPC_MSG_SOCK_FILENAME "wivrn/comp_ipc"
+    // The [1] entry is emitted unconditionally (pure); the manager only inotify-adds it once the
+    // directory exists, and adds it dynamically when the "wivrn" subdir creation event fires on [0].
+    std::vector<SXRReprobeWatch> xrReprobeWatchDirs(const std::string& runtimeDir);
+
+    // Pure predicates over a watch spec + a just-created basename, so the trigger decision is gtestable:
+    bool xrReprobeSocketMatch(const SXRReprobeWatch& w, const std::string& name); // name is a runtime socket -> probe
+    bool xrReprobeSubdirMatch(const SXRReprobeWatch& w, const std::string& name); // name is a nested dir -> watch it too
+
+    // Debounce between a socket-appearance event and the probe: the socket file can exist a beat before
+    // the server is accept()ing on it, so a probe fired the same instant may still fail. On a matching
+    // event the manager resets the backoff to attempt 0 (so if the debounced probe DOES fail it falls
+    // back to the FAST end of the schedule, not the grown delay) and arms this one-shot.
+    inline constexpr int XR_REPROBE_WATCH_DEBOUNCE_MS = 150;
 }
 
 namespace OpenXR {

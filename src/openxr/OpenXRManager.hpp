@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "../helpers/memory/Memory.hpp"
@@ -132,6 +133,10 @@ class COpenXRManager {
     // undonned); empty otherwise. reprobePendingMs(): ms until the next probe, or -1 when none armed.
     std::string reprobeWaitString() const;
     int         reprobePendingMs() const;
+    // Whether the event-driven inotify watch on the runtime socket dir is currently armed (don-the-
+    // headset dead-air fix). True only while dormant in UNAVAILABLE with openxr:reprobe_watch on and
+    // $XDG_RUNTIME_DIR resolvable. Surfaced so `hyprctl openxr status` makes the behavior diagnosable.
+    bool        reprobeWatchArmed() const;
 
     // --- IPC verb funnel (main thread). ONE implementation, two transports: the xrmonitor
     // dispatcher and the hyprctl openxr subcommands both call these (doc 05 §3/§4). Return
@@ -336,6 +341,22 @@ class COpenXRManager {
     void          cancelReprobe(bool resetBackoff);
     // Timer body: re-attempt start() while still UNAVAILABLE + enabled + reprobe.
     void          onReprobeExpired();
+
+    // --- event-driven re-probe: inotify watch on the runtime socket dir (don-the-headset dead-air) ---
+    // While dormant in UNAVAILABLE (and openxr:reprobe + openxr:reprobe_watch on) we inotify-watch the
+    // directory the runtime's IPC socket lands in ($XDG_RUNTIME_DIR, plus its wivrn/ subdir) so a probe
+    // fires the instant the socket appears — instead of waiting out the grown backoff. The timer path
+    // stays fully intact as the fallback. All main-thread (the inotify fd rides the wl_event_loop, like
+    // the frame->main eventfd). Watched paths + trigger logic are the pure OpenXR::xrReprobeWatch* set.
+    void setupReprobeWatch();    // arm: build the inotify fd, add the existing socket dirs, hook the loop
+    void teardownReprobeWatch(); // disarm: remove watches, close the fd, cancel the debounce
+    // inotify_add_watch(spec.dir) if it exists and isn't already watched; record it for dispatch/teardown.
+    // checkSocketNow stats for spec.socketNames right away (used when a nested dir just appeared, to close
+    // the race where its socket was created between the dir-create event and this add).
+    void addReprobeWatchDir(const OpenXR::SXRReprobeWatch& spec, bool checkSocketNow);
+    void onReprobeWatchReadable();  // drain inotify events; add nested dir watches / trigger on the socket
+    void triggerWatchedProbe();     // arm the debounce one-shot (coalesces a burst of create events)
+    void onWatchDebounceExpired();  // reset the backoff to attempt 0 and start() immediately
 
     // Aborts an in-progress start(), tearing down whatever was created, and lands in
     // UNAVAILABLE. Safe to call at any failure point in start().
@@ -553,6 +574,17 @@ class COpenXRManager {
     SP<CEventLoopTimer> m_reprobeTimer;
     int                 m_reprobeAttempt = 0;
     eXRProbeWait        m_probeWait      = XR_WAIT_NONE;
+
+    // Event-driven re-probe (don-the-headset dead-air fix). The inotify fd rides the wl_event_loop
+    // exactly like m_eventFd/m_eventSource; armed on entering UNAVAILABLE, torn down on leaving. All
+    // main-thread. m_watchSpecs is the pure-derived watch set (from OpenXR::xrReprobeWatchDirs);
+    // m_watchByWd maps a live inotify watch descriptor back to its spec for event dispatch;
+    // m_watchDebounceTimer coalesces a burst of create events + waits out the server's accept() gap.
+    int                                        m_watchInotifyFd = -1;
+    wl_event_source*                           m_watchSource    = nullptr;
+    std::vector<OpenXR::SXRReprobeWatch>       m_watchSpecs;
+    std::unordered_map<int, OpenXR::SXRReprobeWatch> m_watchByWd;
+    SP<CEventLoopTimer>                        m_watchDebounceTimer;
 
     // Populated from xrInstanceProperties/xrSystemProperties once a session exists.
     std::string       m_runtimeName;

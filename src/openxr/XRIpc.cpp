@@ -35,6 +35,10 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     // report-20 issue B1: dormant re-probe hint — what we're waiting for + ms until the next probe.
     const std::string REPROBE_WAIT = g_pOpenXRManager->reprobeWaitString();
     const int         REPROBE_MS   = g_pOpenXRManager->reprobePendingMs();
+    // Event-driven re-probe (don-the-headset dead-air fix): is the inotify watch on the runtime socket
+    // dir currently armed? When true, the socket appearing fires an immediate probe (the backoff timer
+    // is just the fallback), so the up-to-30s donning stall is gone.
+    const bool         REPROBE_WATCH = g_pOpenXRManager->reprobeWatchArmed();
     // Read-only observability for the idle-inhibit predicate (doc 05 §6.1). There is otherwise
     // no queryable surface for "is the compositor's idle-inhibit bit currently raised because of
     // XR" — CIdleNotifyProtocol::isInhibited is private with no getter, and it's a fold of every
@@ -111,6 +115,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "visible": "{}",
     "reprobeWaiting": "{}",
     "reprobePendingMs": {},
+    "reprobeWatching": {},
     "inhibitingIdle": {},
     "handInput": {{ "mode": "{}", "state": "{}" }},
     "gaze": {{ "source": "{}", "hoveredMonitor": {}, "hoveredName": "{}", "carrying": {}, "carryMonitor": "{}", "distM": {:.3f} }},
@@ -121,7 +126,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "monitors": [{}{}]
 }}
 )#",
-                           STATE, RUNTIME, SYSTEM, RTGPU, BLEND, OVERLAY ? "true" : "false", SELECTED, FOLLOW, UNPLUG_PEND, PRESENCE, VISIBLE, REPROBE_WAIT, REPROBE_MS, INHIBITING_IDLE ? "true" : "false",
+                           STATE, RUNTIME, SYSTEM, RTGPU, BLEND, OVERLAY ? "true" : "false", SELECTED, FOLLOW, UNPLUG_PEND, PRESENCE, VISIBLE, REPROBE_WAIT, REPROBE_MS, REPROBE_WATCH ? "true" : "false", INHIBITING_IDLE ? "true" : "false",
                            HANDIN.mode, HANDIN.state, GAZE.source, GAZE.hoveredMonitor, GAZE.hoveredName, GAZE.carrying ? "true" : "false", GAZE.carryMonitor, GAZE.dist,
                            HANDS[0].hands ? "hands" : "controllers", HANDS[0].gesture,
                            HANDS[0].filtered ? "true" : "false", HANDS[1].hands ? "hands" : "controllers", HANDS[1].gesture, HANDS[1].filtered ? "true" : "false",
@@ -131,7 +136,9 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     const std::string FOLLOWLINE = UNPLUG_PEND >= 0 ? std::format("{} (unplug in {}ms)", FOLLOW, UNPLUG_PEND) : FOLLOW;
     // report-20 issue B1: append the dormant re-probe hint to the state line, e.g.
     // "unavailable (waiting for headset, retrying in 1800ms)".
-    const std::string STATELINE = REPROBE_WAIT.empty() ? STATE : std::format("{} (waiting for {}, retrying in {}ms)", STATE, REPROBE_WAIT, REPROBE_MS < 0 ? 0 : REPROBE_MS);
+    const std::string STATELINE = REPROBE_WAIT.empty()
+        ? STATE
+        : std::format("{} (waiting for {}, retrying in {}ms{})", STATE, REPROBE_WAIT, REPROBE_MS < 0 ? 0 : REPROBE_MS, REPROBE_WATCH ? ", watching socket" : "");
     const std::string GAZELINE = GAZE.carrying ? std::format("carrying {} at {:.2f}m", GAZE.carryMonitor, GAZE.dist)
                                                 : (GAZE.hoveredMonitor >= 0 ? std::format("looking at {}", GAZE.hoveredName) : "idle");
     std::string       out = std::format(
