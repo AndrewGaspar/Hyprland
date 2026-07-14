@@ -404,19 +404,43 @@ std::vector<OpenXR::SXRReprobeWatch> OpenXR::xrReprobeWatchDirs(const std::strin
     while (base.size() > 1 && base.back() == '/') // normalize a trailing slash (env may carry one)
         base.pop_back();
     std::vector<SXRReprobeWatch> out;
-    // [0] the runtime dir itself: monado's socket lands here directly; WiVRn's "wivrn" subdir is
-    // created here (then its comp_ipc socket inside it).
-    out.push_back(SXRReprobeWatch{.dir = base, .socketNames = {"monado_comp_ipc"}, .subdirNames = {"wivrn"}});
-    // [1] the WiVRn subdir: comp_ipc appears inside once the headset client connects.
-    out.push_back(SXRReprobeWatch{.dir = base + "/wivrn", .socketNames = {"comp_ipc"}, .subdirNames = {}});
+    // [0] the runtime dir itself. Triggers: monado's socket lands here directly, and BOTH runtimes'
+    // pid files land here — the pid file is the only don-time filesystem signal WiVRn emits (live
+    // evidence: comp_ipc is created at service start and inherited by the forked server; wivrn.pid
+    // is created/rewritten by the forked server exactly at headset-connect). "wivrn" subdir creation
+    // is also watched (first service start of a boot creates it, then comp_ipc inside).
+    out.push_back(SXRReprobeWatch{.dir = base, .triggerNames = {"monado_comp_ipc", "monado.pid", "wivrn.pid"}, .subdirNames = {"wivrn"}});
+    // [1] the WiVRn subdir: comp_ipc appears inside at SERVICE start (not at don — see above).
+    out.push_back(SXRReprobeWatch{.dir = base + "/wivrn", .triggerNames = {"comp_ipc"}, .subdirNames = {}});
     return out;
 }
 
-bool OpenXR::xrReprobeSocketMatch(const SXRReprobeWatch& w, const std::string& name) {
-    for (const auto& s : w.socketNames)
+bool OpenXR::xrReprobeTriggerMatch(const SXRReprobeWatch& w, const std::string& name) {
+    for (const auto& s : w.triggerNames)
         if (s == name)
             return true;
     return false;
+}
+
+std::vector<std::string> OpenXR::xrRuntimeSocketPaths(const std::string& runtimeDir) {
+    if (runtimeDir.empty())
+        return {};
+    std::string base = runtimeDir;
+    while (base.size() > 1 && base.back() == '/')
+        base.pop_back();
+    return {base + "/monado_comp_ipc", base + "/wivrn/comp_ipc"};
+}
+
+int64_t OpenXR::xrReprobeDelayMs(bool headsetWait, bool activityRecent, int attempt, int64_t baseMs, int64_t capMs) {
+    // Backoff-policy decision table (live-evidence bug 1). HEADSET-class waits (runtime reachable,
+    // headset absent — includes WiVRn's degraded pre-don mode) and windows of recent relevant
+    // filesystem activity (the runtime is materializing) poll at the fixed base cadence; only a
+    // truly absent, quiet runtime earns the grown backoff.
+    if (baseMs <= 0)
+        baseMs = 2000;
+    if (headsetWait || activityRecent)
+        return baseMs;
+    return xrReprobeBackoffMs(attempt, baseMs, capMs);
 }
 
 bool OpenXR::xrReprobeSubdirMatch(const SXRReprobeWatch& w, const std::string& name) {
