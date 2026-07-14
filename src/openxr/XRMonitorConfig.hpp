@@ -114,43 +114,75 @@ namespace OpenXR {
     int64_t xrReprobeBackoffMs(int attempt, int64_t baseMs, int64_t capMs);
 
     // ---- event-driven re-probe: inotify watch-path derivation (don-the-headset dead-air fix) ----
-    // The problem: WiVRn only becomes a connectable runtime at the instant the headset client
-    // connects — its IPC socket appears in $XDG_RUNTIME_DIR only then. So after login the timer
-    // backoff (xrReprobeBackoffMs) has already grown toward 30s and donning stalls for up to that
-    // long. The fix is to inotify-watch the directory the socket lands in and probe the moment it
-    // appears; the timer stays as fallback.
+    // Live evidence (boot 2026-07-14, instance c41d16e2*_1784014116): WiVRn's main server creates
+    // and LISTENS on $XDG_RUNTIME_DIR/wivrn/comp_ipc at service startup (create_listen_socket in
+    // wivrn server/main.cpp) — the socket exists long before the headset is donned, and it answers
+    // IPC in a degraded "no headset" mode that advertises no EGL/GLES extensions (so probes fail at
+    // the required-extension check while connect() succeeds). When the headset connects, the main
+    // server FORKS the real compositor server, which INHERITS the listen socket — donning produces
+    // ZERO filesystem events at the socket path. What the forked server DOES touch is the pid file:
+    // monado u_process.c pidfile_open/pidfile_write on XRT_IPC_SERVICE_PID_FILENAME —
+    // $XDG_RUNTIME_DIR/wivrn.pid for WiVRn (server/CMakeLists.txt), monado.pid for stock monado —
+    // created on the first don of a boot (IN_CREATE) and truncated+rewritten on later dons
+    // (pidfile_close leaves the file behind; IN_MODIFY). So the trigger set is sockets AND pid
+    // files, and the manager's mask must include IN_MODIFY|IN_CLOSE_WRITE, not just IN_CREATE.
     //
-    // A single directory to inotify-watch, plus the basenames whose creation there means something.
-    // socketNames: creating one of these IS the runtime socket appearing -> probe immediately.
+    // A single directory to inotify-watch, plus the basenames whose events there mean something.
+    // triggerNames: a create/move-in/modify of one of these = the runtime (or its real server) is
+    //   materializing -> probe immediately.
     // subdirNames: creating one of these is a nested socket directory appearing -> start watching it
     //   too (its own socket lands inside a moment later; see xrReprobeWatchDirs for the pairing).
     struct SXRReprobeWatch {
-        std::string              dir;         // absolute directory to watch (IN_CREATE / IN_MOVED_TO)
-        std::vector<std::string> socketNames; // basenames whose creation here triggers an immediate probe
-        std::vector<std::string> subdirNames; // basenames whose creation here means "also watch dir/<name>"
+        std::string              dir;          // absolute directory to watch
+        std::vector<std::string> triggerNames; // basenames whose create/move-in/modify here triggers a probe
+        std::vector<std::string> subdirNames;  // basenames whose creation here means "also watch dir/<name>"
     };
 
     // Derive the watch set from the value of $XDG_RUNTIME_DIR (pass the raw env string; may be empty).
     // Returns {} when runtimeDir is empty — without XDG_RUNTIME_DIR the socket location is unknown and
     // the caller falls back to the timer alone. Otherwise returns, in order:
-    //   [0] $XDG_RUNTIME_DIR         socketNames={monado default "monado_comp_ipc"}, subdirNames={"wivrn"}
-    //   [1] $XDG_RUNTIME_DIR/wivrn   socketNames={"comp_ipc"}
-    // Evidence (both resolve the socket via monado u_file_get_runtime_dir == $XDG_RUNTIME_DIR):
-    //   - monado  CMakeLists.txt: XRT_IPC_MSG_SOCK_FILENAME default "monado_comp_ipc"
-    //   - WiVRn   server/CMakeLists.txt: XRT_IPC_MSG_SOCK_FILENAME "wivrn/comp_ipc"
+    //   [0] $XDG_RUNTIME_DIR       triggers={"monado_comp_ipc","monado.pid","wivrn.pid"}, subdirs={"wivrn"}
+    //   [1] $XDG_RUNTIME_DIR/wivrn triggers={"comp_ipc"}
+    // Sources (all resolve via monado u_file_get_runtime_dir == $XDG_RUNTIME_DIR):
+    //   - monado CMakeLists.txt: XRT_IPC_MSG_SOCK_FILENAME "monado_comp_ipc", XRT_IPC_SERVICE_PID_FILENAME "monado.pid"
+    //   - WiVRn  server/CMakeLists.txt: XRT_IPC_MSG_SOCK_FILENAME "wivrn/comp_ipc", XRT_IPC_SERVICE_PID_FILENAME "wivrn.pid"
     // The [1] entry is emitted unconditionally (pure); the manager only inotify-adds it once the
     // directory exists, and adds it dynamically when the "wivrn" subdir creation event fires on [0].
     std::vector<SXRReprobeWatch> xrReprobeWatchDirs(const std::string& runtimeDir);
 
-    // Pure predicates over a watch spec + a just-created basename, so the trigger decision is gtestable:
-    bool xrReprobeSocketMatch(const SXRReprobeWatch& w, const std::string& name); // name is a runtime socket -> probe
-    bool xrReprobeSubdirMatch(const SXRReprobeWatch& w, const std::string& name); // name is a nested dir -> watch it too
+    // Pure predicates over a watch spec + an event basename, so the trigger decision is gtestable:
+    bool xrReprobeTriggerMatch(const SXRReprobeWatch& w, const std::string& name); // name is a probe trigger
+    bool xrReprobeSubdirMatch(const SXRReprobeWatch& w, const std::string& name);  // name is a nested dir -> watch it too
 
-    // Debounce between a socket-appearance event and the probe: the socket file can exist a beat before
-    // the server is accept()ing on it, so a probe fired the same instant may still fail. On a matching
-    // event the manager resets the backoff to attempt 0 (so if the debounced probe DOES fail it falls
-    // back to the FAST end of the schedule, not the grown delay) and arms this one-shot.
+    // Debounce between a trigger event and the probe: the socket/server can exist a beat before it is
+    // accept()ing usefully, so a probe fired the same instant may still fail. On a matching event the
+    // manager resets the backoff to attempt 0 (so if the debounced probe DOES fail it falls back to
+    // the FAST end of the schedule, not the grown delay) and arms this one-shot.
     inline constexpr int XR_REPROBE_WATCH_DEBOUNCE_MS = 150;
+
+    // Backoff-policy fix (live-evidence bug 1): the next probe delay, replacing the raw backoff call.
+    //   headsetWait     — HEADSET-class wait (xrGetSystem FORM_FACTOR_UNAVAILABLE, or the runtime was
+    //                     reachable but lacked the required extensions — WiVRn's pre-don degraded
+    //                     mode): fixed base cadence, never grows. This is the leg that turned the
+    //                     live boot's dead-air into 30s: the degraded-mode failure was classified as
+    //                     "no runtime" and the backoff grew to the cap.
+    //   activityRecent  — relevant filesystem activity was seen in the watched dirs within
+    //                     XR_REPROBE_ACTIVITY_WINDOW_MS: the runtime is materializing; poll hard
+    //                     (base cadence) instead of honoring a grown backoff.
+    //   otherwise       — the plain xrReprobeBackoffMs schedule.
+    int64_t xrReprobeDelayMs(bool headsetWait, bool activityRecent, int attempt, int64_t baseMs, int64_t capMs);
+
+    // How long after the last relevant watch event the backoff stays capped at the base interval.
+    inline constexpr int64_t XR_REPROBE_ACTIVITY_WINDOW_MS = 60000;
+
+    // The known runtime IPC socket paths under $XDG_RUNTIME_DIR ({} when runtimeDir is empty):
+    //   $RT/monado_comp_ipc  and  $RT/wivrn/comp_ipc
+    // Used by the manager to refine the degraded-runtime wait classification: WiVRn's CLIENT lib
+    // answers xrEnumerateInstanceExtensionProperties with a degraded list even when NO server exists
+    // (verified in an isolated $XDG_RUNTIME_DIR), so "enumerate answered" alone cannot distinguish
+    // "service up, headset undonned" (poll at base forever) from "service not running" (back off).
+    // A LISTENING server always has its socket on disk — stat'ing these is the missing bit.
+    std::vector<std::string> xrRuntimeSocketPaths(const std::string& runtimeDir);
 
     // ---- session-loss hardening (freeze audit, 2026-07-14) ----
     // A live wivrn restart under a two-client session froze the desktop. The frame loop must never make
