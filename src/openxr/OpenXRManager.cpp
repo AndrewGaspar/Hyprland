@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <chrono>
 #include <limits>
+#include <mutex>
 #include <thread>
 #include <cmath>
 #include <format>
@@ -239,29 +240,61 @@ void COpenXRManager::start() {
     publishHandInputPolicy(); // research/16 Part A: seed the hand-input policy from openxr:hand_input
     publishGrabStringTuning(); // task #25: seed hand_grab / hand_grab_anywhere / grab_filter_scope enums
 
-    m_session  = makeUnique<CXRSession>();
-    m_graphics = makeUnique<CXRGraphics>();
+    // Concurrency guard for the off-main handshake below. A previously-abandoned handshake thread may
+    // still be blocked in xrCreateInstance against a wedged runtime; starting a second one would race
+    // the OpenXR loader's process-global init. Skip this attempt — the reprobe retries once the
+    // in-flight handshake resolves and clears the flag.
+    if (m_handshakeInFlight.load(std::memory_order_acquire)) {
+        Log::logger->log(Log::DEBUG, "[OPENXR] a prior runtime handshake is still in flight — deferring this probe");
+        abortStart();
+        return;
+    }
+
+    // Build the session on the heap (raw ownership) so a timed-out handshake can hand it to the helper
+    // thread cleanly — CUniquePointer has no release(). Adopted into m_session only on completion.
+    auto* sess = new CXRSession();
 
     // Overlay session (doc 01). Read openxr:overlay / openxr:overlay_z once, BEFORE createInstance
     // (which enables XR_EXTX_overlay only if requested AND advertised). Same semantics as
     // blend_mode: read at session start — changing requires disable/enable. Requested-but-
     // unsupported downgrades to a normal session with a WARN (never fails startup).
     {
-        static auto POVERLAY          = CConfigValue<Hyprlang::INT>("openxr:overlay");
-        static auto POVERLAYZ         = CConfigValue<Hyprlang::INT>("openxr:overlay_z");
-        m_session->m_overlayRequested = (*POVERLAY != 0);
-        m_session->m_overlayZ         = (uint32_t)std::max<int64_t>(0, (int64_t)*POVERLAYZ);
+        static auto POVERLAY     = CConfigValue<Hyprlang::INT>("openxr:overlay");
+        static auto POVERLAYZ    = CConfigValue<Hyprlang::INT>("openxr:overlay_z");
+        sess->m_overlayRequested = (*POVERLAY != 0);
+        sess->m_overlayZ         = (uint32_t)std::max<int64_t>(0, (int64_t)*POVERLAYZ);
     }
 
+    // Steps 1-2: xrCreateInstance + xrGetSystem — the runtime FIRST-CONTACT handshake. Run on a helper
+    // thread with a bounded wait: the instant wivrn's socket reappears during a restart the event-driven
+    // reprobe fires start(), and that first IPC to a server still coming up can block. Keeping it off the
+    // main thread (with XR_HANDSHAKE_TIMEOUT_MS) is what stops that block from freezing the desktop
+    // (2026-07-14 live-restart audit; mirrors the wrong-GPU probe's bounded-thread pattern).
+    const eHandshakeResult hs = runBoundedHandshake(sess);
+    if (hs == HANDSHAKE_TIMEOUT) {
+        // Ownership of `sess` was transferred to the still-running helper thread — do NOT touch it. It
+        // will destroy the session and clear m_handshakeInFlight when it finally returns.
+        Log::logger->log(Log::WARN, "[OPENXR] runtime handshake did not complete within {}ms — finishing it off-thread; state -> unavailable", OpenXR::XR_HANDSHAKE_TIMEOUT_MS);
+        m_probeWait = XR_WAIT_RUNTIME; // the runtime is present-but-unresponsive; poll it again shortly
+        m_runtimeName.clear();
+        m_systemName.clear();
+        m_runtimeGpu.clear();
+        setState(XR_STATE_UNAVAILABLE);
+        return;
+    }
+
+    // Completed within the budget: the helper thread has exited and we own `sess`. Adopt it.
+    m_session = UP<CXRSession>(sess);
+
     // 1. Instance (extension checks; missing runtime / required extensions -> UNAVAILABLE).
-    if (!m_session->createInstance()) {
+    if (hs == HANDSHAKE_FAILED_INSTANCE) {
         Log::logger->log(Log::WARN, "[OPENXR] no runtime / required extensions unavailable, state -> unavailable");
         abortStart();
         return;
     }
 
     // 2. System.
-    if (!m_session->getSystem()) {
+    if (hs == HANDSHAKE_FAILED_SYSTEM) {
         // report-20 issue B1: FORM_FACTOR_UNAVAILABLE = runtime up, headset not connected/donned — the
         // spec-intended "poll me later" result. The re-probe then waits gently for the headset rather
         // than growing the backoff as it would for an absent runtime.
@@ -270,6 +303,8 @@ void COpenXRManager::start() {
         abortStart();
         return;
     }
+
+    m_graphics = makeUnique<CXRGraphics>();
 
     // report-19: latch whether this runtime+device can drive the plug gate on user presence (else the
     // `visible` mode falls back to visibility + the first-plug blip guard). Fresh session -> clear the
@@ -472,6 +507,57 @@ void COpenXRManager::abortStart() {
     setState(XR_STATE_UNAVAILABLE);
 }
 
+COpenXRManager::eHandshakeResult COpenXRManager::runBoundedHandshake(CXRSession* sess) {
+    // Runs the two blocking first-contact calls (xrCreateInstance + xrGetSystem) on a detached helper
+    // thread and waits at most XR_HANDSHAKE_TIMEOUT_MS. The shared claim block decides EXACTLY ONCE, under
+    // a mutex, who owns `sess`: the main thread (helper finished in time) or the helper thread (main timed
+    // out -> ownership transferred, helper deletes it + clears the concurrency guard when it returns).
+    struct SClaim {
+        std::mutex mu;
+        bool       threadDone = false; // helper finished within the wait; main still owns sess
+        bool       abandoned  = false; // main timed out; helper now owns + deletes sess + clears inflight
+        bool       instanceOk = false;
+        bool       systemOk    = false;
+    };
+    auto              claim    = std::make_shared<SClaim>();
+    std::atomic<bool>* inflight = &m_handshakeInFlight; // stable: the manager is a process-lifetime singleton
+
+    std::thread([sess, claim, inflight]() {
+        const bool iok = sess->createInstance();
+        const bool sok = iok && sess->getSystem();
+        std::lock_guard<std::mutex> lg(claim->mu);
+        claim->instanceOk = iok;
+        claim->systemOk   = sok;
+        if (claim->abandoned) {
+            // Main gave us ownership on timeout. Destroy off the main thread (xrDestroyInstance frees a
+            // possibly-late-created instance + the socket fd), then release the concurrency guard.
+            delete sess;
+            inflight->store(false, std::memory_order_release);
+        } else
+            claim->threadDone = true;
+    }).detach();
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(OpenXR::XR_HANDSHAKE_TIMEOUT_MS);
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lg(claim->mu);
+            if (claim->threadDone)
+                return !claim->instanceOk ? HANDSHAKE_FAILED_INSTANCE : (!claim->systemOk ? HANDSHAKE_FAILED_SYSTEM : HANDSHAKE_OK);
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            std::lock_guard<std::mutex> lg(claim->mu);
+            if (claim->threadDone) // finished right at the boundary — reclaim ownership
+                return !claim->instanceOk ? HANDSHAKE_FAILED_INSTANCE : (!claim->systemOk ? HANDSHAKE_FAILED_SYSTEM : HANDSHAKE_OK);
+            // Transfer ownership of `sess` to the helper thread and latch the guard so no second
+            // handshake starts until the helper returns and clears it.
+            claim->abandoned = true;
+            m_handshakeInFlight.store(true, std::memory_order_release);
+            return HANDSHAKE_TIMEOUT;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
 void COpenXRManager::stop() {
     if (m_state == XR_STATE_DISABLED)
         return;
@@ -503,14 +589,17 @@ void COpenXRManager::stop() {
         m_graphics->destroyGL();
 
     // 3. Per-layer swapchains (context NOT current), then the action system, then XR handles.
+    //    On a lost runtime, skip the per-object xr destroy calls: each is a doomed IPC round-trip
+    //    (the "Broken pipe" storm seen in the field) and a would-be main-thread block against a
+    //    wedged runtime. xrDestroyInstance (in CXRSession::destroy) reaps all child handles.
     for (auto& l : m_layers)
-        l->destroySwapchain();
+        l->destroySwapchain(/*skipXrCall=*/lost);
     if (m_input) {
-        m_input->destroy(); // action spaces are session children — destroy before the session
+        m_input->destroy(/*runtimeLost=*/lost); // action spaces are session children — destroy before the session
         m_input.reset();
     }
     if (m_session)
-        m_session->destroy();
+        m_session->destroy(/*runtimeLost=*/lost);
 
     // 5. EGL/GBM.
     if (m_graphics)
@@ -779,6 +868,7 @@ void COpenXRManager::frameThread() {
     // swapchain, and submits one XrCompositionLayerQuad per layer (doc 01 loop / doc 02).
     eXRManagerState lastReported  = XR_STATE_RUNNING_IDLE;
     int64_t         lastPredicted = 0; // XrTime (ns) of the previous frame, for the solve dt
+    int             frameFailStreak = 0; // consecutive xrWaitFrame/xrBeginFrame failures (loss backstop)
 
     while (m_running.load()) {
         m_session->pollEvents();
@@ -887,12 +977,25 @@ void COpenXRManager::frameThread() {
 
         XrFrameWaitInfo waitInfo = {XR_TYPE_FRAME_WAIT_INFO};
         XrFrameState    fs       = {XR_TYPE_FRAME_STATE};
-        if (XR_FAILED(xrWaitFrame(m_session->m_session, &waitInfo, &fs)))
+        if (XR_FAILED(xrWaitFrame(m_session->m_session, &waitInfo, &fs))) {
+            // pollEvents at the top of the next iteration normally classifies a dead runtime (it maps
+            // the loss to m_exitRequested and the loop breaks). This streak backstop latches loss for
+            // any failure code it does NOT classify, so a dead runtime can never make the loop
+            // busy-spin forever. The short sleep keeps a transient-failure streak off a CPU core.
+            if (++frameFailStreak >= OpenXR::XR_MAX_FRAME_FAIL_STREAK)
+                m_session->markRuntimeLost("xrWaitFrame failure streak", 0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
             continue;
+        }
 
         XrFrameBeginInfo beginInfo = {XR_TYPE_FRAME_BEGIN_INFO};
-        if (XR_FAILED(xrBeginFrame(m_session->m_session, &beginInfo)))
+        if (XR_FAILED(xrBeginFrame(m_session->m_session, &beginInfo))) {
+            if (++frameFailStreak >= OpenXR::XR_MAX_FRAME_FAIL_STREAK)
+                m_session->markRuntimeLost("xrBeginFrame failure streak", 0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
             continue;
+        }
+        frameFailStreak = 0; // a clean wait+begin clears the streak
 
         // Sample controller/hand actions once per frame (doc 04 §2): xrSyncActions + per-hand
         // aim/grip pose + analog reads at the predicted display time, located in the reference
@@ -901,6 +1004,7 @@ void COpenXRManager::frameThread() {
             m_input->sample(fs.predictedDisplayTime, m_session->m_refSpace);
 
         // Per-layer: ensure a swapchain, then blit the latest presented buffer into it.
+        bool lostInFrame = false; // set if a per-layer xr call reveals a dead/wedged runtime
         for (auto& l : active) {
             // Mode change: recreate the swapchain at the new pixel size (doc 02).
             if (l->m_swapchainDirty.exchange(false, std::memory_order_acq_rel)) {
@@ -1017,9 +1121,21 @@ void COpenXRManager::frameThread() {
                 l->retireBuffer(std::move(buf)); // never let a valid buffer SP die on this thread
                 continue;
             }
+            // BOUNDED wait — never XR_INFINITE_DURATION. A wedged/dying runtime here would block the
+            // frame thread indefinitely, and the main thread's join() in stop() blocks with it, so the
+            // compositor stops painting the whole desktop (the 2026-07-14 live-restart freeze class).
+            // On a healthy runtime the image is ready almost immediately; anything past the ceiling (or
+            // an outright loss code) means the runtime is gone — latch loss, bail the frame, let the
+            // main thread tear down to UNAVAILABLE + reprobe.
             XrSwapchainImageWaitInfo waitImg = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-            waitImg.timeout                  = XR_INFINITE_DURATION;
-            xrWaitSwapchainImage(l->m_swapchain, &waitImg);
+            waitImg.timeout                  = (XrDuration)OpenXR::XR_SWAPCHAIN_WAIT_TIMEOUT_NS;
+            const XrResult waitRes           = xrWaitSwapchainImage(l->m_swapchain, &waitImg);
+            if (waitRes != XR_SUCCESS) {
+                l->retireBuffer(std::move(buf)); // never let a valid buffer SP die on this thread
+                m_session->markRuntimeLost("xrWaitSwapchainImage", (int)waitRes);
+                lostInFrame = true;
+                break;
+            }
 
             if (imgIdx < l->m_swapchainImages.size()) {
                 const XR_GLuint dst = l->m_swapchainImages[imgIdx];
@@ -1069,6 +1185,12 @@ void COpenXRManager::frameThread() {
             // not happen on this thread (non-atomic refcounts, see XRMonitorLayer.hpp).
             l->retireBuffer(std::move(buf));
         }
+
+        // Runtime revealed dead mid-layer (bounded swapchain wait failed): skip the anchor solve +
+        // xrEndFrame (both would be more doomed IPC) and restart the loop — the m_exitRequested check
+        // at the top breaks it and wakes the main thread to tear down (UNAVAILABLE + reprobe).
+        if (lostInFrame)
+            continue;
 
         // --- anchor solve (WP5) ---
         // Locate the head (VIEW) pose in our reference space at the predicted display time. In the

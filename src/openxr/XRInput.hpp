@@ -144,7 +144,9 @@ class CXRInput {
     bool init(CXRSession& session, bool hasHandInteraction);
 
     // Main thread, during teardown (frame thread already joined). Destroys action spaces + set.
-    void destroy();
+    // runtimeLost: the runtime IPC is dead — skip the xr destroy calls (doomed IPC round-trips that
+    // only spam "Broken pipe"; xrDestroyInstance in CXRSession::destroy reaps these child handles).
+    void destroy(bool runtimeLost = false);
 
     // Frame thread. xrSyncActions + per-hand pose/analog sampling at predictedDisplayTime,
     // locating aim/grip in refSpace. Snapshots per-hand state into m_hands; the ray cast +

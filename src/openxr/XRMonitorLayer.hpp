@@ -71,7 +71,9 @@ class CXRMonitorLayer {
     // Delete per-layer GL objects (m_lastEGLImg, m_cpuTex). REQUIRES the EGL context current.
     void destroyFrameResourcesGL(CXRGraphics& gfx);
     // Destroy the XrSwapchain. REQUIRES the context NOT current (interop rule, doc 01).
-    void destroySwapchain();
+    // skipXrCall: the runtime IPC is dead — null the swapchain handle without xrDestroySwapchain
+    // (a doomed round-trip; xrDestroyInstance reaps it). Frees the local image list + content state.
+    void destroySwapchain(bool skipXrCall = false);
 
     // ---- main thread ----
     std::string         m_monitorName;         // key; survives monitor teardown

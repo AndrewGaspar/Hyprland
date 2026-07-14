@@ -151,6 +151,32 @@ namespace OpenXR {
     // event the manager resets the backoff to attempt 0 (so if the debounced probe DOES fail it falls
     // back to the FAST end of the schedule, not the grown delay) and arms this one-shot.
     inline constexpr int XR_REPROBE_WATCH_DEBOUNCE_MS = 150;
+
+    // ---- session-loss hardening (freeze audit, 2026-07-14) ----
+    // A live wivrn restart under a two-client session froze the desktop. The frame loop must never make
+    // a BLOCKING xr call that cannot time out: if it wedges, the main thread's join() in stop() wedges
+    // with it and the compositor stops painting the desktop. These bound every such wait.
+
+    // Ceiling for xrWaitSwapchainImage. On a healthy runtime the image is ready ~immediately, so a wait
+    // this long means the runtime is wedged/dying — we treat it as loss (drop the session, reprobe)
+    // rather than block. NEVER XR_INFINITE_DURATION. Value is nanoseconds (XrDuration). 2s is far above
+    // any normal jitter (won't false-drop on a Wi-Fi hiccup) yet bounds the worst-case frame-thread
+    // stall — and therefore the worst-case main-thread join — to ~2s instead of forever.
+    inline constexpr long long XR_SWAPCHAIN_WAIT_TIMEOUT_NS = 2'000'000'000LL;
+
+    // Consecutive xrWaitFrame/xrBeginFrame hard-failures the frame loop tolerates before latching loss.
+    // pollEvents at the top of each iteration normally classifies a dead runtime within one iteration;
+    // this is the backstop for a failure code that isn't INSTANCE_LOST/SESSION_LOST, so the loop can
+    // never busy-spin on a dead runtime forever.
+    inline constexpr int XR_MAX_FRAME_FAIL_STREAK = 8;
+
+    // Bounded wait (ms) for the reconnect handshake (xrCreateInstance + xrGetSystem) that start() runs
+    // on a helper thread. The instant wivrn's socket reappears during a restart the event-driven
+    // reprobe fires start(); if the just-appeared server is not yet answering, that FIRST-contact
+    // handshake can block on the socket. Running it off the main thread with this ceiling keeps the
+    // compositor painting; on timeout start() abandons the attempt (UNAVAILABLE) and reprobes later.
+    // Generous so a healthy cold start never abandons.
+    inline constexpr int XR_HANDSHAKE_TIMEOUT_MS = 5000;
 }
 
 namespace OpenXR {

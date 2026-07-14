@@ -59,9 +59,21 @@ class CXRSession {
     bool               createSession(CXRGraphics& gfx); // XrGraphicsBindingEGLMNDX
     bool               createSpaces(CXRGraphics& gfx);  // reference space (LOCAL_FLOOR/LOCAL) + VIEW space
     bool               chooseSwapchainFormat();         // enumerate + pick once; stored on m_swapchainFormat
-    void               destroy();                       // spaces, session, instance (teardown ordering — doc 01)
+    // Teardown ordering (doc 01): spaces, session, instance. When runtimeLost is true (the runtime IPC
+    // is already dead — a killed/restarted monado-service), the per-child xr destroy calls (spaces,
+    // session) are SKIPPED: each would be a doomed IPC round-trip that only spams "Broken pipe" and,
+    // on a wedged runtime, could block. The child handles are nulled locally and xrDestroyInstance is
+    // still called (it frees loader-side state + the socket fd and implicitly reaps the child handles).
+    void               destroy(bool runtimeLost = false);
 
     void               pollEvents(); // FRAME thread: XR event pump + session state machine
+
+    // Latch "the runtime IPC is dead" from ANY xr call that returns a loss code (pollEvents, the frame
+    // loop's wait/begin, a bounded swapchain wait). Idempotent + once-logged. Sets m_exitRequested so
+    // the frame loop breaks at the top of its next iteration and the main thread tears down to
+    // UNAVAILABLE (+ reprobe). Frame-thread only (matches the existing m_exitRequested/m_instanceLost
+    // writers); the main thread reads the flags after the frame thread is joined.
+    void               markRuntimeLost(const char* why, int xrResult);
 
     const std::string& runtimeName() const {
         return m_runtimeName;
@@ -107,7 +119,8 @@ class CXRSession {
     XrSessionState m_xrState       = XR_SESSION_STATE_UNKNOWN;
     bool           m_sessionBegan  = false;
     bool           m_exitRequested = false; // set on EXITING / LOSS_PENDING / instance loss
-    bool           m_instanceLost  = false; // set on LOSS_PENDING / XrEventDataInstanceLossPending
+    bool           m_instanceLost  = false; // set on LOSS_PENDING / XrEventDataInstanceLossPending / any loss code
+    bool           m_lostLogged    = false; // markRuntimeLost() logs the loss WARN exactly once per session
     // WP-G5: set by pollEvents on XrEventDataInteractionProfileChanged; the frame loop forwards it
     // to CXRInput (re-read xrGetCurrentInteractionProfile) then clears it. Frame-thread only.
     bool           m_interactionProfileChanged = false;

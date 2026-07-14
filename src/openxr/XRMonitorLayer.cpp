@@ -128,9 +128,10 @@ void CXRMonitorLayer::destroyFrameResourcesGL(CXRGraphics& gfx) {
     m_contentTexSize = Vector2D{};
 }
 
-void CXRMonitorLayer::destroySwapchain() {
+void CXRMonitorLayer::destroySwapchain(bool skipXrCall) {
     if (m_swapchain != XR_NULL_HANDLE) {
-        xrDestroySwapchain(m_swapchain);
+        if (!skipXrCall)
+            xrDestroySwapchain(m_swapchain);
         m_swapchain = XR_NULL_HANDLE;
     }
     m_swapchainImages.clear();
