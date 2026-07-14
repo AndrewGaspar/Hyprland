@@ -276,6 +276,11 @@ void COpenXRManager::start() {
         // will destroy the session and clear m_handshakeInFlight when it finally returns.
         Log::logger->log(Log::WARN, "[OPENXR] runtime handshake did not complete within {}ms — finishing it off-thread; state -> unavailable", OpenXR::XR_HANDSHAKE_TIMEOUT_MS);
         m_probeWait = XR_WAIT_RUNTIME; // the runtime is present-but-unresponsive; poll it again shortly
+        // A timed-out handshake means a server ANSWERED the connect but is still coming up (cold
+        // restart) — exactly the "runtime materializing" case: open the activity window so the next
+        // probes run at the base cadence, not the grown backoff. If it stays wedged past the window,
+        // the backoff resumes.
+        markWatchActivity();
         m_runtimeName.clear();
         m_systemName.clear();
         m_runtimeGpu.clear();
@@ -288,7 +293,18 @@ void COpenXRManager::start() {
 
     // 1. Instance (extension checks; missing runtime / required extensions -> UNAVAILABLE).
     if (hs == HANDSHAKE_FAILED_INSTANCE) {
-        Log::logger->log(Log::WARN, "[OPENXR] no runtime / required extensions unavailable, state -> unavailable");
+        // Live-evidence bug 1: a REACHABLE runtime that lacks the required extensions is WiVRn's
+        // degraded pre-don mode (its main server listens on comp_ipc from service start and only
+        // advertises the real extension set once the headset connects and the compositor server
+        // forks). Classify it as a HEADSET wait so the reprobe polls at the fixed base cadence —
+        // growing the no-runtime backoff here is what produced the observed 30s don dead-air.
+        // "Reachable" needs BOTH signals: the enumerate answered (m_runtimeReachable) AND a known
+        // runtime IPC socket exists on disk — WiVRn's CLIENT lib answers enumerate with the same
+        // degraded list even when NO server is running (verified in an isolated $XDG_RUNTIME_DIR),
+        // so without the socket stat a stopped service would poll at base forever too.
+        m_probeWait = m_session->m_runtimeReachable && runtimeSocketPresent() ? XR_WAIT_HEADSET : XR_WAIT_RUNTIME;
+        Log::logger->log(Log::WARN, "[OPENXR] {}, state -> unavailable",
+                         m_probeWait == XR_WAIT_HEADSET ? "runtime reachable but degraded (headset likely not connected)" : "no runtime / required extensions unavailable");
         abortStart();
         return;
     }
@@ -2223,11 +2239,15 @@ void COpenXRManager::maybeArmReprobe() {
 
     static auto   PBASE = CConfigValue<Hyprlang::INT>("openxr:reprobe_interval_ms");
     const int64_t base  = std::max<int64_t>(250, (int64_t)*PBASE);
-    // HEADSET wait (runtime up, headset undonned) polls at the gentle fixed cadence — this is the
-    // spec-intended xrGetSystem poll; growing a backoff there would just make donning feel laggy.
-    // RUNTIME wait (no runtime/server yet) grows the backoff so a permanently-absent runtime is cheap.
-    const int64_t ms = m_probeWait == XR_WAIT_HEADSET ? base : OpenXR::xrReprobeBackoffMs(m_reprobeAttempt, base, 30000);
-    Log::logger->log(Log::DEBUG, "[OPENXR] dormant — re-probing in {}ms (waiting for {}, attempt {})", ms, m_probeWait == XR_WAIT_HEADSET ? "headset" : "runtime", m_reprobeAttempt);
+    // Delay policy (pure, gtested — live-evidence bug 1). HEADSET wait (runtime up/reachable, headset
+    // undonned — includes WiVRn's degraded pre-don mode) polls at the gentle fixed cadence; growing a
+    // backoff there is what produced the observed 30s don dead-air. Recent relevant filesystem
+    // activity in the watched dirs also caps the delay at base: the runtime is materializing, and
+    // that is precisely when polling hard is right. Only a truly absent, quiet runtime backs off.
+    const bool    activity = watchActivityRecent();
+    const int64_t ms       = OpenXR::xrReprobeDelayMs(m_probeWait == XR_WAIT_HEADSET, activity, m_reprobeAttempt, base, 30000);
+    Log::logger->log(Log::DEBUG, "[OPENXR] dormant — re-probing in {}ms (waiting for {}, attempt {}{})", ms, m_probeWait == XR_WAIT_HEADSET ? "headset" : "runtime", m_reprobeAttempt,
+                     activity ? ", fs activity recent" : "");
     armReprobeTimer((int)ms);
 
     // Event-driven leg (don-the-headset dead-air fix): also inotify-watch the runtime socket dir so a
@@ -2255,6 +2275,13 @@ void COpenXRManager::cancelReprobe(bool resetBackoff) {
     if (resetBackoff) {
         m_reprobeAttempt = 0;
         m_probeWait      = XR_WAIT_NONE;
+        // End of the dormant period (real success / user disable): clear the per-period watch
+        // bookkeeping. A mere STARTING transition keeps it — the watch fd is torn down and re-armed
+        // around every probe, and "did the watch ever fire / did we already log the miss" must span
+        // the whole dormant period, not one probe cycle.
+        m_watchEverFired    = false;
+        m_watchMissLogged   = false;
+        m_lastWatchActivity.reset();
     }
 }
 
@@ -2263,6 +2290,30 @@ void COpenXRManager::onReprobeExpired() {
     static auto PREPROBE = CConfigValue<Hyprlang::INT>("openxr:reprobe");
     if (m_state != XR_STATE_UNAVAILABLE || !*PENABLED || !*PREPROBE)
         return; // state moved on / disabled since the timer was armed
+
+    // Paranoid silent-miss guard (live-evidence bug 2 hardening): while the watch is armed, every
+    // timer-fired probe also stats the known trigger paths. A trigger file existing while the watch
+    // never fired this dormant cycle means either the expected pre-don steady state (WiVRn keeps
+    // comp_ipc alive in degraded mode — HEADSET wait, log once at DEBUG) or a genuine watch miss
+    // (RUNTIME wait believes there is no runtime, yet its socket exists — WARN once so future
+    // silent-miss classes are diagnosable from a normal log).
+    if (m_watchInotifyFd >= 0 && !m_watchEverFired && !m_watchMissLogged) {
+        struct stat st;
+        for (const auto& spec : m_watchSpecs) {
+            for (const auto& trig : spec.triggerNames) {
+                const std::string path = spec.dir + "/" + trig;
+                if (stat(path.c_str(), &st) == 0) {
+                    Log::logger->log(m_probeWait == XR_WAIT_HEADSET ? Log::DEBUG : Log::WARN,
+                                     "[OPENXR] reprobe-watch: {} exists but the watch has not fired this dormant cycle ({})", path,
+                                     m_probeWait == XR_WAIT_HEADSET ? "expected: pre-created socket, waiting for the headset" : "possible watch miss — timer probe proceeding");
+                    m_watchMissLogged = true;
+                    break;
+                }
+            }
+            if (m_watchMissLogged)
+                break;
+        }
+    }
 
     m_reprobeAttempt++;
     // start() re-attempts from scratch. On success setState() cancels+resets us; on failure it lands
@@ -2295,12 +2346,11 @@ void COpenXRManager::setupReprobeWatch() {
         return;
     if (m_watchInotifyFd >= 0)
         return; // already armed (maybeArmReprobe is idempotent per dormant cycle)
-    // Only the RUNTIME-wait case benefits: WiVRn's socket appears when the headset client connects, so
-    // watching for its creation turns donning into an instant probe. In the HEADSET-wait case (runtime
-    // already up, xrGetSystem says FORM_FACTOR_UNAVAILABLE) the socket already exists — nothing new is
-    // created on don — so the fixed-cadence timer is the right mechanism and the watch would never fire.
-    if (m_probeWait == XR_WAIT_HEADSET)
-        return;
+    // Armed in BOTH wait modes (live-evidence bug 2 revision): the HEADSET wait was originally
+    // excluded on the theory that nothing new is created on don — false for WiVRn, whose forked
+    // compositor server creates/rewrites $XDG_RUNTIME_DIR/wivrn.pid exactly at headset-connect
+    // (monado u_process.c pidfile machinery). That pid event IS the don signal; the socket itself
+    // never changes (pre-created by the main server and inherited across the fork).
 
     const char* xdg = getenv("XDG_RUNTIME_DIR");
     m_watchSpecs    = OpenXR::xrReprobeWatchDirs(xdg ? std::string(xdg) : std::string());
@@ -2333,19 +2383,21 @@ void COpenXRManager::setupReprobeWatch() {
 
     // Add a watch for every spec dir that currently exists. The primary ($XDG_RUNTIME_DIR) always does;
     // the wivrn/ subdir is added here if it already exists, else dynamically when its create event fires.
-    // No checkSocketNow at arm time: a socket already present means the just-failed probe saw it too, so
-    // an immediate re-probe would only busy-loop; the timer covers that. checkSocketNow is reserved for
-    // the live nested-dir-appeared race in onReprobeWatchReadable().
+    // No checkTriggerNow at arm time: a trigger file already present means the just-failed probe saw it
+    // too, so an immediate re-probe would only busy-loop; the timer covers that. checkTriggerNow is for
+    // the live watch-(re)added-while-things-move races in onReprobeWatchReadable().
     for (const auto& spec : m_watchSpecs)
-        addReprobeWatchDir(spec, /*checkSocketNow=*/false);
+        addReprobeWatchDir(spec, /*checkTriggerNow=*/false);
 
     Log::logger->log(Log::DEBUG, "[OPENXR] reprobe-watch armed on {} ({} dir watch(es))", m_watchSpecs.front().dir, m_watchByWd.size());
 }
 
-void COpenXRManager::addReprobeWatchDir(const OpenXR::SXRReprobeWatch& spec, bool checkSocketNow) {
+void COpenXRManager::addReprobeWatchDir(const OpenXR::SXRReprobeWatch& spec, bool checkTriggerNow) {
     if (m_watchInotifyFd < 0)
         return;
     // Skip if this dir is already watched (avoid duplicate wds on re-entry / dynamic subdir add).
+    // NOTE: a stale wd for a deleted+recreated dir must be ERASED before re-adding (the IN_IGNORED
+    // handler in onReprobeWatchReadable does that) or this dedup would pin the watch to the old inode.
     for (const auto& [wd, s] : m_watchByWd)
         if (s.dir == spec.dir)
             return;
@@ -2354,20 +2406,26 @@ void COpenXRManager::addReprobeWatchDir(const OpenXR::SXRReprobeWatch& spec, boo
     if (stat(spec.dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode))
         return; // dir doesn't exist yet — a parent watch will catch it appearing
 
-    const int wd = inotify_add_watch(m_watchInotifyFd, spec.dir.c_str(), IN_CREATE | IN_MOVED_TO);
+    // Mask (live-evidence bug 2): IN_CREATE|IN_MOVED_TO for sockets/dirs appearing; IN_MODIFY|
+    // IN_CLOSE_WRITE for the pid file being truncated+rewritten on a re-don (pidfile_close leaves the
+    // file behind, so the second and later dons of a boot only ever MODIFY it); IN_DELETE_SELF so a
+    // deleted/recreated watched dir surfaces as an event (with IN_IGNORED) and the watch is re-added
+    // by path instead of following the dead inode.
+    const int wd = inotify_add_watch(m_watchInotifyFd, spec.dir.c_str(), IN_CREATE | IN_MOVED_TO | IN_MODIFY | IN_CLOSE_WRITE | IN_DELETE_SELF);
     if (wd < 0) {
         Log::logger->log(Log::DEBUG, "[OPENXR] reprobe-watch: inotify_add_watch({}) failed", spec.dir);
         return;
     }
     m_watchByWd[wd] = spec;
 
-    // Race close (used when a nested socket dir just appeared): the socket may have been created between
-    // the dir-create event and this add — stat for it now and trigger if it's already there.
-    if (checkSocketNow) {
-        for (const auto& sock : spec.socketNames) {
-            const std::string path = spec.dir + "/" + sock;
+    // Race close (used when a watch is (re)added while the runtime is materializing — a nested dir
+    // just appeared, or a watched dir was recreated): a trigger file may have been created between
+    // the event that got us here and the add above — stat now and probe if it's already there.
+    if (checkTriggerNow) {
+        for (const auto& trig : spec.triggerNames) {
+            const std::string path = spec.dir + "/" + trig;
             if (stat(path.c_str(), &st) == 0) {
-                Log::logger->log(Log::DEBUG, "[OPENXR] reprobe-watch: socket {} already present on add — probing", path);
+                Log::logger->log(Log::DEBUG, "[OPENXR] reprobe-watch: trigger {} already present on add — probing", path);
                 triggerWatchedProbe();
                 break;
             }
@@ -2387,28 +2445,54 @@ void COpenXRManager::onReprobeWatchReadable() {
         for (char* p = buf; p < buf + n;) {
             auto* ev = reinterpret_cast<struct inotify_event*>(p);
             p += sizeof(struct inotify_event) + ev->len;
-            if (ev->len == 0)
-                continue;
             const auto it = m_watchByWd.find(ev->wd);
             if (it == m_watchByWd.end())
+                continue;
+
+            // Watch invalidation (live-evidence bug 2 hardening): the watched dir was deleted,
+            // unmounted, or the kernel dropped the watch — the wd is dead and, left in the map, its
+            // path-dedup entry would block a re-add, silently pinning us to the old inode. Drop it
+            // and re-add BY PATH right away (stat-guarded: if the dir is gone the parent watch
+            // catches its recreation), probing if a trigger file already exists in the new dir.
+            if (ev->mask & (IN_IGNORED | IN_DELETE_SELF | IN_UNMOUNT)) {
+                const OpenXR::SXRReprobeWatch spec = it->second; // copy — erase invalidates the ref
+                m_watchByWd.erase(it);
+                if (ev->mask & (IN_DELETE_SELF | IN_UNMOUNT)) // IN_IGNORED accompanies these; skip doubles
+                    continue;
+                Log::logger->log(Log::DEBUG, "[OPENXR] reprobe-watch: watch on {} invalidated — re-adding by path", spec.dir);
+                addReprobeWatchDir(spec, /*checkTriggerNow=*/true);
+                continue;
+            }
+
+            if (ev->len == 0)
                 continue;
             const std::string name(ev->name);
             const auto&       spec = it->second;
 
             // A nested socket dir (e.g. "wivrn") just appeared: start watching it too, and close the
-            // race where its socket landed before we could add the watch (checkSocketNow=true).
+            // race where its socket landed before we could add the watch (checkTriggerNow=true).
             if (OpenXR::xrReprobeSubdirMatch(spec, name)) {
+                markWatchActivity(); // runtime dir materializing — poll at the fast cadence for a while
                 for (const auto& sub : m_watchSpecs)
                     if (sub.dir == spec.dir + "/" + name) {
                         Log::logger->log(Log::DEBUG, "[OPENXR] reprobe-watch: nested dir {} appeared — watching it", sub.dir);
-                        addReprobeWatchDir(sub, /*checkSocketNow=*/true);
+                        addReprobeWatchDir(sub, /*checkTriggerNow=*/true);
                         break;
                     }
             }
 
-            // The runtime socket itself appeared -> probe (debounced).
-            if (OpenXR::xrReprobeSocketMatch(spec, name)) {
-                Log::logger->log(Log::DEBUG, "[OPENXR] reprobe-watch: runtime socket {}/{} appeared — probing soon", spec.dir, name);
+            // Any named event inside a NESTED watch dir (e.g. wivrn/) is runtime activity by
+            // definition — that dir only ever holds runtime artifacts. Root-dir churn ($XDG_RUNTIME_DIR
+            // sees wayland/dbus/pipewire traffic constantly) only counts when the name matches, or the
+            // activity window would be permanently open and the backoff never grow.
+            if (!m_watchSpecs.empty() && spec.dir != m_watchSpecs.front().dir)
+                markWatchActivity();
+
+            // A trigger (runtime socket created, or pid file created/rewritten by the forked
+            // compositor server at headset-connect) -> probe (debounced).
+            if (OpenXR::xrReprobeTriggerMatch(spec, name)) {
+                markWatchActivity();
+                Log::logger->log(Log::DEBUG, "[OPENXR] reprobe-watch: trigger {}/{} (mask 0x{:x}) — probing soon", spec.dir, name, ev->mask);
                 triggerWatchedProbe();
             }
         }
@@ -2416,6 +2500,8 @@ void COpenXRManager::onReprobeWatchReadable() {
 }
 
 void COpenXRManager::triggerWatchedProbe() {
+    m_watchEverFired = true; // silent-miss guard bookkeeping (spans the dormant period)
+    markWatchActivity();
     // Debounce (XR_REPROBE_WATCH_DEBOUNCE_MS): coalesce a burst of create events AND give the server a
     // beat to start accept()ing before we probe. The one-shot re-arm just pushes the deadline out.
     const auto dur = std::chrono::milliseconds(OpenXR::XR_REPROBE_WATCH_DEBOUNCE_MS);
@@ -2433,12 +2519,45 @@ void COpenXRManager::onWatchDebounceExpired() {
     static auto PREPROBE = CConfigValue<Hyprlang::INT>("openxr:reprobe");
     if (m_state != XR_STATE_UNAVAILABLE || !*PENABLED || !*PREPROBE)
         return; // state moved on since the event fired
-    // Reset the backoff to the fast end: the socket just appeared, so this is a fresh, promising
-    // attempt. If it still fails (socket not accept()ing yet) setState(UNAVAILABLE) re-arms the timer
-    // at attempt 0 (~base ms), not the grown delay — quick recovery without the 30s dead-air.
+    // A prior bounded handshake may still be in flight on its helper thread (2026-07-14 freeze audit:
+    // the OpenXR loader must never be entered twice concurrently). Don't fire another probe into it —
+    // reset the backoff and re-arm the fallback timer at the base cadence instead; by then the helper
+    // has usually resolved (and if not, start()'s own guard defers again, with the activity window
+    // keeping the cadence fast).
+    if (m_handshakeInFlight.load(std::memory_order_acquire)) {
+        static auto PBASE = CConfigValue<Hyprlang::INT>("openxr:reprobe_interval_ms");
+        m_reprobeAttempt  = 0;
+        Log::logger->log(Log::DEBUG, "[OPENXR] reprobe-watch: trigger fired but a handshake is in flight — retrying at base cadence");
+        armReprobeTimer((int)std::max<int64_t>(250, (int64_t)*PBASE));
+        return;
+    }
+    // Reset the backoff to the fast end: a trigger just fired, so this is a fresh, promising attempt.
+    // If it still fails (server not answering usefully yet) setState(UNAVAILABLE) re-arms the timer at
+    // attempt 0 (base ms) — and the recent-activity window in maybeArmReprobe keeps subsequent delays
+    // capped at base while the runtime keeps materializing. No 30s dead-air either way.
     m_reprobeAttempt = 0;
-    Log::logger->log(Log::DEBUG, "[OPENXR] reprobe-watch: socket appeared — probing now (backoff reset)");
+    Log::logger->log(Log::DEBUG, "[OPENXR] reprobe-watch: trigger fired — probing now (backoff reset)");
     start();
+}
+
+bool COpenXRManager::runtimeSocketPresent() const {
+    const char* xdg = getenv("XDG_RUNTIME_DIR");
+    struct stat st;
+    for (const auto& path : OpenXR::xrRuntimeSocketPaths(xdg ? std::string(xdg) : std::string()))
+        if (stat(path.c_str(), &st) == 0 && S_ISSOCK(st.st_mode))
+            return true;
+    return false;
+}
+
+void COpenXRManager::markWatchActivity() {
+    m_lastWatchActivity = Time::steadyNow();
+}
+
+bool COpenXRManager::watchActivityRecent() const {
+    if (!m_lastWatchActivity)
+        return false;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Time::steadyNow() - *m_lastWatchActivity).count();
+    return elapsed >= 0 && elapsed < OpenXR::XR_REPROBE_ACTIVITY_WINDOW_MS;
 }
 
 void COpenXRManager::teardownReprobeWatch() {

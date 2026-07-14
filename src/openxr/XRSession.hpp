@@ -104,6 +104,11 @@ class CXRSession {
     // dormant re-probe distinguish "waiting for the runtime" from "waiting for the headset". Reset to
     // false on a successful getSystem().
     bool       m_formFactorUnavailable = false;
+    // createInstance() reached A runtime (extension enumeration answered), even if the attempt then
+    // failed. Distinguishes "no runtime" (grow the reprobe backoff) from "runtime up but degraded —
+    // WiVRn pre-don advertises no EGL/GLES extensions" (poll at the gentle HEADSET cadence). See the
+    // enumerate step in createInstance() and COpenXRManager::start()'s wait classification.
+    bool       m_runtimeReachable      = false;
 
     // Overlay session (XR_EXTX_overlay, doc 01). COpenXRManager::start() sets m_overlayRequested /
     // m_overlayZ from openxr:overlay / openxr:overlay_z BEFORE createInstance(). m_hasOverlay records

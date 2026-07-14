@@ -52,9 +52,18 @@ CXRSession::~CXRSession() {
 
 bool CXRSession::createInstance() {
     uint32_t extCount = 0;
-    xrEnumerateInstanceExtensionProperties(nullptr, 0, &extCount, nullptr);
+    XrResult enumRes  = xrEnumerateInstanceExtensionProperties(nullptr, 0, &extCount, nullptr);
     std::vector<XrExtensionProperties> extProps(extCount, {XR_TYPE_EXTENSION_PROPERTIES});
-    xrEnumerateInstanceExtensionProperties(nullptr, extCount, &extCount, extProps.data());
+    if (extCount > 0)
+        xrEnumerateInstanceExtensionProperties(nullptr, extCount, &extCount, extProps.data());
+
+    // Live-evidence bug 1: distinguish "no runtime at all" (the loader could not reach one —
+    // enumerate fails / empty) from "a runtime answered but lacks what we need". WiVRn's main server
+    // listens on comp_ipc from service start and, until the headset connects, answers IPC in a
+    // degraded mode advertising NO EGL/GLES extensions — so the required-extension failure below is
+    // really "runtime up, headset not connected" and the manager must poll it at the gentle HEADSET
+    // cadence, not grow the no-runtime backoff to 30s.
+    m_runtimeReachable = XR_SUCCEEDED(enumRes) && extCount > 0;
 
     auto hasExt = [&](const char* name) {
         for (auto& e : extProps)
@@ -64,7 +73,9 @@ bool CXRSession::createInstance() {
     };
 
     if (!hasExt("XR_MNDX_egl_enable") || !hasExt("XR_KHR_opengl_es_enable")) {
-        Log::logger->log(Log::ERR, "[OPENXR] required extensions XR_MNDX_egl_enable / XR_KHR_opengl_es_enable not available");
+        Log::logger->log(m_runtimeReachable ? Log::WARN : Log::ERR,
+                         "[OPENXR] required extensions XR_MNDX_egl_enable / XR_KHR_opengl_es_enable not available{}",
+                         m_runtimeReachable ? " (runtime reachable but degraded — likely headset not connected)" : "");
         return false;
     }
 

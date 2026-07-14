@@ -343,20 +343,31 @@ class COpenXRManager {
     void          onReprobeExpired();
 
     // --- event-driven re-probe: inotify watch on the runtime socket dir (don-the-headset dead-air) ---
-    // While dormant in UNAVAILABLE (and openxr:reprobe + openxr:reprobe_watch on) we inotify-watch the
-    // directory the runtime's IPC socket lands in ($XDG_RUNTIME_DIR, plus its wivrn/ subdir) so a probe
-    // fires the instant the socket appears — instead of waiting out the grown backoff. The timer path
-    // stays fully intact as the fallback. All main-thread (the inotify fd rides the wl_event_loop, like
-    // the frame->main eventfd). Watched paths + trigger logic are the pure OpenXR::xrReprobeWatch* set.
-    void setupReprobeWatch();    // arm: build the inotify fd, add the existing socket dirs, hook the loop
+    // While dormant in UNAVAILABLE (and openxr:reprobe + openxr:reprobe_watch on) we inotify-watch
+    // $XDG_RUNTIME_DIR (plus its wivrn/ subdir) for the runtime materializing. Live evidence (boot
+    // 2026-07-14) reshaped this: WiVRn pre-creates comp_ipc at SERVICE start and the don-time signal
+    // is the forked compositor server creating/rewriting wivrn.pid — so the triggers are sockets AND
+    // pid files, the mask includes MODIFY, and the watch is armed in both wait modes. The timer path
+    // stays fully intact as the fallback. All main-thread (the inotify fd rides the wl_event_loop,
+    // like the frame->main eventfd). Watched paths + trigger logic are the pure OpenXR::xrReprobe* set.
+    void setupReprobeWatch();    // arm: build the inotify fd, add the existing dirs, hook the loop
     void teardownReprobeWatch(); // disarm: remove watches, close the fd, cancel the debounce
     // inotify_add_watch(spec.dir) if it exists and isn't already watched; record it for dispatch/teardown.
-    // checkSocketNow stats for spec.socketNames right away (used when a nested dir just appeared, to close
-    // the race where its socket was created between the dir-create event and this add).
-    void addReprobeWatchDir(const OpenXR::SXRReprobeWatch& spec, bool checkSocketNow);
-    void onReprobeWatchReadable();  // drain inotify events; add nested dir watches / trigger on the socket
-    void triggerWatchedProbe();     // arm the debounce one-shot (coalesces a burst of create events)
+    // checkTriggerNow stats for spec.triggerNames right away (used when a watch is (re)added mid-churn —
+    // nested dir just appeared / watched dir recreated — to close the created-before-the-add race).
+    void addReprobeWatchDir(const OpenXR::SXRReprobeWatch& spec, bool checkTriggerNow);
+    void onReprobeWatchReadable();  // drain inotify: nested-dir adds, IN_IGNORED re-adds, trigger matches
+    void triggerWatchedProbe();     // arm the debounce one-shot (coalesces a burst of trigger events)
     void onWatchDebounceExpired();  // reset the backoff to attempt 0 and start() immediately
+    // Recent-relevant-activity window (live-evidence bug 1): trigger/subdir/nested-dir events stamp
+    // m_lastWatchActivity; while it is fresher than XR_REPROBE_ACTIVITY_WINDOW_MS, maybeArmReprobe
+    // caps the delay at the base interval (the runtime is materializing — poll hard).
+    void markWatchActivity();
+    bool watchActivityRecent() const;
+    // Is a known runtime IPC socket (monado_comp_ipc / wivrn/comp_ipc) present on disk? Refines the
+    // degraded-runtime HEADSET classification in start(): WiVRn's client lib answers extension
+    // enumeration even with no server, so only enumerate+socket together mean "service up".
+    bool runtimeSocketPresent() const;
 
     // Aborts an in-progress start(), tearing down whatever was created, and lands in
     // UNAVAILABLE. Safe to call at any failure point in start().
@@ -598,6 +609,15 @@ class COpenXRManager {
     std::vector<OpenXR::SXRReprobeWatch>       m_watchSpecs;
     std::unordered_map<int, OpenXR::SXRReprobeWatch> m_watchByWd;
     SP<CEventLoopTimer>                        m_watchDebounceTimer;
+    // Per-dormant-PERIOD bookkeeping (survives the per-probe watch teardown/re-arm; cleared only by
+    // cancelReprobe(resetBackoff=true) — real success / user disable). m_lastWatchActivity: last
+    // relevant inotify event, drives the fast-cadence activity window. m_watchEverFired /
+    // m_watchMissLogged: the timer-probe silent-miss guard (a trigger path existing on disk while the
+    // watch has never fired is logged once — WARN on RUNTIME wait, DEBUG on the expected WiVRn
+    // pre-don HEADSET wait).
+    std::optional<Time::steady_tp>             m_lastWatchActivity;
+    bool                                       m_watchEverFired  = false;
+    bool                                       m_watchMissLogged = false;
 
     // Populated from xrInstanceProperties/xrSystemProperties once a session exists.
     std::string       m_runtimeName;
