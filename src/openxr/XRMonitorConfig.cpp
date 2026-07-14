@@ -474,6 +474,27 @@ bool OpenXR::shouldForceLinear(eForceLinearMode mode, bool xrValid, int64_t xrMa
     }
 }
 
+OpenXR::SRuntimeJsonEnvAction OpenXR::resolveRuntimeJsonEnv(const std::string& configValue, bool originalPresent, const std::string& originalValue, bool currentPresent,
+                                                           const std::string& currentValue) {
+    // Desired environment state:
+    //   configValue non-empty -> XR_RUNTIME_JSON should be exactly configValue (the override).
+    //   configValue empty      -> restore the ORIGINAL (the runtime the process launched with): either
+    //                             the original value, or "unset" if the process had none.
+    const bool        wantPresent = !configValue.empty() || originalPresent;
+    const std::string wantValue   = configValue.empty() ? originalValue : configValue;
+
+    if (!wantPresent) {
+        // Want no XR_RUNTIME_JSON at all. Unset only if something is currently set (else NOOP).
+        return currentPresent ? SRuntimeJsonEnvAction{XR_RTJSON_UNSET, ""} : SRuntimeJsonEnvAction{XR_RTJSON_NOOP, ""};
+    }
+
+    // Want XR_RUNTIME_JSON == wantValue. Skip the environ mutation entirely if it already matches
+    // (steady-state reprobes must not churn `environ` — that is the whole point of the guard).
+    if (currentPresent && currentValue == wantValue)
+        return {XR_RTJSON_NOOP, ""};
+    return {XR_RTJSON_SET, wantValue};
+}
+
 std::string OpenXR::anchorModeToString(eXRAnchorMode mode, eXRHand device) {
     switch (mode) {
         case XR_ANCHOR_LOCAL: return "local";
