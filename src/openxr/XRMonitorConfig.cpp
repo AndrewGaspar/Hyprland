@@ -396,6 +396,36 @@ int64_t OpenXR::xrReprobeBackoffMs(int attempt, int64_t baseMs, int64_t capMs) {
     return v;
 }
 
+std::vector<OpenXR::SXRReprobeWatch> OpenXR::xrReprobeWatchDirs(const std::string& runtimeDir) {
+    // No XDG_RUNTIME_DIR -> the runtime socket location is unresolvable; caller relies on the timer.
+    if (runtimeDir.empty())
+        return {};
+    std::string base = runtimeDir;
+    while (base.size() > 1 && base.back() == '/') // normalize a trailing slash (env may carry one)
+        base.pop_back();
+    std::vector<SXRReprobeWatch> out;
+    // [0] the runtime dir itself: monado's socket lands here directly; WiVRn's "wivrn" subdir is
+    // created here (then its comp_ipc socket inside it).
+    out.push_back(SXRReprobeWatch{.dir = base, .socketNames = {"monado_comp_ipc"}, .subdirNames = {"wivrn"}});
+    // [1] the WiVRn subdir: comp_ipc appears inside once the headset client connects.
+    out.push_back(SXRReprobeWatch{.dir = base + "/wivrn", .socketNames = {"comp_ipc"}, .subdirNames = {}});
+    return out;
+}
+
+bool OpenXR::xrReprobeSocketMatch(const SXRReprobeWatch& w, const std::string& name) {
+    for (const auto& s : w.socketNames)
+        if (s == name)
+            return true;
+    return false;
+}
+
+bool OpenXR::xrReprobeSubdirMatch(const SXRReprobeWatch& w, const std::string& name) {
+    for (const auto& s : w.subdirNames)
+        if (s == name)
+            return true;
+    return false;
+}
+
 OpenXR::eForceLinearMode OpenXR::parseForceLinearMode(const std::string& s) {
     if (s == "on" || s == "true" || s == "1" || s == "yes")
         return XR_LINEAR_ON;
