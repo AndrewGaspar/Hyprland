@@ -9,11 +9,29 @@ pin, Basalt practicalities, XREAL's own software, and a GO/NO-GO threshold. The
 user is **not** pursuing this now; the job of this doc is to make a future
 decision takeable in minutes.
 
+> **UPDATE 2026-07-14 — R1 empirically resolved (live capture on this box).**
+> Streamed the Ultra's `video2` (+ the `video3` UVC-metadata node) and decoded the
+> 241st row. **It carries a per-frame device-clock timestamp: a 48-bit little-endian
+> nanosecond counter at row-240 byte offset 0, epoch = device power-on, running 1:1
+> with real nanoseconds** (≈227 ppm off host `CLOCK_MONOTONIC`, i.e. the device's own
+> oscillator). This is exactly the "one thing that could rescue" the §2 sync blocker.
+> The camera↔IMU-sync verdict softens from "structural, needs online `td` eating USB
+> jitter" to **"tractable — the frame timestamp lands each image on the device clock
+> *before* USB transport, leaving at most a constant camera↔IMU epoch offset to
+> measure once"** (the IMU HID counter is *also* a device-ns counter per the driver;
+> a bit-exact epoch match couldn't be confirmed this pass — hidraw was root-only, no
+> sudo). **The overall verdict stays NO-GO**: calibration (§3 / GO-cond-1) and
+> demonstrated desktop quality (GO-cond-3) are untouched. Full byte map + regression
+> in **§2.1**.
+
 Evidence base (all read-only this pass):
 
 - **Live USB descriptors** of the plugged-in Ultra (`3318:0426`) via `lsusb -v`
   (descriptor read, no claim, no stream) and **V4L2 node listing**
   (`/dev/v4l/by-id`, `by-path`).
+- **Live V4L2 capture** (2026-07-14 follow-up, R1): 300 frames of `video2` (YUYV
+  640×241 @60) with per-frame `CLOCK_MONOTONIC` timestamps + the `video3`
+  UVC-metadata node, via a ctypes V4L2 mmap script. Used to decode the 241st row.
 - **Vendored Monado** `subprojects/monado` @ `c2ddab59` — `drivers/xreal_air`,
   `drivers/wmr` (the SLAM-feed template), `drivers/twrap` (generic SLAM wrapper),
   `auxiliary/tracking/t_tracker_slam.cpp`, `auxiliary/util/u_sink.h`, and the VIT
@@ -32,21 +50,30 @@ Evidence base (all read-only this pass):
 1. **The cameras are real, live, and enumerated — as ONE UVC stream, not two.**
    The Ultra exposes a single UVC video-streaming interface offering exactly one
    format: **YUYV, 640×241, 60 fps** (`dwFrameInterval 166667` × 100 ns = 16.67 ms;
-   `dwMaxVideoFrameBufferSize 308480 = 640×241×2`). Grayscale-IR stereo is packed
-   into that one 640×**241** frame (≈240 image rows + an embedded metadata/timestamp
-   row) — **not** two independent camera nodes. On this box it is `video2`
+   `dwMaxVideoFrameBufferSize 308480 = 640×241×2`). Each frame is ≈240 image rows +
+   **1 embedded metadata/timestamp row** (confirmed live, §2.1) — **not** two
+   independent camera nodes. The two grayscale-IR eyes arrive as **consecutive
+   frames** (60 fps = 30 stereo pairs/s; R1 revises the earlier "packed side-by-side"
+   guess). On this box it is `video2`
    (`usb-XREAL...-video-index0`); `video3` is the paired UVC metadata node. A
    vendor **extension unit** (`GUID {a29e7641-de04-47e3-8b2b-f4341aff003b}`) sits on
    the VideoControl interface — the undocumented control surface for
    enabling/configuring the cameras.
-2. **The IMU and cameras do NOT share a host-visible clock.** IMU arrives over
-   **HID** (the driver's existing path), cameras over **UVC** — separate USB pipes.
-   The driver already anchors IMU to `os_monotonic_get_ns()` at arrival
-   (`xreal_air_hmd.c:557,587`); UVC frames would be kernel-timestamped at arrival
-   too. There is **no exposed hardware sync** between the two streams, so a
-   camera-IMU time offset (`td`) must be **estimated online** and will carry USB
-   scheduling jitter. This is the single biggest VIO-quality risk and it is
-   structural, not tunable-away.
+2. **The cameras DO expose a device-clock timestamp (R1, confirmed live) — the
+   camera↔IMU sync problem is smaller than it first looked.** Original concern:
+   IMU arrives over **HID**, cameras over **UVC** (separate USB pipes), both merely
+   kernel-timestamped at host arrival with **no exposed hardware sync**, so a
+   camera-IMU offset (`td`) would have to be estimated online while eating USB
+   scheduling jitter. **But the 241st row carries a per-frame device timestamp**
+   (48-bit LE nanosecond counter, epoch = power-on, 1:1 with real ns — §2.1). That
+   stamps each frame on the *device* clock **before** USB transport, so USB jitter
+   no longer corrupts the frame time. The IMU HID counter is *also* a device-ns
+   counter (`xreal_air_hmd.c` treats its delta as ns). If the two share the on-device
+   oscillator's epoch — the strong hypothesis, since the two on-device clocks I *did*
+   observe differ only by a **constant** offset — alignment reduces to a **one-time
+   epoch measurement**, not per-frame online `td`. Not yet bit-confirmed (IMU HID was
+   root-only; no sudo this pass). Net: this dropped from *the* structural blocker to
+   a tractable, mostly-de-risked item.
 3. **Factory calibration over HID is IMU-only — there is NO camera calibration
    anywhere we can read.** `xreal_air_hmd.h:76–109`: the factory blob is accel/gyro/
    **mag** bias, scale, cross-axis quats, and `imu_noises[4]` — and nothing else. No
@@ -78,10 +105,12 @@ Evidence base (all read-only this pass):
    monitors and a blank wall *is* the low-feature failure case. So the one workload
    we'd want it for — anchored desktop monitors — is close to its worst case.
 
-**VERDICT: NO-GO for now — park it, don't build it.** The blockers are structural
-(no camera-IMU hardware sync, no factory camera calibration, per-device Kalibr
-required) and the payoff is a jittery ~cm-drift pose that is weakest in exactly
-the seated-desk scenario. 3DoF + easy recenter (per `XREAL-3DOF.md`) is the honest
+**VERDICT: NO-GO for now — park it, don't build it.** *(R1 update: one of the three
+original structural blockers — camera↔IMU sync — is now substantially de-risked by
+the confirmed device-clock frame timestamp (§2.1); the verdict is unchanged because
+the other two stand.)* The remaining blockers are structural (**no factory camera
+calibration, per-device Kalibr required**) and the payoff is a ~cm-drift pose that is
+weakest in exactly the seated-desk scenario. 3DoF + easy recenter (per `XREAL-3DOF.md`) is the honest
 product. **Revisit only if all three GO conditions in §8 flip true** — most
 plausibly if XREAL or the community ships a *bundled per-device camera calibration
 path* and someone demonstrates usable desktop-anchored 6DoF on this exact hardware.
@@ -111,14 +140,15 @@ functions.
 
 **Interpretation.** 640×**241** is the tell: ≈240 rows of image + **1 row of
 embedded frame metadata** (a common VIO-camera trick that carries a per-frame
-device timestamp and exposure info). The two grayscale-IR eyes are packed into the
-640×240 image region — most likely side-by-side as two ~320-wide views, or
-column-interleaved via the YUYV Y-lanes. Determining the exact packing requires
-actually streaming (out of scope this pass) — but Monado has the tools for either:
-`u_sink_stereo_sbs_split_create` splits a side-by-side frame into two SLAM camera
-sinks, and `u_sink_create_..._or_l8` converts YUYV → grayscale L8. **Open question:
-confirm the packing and whether that metadata row carries a usable hardware
-timestamp** (if it does, RQ1's sync problem eases considerably — see §2).
+device timestamp and exposure info). **→ Confirmed live (§2.1): the 241st row IS a
+telemetry row carrying a device-clock nanosecond timestamp, a stereo-pair counter,
+and exposure/gain.** The eye packing was originally guessed as side-by-side ~320-wide
+views or YUYV-lane column-interleave; the live capture **revises** this — the two
+eyes arrive as **consecutive frames** (60 fps = 30 stereo pairs/s), and the intra-frame
+pixel layout is a **vendor Y/U/V-lane interleave that does not resolve as a clean
+320+320 grayscale raster** (§2.1). So `u_sink_stereo_sbs_split_create` is *not* a
+drop-in; the exact de-interleave must be reverse-engineered first. `u_sink_create_..._or_l8`
+still applies for YUYV→L8 once the layout is known.
 
 **Shutter type.** Not stated in any descriptor or teardown found. *XR Reality
 Check* explicitly notes manufacturers restrict this disclosure; it uses the
@@ -159,7 +189,79 @@ today. The Ultra's split-bus design is the structurally hard part.
 a device-clocked frame timestamp on the *same* counter the IMU HID reports, then
 camera and IMU can be aligned in device time and jitter collapses. **This is worth
 checking first in any future attempt** — it is the difference between "hard but
-good" and "hard and jittery."
+good" and "hard and jittery." **→ Checked (R1, §2.1): the row DOES carry a
+device-clock nanosecond timestamp. The "same counter as the IMU" half is the strong
+hypothesis but not yet bit-confirmed.**
+
+---
+
+## 2.1 R1 resolved — the 241st row is a device-timestamp/telemetry row (live, 2026-07-14)
+
+Streamed `video2` (YUYV 640×241 @60) for 300 frames via a ctypes V4L2 mmap capture,
+recording each frame's `CLOCK_MONOTONIC` kernel timestamp (`VIDIOC_DQBUF`) alongside
+row 0 (image) and **row 240** (the "241st" row). Captured the `video3` UVC-metadata
+node in parallel. Scripts in the agent scratch (`cap.py`, `decode.py`, `decode2.py`,
+`img.py`); nothing from them is committed.
+
+**The 241st row is not image data — it is a per-frame metadata/telemetry row.** Of
+its 1280 bytes, only the first ~70 are structured fields (the tail mirrors image
+bytes / is undecoded). Little-endian byte map, row 240:
+
+| offset | width | field | evidence | confidence |
+|---|---|---|---|---|
+| **0** | 6 (u48; u64 with top zero) | **device timestamp, nanoseconds, epoch = power-on** | per-frame Δ = 16.667 ms (60 Hz); span/host-span = **1.000242**; regression slope vs host ns = **1.000227** (device oscillator, ~227 ppm fast); value ≈ 4.310×10¹² ns ≈ **71.8 min uptime** = time since the glasses were plugged in | **HIGH** |
+| 18 | 1 (u8) | **stereo-pair counter** (increments once per **2** frames → 30 Hz) | 1,1,2,2,3,3,… lock-step with frame pairs | **HIGH** |
+| 22 | 3 (u24) | **exposure** (≈ ns; 7,992,500 ≈ 7.99 ms) | constant across capture, zero during warm-up | MED |
+| 26 | 1 (u8) | **gain / exposure index** (=100) | constant, appears with exposure | MED-LOW |
+| 51–55 | 5 | static magic/config (`80 02 e0 01 80`) | never changes | — |
+| 62 | 5 | **second device-ns timestamp**, per-*pair* | identical within a pair, +33.333 ms per pair; **constant** ≈3298.5 s offset from the offset-0 clock | MED-HIGH |
+| 6–17, 27–61, 63+ | — | zero / static / undecoded (image spill in tail) | — | — |
+
+**What the numbers establish (the load-bearing result):**
+
+- **Row 240 offset 0 is a real device-clock timestamp in nanoseconds.** Its per-frame
+  delta is 16.667 ms and it tracks host `CLOCK_MONOTONIC` at 1.000227 slope — a fixed
+  ~227 ppm crystal offset, i.e. it is the **device's own free-running oscillator**
+  exposed to the host, not a host-derived or arbitrary tick. The magnitude equals the
+  device's power-on uptime.
+- **Two on-device clocks, one oscillator.** The offset-0 and offset-62 timestamps run
+  at the same rate and differ by a **constant** ~3298.5 s (drift < 0.5 ms over the
+  5 s capture). That is the fingerprint of two counters off the *same* oscillator with
+  *different epochs* — which is precisely the situation to expect for a
+  camera-timestamp vs an IMU-timestamp on this single-MCU device.
+
+**Bonus finding — frame/eye structure (revises §1).** The pair-counter (byte 18)
+increments every **two** UVC frames: the device delivers **60 frames/s = 30 stereo
+pairs/s**, the two eyes as **consecutive frames**, not side-by-side in one frame. The
+two frames of a pair are exposed within **~±15 µs** of each other (offset-0 timestamps
+nearly equal within a pair, then +33.333 ms to the next pair). This reconciles *XR
+Reality Check*'s "30 fps" with the descriptor's "60 fps". Frame mean-brightness
+alternates cleanly (≈64.6 vs ≈71.9) frame-to-frame, consistent with two cameras of
+slightly different response. **Exact intra-frame pixel packing stays open**: a naïve
+YUYV-luma raster does not resolve to a clean grayscale image (persistent horizontal
+row-striping even after row de-interleave), so the eye image is a **vendor interleave**
+of the Y/U/V lanes, **not** the clean 320+320 side-by-side the original §1 guessed.
+Decoding that packing is out of R1's scope (it does not affect the sync verdict) and
+is left as a first task for any real driver work (Monado's `u_sink` splitters assume a
+known layout).
+
+**Clock-domain verdict: SAME-DOMAIN is the strong hypothesis; not yet bit-confirmed.**
+The camera side is proven: frames self-timestamp on a device-ns clock **before** USB
+transport, so USB scheduling jitter no longer corrupts the frame time (the original
+§2 fear). The IMU side is *also* a device-ns counter (`xreal_air_hmd.c:575` /
+`xreal_air_packet.c:300` — a `u64` the driver's delta logic treats directly as ns).
+Because both live on one MCU/oscillator, the worst case is a **constant** camera↔IMU
+epoch offset (exactly like the offset-0/offset-62 pair above), which is measured
+**once**, not tracked per-frame. **What's missing to close it fully:** a simultaneous
+read of a camera frame timestamp and an IMU HID timestamp to confirm the epoch
+relationship. That needs IMU HID access — blocked this pass (the four XREAL
+`hidraw` nodes are `crw------- root:root` with no udev rule; task scope forbids
+`sudo`). So: **sync is de-risked from "structural" to "one measurement from
+confirmed," but honesty requires flagging that final measurement as still TODO.**
+
+**A timestamp does not un-block calibration.** This flips *only* the sync sub-blocker.
+Per-device camera calibration (§3) and the low-feature desktop quality ceiling (§8)
+are untouched, so the overall verdict does not move (see revised §8).
 
 ---
 
@@ -375,7 +477,7 @@ than "hard but worth it."
 
 | WP | Item | Size | Risk |
 |----|------|------|------|
-| R1 | **Confirm camera packing + metadata-row timestamp** (stream `video2`, inspect the 241st row, decode the XU). Decides whether §2 sync is tractable. | S | gates everything |
+| R1 | ~~Confirm camera packing + metadata-row timestamp~~ **DONE (§2.1)**: metadata row carries a device-ns frame timestamp → §2 sync tractable. *Residual*: confirm IMU↔camera epoch (one simultaneous read; IMU HID was root-only this pass) + reverse the intra-frame eye pixel-interleave. | ~~S~~ / residual S | ~~gates everything~~ **sync gate cleared** |
 | R2 | **Per-device Kalibr calibration** of the IR stereo rig + IMU (AprilGrid, `T_imu_cam`, `td`). Repeatable but manual, per unit. | M | quality-capping |
 | R3 | **Camera source in `xreal_air`** — `v4l2_fs` open, YUYV→L8, `u_sink_stereo_sbs_split`, metadata strip. | M | low (existing utils) |
 | R4 | **IMU/camera timestamp alignment** — feed HID IMU into the SLAM sink on the camera clock; online `td`. | M | **high** (the §2 risk) |
@@ -397,6 +499,10 @@ us.
 2. **Camera-IMU sync is shown tractable** — either the metadata row carries a
    device-clock timestamp aligned to the IMU counter (R1 success), or someone
    demonstrates stable VIO on the Ultra's split-bus design (de-risks R4).
+   **→ MOSTLY MET (R1, §2.1):** the metadata row *does* carry a device-clock ns
+   timestamp; the only residual is a one-time confirmation that the IMU HID counter
+   shares its epoch (strong hypothesis — single oscillator). This condition is no
+   longer the hard gate; **conditions 1 and 3 now carry the NO-GO.**
 3. **Demonstrated desktop-usable quality** — a public result showing sub-jitter,
    low-drift **anchored-monitor** 6DoF on the Air 2 Ultra specifically (not a
    walking-around demo), clearing the low-feature-scene concern.
@@ -409,8 +515,12 @@ failure modes.
 
 ## Open questions
 
-1. **Camera packing & metadata row** — side-by-side vs interleaved, and does the
-   241st row carry a device-clock timestamp? (R1; requires streaming — deferred.)
+1. ~~**Camera packing & metadata row**~~ **RESOLVED (R1, §2.1).** The 241st row
+   carries a **device-clock nanosecond timestamp** (offset 0, 48-bit LE, epoch =
+   power-on), plus a stereo-pair counter and exposure/gain. Eyes arrive as
+   **consecutive frames** (60 fps = 30 pairs/s), ~±15 µs apart — **not** side-by-side
+   in one frame. Intra-frame pixel packing is a vendor Y/U/V-lane interleave (does not
+   resolve as clean 320+320) — **still open**, but it does not affect the sync verdict.
 2. **Shutter type** — global or rolling? (Leaning rolling; unconfirmed by any
    teardown found.)
 3. **Vendor XU `{a29e7641...}`** — what does it gate (camera enable? sync? a
