@@ -54,6 +54,7 @@ Every variable, grouped by area. The "applies" column notes when a change takes 
 | `reprobe_interval_ms` | int | `2000` | Base interval for the reprobe backoff. "Waiting for the runtime" grows the delay from this base up to 30s; "waiting for the headset" (runtime up, not donned) polls at this fixed cadence. | hot |
 | `reprobe_watch` | bool | `true` | While dormant in `unavailable`, also **inotify-watch** `$XDG_RUNTIME_DIR` for the runtime materializing and probe **immediately** when it does — instead of waiting out the backoff. Triggers: the IPC socket appearing (`monado_comp_ipc`, `wivrn/comp_ipc`) **and the pid file being created or rewritten** (`monado.pid`, `wivrn.pid`) — the latter is WiVRn's only don-time filesystem signal (its socket is pre-created at service start and inherited by the compositor server forked at headset-connect). A trigger also resets the backoff to the base interval, and any relevant watched-dir activity keeps it capped at base for the next 60s (the runtime is materializing — poll hard). The `reprobe`/`reprobe_interval_ms` timer stays as the fallback (inotify can miss across mount namespaces, and needs `$XDG_RUNTIME_DIR` set); each timer probe also stats the trigger paths and logs once per dormant period if one exists that the watch never saw (silent-miss guard). | hot (next reprobe cycle) |
 | `gpu` | string | `""` | DRM render node for the XR EGL context (e.g. `/dev/dri/renderD128`). Empty = follow Hyprland's primary GPU. Set it on hybrid/multi-GPU machines where the runtime composites on a different GPU than Hyprland — a detected mismatch is refused at startup rather than crashing the graphics driver (see the session/graphics doc). | start |
+| `runtime_json` | string | `""` | Path to the OpenXR runtime manifest (`openxr_*.json`) the session should handshake against, overriding `XR_RUNTIME_JSON` / `active_runtime.json` **for this compositor's XR session only**. Empty = leave the login environment untouched (loader default). Read on the **main thread** at each session start and applied to the loader's `XR_RUNTIME_JSON` before the handshake; clearing it back to empty restores the runtime the process launched with, so it round-trips cleanly. This is how the XREAL flat↔XR toggle (`scripts/xreal-mode.sh`) selects the xreal-flavor Monado without disturbing a WiVRn `active_runtime`. Set live with `hyprctl keyword openxr:runtime_json <path>` then `hyprctl openxr disable && hyprctl openxr enable` to re-handshake. Surfaced in `status` as `runtime json:`. See the XREAL rig doc (07). | start |
 | `force_linear` | string | `auto` | Allocate LINEAR (cross-GPU-importable) buffers for XR monitors: `auto` (only when a cross-GPU split is detected) / `on` / `off`. Needed together with `gpu` when the runtime GPU differs from the desktop's render GPU. Linear costs some compositing throughput. | start (applied at monitor bind) |
 | `blend_mode` | string | `auto` | Environment blend mode: `auto` (runtime's preferred) / `opaque` (monitors over a black void) / `alpha` (**passthrough** — monitors over your real room, on runtimes that support it, e.g. WiVRn on Quest 3) / `additive` (optical see-through). An explicit mode the runtime doesn't advertise falls back to the preferred one with a warning. | start |
 | `overlay` | bool | `false` | Run as an `XR_EXTX_overlay` session so monitors composite **on top of another VR app** (a game, or `hypxrpaper`) instead of owning the view. Needs a runtime with the extension — Monado and WiVRn have it; SteamVR-Linux does not (downgrades to a normal exclusive session with a warning). See §8. | start |
@@ -447,6 +448,7 @@ state: focused
 runtime: Monado(XRT) by Collabora et al.
 system: Simulated HMD
 runtime gpu: AMD Radeon Graphics (drm 226:128)
+runtime json: (loader default)
 blend mode: opaque
 overlay: no
 selected: XR-code
@@ -475,6 +477,7 @@ JSON (`hyprctl -j openxr`) — all keys always present:
     "runtimeName": "Monado(XRT) by Collabora et al.",
     "systemName": "Simulated HMD",
     "runtimeGpu": "AMD Radeon Graphics (drm 226:128)",
+    "runtimeJson": "",
     "blendMode": "opaque",
     "overlay": false,
     "selected": "XR-code",

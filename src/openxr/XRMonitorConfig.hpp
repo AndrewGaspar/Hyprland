@@ -79,6 +79,33 @@ namespace OpenXR {
     // nodes. No OpenXR/aquamarine types so hyprland_gtests can exercise it without a runtime.
     bool shouldForceLinear(eForceLinearMode mode, bool xrValid, int64_t xrMajor, int64_t xrMinor, bool allocValid, int64_t allocMajor, int64_t allocMinor);
 
+    // openxr:runtime_json plumbing (WP-XR1). The compositor may override which OpenXR runtime the
+    // session handshakes against by pointing the loader at a specific manifest — the loader ONLY reads
+    // the XR_RUNTIME_JSON environment variable for this (there is no programmatic override in the
+    // loader API), so we must setenv/unsetenv it on the main thread before the handshake helper spawns.
+    // setenv in a threaded process is hazardous (glibc can realloc `environ`, use-after-free vs a
+    // concurrent getenv), so we mutate it as rarely as possible: this pure function decides the minimal
+    // action given the process's ORIGINAL XR_RUNTIME_JSON (captured once at first start), the value
+    // currently in the environment, and the requested config value. Toggling the config back to empty
+    // restores the original login environment, so the flat<->XR toggle is fully reversible via config.
+    // No env access here — the caller reads getenv and applies the action — so it is unit-testable
+    // (tests/xr/runtime_json.cpp) without touching the real process environment.
+    enum eRuntimeJsonAction : uint8_t {
+        XR_RTJSON_NOOP = 0, // environment already matches the desired value — do not touch environ
+        XR_RTJSON_SET,      // setenv("XR_RUNTIME_JSON", action.value)
+        XR_RTJSON_UNSET,    // unsetenv("XR_RUNTIME_JSON") — restore "no override" (original had none)
+    };
+    struct SRuntimeJsonEnvAction {
+        eRuntimeJsonAction kind = XR_RTJSON_NOOP;
+        std::string        value;           // meaningful only for XR_RTJSON_SET
+        bool               operator==(const SRuntimeJsonEnvAction&) const = default;
+    };
+    // configValue = openxr:runtime_json (empty => "no override, use whatever the process launched
+    // with"). originalPresent/originalValue = the XR_RUNTIME_JSON the process had at first start.
+    // currentPresent/currentValue = what is in the environment right now. Returns the minimal action.
+    SRuntimeJsonEnvAction resolveRuntimeJsonEnv(const std::string& configValue, bool originalPresent, const std::string& originalValue, bool currentPresent,
+                                                const std::string& currentValue);
+
     // Plugged-state policy (research/18 + report-18/19 addenda — XR monitors behave like unplugged
     // external monitors while the headset is not being worn). Pure and unconditional so
     // hyprland_gtests can exercise it (tests/xr/plugged.cpp). Instantaneous predicate — the anti-flap

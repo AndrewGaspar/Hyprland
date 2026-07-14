@@ -1,0 +1,18 @@
+# XREAL / Nreal Air glasses family — grant the logged-in seat user access to the HID interfaces
+# (WP-XR1, docs/openxr/07-xreal.md §udev). Without this, monado-service (and scripts/xreal-ctl) cannot
+# open the sensor + control HID interfaces without root.
+#
+# Install (one-time, needs root):
+#   sudo install -m 0644 contrib/xreal/70-xreal.rules /etc/udev/rules.d/70-xreal.rules
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   # then re-plug the glasses (or log out/in) so the seat ACL is applied.
+#
+# TAG+="uaccess" is the modern, seat-scoped grant (logind hands the ACL to whoever is logged in at the
+# active seat) — cleaner than a blanket world-readable node. The MODE="0660" is a belt-and-suspenders
+# fallback for systems where uaccess isn't wired up; drop it if you prefer uaccess-only.
+#
+# VID 0x3318 covers Air (0424), Air 2 (0428), Air 2 Pro (0432), Air 2 Ultra (0426) — matching the
+# vendored monado xreal_air driver's product table.
+
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3318", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="3318", MODE="0660", TAG+="uaccess"

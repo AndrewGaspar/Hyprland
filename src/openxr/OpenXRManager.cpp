@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <numeric>
@@ -147,6 +148,10 @@ const std::string& COpenXRManager::runtimeGpu() const {
     return m_runtimeGpu;
 }
 
+const std::string& COpenXRManager::runtimeJson() const {
+    return m_runtimeJson;
+}
+
 std::string COpenXRManager::blendModeName() const {
     // Reflect the mode the frame loop actually submits while a session exists; the OPAQUE default
     // otherwise (nothing composited).
@@ -248,6 +253,45 @@ void COpenXRManager::start() {
         Log::logger->log(Log::DEBUG, "[OPENXR] a prior runtime handshake is still in flight — deferring this probe");
         abortStart();
         return;
+    }
+
+    // WP-XR1: apply openxr:runtime_json to the loader's XR_RUNTIME_JSON before the FIRST loader call.
+    // The OpenXR loader resolves the runtime manifest exclusively from getenv("XR_RUNTIME_JSON") (no
+    // programmatic override exists), so this is the only lever — and it must be set on THIS thread,
+    // BEFORE runBoundedHandshake() spawns the helper that calls xrCreateInstance. setenv in a threaded
+    // process is hazardous: glibc's setenv can realloc `environ`, which is a use-after-free against any
+    // concurrent getenv on another thread. We contain that three ways: (1) we are on the main thread and
+    // have already passed the m_handshakeInFlight guard above — so NO XR loader thread (the only threads
+    // that call getenv("XR_RUNTIME_JSON")) is live right now; the frame thread does not start until
+    // createSession() far below; (2) resolveRuntimeJsonEnv returns NOOP whenever the environment already
+    // holds the desired value, so steady-state reprobes never touch `environ`; (3) the value is captured
+    // ONCE (s_originalRtJson) so clearing openxr:runtime_json back to empty restores exactly the runtime
+    // the process launched with — the flat<->XR toggle is reversible with no residual state. This is a
+    // rare, sequenced, main-thread-only mutation, which is the accepted way to steer the loader.
+    {
+        static auto PRTJSON = CConfigValue<std::string>("openxr:runtime_json");
+        // Capture the login-time XR_RUNTIME_JSON exactly once, before we ever mutate it.
+        static const std::optional<std::string> s_originalRtJson = [] {
+            const char* v = std::getenv("XR_RUNTIME_JSON");
+            return v ? std::optional<std::string>{std::string(v)} : std::nullopt;
+        }();
+
+        const std::string cfg     = *PRTJSON;
+        const char*       curRaw  = std::getenv("XR_RUNTIME_JSON");
+        const auto        action  = OpenXR::resolveRuntimeJsonEnv(cfg, s_originalRtJson.has_value(), s_originalRtJson.value_or(""), curRaw != nullptr, curRaw ? curRaw : "");
+        switch (action.kind) {
+            case OpenXR::XR_RTJSON_SET:
+                setenv("XR_RUNTIME_JSON", action.value.c_str(), 1);
+                Log::logger->log(Log::DEBUG, "[OPENXR] openxr:runtime_json -> XR_RUNTIME_JSON = {}", action.value);
+                break;
+            case OpenXR::XR_RTJSON_UNSET:
+                unsetenv("XR_RUNTIME_JSON");
+                Log::logger->log(Log::DEBUG, "[OPENXR] openxr:runtime_json cleared -> restored login XR_RUNTIME_JSON (unset)");
+                break;
+            case OpenXR::XR_RTJSON_NOOP: break;
+        }
+        // Publish the active override (empty = using the loader default / active_runtime.json) for status.
+        m_runtimeJson = cfg;
     }
 
     // Build the session on the heap (raw ownership) so a timed-out handshake can hand it to the helper
