@@ -723,6 +723,11 @@ std::vector<SP<IValue>> Values::getConfigValues() {
                 "base interval for the openxr:reprobe backoff, in milliseconds. Waiting for the runtime grows the delay from this base up to 30s; waiting for the headset "
                 "(runtime up, not donned) polls at this fixed cadence",
                 2000, {.min = 250, .max = 60000}),
+        MS<Bool>("openxr:reprobe_watch",
+                 "while dormant in 'unavailable', also inotify-watch $XDG_RUNTIME_DIR for the runtime's IPC socket appearing (monado_comp_ipc / wivrn/comp_ipc) and probe "
+                 "immediately when it does, instead of waiting out the reprobe backoff. Kills the up-to-30s stall between donning the headset and the session coming up "
+                 "(WiVRn's socket only appears when the headset connects). The reprobe backoff timer stays as fallback",
+                 true),
         MS<Bool>("openxr:recenter_on_plug",
                  "on the first time the headset is donned in a session, re-seat anchor:local monitors relative to your current head pose instead of the runtime's (often "
                  "arbitrary, under boundaryless/standby) LOCAL_FLOOR origin — the monitors appear in front of you at their configured height/distance. Multi-monitor layouts "

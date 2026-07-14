@@ -151,7 +151,11 @@ STOPPING        stop() in progress: joining the frame thread, tearing down
   set, a backoff timer re-attempts `start()` so the session comes up automatically once the
   runtime starts or the headset is donned; "waiting for the runtime" grows the delay up to
   30s, "waiting for the headset" polls at the fixed interval. Session/instance loss lands
-  here and thus auto-reconnects.
+  here and thus auto-reconnects. In the "waiting for the runtime" case an **event-driven** leg
+  (`openxr:reprobe_watch`, default on) also inotify-watches `$XDG_RUNTIME_DIR` for the runtime's
+  IPC socket (`monado_comp_ipc` / `wivrn/comp_ipc`) and probes within ~150ms of it appearing, so
+  donning a WiVRn headset (whose socket only appears at headset-connect) comes up immediately
+  instead of waiting out the grown backoff; the timer stays as the fallback.
 - `RUNNING` sub-states mirror `XrSessionState`, driven by the frame thread's event pump; each
   transition posts the `openxrsessionstate` socket2 event and re-runs the idle-inhibit check.
 - Runtime-initiated `STOPPING` is not manager STOPPING — the frame thread ends the session
