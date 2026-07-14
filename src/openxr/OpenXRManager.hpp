@@ -362,6 +362,19 @@ class COpenXRManager {
     // UNAVAILABLE. Safe to call at any failure point in start().
     void abortStart();
 
+    // Outcome of the bounded first-contact handshake (xrCreateInstance + xrGetSystem).
+    enum eHandshakeResult {
+        HANDSHAKE_OK,               // both succeeded; caller owns `sess` and continues start()
+        HANDSHAKE_FAILED_INSTANCE,  // xrCreateInstance failed; caller owns `sess`, aborts to UNAVAILABLE
+        HANDSHAKE_FAILED_SYSTEM,    // xrGetSystem failed; caller owns `sess`, aborts (headset vs runtime wait)
+        HANDSHAKE_TIMEOUT,          // did not finish in time; ownership of `sess` moved to the helper thread
+    };
+    // Runs steps 1-2 of start() on a helper thread with a bounded wait so a not-yet-ready runtime socket
+    // (the instant-reprobe-after-restart case) cannot block the compositor main thread. On TIMEOUT the
+    // caller must NOT touch `sess` (the helper owns it) and m_handshakeInFlight stays set until the helper
+    // returns. Main thread only. See the 2026-07-14 freeze audit + XR_HANDSHAKE_TIMEOUT_MS.
+    eHandshakeResult runBoundedHandshake(CXRSession* sess);
+
     // The XR frame thread body (owns the EGL context + XR frame loop while running).
     void frameThread();
 
@@ -603,6 +616,13 @@ class COpenXRManager {
 
     std::thread       m_frameThread;
     std::atomic<bool> m_running{false};
+
+    // Set true only when a bounded runtime handshake (runBoundedHandshake) TIMED OUT and its helper
+    // thread is still running (blocked in xrCreateInstance against a wedged runtime). While set, start()
+    // defers — never runs a second concurrent handshake (the OpenXR loader's global init is not
+    // re-entrant). The abandoned helper clears it when it finally returns. Normal fast handshakes never
+    // set it. Read on the main thread, cleared on the helper thread.
+    std::atomic<bool> m_handshakeInFlight{false};
 
     // XR monitor layers. m_layers is written on the main thread and snapshotted per frame by
     // the frame thread, both under m_layersMu (doc 00 handoff table). std::shared_ptr, NOT

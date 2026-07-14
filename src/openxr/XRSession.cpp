@@ -408,27 +408,42 @@ void CXRSession::pollEvents() {
     // /XR_ERROR_SESSION_LOST directly. XR_EVENT_UNAVAILABLE is the normal "no more events"
     // sentinel and must be ignored. Treat the lost codes as instance loss -> teardown ->
     // UNAVAILABLE.
-    if (r == XR_ERROR_INSTANCE_LOST || r == XR_ERROR_SESSION_LOST) {
-        Log::logger->log(Log::WARN, "[OPENXR] runtime lost (xrPollEvent -> {}) -> teardown to unavailable", (int)r);
-        m_exitRequested = true;
-        m_instanceLost  = true;
-    }
+    if (r == XR_ERROR_INSTANCE_LOST || r == XR_ERROR_SESSION_LOST)
+        markRuntimeLost("xrPollEvent", (int)r);
 }
 
-void CXRSession::destroy() {
+void CXRSession::markRuntimeLost(const char* why, int xrResult) {
+    // Once-per-session WARN so a dead runtime + a spinning frame loop cannot flood the log.
+    if (!m_lostLogged) {
+        Log::logger->log(Log::WARN, "[OPENXR] runtime lost ({} -> {}) -> teardown to unavailable", why, xrResult);
+        m_lostLogged = true;
+    }
+    m_exitRequested = true;
+    m_instanceLost  = true;
+}
+
+void CXRSession::destroy(bool runtimeLost) {
     // Called after the frame thread is joined; the EGL context is NOT current here (the
     // manager's CXRGraphics::destroyGL already unbound it), matching the interop rule.
-    // If the instance was lost, these calls may return errors — ignore, but null handles.
+    //
+    // runtimeLost: the runtime IPC is already dead. Skip the per-child xr destroy calls — each is a
+    // doomed round-trip that only logs "Broken pipe"/XRT_ERROR_IPC_FAILURE and, against a wedged
+    // runtime, is a would-be main-thread block. xrDestroyInstance still runs: it frees loader-side
+    // state + the socket fd and (per the OpenXR spec) implicitly destroys the child handles, so the
+    // spaces/session are reaped without individually poking the dead socket.
     if (m_viewSpace != XR_NULL_HANDLE) {
-        xrDestroySpace(m_viewSpace);
+        if (!runtimeLost)
+            xrDestroySpace(m_viewSpace);
         m_viewSpace = XR_NULL_HANDLE;
     }
     if (m_refSpace != XR_NULL_HANDLE) {
-        xrDestroySpace(m_refSpace);
+        if (!runtimeLost)
+            xrDestroySpace(m_refSpace);
         m_refSpace = XR_NULL_HANDLE;
     }
     if (m_session != XR_NULL_HANDLE) {
-        xrDestroySession(m_session);
+        if (!runtimeLost)
+            xrDestroySession(m_session);
         m_session = XR_NULL_HANDLE;
     }
     if (m_instance != XR_NULL_HANDLE) {
