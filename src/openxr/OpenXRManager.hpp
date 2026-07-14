@@ -76,6 +76,11 @@ class COpenXRManager {
     // be determined (runtime lacks XR_KHR_vulkan_enable2, no Vulkan, etc.). Surfaced in status so
     // the user can see which GPU to point openxr:gpu at.
     const std::string& runtimeGpu() const;
+    // The openxr:runtime_json override currently applied to the XR session (WP-XR1) — the OpenXR
+    // runtime manifest path forced into XR_RUNTIME_JSON for this session, or empty when no override is
+    // set (the loader default / active_runtime.json is used). Surfaced in `hyprctl openxr status` so
+    // the XREAL flat/XR toggle can confirm which runtime the session handshook against.
+    const std::string& runtimeJson() const;
     // Currently-active environment blend mode as "opaque"|"alpha"|"additive" (doc 05 §4.3). The
     // selected mode while a session exists; "opaque" (the default) otherwise.
     std::string        blendModeName() const;
@@ -624,6 +629,8 @@ class COpenXRManager {
     std::string       m_systemName;
     // Set by the wrong-GPU probe in start() (see runtimeGpu()); empty when undeterminable.
     std::string       m_runtimeGpu;
+    // The openxr:runtime_json override active for this session (see runtimeJson()); empty = none.
+    std::string       m_runtimeJson;
 
     UP<CXRIpc>        m_ipc;
     UP<CXRSession>    m_session;
