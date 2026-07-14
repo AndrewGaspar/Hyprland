@@ -734,6 +734,12 @@ std::vector<SP<IValue>> Values::getConfigValues() {
                  "are recentered rigidly (relative arrangement preserved). A brief doff-and-don within the same session does NOT re-seat (report-20)",
                  true),
         MS<String>("openxr:gpu", "DRM render node to use for XR (e.g. /dev/dri/renderD128). Empty = follow Hyprland's primary GPU", ""),
+        MS<String>("openxr:runtime_json",
+                   "path to the OpenXR runtime manifest (openxr_*.json) the session should use, overriding XR_RUNTIME_JSON / active_runtime.json for THIS compositor's XR "
+                   "session. Empty (default) = leave the login environment untouched (loader default / active_runtime.json). Read on the main thread at each session start; set "
+                   "it live with `hyprctl keyword openxr:runtime_json <path>` then `hyprctl openxr disable && hyprctl openxr enable` to re-handshake against it. Clearing it back "
+                   "to empty restores the runtime the process launched with. Powers the XREAL flat/XR toggle (pick the xreal monado build without touching WiVRn's active_runtime)",
+                   ""),
         MS<String>("openxr:force_linear",
                    "allocate LINEAR buffers for XR monitors so the XR GPU can import them: auto (only when a cross-GPU split is detected, "
                    "default) | on | off. Needed when openxr:gpu is a different GPU than the desktop renders on; costs some compositing throughput",
