@@ -261,7 +261,11 @@ void CMonitor::onConnect(bool noRule) {
     // get monitor rule that matches
     auto monitorRule = Config::monitorRuleMgr()->get(m_self.lock());
 
-    if (m_enabled && !monitorRule.m_disabled) {
+    // A leasable output must never take the "already-enabled desktop, just reapply the rule" shortcut —
+    // it has to fall through to the lease gate below so it gets offered (and not configured as desktop).
+    // The desktop→lease transition first onDisconnect()s (m_enabled=false), so in practice this guard is
+    // only a belt-and-suspenders against a direct onConnect() on a still-enabled monitor.
+    if (m_enabled && !monitorRule.m_disabled && !monitorRule.m_lease) {
         auto cpy = monitorRule;
         applyMonitorRule(std::move(cpy));
 
@@ -286,8 +290,13 @@ void CMonitor::onConnect(bool noRule) {
         return;
     }
 
-    if (m_output->nonDesktop) {
-        Log::logger->log(Log::DEBUG, "Not configuring non-desktop output");
+    // Offer to drm-lease-v1 clients (and do NOT configure as a desktop) when either the connector's EDID
+    // marks it non-desktop (real HMDs), OR the HypXRland `lease` monitor-rule flag opts this named desktop
+    // output in (XREAL V2.2 leasable-on-demand direct mode). monitorRule is the freshly-fetched rule for
+    // this connector; the flag defaults false so stock outputs are unaffected. offer() enforces the
+    // same-DRM-backend constraint, so only the lease protocol owning this connector's GPU accepts it.
+    if (m_output->nonDesktop || monitorRule.m_lease) {
+        Log::logger->log(Log::DEBUG, "Not configuring output {} as desktop ({})", m_name, m_output->nonDesktop ? "non-desktop EDID" : "lease rule flag");
 
         for (auto& [name, lease] : PROTO::lease) {
             if (!lease || m_output->getBackend() != lease->getBackend())

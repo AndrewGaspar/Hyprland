@@ -205,7 +205,26 @@ DP-5 with window rules (workspace-bind to the DP-5 workspace, `fullscreen`,
   `directScanoutTo`/`solitary` on DP-5 — a single fullscreen surface should
   qualify).
 
-### (b) DRM-lease direct mode — **BLOCKED today; V2 knob**
+### (b) DRM-lease direct mode — **IMPLEMENTED as opt-in (V2.2); window path stays default**
+
+> **V2.2 update (implemented).** Option 2 below (the Hyprland config knob) is now shipped as the
+> `lease` monitor-rule flag: `monitor = DP-5, …, lease` makes the `Monitor.cpp` gate ALSO offer that
+> named desktop output to `drm-lease-v1` (and NOT configure it as a desktop), reusing the existing
+> non-desktop code path. It is **off by default** (a stock config is byte-identical), tightly gated to
+> the named connector, respects the same-DRM-backend constraint, and toggling it drives a clean
+> offer↔reclaim transition (`MonitorRuleManager` + a new `CDRMLeaseProtocol::reclaim()` that withdraws
+> the offer before the output returns to being a desktop). Monado needs **no code change** — its
+> `comp_window_direct_wayland` backend is already compiled (`XRT_HAVE_WAYLAND_DIRECT`) and is selected
+> by env (`XRT_COMPOSITOR_FORCE_WAYLAND_DIRECT=1`, connector via `XRT_COMPOSITOR_WAYLAND_CONNECTOR`).
+> Driven by `scripts/xreal-mode.sh xr --direct`; `flat` reclaims DP-5 as a desktop. **Rationale for
+> keeping the window path the default:** direct mode is the lower-latency path (Monado owns the flip,
+> no second compositor hop), but (i) while leased DP-5 is NOT a usable desktop, so a failed XR bring-up
+> leaves no fallback screen — the window path always leaves DP-5 a real monitor; (ii) direct mode was
+> not yet worn-validated at ship time (needs the build+relog + Vulkan direct-display on the leased
+> connector). It is opt-in until validated; promoting it to default afterwards is a one-line script
+> change. The original analysis, still accurate, follows.
+
+_Original analysis:_
 
 Read of `DRMLease.cpp` + `Monitor.cpp`: Hyprland *has* full `drm-lease-v1`
 (`ProtocolManager.cpp:224` builds a `CDRMLeaseProtocol` per DRM backend), but a
@@ -483,7 +502,7 @@ unaffected (separate socket, separate runtime json); no NVIDIA involvement.
 | # | Item | Size |
 |---|------|------|
 | V2.1 | **`openxr:runtime_json` config key** (§5) — main-thread read → spawn-time consumption; convenience over `XR_RUNTIME_JSON`. | **S** |
-| V2.2 | **DRM-lease force-offer knob** (`monitor=DP-5,…,lease` or an openxr allowlist) at the `Monitor.cpp:289` gate, *only if* window-mode latency proves inadequate — unlocks monado direct mode. | **M** |
+| V2.2 | **DONE — DRM-lease force-offer knob** (`monitor=DP-5,…,lease`) at the `Monitor.cpp` gate + `CDRMLeaseProtocol::reclaim()` + `MonitorRuleManager` offer↔reclaim transition; unlocks monado direct mode (`xreal-mode.sh xr --direct`, monado env-only). Off by default; window path stays default. Code-verified; needs relog+wear to confirm end-to-end. | **M** |
 | V2.3 | **Tracking-caps-aware UX**: detect 3DoF vs 6DoF at runtime and switch layout/roam behaviour, so a future 6DoF path lights up automatically. | **M** |
 | V2.4 | **Presence/brightness niceties**: optional auto sink-routing; optional driver patch to surface the proximity byte as `XR_EXT_user_presence` (upstreamable). | **M** |
 | V2.5 | **Cherry-pick eval** of `95b320d41` (scanout compensation) if latency needs it. | **S** |
