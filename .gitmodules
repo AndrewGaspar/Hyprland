@@ -9,7 +9,7 @@
 	url = https://github.com/wolfpld/tracy
 [submodule "subprojects/monado"]
 	path = subprojects/monado
-	url = https://gitlab.freedesktop.org/monado/monado.git
+	url = https://github.com/AndrewGaspar/monado.git
 	shallow = true
 	ignore = dirty
 [submodule "subprojects/eigen"]
