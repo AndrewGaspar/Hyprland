@@ -30,6 +30,23 @@ Environment=XRT_NO_STDIN=1
 EnvironmentFile=-%h/.config/xreal/monado.env
 ExecStart=/bin/sh -c 'exec "$MONADO_XREAL_SERVICE"'
 Restart=no
+# Clean shutdown: monado-service's IPC mainloop (ipc_server_mainloop_linux.c) only tears down on stdin
+# activity/EOF (epoll on fd 0) — and we run it with XRT_NO_STDIN=1 (so a systemd /dev/null stdin does not
+# EOF-shutdown it the instant it starts), which removes fd 0 from the epoll set entirely. The net effect is
+# that this build has NO signal-driven shutdown path: SIGTERM and SIGINT are both effectively ignored, so a
+# default `stop` hung for systemd's 90s TimeoutStopSec before SIGKILL. Since the service is stateless (it
+# re-reads the device and recreates its IPC socket on every start) and the kernel releases the hidraw fds +
+# Vulkan/Wayland resources on process death, we stop it decisively and immediately with SIGKILL — that
+# makes stop/restart instant and, because the process dies from the configured stop signal, systemd records
+# it as a clean stop (not a 'failed'/'timeout' unit). TimeoutStopSec is just a backstop.
+# (Upstream-correct fix, out of scope here: patch monado to handle SIGINT/SIGTERM, or feed it a controllable
+#  stdin — then this could be a graceful SIGTERM.)
+KillSignal=SIGKILL
+KillMode=mixed
+TimeoutStopSec=10
+# The main process necessarily dies FROM that SIGKILL, which systemd would otherwise record as
+# Result=signal → a 'failed' unit; whitelist it so a normal stop leaves the unit cleanly inactive/dead.
+SuccessExitStatus=SIGKILL
 # monado-service needs WAYLAND_DISPLAY + XDG_RUNTIME_DIR to reach Hyprland; scripts/xreal-mode.sh runs
 # `systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR` before starting this unit.
 

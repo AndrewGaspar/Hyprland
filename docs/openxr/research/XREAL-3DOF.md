@@ -259,6 +259,18 @@ no PRIME, no cross-GPU copies.**
 
 ## 4. Stereo / SBS output
 
+> **RESOLVED live 2026-07-14 (Framework 16).** This §4 "highest risk" is de-risked. Correction to the
+> assumption below: the glasses do **NOT** auto-advertise a 3840×1080 EDID mode after the HID 3D switch
+> on this host — the connector re-probes but still exposes only its native 1920×1080 DTDs. The working
+> answer is to **force an unadvertised 3840×1080 CVT-RB modeline**
+> (`266.50 3840 3888 3920 4000 1080 1083 1093 1111 +hsync -vsync`); DP-5 accepted it and stayed
+> `connected`, the glasses hardware-split it L/R, monado's `comp_main` came up **3840×1080 fullscreen**
+> with a 2-view stereo device, and `openxr status` reached `focused`. Two extra facts learned live:
+> (1) the HID `mode 3d` must precede the monado start (the driver latches view geometry at create time);
+> (2) `comp_main` renders the surface at **half resolution** under `XRT_COMPOSITOR_FORCE_WAYLAND`
+> (`comp_settings.c` `preferred /= 2`) → the SBS split is geometrically correct but soft until that
+> `/= 2` is patched out (needs a monado rebuild). Full write-up + the corrected toggle: `07-xreal.md` §0.
+
 `switch_display_mode` (`xreal_air_hmd.c:976–1015`) is unambiguous about how the
 Ultra does stereo:
 
