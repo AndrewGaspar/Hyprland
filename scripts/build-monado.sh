@@ -161,10 +161,18 @@ done
 
 echo ">> done: $MONADO_BUILD"
 if [[ $_had_sys_nice -eq 1 ]]; then
-    echo
-    echo "   !! the rebuild DROPPED monado-service's cap_sys_nice file capability (REALTIME GPU queue)."
-    echo "   !! re-apply it:  sudo setcap cap_sys_nice+ep $_svc_bin"
-    echo
+    # Try the passwordless sudoers rule first (/etc/sudoers.d/10-xreal-setcap grants exactly
+    # this command for the known build paths). -n = never prompt; fall back to a manual
+    # reminder if the rule isn't installed or the path isn't covered.
+    if sudo -n /usr/bin/setcap cap_sys_nice+ep "$_svc_bin" 2>/dev/null; then
+        echo "   re-applied cap_sys_nice+ep to monado-service (REALTIME GPU queue kept)."
+    else
+        echo
+        echo "   !! the rebuild DROPPED monado-service's cap_sys_nice file capability (REALTIME GPU queue)."
+        echo "   !! re-apply it:  sudo setcap cap_sys_nice+ep $_svc_bin"
+        echo "   (passwordless: install the sudoers rule from docs/openxr/07-xreal.md §setcap)"
+        echo
+    fi
 fi
 if [[ $FLAVOR == xreal ]]; then
     echo "   runtime manifest: $MONADO_BUILD/openxr_monado-dev.json"

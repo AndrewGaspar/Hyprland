@@ -237,6 +237,31 @@ systemctl --user daemon-reload
 The unit is wholly independent of `wivrn.service` (no ordering, no `Conflicts`) — the two runtimes use
 different IPC socket names and never fight.
 
+### 1.4b setcap — REALTIME GPU queue (optional, direct mode)
+
+amdgpu only grants GPU queue priorities above NORMAL to processes with `CAP_SYS_NICE`; without it
+monado runs its compositor on a MEDIUM-priority queue and heavy iGPU load can slip whole 60 Hz
+frames (motion judder in direct mode). Grant it on the service binary:
+
+```sh
+sudo setcap cap_sys_nice+ep subprojects/monado/build-xreal/src/xrt/targets/service/monado-service
+```
+
+**Every rebuild wipes the file capability.** `scripts/build-monado.sh` detects the loss and
+re-applies it automatically via `sudo -n` if you install this passwordless sudoers rule (exact
+command + cap + paths, no wildcards — the only thing it permits is granting `cap_sys_nice` to
+these two build artifacts):
+
+```
+# /etc/sudoers.d/10-xreal-setcap   (install -m 0440, validate with `sudo visudo -c`)
+ajg ALL=(root) NOPASSWD: /usr/bin/setcap cap_sys_nice+ep /home/ajg/code/Hyprland/subprojects/monado/build-xreal/src/xrt/targets/service/monado-service
+ajg ALL=(root) NOPASSWD: /usr/bin/setcap cap_sys_nice+ep /home/ajg/code/hypxrland/subprojects/monado/build-xreal/src/xrt/targets/service/monado-service
+```
+
+Without the rule the build script prints the manual `sudo setcap` reminder instead. Verify it
+took effect (needs a monado restart): the journal shows `QUEUE_GLOBAL_PRIORITY_REALTIME` instead
+of `..._MEDIUM`.
+
 ### 1.5 The 3DoF profile
 
 Source `example/xreal.conf` from your `hyprland.conf` and bind the toggle to a key:
