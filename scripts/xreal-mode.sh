@@ -127,6 +127,19 @@ monitor_has_wide_mode() {
     fi
 }
 
+# Does the given connector's KERNEL DRM mode list advertise a mode >= SBS_WIDTH wide? Reads
+# /sys/class/drm/card*-<mon>/modes — the GROUND TRUTH for what Monado's direct-mode Vulkan
+# VkDisplayModeKHR enumeration will see on the LEASED connector. After the HID 3D switch the glasses
+# drop the DP link (~0.5s) and re-present a native EDID that advertises ONLY the 3840x1080 SBS mode; we
+# must gate the lease flip on THIS (not just hyprctl availableModes) so Monado leases a connector whose
+# mode list already contains 3840 and its auto mode-select (max pixels) picks 3840, not a stale 1920.
+connector_has_wide_mode() {
+    local mon="$1" conn
+    conn="$(sys_connector_dir "$mon")" || return 1
+    [[ "$(cat "$conn/status" 2>/dev/null)" == "connected" ]] || return 1
+    awk -F x -v w="$SBS_WIDTH" '$1+0 >= w {found=1} END{exit !found}' "$conn/modes" 2>/dev/null
+}
+
 # Map a Hyprland connector name (e.g. "DP-5") to its /sys DRM connector dir (e.g. card2-DP-5).
 sys_connector_dir() {
     local mon="$1" d
@@ -363,6 +376,32 @@ cmd_xr() {
     #    WINDOW mode (default): set the DP output mode ourselves (mono native 1920x1080, or the forced/native
     #    3840x1080 SBS) and VERIFY it, reverting to flat + 2D if it never comes up (desktop never left dead).
     if [[ $DIRECT -eq 1 ]]; then
+        # CRITICAL ORDERING: Monado's direct-wayland backend leases $mon and reads the display mode off the
+        # LEASED connector's own VkDisplayModeKHR list. After the HID 3D switch the glasses drop the DP link
+        # and re-present a native EDID advertising the 3840-wide SBS mode ~1s later. If we flip to `lease`
+        # BEFORE that settles, Monado leases a connector whose only mode is the stale 1920x1080 and clamps the
+        # SBS frame into 1920 ("Ignoring given extent 3840x1080 and using 1920x1080 from mode") — both eyes
+        # squished into one buffer, no per-eye split. So WAIT for the connector's kernel DRM mode list to
+        # actually advertise ${SBS_WIDTH}-wide before offering the lease. (Gate on /sys, the exact list Monado
+        # enumerates — not hyprctl availableModes.) With 3840 present, Monado's auto mode-select (max pixels)
+        # picks 3840x1080 and the glasses hardware-split the side-by-side frame per eye.
+        if [[ $DRY_RUN -eq 0 ]]; then
+            echo "  waiting for $mon's DRM connector to advertise a native ${SBS_WIDTH}-wide mode after the HID 3D switch…"
+            local i=0
+            while :; do
+                connector_has_wide_mode "$mon" && break
+                i=$((i+1)); [[ $i -le 40 ]] || {   # ~10s
+                    echo "!! $mon never advertised a ${SBS_WIDTH}-wide mode; leasing anyway would clamp to 1920." >&2
+                    echo "   Current DRM modes: $(tr '\n' ' ' < "$(sys_connector_dir "$mon")/modes" 2>/dev/null)" >&2
+                    echo "   Reverting glasses to 2D and aborting (desktop restored). Retry, or replug if the glasses wedged." >&2
+                    [[ -n $XREAL_CTL ]] && "$XREAL_CTL" mode 2d >/dev/null 2>&1 || true
+                    hyprctl keyword monitor "$mon,${FLAT_MODE},auto,1" >/dev/null 2>&1 || true
+                    exit 1
+                }
+                sleep 0.25
+            done
+            echo "  $mon advertises ${SBS_WIDTH}-wide (DRM connector) — offering the lease."
+        fi
         echo "  flipping $mon to LEASE — offered to Monado direct mode; it leaves the desktop."
         run hyprctl keyword monitor "$mon,preferred,auto,1,lease"
     elif [[ $MONO -eq 1 ]]; then
