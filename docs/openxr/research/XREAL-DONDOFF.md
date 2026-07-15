@@ -1,11 +1,32 @@
-# Research: IMU-based don/doff (wear detection) for the XREAL Air 2 Ultra
+# Research: don/doff (wear detection) for the XREAL Air 2 Ultra
 
-Research memo (2026-07-14). Evaluates whether the **XREAL Air 2 Ultra**'s IMU can
-serve as a **don/doff (wear-detection)** signal to drive HypXRland's XR
-monitor plugged-state on a device with **no hardware proximity sensor**. Today the
-3DoF rig ([`07-xreal.md`](../07-xreal.md), WP-XR1) tears down only on **USB
-unplug**; the ask is a **softer, faster** signal — glasses set down on the desk =
-monitors unplug/idle even while still plugged in.
+> **CORRECTION (2026-07-15, WP-XR-DONDOFF — IMPLEMENTED).** The premise of the
+> original memo below — that the Air 2 Ultra has **no hardware proximity/wear
+> signal** and that don/doff must therefore be **inferred from IMU stillness** — was
+> **wrong**. A later read-only HID capture (control interface 0, `/dev/hidraw7`)
+> while the user physically donned/doffed the glasses 3× showed a clean
+> `XREAL_AIR_MSG_P_DISPLAY_TOGGLED` (**0x6C04**) event on **every** transition:
+> **don → state byte `0x01`** (plus an ASCII log event 0x6c09 "Open OLED 2D"),
+> **doff → state byte `0x00`** (plus "Close OLED"). It is **pushed autonomously**
+> (no heartbeat needed), and the driver **already parses it** —
+> `handle_control_display_toggled` (`xreal_air_hmd.c`) sets `hmd->display_on`. So
+> `hmd->display_on` **is** a true hardware wear signal.
+>
+> **The hardware-presence path was implemented and is the chosen design** (see
+> §4/§5/§8, updated). The IMU-stillness heuristic in §1–§3/§7 is **dropped**; it is
+> retained below **only as a hypothetical fallback** for a hypothetical device that
+> genuinely lacks the proximity signal. Read §4–§5 for what shipped; treat §1–§3 as
+> superseded background, not the plan.
+
+---
+
+Research memo (2026-07-14, superseded background). Originally evaluated whether the
+**XREAL Air 2 Ultra**'s IMU could serve as a **don/doff (wear-detection)** signal to
+drive HypXRland's XR monitor plugged-state on a device *assumed* to have **no
+hardware proximity sensor** (that assumption was later disproven — see the
+correction above). Today's baseline 3DoF rig ([`07-xreal.md`](../07-xreal.md), WP-XR1)
+tears down only on **USB unplug**; the ask is a **softer, faster** signal — glasses
+set down on the desk = monitors unplug/idle even while still plugged in.
 
 This memo includes **live, read-only IMU capture** from the glasses (they were
 plugged in and enumerated during the session, driving DP-5). No display,
@@ -33,6 +54,23 @@ Evidence base:
 ---
 
 ## TL;DR — RECOMMENDATION
+
+> **SUPERSEDED by the correction above.** The shipped design does **not** use the
+> IMU. It uses the **hardware proximity/wear signal** (`display_on`, from the 0x6C04
+> DISPLAY_TOGGLED event) emitted as `XR_EXT_user_presence`, plus a generic per-frame
+> presence poll in the multi-compositor that broadcasts
+> `XRT_SESSION_EVENT_USER_PRESENCE_CHANGE` on change. That is instant, accurate, and
+> costs nothing extra (the driver already parses the event; the poll is a per-frame
+> bool read on a thread that already runs). See §4/§5/§8. The IMU analysis below is a
+> hypothetical fallback for a device that lacks the proximity signal — **this device
+> has it.** The one part of the original plan that survived unchanged is §5's
+> **runtime-propagation gap**: that gap was real and is what made this M-sized; the
+> fix (the per-frame poll + broadcast) is generic and also gives Rift/PSVR2 live
+> presence.
+
+---
+
+### (superseded) original IMU-path TL;DR
 
 **Power/perf verdict (load-bearing): IMU wear-detection is essentially FREE — but
 ONLY if the classifier rides Monado's existing IMU read loop. It is expensive and
@@ -252,7 +290,12 @@ a control ack.)
 
 ---
 
-## 4. The `XR_EXT_user_presence` path (why the driver is the right home)
+## 4. The `XR_EXT_user_presence` path (SHIPPED — hardware `display_on`)
+
+> **This is the implemented path.** The driver emits presence from the **hardware
+> wear signal** `hmd->display_on` (set by the 0x6C04 DISPLAY_TOGGLED event), **not**
+> from IMU stillness. The IMU-classifier text later in this section is retained only
+> as the hypothetical-fallback populate step.
 
 HypXRland **already** consumes user presence to gate the XR monitor plug state:
 
@@ -269,23 +312,40 @@ Monado template is small and already in-tree (Rift CV1,
 `drivers/rift/rift_driver.c`):
 
 - advertise: `hmd->base.supported.presence = true;` (`rift_driver.c:664`) →
-  propagates to `supportsUserPresence` via `oxr_system.c:697`.
-- implement: `hmd->base.get_presence = ..._get_presence;` (`rift_driver.c:636`,
-  returns a cached bool).
-- populate: in the read loop set the bool — Rift uses a hardware proximity sensor
-  (`hmd->presence = report.cv1.presence_sensor > 3;`, `rift_driver.c:123`); **for
-  XReal we substitute the IMU stillness classifier from §2** (the XReal has no
-  proximity sensor — this is the whole point).
+  propagates to `supportsUserPresence` via `oxr_system.c:697`. **Done** in
+  `xreal_air_hmd.c` device setup.
+- implement: `hmd->base.get_presence = xreal_air_hmd_get_presence;`
+  (`rift_driver.c:636` is the template; returns a debounced bool). **Done** — it
+  returns the debounced `hmd->display_on` under the device mutex.
+- populate: **XReal uses its hardware proximity/wear signal** — `hmd->display_on`,
+  already set by `handle_control_display_toggled` from the 0x6C04 event (don `0x01` /
+  doff `0x00`). This is exactly analogous to Rift's
+  `hmd->presence = report.cv1.presence_sensor > 3;` (`rift_driver.c:123`) — a
+  hardware sensor, not an inference. A small **~400 ms debounce** in `get_presence`
+  (accept an edge only once it has held steady) guards against a jittery proximity
+  threshold; the captured transitions were clean single edges, so it is light.
+  *(The §2 IMU-stillness classifier is the **fallback** for a device with no such
+  sensor — not used here.)*
 
-PSVR2 (`drivers/psvr2/psvr2.c:206,1257`) and `blubur_s1` are the same shape. This
-is a **~40-line, self-contained driver change** that mirrors an existing pattern.
+PSVR2 (`drivers/psvr2/psvr2.c:206,1257`) and `blubur_s1` are the same shape. The
+XReal driver change is **~40 lines, self-contained**, mirroring that pattern.
 
 ---
 
-## 5. The runtime-propagation gap (this sizes the WP)
+## 5. The runtime-propagation gap (REAL — and now RESOLVED)
+
+> **This gap was correct and is what sized the WP. It has been fixed** by option (A):
+> a per-frame poll of the head device's `get_presence` in `comp_multi_system`'s main
+> loop (`poll_and_broadcast_presence`), broadcasting
+> `XRT_SESSION_EVENT_USER_PRESENCE_CHANGE` to all clients on change. The head device
+> is threaded in via `comp_multi_create_system_compositor(..., head_xdev, ...)` and
+> stored **only if** it advertises `supported.presence`, so the poll is a no-op /
+> zero-cost when nothing presence-capable is bound. This is **generic** — it gives
+> live presence to Rift CV1 / PSVR2 too, not just XReal. `oxr_session.c:630` already
+> turns that session event into `XR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT`.
 
 Setting `supported.presence` + `get_presence` is **necessary but not sufficient for
-live don/doff** in the vendored Monado:
+live don/doff** in the vendored Monado (the gap this WP had to close):
 
 - `xrt_device_get_presence` is called from **exactly one place**: `oxr_session.c:352`,
   **at session begin only**. There is **no periodic poll** anywhere in the tree
@@ -367,36 +427,34 @@ already computes, it clears the bar — **as phase 2, behind a phase-1 manual to
 
 ---
 
-## 8. WP sketch — "XReal IMU don/doff → user-presence" (size **M**)
+## 8. WP sketch — "XReal HARDWARE don/doff → user-presence" (size **M**, SHIPPED)
 
-Almost entirely a **Monado-driver** change; **no HypXRland compositor code** if the
-presence path is completed (the plug gate already consumes presence).
+Entirely a **Monado** change; **no HypXRland compositor code** (the plug gate already
+consumes presence). What was actually built:
 
-1. **Driver stillness classifier** *(S, `xreal_air_hmd.c`)*: in the read/fusion
-   path, accumulate `time-since-last-motion` from `hmd->fusion.grav.is_rotating`
-   (or `last.gyro_length` vs `0.1 rad/s`), plus a gravity-stable check from
-   `hmd->fusion.rot` / `grav.is_accel`. Maintain `hmd->presence`
-   (worn = recent motion; doffed = still ≥ dwell). Config the dwell + threshold via
-   `XREAL_AIR_*` env/debug knobs to start.
+1. **Driver presence from hardware `display_on`** *(S, `xreal_air_hmd.c`)*: no IMU
+   classifier — `handle_control_display_toggled` already sets `hmd->display_on` from
+   the 0x6C04 event. Added `xreal_air_set_display_on()` (stamps the transition time on
+   a real edge) and `xreal_air_hmd_get_presence()` returning a **~400 ms-debounced**
+   `display_on` under the device mutex.
 2. **Advertise presence** *(XS)*: `base.supported.presence = true`,
-   `base.get_presence = xreal_air_get_presence` (return `hmd->presence`) — mirror
-   `rift_driver.c:636,664`.
-3. **Runtime propagation** *(M, the real work)*: add a per-frame poll of the head
-   device's `get_presence` in `comp_multi_system` (or a device→session-sink push)
-   that broadcasts `XRT_SESSION_EVENT_USER_PRESENCE_CHANGE` on change, so
-   `oxr_session.c:630` → `oxr_event.c:348` emits
-   `XR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT`. Generic; fixes live presence for
-   all presence-capable drivers.
+   `base.get_presence = xreal_air_hmd_get_presence` — mirrors `rift_driver.c:636,664`.
+3. **Runtime propagation** *(M, the real work — done)*: per-frame
+   `poll_and_broadcast_presence()` in `comp_multi_system`'s main loop broadcasts
+   `XRT_SESSION_EVENT_USER_PRESENCE_CHANGE` on change → `oxr_session.c:630` →
+   `oxr_event.c` emits `XR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT`. Head device
+   threaded through `comp_multi_create_system_compositor(..., head_xdev, ...)`; stored
+   only if presence-capable (zero-cost otherwise). Generic — fixes Rift/PSVR2 live
+   presence too.
 4. **Compositor: nothing** — `XRSession.cpp:390` already handles the event and
-   `XRMonitorConfig.cpp:345` already gates on it. Optionally flip the XReal rig's
-   documented default from `monitors_follow_session=session` to `visible` once
-   presence is live, so set-down idles without USB unplug.
-5. **Manual toggle (ship first, independent)** *(S)*: a keybind/voice "doff" that
-   drives the same plug gate (synthetic presence-absent), giving the reliable
-   zero-guess path immediately and a ground truth to validate the auto-heuristic
-   against.
+   `XRMonitorConfig.cpp` already gates on it. **Done:** flipped the XReal rig default
+   from `monitors_follow_session=session` to `visible` (+ `monitor_unplug_grace_ms =
+   3000`) in `example/xreal.conf`, so set-down idles without USB unplug.
+5. **Manual toggle (optional override)** *(S)*: a keybind/voice "doff" driving the
+   same gate (synthetic presence-absent) is a nice-to-have fallback, but the hardware
+   signal is primary and reliable, so it is **secondary** — not required for the UX.
 6. **Later / opt-in** *(separate WP)*: panel-sleep on doff (needs a verified
-   display-off HID path; do not couple to the unplug).
+   display-off HID path; do not couple to the unplug — left display **on**).
 
 ---
 
