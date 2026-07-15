@@ -1452,6 +1452,10 @@ std::optional<std::string> CConfigManager::handleMonitor(const std::string& comm
         } else if (ARGS[argno] == "icc") {
             parser.parseICC(std::string(ARGS[argno + 1]));
             argno++;
+        } else if (ARGS[argno] == "lease") {
+            // HypXRland XREAL V2.2: offer this named desktop output for drm-lease-v1 instead of
+            // configuring it as a desktop (monado direct/XR mode). Valueless flag — no argno++ for a value.
+            parser.setLease();
         } else {
             Log::logger->log(Log::ERR, "Config error: invalid monitor syntax at \"{}\"", ARGS[argno]);
             return "invalid syntax at \"" + std::string(ARGS[argno]) + "\"";

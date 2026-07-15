@@ -2,6 +2,7 @@
 
 #include "../../../debug/log/Logger.hpp"
 #include "../../../protocols/OutputManagement.hpp"
+#include "../../../protocols/DRMLease.hpp"
 #include "../../../output/Monitor.hpp"
 #include "../../../Compositor.hpp"
 #include "../../../render/Renderer.hpp"
@@ -181,8 +182,35 @@ void CMonitorRuleManager::ensureMonitorStatus() {
         if (!m->m_output)
             continue;
 
-        if (m->m_enabled == m->m_activeMonitorRule.m_disabled)
-            m->m_activeMonitorRule.m_disabled ? m->onDisconnect() : m->onConnect(true);
+        // Desired states for this output. m_enabled tracks "configured as a desktop". A leasable output
+        // (HypXRland XREAL V2.2 `lease` flag) is neither disabled nor a desktop: it is offered to
+        // drm-lease-v1 and its m_enabled stays false while it is being leased/offered.
+        const bool WANT_LEASE   = m->m_activeMonitorRule.m_lease && !m->m_activeMonitorRule.m_disabled;
+        const bool WANT_DESKTOP = !m->m_activeMonitorRule.m_disabled && !m->m_activeMonitorRule.m_lease;
+
+        // If this output should no longer be leased (returning to desktop, or being disabled), withdraw any
+        // standing lease offer first. reclaim() fast-returns for outputs that were never offered, so this
+        // does nothing for ordinary monitors — the non-lease reconfigure path is byte-identical to stock.
+        if (!WANT_LEASE) {
+            for (auto& [name, lease] : PROTO::lease) {
+                if (lease)
+                    lease->reclaim(m);
+            }
+        }
+
+        if (m->m_enabled && !WANT_DESKTOP) {
+            // Leaving the desktop (disabled OR switching to lease/direct-XR): tear it down — this relocates
+            // its workspaces to another monitor and frees the CRTC/connector so it can be leased.
+            m->onDisconnect();
+            // For a leasable output, re-enter connect so CMonitor::onConnect's lease gate offers the
+            // connector to lease clients (it early-returns there without configuring a desktop).
+            if (WANT_LEASE)
+                m->onConnect(true);
+        } else if (!m->m_enabled && WANT_DESKTOP) {
+            // Becoming (or returning to) a normal desktop output. The stale lease offer, if any, was already
+            // withdrawn above, so no lease client can grab the connector we are about to scan out on.
+            m->onConnect(true);
+        }
     }
 
     for (auto const& w : Desktop::windowState()->windows()) {

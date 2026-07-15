@@ -285,6 +285,10 @@ void CMonitorRuleParser::setDisabled() {
     m_rule.m_disabled = true;
 }
 
+void CMonitorRuleParser::setLease() {
+    m_rule.m_lease = true;
+}
+
 void CMonitorRuleParser::setMirror(const std::string& value) {
     m_rule.m_mirrorOf = value;
 }
