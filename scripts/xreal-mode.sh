@@ -219,6 +219,22 @@ enable_direct_dropin() {
 UnsetEnvironment=XRT_COMPOSITOR_FORCE_WAYLAND
 Environment=XRT_COMPOSITOR_FORCE_WAYLAND_DIRECT=1
 Environment=XRT_COMPOSITOR_WAYLAND_CONNECTOR=$mon
+# Direct-scanout pacing (fake pacer; RADV exposes no VK_GOOGLE_display_timing so the
+# non-feedback pacer is the only option — it phase-locks to the VK_EXT_display_control
+# FIRST_PIXEL_OUT vblank events on the leased connector):
+#  - present->display offset: with the xreal_air driver reporting rolling-scanout info the
+#    compositor samples a begin-of-scanout pose (photon time of row 0 ~= the first-pixel-out
+#    vblank the pacer locks to) and an end-of-scanout pose (+16.0ms), so the old mid-frame
+#    guess (default 4ms, "based on Index") is wrong here; 1ms ~= DP link + panel row latency
+#    (and is the pacer's documented minimum).
+#  - min compositor time: the wake->flip budget. The default 3.33ms (20% of 16.7ms) has no
+#    headroom when the iGPU is contended by desktop/XR rendering (monado only gets a MEDIUM
+#    global-priority queue without CAP_SYS_NICE), and every overrun is a FIFO flip slipping a
+#    full 60Hz period = a visible stutter. 8ms covers the measured contention tails (worst ~6.5ms under a saturated iGPU); the
+#    pose for the frame is still *predicted* for its display time, so the cost is prediction
+#    horizon, not extra perceived lag.
+Environment=U_PACING_COMP_PRESENT_TO_DISPLAY_OFFSET_MS=1.0
+Environment=U_PACING_COMP_MIN_TIME_MS=8.0
 EOF
     printf '  + wrote %s (direct-wayland, connector %s)\n' "$DIRECT_DROPIN" "$mon"
     systemctl --user daemon-reload
