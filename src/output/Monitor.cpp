@@ -295,8 +295,12 @@ void CMonitor::onConnect(bool noRule) {
     // output in (XREAL V2.2 leasable-on-demand direct mode). monitorRule is the freshly-fetched rule for
     // this connector; the flag defaults false so stock outputs are unaffected. offer() enforces the
     // same-DRM-backend constraint, so only the lease protocol owning this connector's GPU accepts it.
-    if (m_output->nonDesktop || monitorRule.m_lease) {
-        Log::logger->log(Log::DEBUG, "Not configuring output {} as desktop ({})", m_name, m_output->nonDesktop ? "non-desktop EDID" : "lease rule flag");
+    // Offer (and do NOT configure as desktop) when the EDID marks it non-desktop, OR the `lease` rule flag
+    // opts it in, OR it is STILL actively leased (m_isBeingLeased): a live lease means the lessee owns the
+    // CRTC, so falling through to the desktop-modeset path below would hang the compositor on the held lease.
+    if (m_output->nonDesktop || monitorRule.m_lease || m_isBeingLeased) {
+        Log::logger->log(Log::DEBUG, "Not configuring output {} as desktop ({})", m_name,
+                         m_output->nonDesktop ? "non-desktop EDID" : (m_isBeingLeased ? "actively leased" : "lease rule flag"));
 
         for (auto& [name, lease] : PROTO::lease) {
             if (!lease || m_output->getBackend() != lease->getBackend())
@@ -754,6 +758,13 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
 
     // don't touch VR headsets
     if (m_output->nonDesktop)
+        return true;
+
+    // Never modeset/commit a connector that is actively leased: a lease client (e.g. Monado direct mode)
+    // owns its CRTC via wp_drm_lease_v1, so a DRM commit here blocks against the held lease and hangs the
+    // compositor. The lessee drives the connector; there is nothing for us to apply. Defense-in-depth — the
+    // primary guard skips leased outputs in CMonitorRuleManager::ensureMonitorStatus() before we get here.
+    if (m_isBeingLeased)
         return true;
 
     const bool autoScale = RULE->m_scale <= 0.1;
