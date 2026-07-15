@@ -148,6 +148,18 @@ void CMonitorRuleManager::ensureMonitorStatus() {
         if (m->m_xrManagedPlug && !m->m_enabled)
             continue;
 
+        // A connector a lease client currently holds ACTIVE (m_isBeingLeased — e.g. Monado direct mode
+        // owns DP-5's CRTC via wp_drm_lease_v1 / VkDisplayKHR) must NEVER be reconfigured here.
+        // applyMonitorRule()/onConnect() below would issue a DRM modeset/commit on a connector owned by
+        // the lessee; the kernel/aquamarine commit blocks against the held lease and wedges the compositor's
+        // main thread → full-system freeze (the XREAL V2.2 direct-mode hang). Leave a leased output entirely
+        // alone: its active rule + standing lease offer persist, so direct mode SURVIVES a config reload that
+        // dropped the runtime `lease` flag (e.g. an Omarchy theme change re-applying monitor= from the file).
+        // The output only returns to desktop once the lease is actually released (Monado exits), which
+        // re-drives this pass (see CDRMLeaseResource's destroy listener → scheduleReload()).
+        if (m->m_isBeingLeased)
+            continue;
+
         auto rule = get(m);
 
         auto cmp = rule.compare(m->m_activeMonitorRule);
