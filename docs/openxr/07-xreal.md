@@ -274,19 +274,23 @@ the glasses are unplugged, and it **never** touches `wivrn.service`.
   where the glasses share Hyprland's primary GPU it's a no-op; where they don't (FW16) it corrects it.
   The wrong-GPU guard in `start()` (`XRGpuProbe`) still refuses safely if the EGL node ever mismatches.
 
-- **Doff detection: there is none over HID — rely on UNPLUG.** The driver does not surface the wear
-  sensor, and the device advertises no `XR_EXT_user_presence`, so the session always reads
-  `visible`/present. There is no reliable "took the glasses off" signal. What *does* remove the display
-  is **unplugging the USB cable**: that drops DP-5 (the connector disappears) **and** the `3318:0426`
-  HID device, so `monado-service` loses the HMD, the OpenXR session ends, and HypXRland's
-  **session-loss path** runs — under `monitors_follow_session = session` (the profile's setting) the XR
-  monitors unplug and their workspaces evacuate to your remaining displays, exactly like yanking a
-  physical monitor. Re-plugging + `xreal-mode xr` brings it back. This is why the profile uses
-  `session` (not `visible`): `visible` gates on a presence/visibility signal this device can't provide,
-  so it would never plug; `session` keeps the monitors up for the life of the (always-present) session
-  and lets the physical unplug be the teardown trigger. Verified against the code: `session` mode keys
-  purely on session existence (`OpenXRManager.cpp` follow-mode handling), and session teardown on
-  runtime/device loss drives the same unplug that a physical disconnect would.
+- **Doff detection: HARDWARE presence over HID (WP-XR-DONDOFF), USB-unplug is the backstop.** The Air 2
+  Ultra's proximity sensor **does** surface wear on the control interface: every physical don/doff pushes
+  a `XREAL_AIR_MSG_P_DISPLAY_TOGGLED` (0x6C04) event (don → state `0x01` "Open OLED 2D"; doff → `0x00`
+  "Close OLED"). The vendored `xreal_air` driver now advertises `XR_EXT_user_presence`
+  (`base.supported.presence = true`, `get_presence` returns the debounced `display_on`), and the vendored
+  monado's multi-compositor polls that head device once per frame and broadcasts a
+  `XRT_SESSION_EVENT_USER_PRESENCE_CHANGE` on change — so don/doff reaches HypXRland live as
+  `XR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT`. (Vanilla Monado only reads `get_presence` once at
+  session begin; this per-frame poll is the generic fix, and also gives Rift CV1 / PSVR2 live presence.)
+  The profile therefore uses **`monitors_follow_session = visible`**: doffing (set the glasses on the
+  desk) idles the XR monitors — their workspaces evacuate to your laptop — after a short
+  `monitor_unplug_grace_ms` (3 s anti-flap), and donning re-plugs them **immediately**, no cable pull
+  needed. Confirm with `hyprctl openxr status`: `presence: yes` when worn, `no` when doffed (it reads
+  `unsupported` only on a runtime without the emit). **USB-unplug is still the hard backstop**: pulling
+  the cable drops DP-5 **and** the `3318:0426` HID device, `monado-service` loses the HMD, the session
+  ends, and the same session-loss unplug runs. A tiny driver-side debounce (~400 ms) keeps a jittery
+  proximity threshold from flickering presence; the captured transitions were clean single edges.
 
 - **3DoF UX guards.** No controllers, no hands: the profile sets `pointer = false` and
   `hand_input = off`. Roam/geofence/leash are irrelevant with no positional tracking, so the arc uses
@@ -326,12 +330,16 @@ use `XREAL_MONITOR=` or rely on auto-detect, and set `~/.config/xreal/monado.env
    tracking); `SUPER+ALT+=/-` push/pull; tap again to drop.
 7. **`xreal-mode flat`:** the `openxr` window closes, the DP output returns to 1920×1080, and the
    glasses are an ordinary head-locked monitor again. Run it a second time — it should be a safe no-op.
-8. **Unplug behavior:** with `xreal-mode xr` active, pull the USB cable. The XR session should end and
-   the XR monitors unplug (workspaces evacuate to your other displays). Re-plug + `xreal-mode xr`
-   restores. (This is the stand-in for doff — there is no HID doff signal.)
-9. **WiVRn untouched:** if you use WiVRn/Quest, confirm `xreal-mode flat/xr` never stops
-   `wivrn.service` and a running WiVRn session is unaffected (separate socket + separate runtime json).
-10. **Idempotence / unplugged safety:** `xreal-mode xr` with the glasses unplugged should refuse
+8. **Doff/don (hardware presence):** with `xreal-mode xr` active and the glasses **on**, `hyprctl openxr
+   status` shows `presence: yes`. Set them on the desk (doff): after ~3 s (`monitor_unplug_grace_ms`)
+   `presence: no` and the XR monitors unplug — their workspaces evacuate to your laptop — with the cable
+   still connected. Put them back on (don): `presence: yes` and the monitors re-plug **immediately**.
+9. **Unplug behavior (backstop):** with `xreal-mode xr` active, pull the USB cable. The XR session should
+   end and the XR monitors unplug (workspaces evacuate to your other displays). Re-plug + `xreal-mode xr`
+   restores. (This is the hard teardown even if presence were ever unavailable.)
+10. **WiVRn untouched:** if you use WiVRn/Quest, confirm `xreal-mode flat/xr` never stops
+    `wivrn.service` and a running WiVRn session is unaffected (separate socket + separate runtime json).
+11. **Idempotence / unplugged safety:** `xreal-mode xr` with the glasses unplugged should refuse
     cleanly ("no XREAL device detected"); `xreal-mode flat` with nothing active should be a quiet no-op.
 
 Report back the SBS result (step 4) especially — that's the one architectural risk we couldn't
