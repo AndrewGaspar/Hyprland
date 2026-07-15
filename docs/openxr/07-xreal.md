@@ -126,13 +126,45 @@ on the AMD 890M's `DP-5`). What actually works, and the gotchas that were NOT ob
    also streams IMU via the read thread's `0xAA` path even before the `0x01` enable, which is why motion
    appeared as soon as the parse stopped looping.
 
+9b. **FIXED for real — factory IMU cal now applied EVERY boot (2026-07-15).** The de-rotation parse
+   (commit `1d521ab80`) parsed *offline* buffer dumps but the LIVE runtime still fell back to default
+   zero-bias cal on most boots. Root-caused from FRESH live captures (10 boots, `XREAL_CAL_DUMP=1`):
+   - `GET_CAL_DATA_LENGTH` reports **55845 = the JSON document length**. But the flash calibration
+     region is zero-padded up to a **504-byte segment boundary**, so its true period is
+     **F = 55944 = 111×504 = document(55845) + 99 zero-pad**.
+   - The firmware's segment read cursor is **not reset** by `GET_CAL_DATA_LENGTH` and **drifts ~504
+     bytes per boot** (observed: the 99-zero pad's offset marched 51309→50805→…→46269 across ten
+     consecutive boots), wrapping at F.
+   - Reading only `length` (55845) bytes therefore returns a window **99 bytes short of one full
+     period**: unless the cursor happens to sit exactly at the document start, the window includes the
+     zero-pad **and permanently OMITS 99 real document bytes** — a loss no de-rotation can undo. It
+     silently produced corrupt-but-sometimes-parseable JSON (IMU survived by luck) or dropped to
+     default. Proven over all 111 cursor positions: read-`length` hard-fails ~13 % and corrupts the
+     rest; **read-full-period recovers the exact document 111/111.**
+   - **Fix** (`xreal_air_hmd.c`, `handle_sensor_control_get_cal_data_length`): round the reported
+     length **up to the segment-payload boundary** and read that many bytes (55944), capturing the
+     whole period `[document + zero-pad]` regardless of cursor; `xreal_air_parse_calibration_buffer()`
+     then de-rotates around the 99-zero pad and recovers the complete document every time. (Reading
+     exactly one period also leaves the firmware cursor where it started.)
+   - **Verified live, headless, across 13 monado-service runs + the systemd service:** every boot logs
+     `Factory calibration parsed: gyro_bias=[-0.02333 0.00093 -0.02513] accel_bias=[0.01041 -0.20677
+     0.02486]` (the real factory biases) with **zero** `using default IMU calibration`, while the pad
+     offset keeps drifting (proving robustness, not a lucky cursor). `hyprctl openxr status` reaches
+     and sustains `state: focused`. The per-eye **FOV now parses too**: `Factory display: res=1920x1080
+     per-eye FOVh: left=42.23° right=42.16°` (still gated behind `XREAL_AIR_USE_FACTORY_FOV`, default
+     off — A/B worn), and the 32×18 distortion meshes are detected (still not wired to
+     `compute_distortion`). *Honest limit:* this proves the factory cal is now APPLIED; whether worn
+     yaw-drift subjectively improves is the user's to feel.
+
 **Still needs the glasses WORN to judge:** stereo *comfort* and recenter feel. Recenter uses the current
 head pose, so recenter **while wearing them and looking straight ahead at where you want the screen** — a
 recenter captured with the glasses held/tilted on the desk places the panel at a skewed, too-close pose
-(which reads as "jank" that is really just placement). There is **no factory optical/display cal applied**
-(the driver runs `u_distortion_mesh_none` and hardcoded 46°H≈52° diagonal FOV / symmetric lens centers —
-plausibly correct for the birdbath, but the `left_display`/`right_display` distortion meshes in the blob
-are **not** consumed; a future improvement could feed them to `compute_distortion`).
+(which reads as "jank" that is really just placement). The factory optical/display cal is now **parsed
+but not applied by default**: the per-eye FOV derived from the blob's pinhole intrinsics is ≈**42.2°H**
+(vs the hardcoded 46°), available behind `XREAL_AIR_USE_FACTORY_FOV` (default off — it changes on-screen
+scale ~9 % and can only be validated worn); the driver still runs `u_distortion_mesh_none` and the
+`left_display`/`right_display` 32×18 distortion meshes are detected but **not** consumed (a future
+improvement could feed them to `compute_distortion`).
 
 **Not validated by the author (cannot see through the glasses):** absolute distortion/convergence quality.
 The remaining "does it look right when worn" is the user's call.
