@@ -131,6 +131,16 @@ one):
 - **Factory calibration read over HID** (`MSG_GET_CAL_DATA_LENGTH 0x14`,
   `CAL_DATA_GET_NEXT_SEGMENT 0x15`, …; `xreal_air_parsed_calibration`) — gyro/accel
   bias + scale come from the device, so fusion starts from a calibrated IMU.
+  **As of 2026-07-15 this is reliably applied every boot** (real factory
+  `gyro_bias=[-0.02333 0.00093 -0.02513]`, `accel_bias=[0.01041 -0.20677 0.02486]`,
+  not zero-bias defaults). The Air 2 Ultra's ~55 KB blob is trickier than the Air 1's:
+  `GET_CAL_DATA_LENGTH` returns the *document* length (55845), but the flash region is
+  zero-padded to a 504-byte segment boundary (true period **55944 = 111×504**) and the
+  firmware segment cursor drifts ~504 B/boot and is never reset — so a `length`-sized
+  read is 99 bytes short of a full period and silently drops document bytes. The driver
+  now reads the **full padded period** (round length up to the segment boundary) and
+  de-rotates around the 99-byte zero-pad seam → the complete document every boot. See
+  `07-xreal.md §9b`.
 - **Display-mode + brightness control over HID** (§4). `switch_display_mode`
   (`:976`) configures a **split side-by-side** stereo device via
   `u_device_setup_split_side_by_side`, 46°×46° FOV.
