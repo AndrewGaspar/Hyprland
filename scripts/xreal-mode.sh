@@ -220,6 +220,38 @@ disable_direct_dropin() {
     systemctl --user daemon-reload
 }
 
+# True iff Monado is CURRENTLY running in DRM-lease direct mode — i.e. it holds the glasses' DP connector's
+# DRM lease. Proxy: the direct drop-in is installed AND the monado unit is active. When this is true, Monado
+# owns the leased CRTC, so it MUST be stopped (lease released) before anything disables the XR session or
+# modesets that connector — see stop_monado_for_lease_release().
+direct_mode_active() {
+    [[ -f $DIRECT_DROPIN ]] || return 1
+    systemctl --user is-active --quiet "$XREAL_SERVICE_UNIT"
+}
+
+# Stop Monado and let Hyprland observe the DRM-lease release BEFORE the caller disables the XR session or
+# reclaims/modesets the connector. CRITICAL anti-deadlock ordering for direct mode:
+#   Disabling the XR session (hyprctl openxr disable) or reclaiming the DP connector to a desktop WHILE
+#   Monado still holds the lease deadlocks the compositor — Hyprland's main thread blocks on a synchronous
+#   OpenXR IPC teardown (xrDestroySession/xrDestroyInstance) against a Monado that is itself blocked on its
+#   leased DP flip / lease-release (which needs Hyprland's wayland thread — the very thread that is blocked).
+#   That cross-process deadlock hangs the WHOLE session (eDP included → hard reboot).
+# `systemctl --user stop` blocks until the unit's process is reaped; reaping closes BOTH the OpenXR IPC
+# socket (so a later openxr-disable hits a dead socket and returns fast, never blocking) AND the DRM-lease
+# fd (so the kernel revokes the lease). We then wait for the unit to report inactive and give Hyprland's
+# wayland loop a beat to process Monado's disconnect and clear the connector's leased state.
+stop_monado_for_lease_release() {
+    echo "  direct mode active — stopping Monado FIRST to release the DP lease (anti-deadlock ordering)."
+    run systemctl --user stop "$XREAL_SERVICE_UNIT"
+    [[ $DRY_RUN -eq 1 ]] && return 0
+    local i=0
+    while [[ $i -lt 20 ]]; do
+        systemctl --user is-active --quiet "$XREAL_SERVICE_UNIT" || break
+        i=$((i+1)); sleep 0.1
+    done
+    sleep 0.5   # let Hyprland's wayland loop drop the lease (monitor m_isBeingLeased -> false) before we proceed
+}
+
 # Is the currently-active XR session using OUR xreal runtime manifest? (so `flat` only disables ours)
 xr_session_is_xreal() {
     local status
@@ -300,11 +332,19 @@ cmd_xr() {
     fi
     echo "  glasses DP output: $mon"
 
-    # 2. End any active XR session first, then release the HID device by stopping monado, so the HID
-    #    display-mode switch below is uncontended AND — crucially — monado re-reads the display mode when
-    #    it restarts. The xreal_air driver picks stereo-vs-mono view geometry ONCE, at create time, from
-    #    whatever mode the glasses report over HID (control_display_mode → switch_display_mode). So the
-    #    HID switch MUST precede the monado (re)start or comp_main comes up with the wrong view count.
+    # 2. If we are ALREADY in DRM-lease direct mode, Monado holds the DP lease — release it FIRST (stop
+    #    Monado and wait for Hyprland to drop the lease) BEFORE disabling the XR session. Disabling the
+    #    session while the lease is held deadlocks the compositor (full-system hang); this also makes
+    #    re-running `xr`/`xr --direct` while already in direct mode a SAFE clean teardown, not a re-entry hang.
+    if direct_mode_active; then
+        stop_monado_for_lease_release
+    fi
+    # End any active XR session, then release the HID device by stopping monado, so the HID display-mode
+    # switch below is uncontended AND — crucially — monado re-reads the display mode when it restarts. The
+    # xreal_air driver picks stereo-vs-mono view geometry ONCE, at create time, from whatever mode the glasses
+    # report over HID (control_display_mode → switch_display_mode). So the HID switch MUST precede the monado
+    # (re)start or comp_main comes up with the wrong view count. (In direct mode the lease was already released
+    # just above, so this openxr-disable runs with no live lease and cannot deadlock.)
     run hyprctl openxr disable
     run systemctl --user stop "$XREAL_SERVICE_UNIT"
 
@@ -446,6 +486,13 @@ cmd_xr() {
 
 cmd_flat() {
     echo "== xreal-mode flat =="
+    # 0. If we are in DRM-lease direct mode, Monado holds the DP lease. Release it FIRST — stop Monado and
+    #    wait for Hyprland to drop the lease — BEFORE disabling the XR session or reclaiming the connector to
+    #    a desktop. Tearing down (openxr disable / DP modeset) while the lease is held deadlocks the compositor
+    #    (full-system hang). Once the lease is released the reclaim/modeset in step 4 is safe. See cmd_xr.
+    if direct_mode_active; then
+        stop_monado_for_lease_release
+    fi
     # 1. Disable the XR session ONLY if it is our xreal runtime (leave WiVRn/Quest sessions alone).
     if [[ $DRY_RUN -eq 1 ]] || xr_session_is_xreal; then
         run hyprctl openxr disable

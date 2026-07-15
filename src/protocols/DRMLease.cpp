@@ -1,6 +1,7 @@
 #include "DRMLease.hpp"
 #include "../Compositor.hpp"
 #include "../output/Monitor.hpp"
+#include "../config/shared/monitor/MonitorRuleManager.hpp"
 #include "../event/EventBus.hpp"
 #include "drm-lease-v1.hpp"
 #include "managers/eventLoop/EventLoopManager.hpp"
@@ -82,6 +83,13 @@ CDRMLeaseResource::CDRMLeaseResource(SP<CWpDrmLeaseV1> resource_, SP<CDRMLeaseRe
 
         m_resource->sendFinished();
         LOGM(Log::DEBUG, "Revoking lease for fd {}", m_lease->leaseFD);
+
+        // The lease is gone (e.g. Monado direct mode exited): the connectors are no longer m_isBeingLeased,
+        // so re-drive the monitor-rule pass to reconcile them to their current rule. A `lease`-flagged output
+        // re-offers; an output whose rule now wants desktop (e.g. a config reload dropped the flag while it was
+        // leased — ensureMonitorStatus deliberately left it untouched) is reclaimed to a desktop here. Without
+        // this the connector would stay dark until the next manual reconfigure. Runs on the main/wayland thread.
+        Config::monitorRuleMgr()->scheduleReload();
     });
 
     LOGM(Log::DEBUG, "Granting lease, sending fd {}", m_lease->leaseFD);
