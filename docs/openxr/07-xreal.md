@@ -309,6 +309,30 @@ Machine-agnostic knobs (env): `XREAL_MONITOR` (connector name; else auto-detecte
 description), `MONADO_XREAL_BUILD` (build dir), `XREAL_CTL`, `XREAL_FLAT_MODE`. Idempotent, safe when
 the glasses are unplugged, and it **never** touches `wivrn.service`.
 
+> ### ⚠️ Direct-mode teardown ordering — the lease MUST be released before any XR-disable / DP modeset
+> A DRM lease makes Monado the **DRM master of DP-5's CRTC**. If HypXRland disables the XR session
+> (`hyprctl openxr disable`) or reclaims/modesets DP-5 **while the lease is still held**, the compositor
+> **deadlocks and the whole session hangs** (hard reboot): `openxr disable` tears the session down via a
+> **synchronous OpenXR IPC** (`xrDestroySession`/`xrDestroyInstance`) on Hyprland's main thread, and in
+> direct mode Monado can only answer that after finishing/releasing its leased DP-5 flip — which needs
+> Hyprland's wayland thread, i.e. the very thread blocked in the IPC. Cross-process deadlock.
+>
+> **Two independent safeguards now prevent this (belt + suspenders):**
+> - **Script (`xreal-mode.sh`, belt):** `xr`, `xr --direct` and `flat` all detect an active direct mode
+>   (`direct_mode_active`: drop-in present **and** the unit active) and **stop Monado FIRST**
+>   (`stop_monado_for_lease_release`), waiting for the lease to drop, *before* `openxr disable` or any DP
+>   modeset. This also makes **re-running `xr --direct` while already in direct mode** a safe clean
+>   teardown instead of the re-entry hang.
+> - **Compositor (suspenders):** `CMonitorRuleManager::ensureMonitorStatus()` **skips any output that is
+>   actively leased** (`m_isBeingLeased`) — it never `applyMonitorRule()`s or `onConnect()`s a leased
+>   connector (with defense-in-depth bails in `CMonitor::applyMonitorRule` and the `onConnect` lease
+>   gate). So a held lease **cannot** be modeset out from under Monado no matter what re-drives the rule
+>   pass. **This also makes direct mode survive a config reload** (e.g. an Omarchy theme change re-applying
+>   `monitor=DP-5,…` from the file *without* the runtime `lease` flag): the leased output is left untouched,
+>   keeping its offer/lease, so DP-5 stays leased instead of reverting to a desktop and breaking the session.
+>   When the lease is finally released (Monado exits), the lease-destroy listener schedules a rule pass so
+>   DP-5 reconciles back to a desktop (or re-offers) on its own.
+
 ---
 
 ## 3. How it hangs together (design facts to know)
