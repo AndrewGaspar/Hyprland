@@ -178,6 +178,37 @@ xr_session_is_xreal() {
         || printf '%s' "$status" | grep -qF "$RUNTIME_JSON"
 }
 
+# Robustly land the Monado comp_main window (Wayland app-id "openxr", title "Monado") FULLSCREEN on the
+# glasses' DP output. The window is a floating toplevel; a windowrule alone is unreliable (it only fires
+# at map time, and only if this profile's xreal.conf windowrule is actually sourced), so we ALSO move it
+# to the monitor and fullscreen it explicitly, by address. Idempotent; safe to call repeatedly.
+place_openxr_window() {
+    local mon="$1" addr i m
+    # Session-scoped windowrule so any freshly-created openxr window also lands correctly.
+    run hyprctl keyword windowrule "monitor $mon, fullscreen 1, border_size 0, no_anim 1, no_blur 1, immediate 1, match:class ^(openxr)\$"
+    [[ $DRY_RUN -eq 1 ]] && return 0
+    have_jq || { echo "  (jq not found — relying on the windowrule to place the openxr window)"; return 0; }
+    # Wait for the openxr window to exist (comp_main opens its toplevel a beat after the socket binds).
+    addr=""
+    for i in $(seq 1 40); do
+        addr="$(hyprctl -j clients 2>/dev/null | jq -r '.[]|select(.class=="openxr")|.address' | head -n1)"
+        [[ -n $addr && $addr != null ]] && break
+        addr=""; sleep 0.25
+    done
+    [[ -n $addr ]] || { echo "  (openxr window never appeared — check: hyprctl clients)"; return 1; }
+    # Move to the glasses' output, then fullscreen deterministically (fullscreenstate 2 2 = full).
+    hyprctl dispatch focuswindow "address:$addr" >/dev/null 2>&1 || true
+    hyprctl dispatch movewindow "mon:$mon" >/dev/null 2>&1 || true
+    sleep 0.4
+    hyprctl dispatch focuswindow "address:$addr" >/dev/null 2>&1 || true
+    hyprctl dispatch fullscreenstate 2 2 >/dev/null 2>&1 || true
+    sleep 0.4
+    # Report where it landed (monitor is an ID in clients json; map it to a name).
+    m="$(hyprctl -j clients 2>/dev/null | jq -r --arg a "$addr" '.[]|select(.address==$a)|.monitor')"
+    m="$(hyprctl -j monitors all 2>/dev/null | jq -r --arg id "$m" '.[]|select((.id|tostring)==$id)|.name')"
+    echo "  openxr window placed on: ${m:-<unknown>} (want $mon), fullscreen requested"
+}
+
 # ---- commands ----
 cmd_status() {
     local mon
@@ -240,26 +271,51 @@ cmd_xr() {
     #    desktop is never left on a dead mode, then bails.
     if [[ $MONO -eq 1 ]]; then
         run hyprctl keyword monitor "$mon,${FLAT_MODE},auto,1"
+    elif [[ $DRY_RUN -eq 1 ]]; then
+        run hyprctl keyword monitor "$mon,${SBS_WIDTH}x1080@60,auto,1.0"
     else
-        echo "  forcing ${SBS_WIDTH}x1080 modeline on $mon (glasses hardware-split L/R)…"
-        run hyprctl keyword monitor "$mon,modeline ${SBS_MODELINE},auto,1"
-        if [[ $DRY_RUN -eq 0 ]]; then
-            local i=0 w=0
-            while :; do
-                w="$(monitor_width "$mon")"
-                connector_is_connected "$mon" && [[ "$w" == "$SBS_WIDTH" ]] && break
-                i=$((i+1)); [[ $i -le 12 ]] || {
-                    echo "!! $mon did not come up ${SBS_WIDTH}-wide (width=$w, connected=$(connector_is_connected "$mon" && echo yes || echo no))." >&2
-                    echo "   Reverting $mon to $FLAT_MODE + glasses to 2D and aborting SBS (desktop restored)." >&2
-                    hyprctl keyword monitor "$mon,${FLAT_MODE},auto,1" >/dev/null 2>&1 || true
-                    [[ -n $XREAL_CTL ]] && "$XREAL_CTL" mode 2d >/dev/null 2>&1 || true
-                    echo "   Retry, or use: xreal-mode.sh xr --mono" >&2
-                    exit 1
-                }
-                sleep 0.25
-            done
-            echo "  $mon is up ${SBS_WIDTH}x1080 (connected)."
+        # After the HID 3D switch the glasses re-present a NATIVE 3840-wide EDID mode, but the connector
+        # first drops and returns (~2s). PREFER that native mode; fall back to a forced CVT modeline only
+        # if it never shows up. (The forced modeline is a slightly-off 59.855 Hz AND makes the glasses'
+        # internal L/R scaler mis-sample → diagonal striping + no stereo alignment; the native 60 Hz mode
+        # is what the scaler expects.) Scale is pinned to 1.0 below: any fractional scale resamples the SBS
+        # frame (1 buffer px must map to 1 physical px, else the left/right split softens and can skew).
+        echo "  waiting for $mon to re-present a native ${SBS_WIDTH}-wide mode after the HID 3D switch…"
+        local i=0 have_wide=""
+        while :; do
+            if monitor_has_wide_mode "$mon"; then have_wide=1; break; fi
+            i=$((i+1)); [[ $i -le 20 ]] || break   # ~5s
+            sleep 0.25
+        done
+        if [[ -n $have_wide ]]; then
+            local modestr=""
+            if have_jq; then
+                modestr="$(hyprctl -j monitors all 2>/dev/null | jq -r --arg m "$mon" --argjson w "$SBS_WIDTH" \
+                    '[.[]|select(.name==$m)|.availableModes[]|select((split("x")[0]|tonumber)>=$w)][0] // empty' | sed 's/Hz$//')"
+            fi
+            [[ -n $modestr ]] || modestr="${SBS_WIDTH}x1080@60"
+            echo "  native wide mode advertised ($modestr) — using it."
+            run hyprctl keyword monitor "$mon,${modestr},auto,1.0"
+        else
+            echo "  no native ${SBS_WIDTH} mode appeared — forcing the CVT modeline (glasses hardware-split L/R)…"
+            run hyprctl keyword monitor "$mon,modeline ${SBS_MODELINE},auto,1.0"
         fi
+        # Verify the connector actually came up ${SBS_WIDTH}-wide and still connected; else revert + bail.
+        i=0; local w=0
+        while :; do
+            w="$(monitor_width "$mon")"
+            connector_is_connected "$mon" && [[ "$w" == "$SBS_WIDTH" ]] && break
+            i=$((i+1)); [[ $i -le 12 ]] || {
+                echo "!! $mon did not come up ${SBS_WIDTH}-wide (width=$w, connected=$(connector_is_connected "$mon" && echo yes || echo no))." >&2
+                echo "   Reverting $mon to $FLAT_MODE + glasses to 2D and aborting SBS (desktop restored)." >&2
+                hyprctl keyword monitor "$mon,${FLAT_MODE},auto,1" >/dev/null 2>&1 || true
+                [[ -n $XREAL_CTL ]] && "$XREAL_CTL" mode 2d >/dev/null 2>&1 || true
+                echo "   Retry, or use: xreal-mode.sh xr --mono" >&2
+                exit 1
+            }
+            sleep 0.25
+        done
+        echo "  $mon is up ${SBS_WIDTH}x1080 (connected)."
     fi
 
     # 5. Nudge the DP output through a dpms off/on cycle to wake the panel (the glasses' panel can sleep
@@ -302,6 +358,11 @@ cmd_xr() {
     #    bypassing WiVRn's active_runtime).
     run hyprctl keyword openxr:runtime_json "$RUNTIME_JSON"
     run hyprctl openxr enable
+
+    # 9. Land the Monado comp_main window (app-id "openxr") fullscreen on the glasses' output. Explicit
+    #    move + fullscreen so it never drifts to the laptop panel or a scratchpad, regardless of whether
+    #    the profile's windowrule is sourced.
+    place_openxr_window "$mon"
 
     echo "done. Check: hyprctl openxr status   (state should reach 'focused'; runtime json: $RUNTIME_JSON)"
     echo "The monado comp_main window (class 'openxr', title 'Monado') should be fullscreen on $mon at"

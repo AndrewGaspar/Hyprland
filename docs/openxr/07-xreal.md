@@ -30,20 +30,25 @@ The pieces:
 The whole SBS path was **de-risked live** on the Framework 16 (Ryzen AI 300 + RTX 5070 Laptop, glasses
 on the AMD 890M's `DP-5`). What actually works, and the gotchas that were NOT obvious from the research:
 
-1. **The glasses do NOT re-advertise a 3840-wide EDID after the HID 3D switch — you must FORCE the mode.**
-   The research (§4) assumed that `xreal-ctl mode 3d` makes a 3840×1080 mode "appear" (community reports
-   said so). On this host it does **not**: after the HID switch the connector re-probes but still only
-   exposes its three native 1920×1080 DTDs. So `xreal-mode.sh xr` now **forces an unadvertised
-   3840×1080 CVT reduced-blanking modeline** and verifies the connector comes up 3840-wide:
+1. **The glasses DO re-advertise a native 3840×1080@60 EDID mode after the HID 3D switch — WAIT for it and
+   USE it; the forced modeline is a last-resort fallback that STRIPES.** Corrected 2026-07-15 on the live
+   device: after `xreal-ctl mode 3d` the DP-5 connector drops and returns (~2 s) and then advertises a
+   **native `3840×1080@60` mode** (297 MHz DTD) alongside its 1920×1080 modes. That native timing is what
+   the glasses' internal L/R scaler expects. Driving 3D SBS on a **forced/unadvertised CVT modeline**
+   (e.g. `266.50 3840 …`) instead produces **diagonal striping across the panel and no left/right stereo
+   alignment** — the scaler mis-samples the non-native timing. So `xreal-mode.sh xr` now **waits for the
+   native wide mode and sets it**, e.g.:
    ```
-   monitor = DP-5, modeline 266.50 3840 3888 3920 4000 1080 1083 1093 1111 +hsync -vsync, auto, 1
+   monitor = DP-5, 3840x1080@60, auto, 1
    ```
-   This was tested live: **DP-5 accepted the forced mode and stayed `connected` at 3840×1080.** The
-   glasses' internal scaler takes the wide frame and hardware-splits it left-half → left eye,
-   right-half → right eye. Bandwidth: 266.5 MHz pixel clock × 24bpp ≈ **6.4 Gbit/s**, *below* the
-   glasses' proven link budget (native 1920×1080@120 = 297 MHz ≈ 7.1 Gbit/s works) and inside a 2-lane
-   HBR2 DP-alt link (10.8 Gbit/s). **Keep 3D at ≤72 Hz** — 3840-wide @90+ exceeds the 2-lane budget and
-   goes out-of-range/black (this is also why XREAL only offers 90/120 Hz at the 1920-wide 2D mode).
+   and only falls back to the forced modeline (`XREAL_SBS_MODELINE`, retained for hosts that genuinely
+   never re-present a wide EDID) if the native mode never appears within ~5 s. On the FW16 the native mode
+   always appeared and looked correct; the earlier forced-modeline path was the source of the "super jank /
+   striping" the user saw. **Keep 3D at ≤72 Hz on any forced fallback** — 3840-wide @90+ exceeds the 2-lane
+   DP-alt budget and goes out-of-range/black (the native mode is 60 Hz, comfortably inside budget). **Also
+   pin the DP output to `scale = 1.0`** — an `auto` scale on this output picked **1.25**, which makes
+   Hyprland resample the 3840×1080 SBS frame (1 buffer px must map to 1 physical px, or the per-eye split
+   softens and can skew). `xreal-mode.sh xr` now sets the mode with an explicit `,auto,1.0`.
 
 2. **Mode-switch ordering is load-bearing.** The `xreal_air` driver picks stereo-vs-mono view geometry
    **once, at device-create time**, from whatever display mode the glasses report over HID
@@ -73,13 +78,13 @@ on the AMD 890M's `DP-5`). What actually works, and the gotchas that were NOT ob
    the upper-left" photo was the **3-D scene seen through one eye plus an off recenter pose on the unworn
    glasses**, not a packing bug. Both paths are usable; SBS is the correct per-eye one.
 
-6. **Known quality caveat — the SBS view is rendered at half resolution.** Monado's Wayland window backend
-   deliberately **halves** the surface under `XRT_COMPOSITOR_FORCE_WAYLAND` (`comp_settings.c`: *"HMD
-   screen tends to be much larger than monitors"* → `preferred.width/height /= 2`). So the present surface
-   is **1920×540** (per-eye 960×540) upscaled by Hyprland to fill the 3840×1080 output → **soft**. The
-   geometry/split is correct; only sharpness suffers. **Fix (needs a monado rebuild, so out of tonight's
-   scope):** drop the `/= 2` in `comp_settings.c` under `force_wayland` (or gate it on an env var) to get
-   full-res SBS. Tracked as a follow-up.
+6. **FIXED — full-resolution SBS.** Monado's Wayland window backend used to **halve** the surface under
+   `XRT_COMPOSITOR_FORCE_WAYLAND` (`comp_settings.c`: *"HMD screen tends to be much larger than
+   monitors"* → `preferred.width/height /= 2`), so the present surface was **1920×540** (per-eye 960×540)
+   upscaled to 3840×1080 → soft. Patched 2026-07-15: the wayland halving is now **gated behind
+   `XRT_COMPOSITOR_WAYLAND_HALVE_SURFACE` (default OFF)**, so the surface comes up at the HMD's native
+   **3840×1080** (per-eye **1920×1080**). Verified live: `hyprctl clients` shows the `openxr` window at
+   `size [3840,1080]`. The xcb path is unchanged.
 
 7. **Panel sleeps when unworn in 2D.** After `xreal-mode.sh flat`, with no session and the glasses in 2D
    on the desk, the wear sensor powers the panel down and DP-5 may read `disconnected` at the DRM layer —
@@ -92,10 +97,52 @@ on the AMD 890M's `DP-5`). What actually works, and the gotchas that were NOT ob
    cleanly `inactive/dead` (previously a plain stop hung for the 90 s default timeout then SIGKILL'd →
    `failed`). The service is stateless, so SIGKILL is safe.
 
-**Not yet validated (needs the glasses WORN):** head-tracking motion/pose correctness and stereo comfort —
-the IMU pose is static/uncalibrated on the unworn desk unit (the driver also logged repeated *"Failed
-parse calibration data"* on the unworn unit; revisit worn). All of the above is the *geometry* path, which
-is validatable without wearing them.
+9. **FIXED — head tracking + factory IMU calibration parse (Air 2 Ultra).** The driver logged *"Failed
+   parse calibration data!"* ~continuously (866× in one session) and — per the original code — only started
+   the IMU data stream **on a successful parse**, so head tracking was dead and the log/HID bus were
+   flooded. Root cause found by dumping the raw calibration blob (`/tmp/xreal_cal_dump.bin`): the Air 2
+   Ultra returns a **~55 KB JSON** bundling the per-eye **display distortion meshes** (`left_display` /
+   `right_display`, 32×18 grids) **and** the IMU calibration, and that blob does **not** reassemble into a
+   byte-0-valid JSON document over the segmented HID transfer (the leading `{"left_display":{"data":[` is
+   missing and there's a zero-filled gap before the `{"FSN":…}` root), so `cJSON_ParseWithLength()` over the
+   whole buffer failed. The **embedded `"IMU"` object is intact**, though, and its schema is exactly what
+   the existing parser expects (`accel_bias`, `accel_q_gyro`=[0,0,0,1], `gyro_bias`, `gyro_q_mag`=
+   [-0.5,0.5,-0.5,0.5], `scale_*`=[1,1,1], `imu_noises`, real per-axis biases). Fix (vendored monado,
+   `xreal_air_packet.c` / `xreal_air_hmd.c`):
+   - `xreal_air_parse_calibration_buffer()` now **locates and parses just the embedded `"IMU"` object**
+     (brace-matched, string-aware) when the whole-buffer parse fails → the **real factory IMU calibration**
+     is applied (accurate bias + gyro/mag misalignment). The original whole-buffer path is kept for the
+     Air 1.
+   - The calibration is initialized to **sane defaults** (identity misalignment, unit scale, zero bias) at
+     device create AND as a fallback, so the fusion is never fed the all-zero calloc'd calibration (which
+     would zero the scale factors and freeze the pose).
+   - Parse failure is now **non-fatal**: the IMU stream is started regardless (`0x01`) and the calibration
+     is marked "done" so the driver stops re-fetching the 55 KB blob on every packet → the log flood stops.
+   Verified live: after the patch the *"Failed to parse"* count is **0**, and the user confirmed **head
+   motion moves the view** (picked the glasses up → the virtual panel swung with them). The Air 2 Ultra
+   also streams IMU via the read thread's `0xAA` path even before the `0x01` enable, which is why motion
+   appeared as soon as the parse stopped looping.
+
+**Still needs the glasses WORN to judge:** stereo *comfort* and recenter feel. Recenter uses the current
+head pose, so recenter **while wearing them and looking straight ahead at where you want the screen** — a
+recenter captured with the glasses held/tilted on the desk places the panel at a skewed, too-close pose
+(which reads as "jank" that is really just placement). There is **no factory optical/display cal applied**
+(the driver runs `u_distortion_mesh_none` and hardcoded 46°H≈52° diagonal FOV / symmetric lens centers —
+plausibly correct for the birdbath, but the `left_display`/`right_display` distortion meshes in the blob
+are **not** consumed; a future improvement could feed them to `compute_distortion`).
+
+**Not validated by the author (cannot see through the glasses):** absolute distortion/convergence quality.
+The remaining "does it look right when worn" is the user's call.
+
+10. **Known wart — the glasses' DP output (`DP-5`) is still a distinct addressable Hyprland monitor.** In a
+    fully-integrated solution only `eDP-2` (laptop) and the virtual `XR-main` would be addressable; `DP-5`
+    would be a pure scanout target for the Monado surface. Today `DP-5` is an ordinary Hyprland output that
+    the `openxr` window is fullscreened onto, so it appears in `hyprctl monitors`, can be cycled to, and
+    can (mis)receive stray windows/workspaces. The clean fix is a **dedicated/leased output** for the
+    compositor surface (DRM-lease direct mode — explicitly out of scope here, see the top of this doc).
+    Pragmatic mitigations until then: bind a dedicated empty workspace to `DP-5` and keep it out of your
+    normal workspace-switch binds so nothing drifts there, and/or rely on the `openxr` windowrule keeping
+    that output occupied by the Monado surface. Tracked as a follow-up.
 
 ---
 
@@ -178,13 +225,16 @@ scripts/xreal-mode.sh xr --dry-run   # print every action without doing anything
 
 **`xr`** does, in order (see §0 for why this exact order): verify the glasses are present over HID →
 **end any active session + stop monado** (free the HID device so the switch is uncontended and monado
-re-reads the mode on restart) → `xreal-ctl mode 3d` (HID switch to SBS) → **force the 3840×1080
-modeline** on the DP output and verify it comes up 3840-wide (revert + bail if not — see §0.1) → dpms
-nudge → **auto-set `openxr:gpu`** to the connector's DRM render node + `openxr:blend_mode = opaque` →
+re-reads the mode on restart) → `xreal-ctl mode 3d` (HID switch to SBS) → **wait for the native
+3840×1080@60 mode** the glasses re-present and set it (fall back to the forced modeline only if it never
+appears — see §0.1), verifying the connector comes up 3840-wide (revert + bail if not) → dpms nudge →
+**auto-set `openxr:gpu`** to the connector's DRM render node + `openxr:blend_mode = opaque` →
 **restart** `monado-xreal.service` (after importing `WAYLAND_DISPLAY`) → wait for monado's
 `monado_comp_ipc` socket → `hyprctl keyword openxr:runtime_json <xreal manifest>` → `hyprctl openxr
-enable`. The xreal Monado's `comp_main` opens a Wayland toplevel (class `openxr`, title `Monado`),
-which HypXRland fullscreens on the glasses' DP output at 3840×1080. `--mono` instead switches the
+enable` → **explicitly move+fullscreen** the `openxr` window on the glasses' output (by address, not just
+a windowrule, so it never drifts to the laptop panel). The xreal Monado's `comp_main` opens a Wayland
+toplevel (class `openxr`, title `Monado`), landed fullscreen on the glasses' DP output at 3840×1080.
+`--mono` instead switches the
 glasses to 2D and drives a single 1920×1080 head-tracked view.
 
 **`flat`** reverses it: it disables the XR session **only if** the active session is the xreal runtime
@@ -268,7 +318,10 @@ use `XREAL_MONITOR=` or rely on auto-detect, and set `~/.config/xreal/monado.env
      the SBS risk — fall back to **`xreal-mode xr --mono`** (a single head-tracked 1920×1080 panel,
      still a usable XR display) and note it for follow-up.
 5. **Recenter:** re-don the glasses (or `xreal-mode flat` then `xr`) → the arc re-seats in front of
-   you. `SUPER+Home` recenters the selected panel.
+   you. Recenter with **`SUPER+SHIFT+Home`** (`SUPER+Home` is walker in Omarchy) or
+   `hyprctl dispatch xrmonitor center` — do it **while wearing the glasses and looking straight ahead**,
+   since recenter captures the live head pose (a recenter with the glasses tilted on the desk places the
+   panel at a skewed, too-close pose).
 6. **Gaze grab:** `SUPER+SHIFT+G` while looking at a panel grabs it (head-forward ray, no eye
    tracking); `SUPER+ALT+=/-` push/pull; tap again to drop.
 7. **`xreal-mode flat`:** the `openxr` window closes, the DP output returns to 1920×1080, and the
