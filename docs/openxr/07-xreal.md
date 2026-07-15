@@ -278,15 +278,26 @@ glasses to 2D and drives a single 1920×1080 head-tracked view.
 setting a DP mode and placing a window, it **flips the HypXRland `lease` monitor-rule flag on DP-5**
 (`hyprctl keyword monitor DP-5,preferred,auto,1,lease`) so HypXRland stops driving DP-5 as a desktop and
 **offers the connector via `wp_drm_lease_v1`**. It also writes a systemd drop-in
-(`monado-xreal.service.d/10-xreal-direct.conf`) that unsets `XRT_COMPOSITOR_FORCE_WAYLAND` and sets
-`XRT_COMPOSITOR_FORCE_WAYLAND_DIRECT=1` + `XRT_COMPOSITOR_WAYLAND_CONNECTOR=DP-5`, so Monado's
-`comp_window_direct_wayland` backend **leases DP-5 and owns the flip** — removing the second compositor
+(`monado-xreal.service.d/10-xreal-direct.conf`) that **`UnsetEnvironment=`s `XRT_COMPOSITOR_FORCE_WAYLAND`**
+(the base unit sets it `=1`) and sets `XRT_COMPOSITOR_FORCE_WAYLAND_DIRECT=1` +
+`XRT_COMPOSITOR_WAYLAND_CONNECTOR=DP-5`, so Monado's `comp_window_direct_wayland` backend
+**leases DP-5 and owns the flip** — removing the second compositor
 hop (Monado→Wayland-window→Hyprland→scanout) for lower latency and a vsync Monado controls. No `openxr`
 window exists in this mode; verify with `hyprctl monitors` (DP-5 should be **absent** as a desktop
 output) and the Monado journal (`connector id …`). The `lease` flag is a **HypXRland-specific**
 affordance (upstream compositors only offer EDID-flagged non-desktop connectors); it is **off by
 default**, so a stock desktop config is byte-identical. Requires the running HypXRland binary to carry
 the `lease` support (build + relog).
+
+> **Gotcha — `UnsetEnvironment`, not `Environment=…=` (empty):** Monado reads its `XRT_*` options with
+> plain `getenv()` (`u_debug.c` `get_option_raw`), and `debug_string_to_bool("")` returns **TRUE** (an
+> empty string matches none of the `false`/`0` cases). So an *empty* `XRT_COMPOSITOR_FORCE_WAYLAND=` is
+> still truthy, and since `comp_settings.c` checks `force_wayland` **after** `force_wayland_direct`, it
+> clobbers `target_identifier` back to the windowed `wayland` backend — Monado then falls back to a
+> `VK_KHR_wayland_surface` toplevel (an `openxr` window) and never leases the connector. The drop-in must
+> therefore **`UnsetEnvironment=XRT_COMPOSITOR_FORCE_WAYLAND`** to remove it entirely (so `getenv()` →
+> NULL → `false`). This was the V2.2 direct-mode regression: window fallback despite the lease being
+> offered.
 
 **`flat`** reverses it (and is the rollback for either path): it disables the XR session **only if** the
 active session is the xreal runtime (a WiVRn/Quest session is left alone) → stops the xreal Monado unit
