@@ -25,6 +25,80 @@ The pieces:
 
 ---
 
+## 0. Live bring-up on the Framework Laptop 16 (validated 2026-07-14)
+
+The whole SBS path was **de-risked live** on the Framework 16 (Ryzen AI 300 + RTX 5070 Laptop, glasses
+on the AMD 890M's `DP-5`). What actually works, and the gotchas that were NOT obvious from the research:
+
+1. **The glasses do NOT re-advertise a 3840-wide EDID after the HID 3D switch — you must FORCE the mode.**
+   The research (§4) assumed that `xreal-ctl mode 3d` makes a 3840×1080 mode "appear" (community reports
+   said so). On this host it does **not**: after the HID switch the connector re-probes but still only
+   exposes its three native 1920×1080 DTDs. So `xreal-mode.sh xr` now **forces an unadvertised
+   3840×1080 CVT reduced-blanking modeline** and verifies the connector comes up 3840-wide:
+   ```
+   monitor = DP-5, modeline 266.50 3840 3888 3920 4000 1080 1083 1093 1111 +hsync -vsync, auto, 1
+   ```
+   This was tested live: **DP-5 accepted the forced mode and stayed `connected` at 3840×1080.** The
+   glasses' internal scaler takes the wide frame and hardware-splits it left-half → left eye,
+   right-half → right eye. Bandwidth: 266.5 MHz pixel clock × 24bpp ≈ **6.4 Gbit/s**, *below* the
+   glasses' proven link budget (native 1920×1080@120 = 297 MHz ≈ 7.1 Gbit/s works) and inside a 2-lane
+   HBR2 DP-alt link (10.8 Gbit/s). **Keep 3D at ≤72 Hz** — 3840-wide @90+ exceeds the 2-lane budget and
+   goes out-of-range/black (this is also why XREAL only offers 90/120 Hz at the 1920-wide 2D mode).
+
+2. **Mode-switch ordering is load-bearing.** The `xreal_air` driver picks stereo-vs-mono view geometry
+   **once, at device-create time**, from whatever display mode the glasses report over HID
+   (`control_display_mode` → `switch_display_mode`, `xreal_air_hmd.c`). So the HID `mode 3d` **must
+   happen before monado (re)starts**, or `comp_main` comes up 1920-wide (mono) even though DP-5 is 3840.
+   The toggle now does: end session → **stop monado** → `mode 3d` → force 3840 → **restart monado** →
+   enable. Confirmed live: with this order, the `comp_main` window (class `openxr`, title `Monado`)
+   comes up **3840×1080 fullscreen on DP-5** and `hyprctl openxr status` reaches `state: focused`.
+
+3. **Two GPUs — `openxr:gpu` MUST point at the AMD node that scans out the glasses.** This box is NOT
+   single-GPU (the research's §3(c)/§"GPU" bullet is wrong for the FW16; it was written for the AMD
+   *desktop*). DP-5 hangs off the AMD 890M (`renderD129`); the box's default Vulkan ICD and the WiVRn
+   config's `openxr:gpu` both point at the **NVIDIA** node (`renderD128`), which cross-GPU-crashes when
+   monado's comp_main is scanned out by AMD. Two pins are required and the toggle now sets them
+   automatically: (a) **monado onto AMD RADV** via `~/.config/xreal/monado.env`
+   (`VK_DRIVER_FILES=/usr/share/vulkan/icd.d/radeon_icd.json` — note the **Arch filename has no
+   `.x86_64` suffix** — plus `__GLX_VENDOR_LIBRARY_NAME=mesa`); (b) **HypXRland's OpenXR EGL/composite
+   node** via `openxr:gpu`, which `xreal-mode.sh xr` auto-detects from the connector's DRM render node
+   (`/dev/dri/renderD129`). Requires `sudo pacman -S vulkan-radeon`.
+
+4. **`blend_mode` must be `opaque`.** The birdbath is additive/see-through, so Monado defaults to an
+   additive blend and the black scene background stays transparent (and the surface can't go
+   solitary/direct-scanout). `xreal-mode.sh xr` sets `openxr:blend_mode = opaque`.
+
+5. **SBS is real stereo; `--mono` is a genuine single view, NOT a "squished" fallback.** In 2D the driver
+   collapses the second view to 1×1 (a real mono 1920×1080 head-tracked panel). The earlier "tiny btop in
+   the upper-left" photo was the **3-D scene seen through one eye plus an off recenter pose on the unworn
+   glasses**, not a packing bug. Both paths are usable; SBS is the correct per-eye one.
+
+6. **Known quality caveat — the SBS view is rendered at half resolution.** Monado's Wayland window backend
+   deliberately **halves** the surface under `XRT_COMPOSITOR_FORCE_WAYLAND` (`comp_settings.c`: *"HMD
+   screen tends to be much larger than monitors"* → `preferred.width/height /= 2`). So the present surface
+   is **1920×540** (per-eye 960×540) upscaled by Hyprland to fill the 3840×1080 output → **soft**. The
+   geometry/split is correct; only sharpness suffers. **Fix (needs a monado rebuild, so out of tonight's
+   scope):** drop the `/= 2` in `comp_settings.c` under `force_wayland` (or gate it on an env var) to get
+   full-res SBS. Tracked as a follow-up.
+
+7. **Panel sleeps when unworn in 2D.** After `xreal-mode.sh flat`, with no session and the glasses in 2D
+   on the desk, the wear sensor powers the panel down and DP-5 may read `disconnected` at the DRM layer —
+   this is normal and self-recovering (it comes back when worn or re-driven); the laptop panel (eDP-2) is
+   unaffected. A dpms off/on nudge in the toggle re-lights the panel across mode switches.
+
+8. **Monado lifecycle.** `monado-service` has no signal-driven clean shutdown with `XRT_NO_STDIN=1` (its
+   IPC mainloop only stops on stdin EOF), so the unit now stops it with an immediate, whitelisted SIGKILL
+   (`KillSignal=SIGKILL` + `SuccessExitStatus=SIGKILL`) → stop/restart is instant and the unit stays
+   cleanly `inactive/dead` (previously a plain stop hung for the 90 s default timeout then SIGKILL'd →
+   `failed`). The service is stateless, so SIGKILL is safe.
+
+**Not yet validated (needs the glasses WORN):** head-tracking motion/pose correctness and stereo comfort —
+the IMU pose is static/uncalibrated on the unworn desk unit (the driver also logged repeated *"Failed
+parse calibration data"* on the unworn unit; revisit worn). All of the above is the *geometry* path, which
+is validatable without wearing them.
+
+---
+
 ## 1. One-time setup
 
 ### 1.1 udev rule (HID access)
@@ -102,12 +176,16 @@ scripts/xreal-mode.sh status    # detection + current DP mode + hyprctl openxr s
 scripts/xreal-mode.sh xr --dry-run   # print every action without doing anything
 ```
 
-**`xr`** does, in order: verify the glasses are present over HID → `xreal-ctl mode 3d` (HID switch to
-SBS) → wait for the DP connector to advertise a 3840-wide mode, then set it (`hyprctl keyword
-monitor`) → `systemctl --user start monado-xreal.service` (after importing `WAYLAND_DISPLAY`) →
-`hyprctl keyword openxr:runtime_json <xreal manifest>` → `hyprctl openxr disable && enable`. The
-xreal Monado's `comp_main` opens a Wayland toplevel (app-id `openxr`), which the `example/xreal.conf`
-window rules fullscreen on the glasses' DP output.
+**`xr`** does, in order (see §0 for why this exact order): verify the glasses are present over HID →
+**end any active session + stop monado** (free the HID device so the switch is uncontended and monado
+re-reads the mode on restart) → `xreal-ctl mode 3d` (HID switch to SBS) → **force the 3840×1080
+modeline** on the DP output and verify it comes up 3840-wide (revert + bail if not — see §0.1) → dpms
+nudge → **auto-set `openxr:gpu`** to the connector's DRM render node + `openxr:blend_mode = opaque` →
+**restart** `monado-xreal.service` (after importing `WAYLAND_DISPLAY`) → wait for monado's
+`monado_comp_ipc` socket → `hyprctl keyword openxr:runtime_json <xreal manifest>` → `hyprctl openxr
+enable`. The xreal Monado's `comp_main` opens a Wayland toplevel (class `openxr`, title `Monado`),
+which HypXRland fullscreens on the glasses' DP output at 3840×1080. `--mono` instead switches the
+glasses to 2D and drives a single 1920×1080 head-tracked view.
 
 **`flat`** reverses it: it disables the XR session **only if** the active session is the xreal runtime
 (a WiVRn/Quest session is left alone) → stops the xreal Monado unit → `xreal-ctl mode 2d` → restores
@@ -135,13 +213,16 @@ the glasses are unplugged, and it **never** touches `wivrn.service`.
   must actually pick up the 3840-wide mode after the HID switch. The toggle waits for that mode to appear
   and, if it never does, tells you to retry or use `--mono`.
 
-- **GPU: single-GPU on both target boxes, so `openxr:gpu` stays unset.** On the AMD desktop the
-  glasses' DP output (DP-5) is on the **same** GPU (890M iGPU, `renderD129`) that Hyprland renders the
-  desktop with — it *is* the primary, so following the primary is correct. The RTX 5070 is a different
-  card that never touches this path. On the Lunar Lake laptop there is only one GPU. The wrong-GPU guard
-  in `start()` (`XRGpuProbe`) verifies the XR EGL node matches the runtime's composite GPU and refuses
-  safely if it's ever wrong — so leaving `openxr:gpu` unset is both correct and fail-safe here. Only set
-  it if your glasses' DP connector is driven by a *different* GPU than Hyprland's primary.
+- **GPU: box-dependent — on the two-GPU Framework 16, `openxr:gpu` MUST be set (see §0.3).** The claim
+  that both target boxes are single-GPU held for the standalone AMD desktop and the Lunar Lake laptop,
+  but the **Framework Laptop 16** (the live fishfood box) is a hybrid AMD+NVIDIA machine: DP-5 is on the
+  AMD 890M (`renderD129`) while the default Vulkan ICD and the running WiVRn config both point at the
+  NVIDIA node (`renderD128`), which cross-GPU-crashes monado. So on the FW16 you must (a) pin
+  **monado** onto AMD RADV (`~/.config/xreal/monado.env`, `VK_DRIVER_FILES=…/radeon_icd.json`) and
+  (b) point **HypXRland's `openxr:gpu`** at the glasses' render node. `xreal-mode.sh xr` now
+  auto-detects the connector's render node and sets `openxr:gpu` for you, so this is handled on any box:
+  where the glasses share Hyprland's primary GPU it's a no-op; where they don't (FW16) it corrects it.
+  The wrong-GPU guard in `start()` (`XRGpuProbe`) still refuses safely if the EGL node ever mismatches.
 
 - **Doff detection: there is none over HID — rely on UNPLUG.** The driver does not surface the wear
   sensor, and the device advertises no `XR_EXT_user_presence`, so the session always reads
