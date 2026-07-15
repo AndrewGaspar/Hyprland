@@ -8,8 +8,11 @@ output. This is the operational companion to the research memo
 
 **Scope (v1):** 3DoF (no positional tracking), stereo **SBS 3840×1080** with a **mono 1920×1080
 fallback**, keyboard + gaze + voice input (no controllers, no hand tracking — the driver exposes an
-HMD only), no compositor patches beyond the `openxr:runtime_json` selector. **Out of scope:** 6DoF
-(the stereo cameras / Basalt VIO path), DRM-lease direct mode.
+HMD only). Two display paths: the default **fullscreen-window** path (no compositor patches beyond the
+`openxr:runtime_json` selector) and, **new in V2.2**, an opt-in **DRM-lease / direct mode**
+(`xreal-mode.sh xr --direct`) in which HypXRland leases the glasses' DP connector to Monado so it owns
+the flip (one fewer compositor hop → lower latency). Flat/window mode is fully preserved — the lease
+knob is off by default. **Out of scope:** 6DoF (the stereo cameras / Basalt VIO path).
 
 The pieces:
 
@@ -139,10 +142,11 @@ The remaining "does it look right when worn" is the user's call.
     would be a pure scanout target for the Monado surface. Today `DP-5` is an ordinary Hyprland output that
     the `openxr` window is fullscreened onto, so it appears in `hyprctl monitors`, can be cycled to, and
     can (mis)receive stray windows/workspaces. The clean fix is a **dedicated/leased output** for the
-    compositor surface (DRM-lease direct mode — explicitly out of scope here, see the top of this doc).
-    Pragmatic mitigations until then: bind a dedicated empty workspace to `DP-5` and keep it out of your
-    normal workspace-switch binds so nothing drifts there, and/or rely on the `openxr` windowrule keeping
-    that output occupied by the Monado surface. Tracked as a follow-up.
+    compositor surface — now available as **`xreal-mode.sh xr --direct`** (V2.2 DRM-lease mode, §2): while
+    leased, `DP-5` leaves `hyprctl monitors` entirely and cannot receive stray windows. This wart applies
+    only to the default **window** path; pragmatic mitigations there: bind a dedicated empty workspace to
+    `DP-5` and keep it out of your normal workspace-switch binds so nothing drifts there, and/or rely on the
+    `openxr` windowrule keeping that output occupied by the Monado surface.
 
 ---
 
@@ -217,10 +221,11 @@ Edit the `monitor DP-5` window rules in that file to your glasses' connector nam
 ## 2. The toggle
 
 ```sh
-scripts/xreal-mode.sh xr        # 3D SBS arc     (add --mono for the 1920×1080 mono fallback)
-scripts/xreal-mode.sh flat      # back to an ordinary head-locked 1920×1080 monitor on the DP output
-scripts/xreal-mode.sh status    # detection + current DP mode + hyprctl openxr status
-scripts/xreal-mode.sh xr --dry-run   # print every action without doing anything
+scripts/xreal-mode.sh xr           # 3D SBS arc, fullscreen-WINDOW path (default). --mono = 1920×1080 mono
+scripts/xreal-mode.sh xr --direct  # 3D SBS via DRM-LEASE direct mode (V2.2): Monado leases DP-5, owns the flip
+scripts/xreal-mode.sh flat         # back to an ordinary head-locked 1920×1080 monitor on the DP output
+scripts/xreal-mode.sh status       # detection + current DP mode + hyprctl openxr status
+scripts/xreal-mode.sh xr --dry-run # print every action without doing anything
 ```
 
 **`xr`** does, in order (see §0 for why this exact order): verify the glasses are present over HID →
@@ -237,9 +242,25 @@ toplevel (class `openxr`, title `Monado`), landed fullscreen on the glasses' DP 
 `--mono` instead switches the
 glasses to 2D and drives a single 1920×1080 head-tracked view.
 
-**`flat`** reverses it: it disables the XR session **only if** the active session is the xreal runtime
-(a WiVRn/Quest session is left alone) → stops the xreal Monado unit → `xreal-ctl mode 2d` → restores
-the DP output to 1920×1080.
+**`xr --direct`** (V2.2 DRM-lease / direct mode) takes the same HID/gpu/runtime steps but, instead of
+setting a DP mode and placing a window, it **flips the HypXRland `lease` monitor-rule flag on DP-5**
+(`hyprctl keyword monitor DP-5,preferred,auto,1,lease`) so HypXRland stops driving DP-5 as a desktop and
+**offers the connector via `wp_drm_lease_v1`**. It also writes a systemd drop-in
+(`monado-xreal.service.d/10-xreal-direct.conf`) that unsets `XRT_COMPOSITOR_FORCE_WAYLAND` and sets
+`XRT_COMPOSITOR_FORCE_WAYLAND_DIRECT=1` + `XRT_COMPOSITOR_WAYLAND_CONNECTOR=DP-5`, so Monado's
+`comp_window_direct_wayland` backend **leases DP-5 and owns the flip** — removing the second compositor
+hop (Monado→Wayland-window→Hyprland→scanout) for lower latency and a vsync Monado controls. No `openxr`
+window exists in this mode; verify with `hyprctl monitors` (DP-5 should be **absent** as a desktop
+output) and the Monado journal (`connector id …`). The `lease` flag is a **HypXRland-specific**
+affordance (upstream compositors only offer EDID-flagged non-desktop connectors); it is **off by
+default**, so a stock desktop config is byte-identical. Requires the running HypXRland binary to carry
+the `lease` support (build + relog).
+
+**`flat`** reverses it (and is the rollback for either path): it disables the XR session **only if** the
+active session is the xreal runtime (a WiVRn/Quest session is left alone) → stops the xreal Monado unit
+(releasing any DRM lease) + **removes the direct drop-in** → `xreal-ctl mode 2d` → **restores DP-5 to a
+normal 1920×1080 desktop monitor** (re-issuing a `monitor=DP-5,…` rule *without* `lease` reclaims the
+lease offer and reconnects it as a desktop).
 
 Machine-agnostic knobs (env): `XREAL_MONITOR` (connector name; else auto-detected from the EDID
 description), `MONADO_XREAL_BUILD` (build dir), `XREAL_CTL`, `XREAL_FLAT_MODE`. Idempotent, safe when

@@ -24,7 +24,11 @@ Type=simple
 # different repo location (e.g. the Lunar Lake laptop) — the EnvironmentFile line below picks it up.
 Environment=MONADO_XREAL_SERVICE=%h/code/Hyprland/subprojects/monado/build-xreal/src/xrt/targets/service/monado-service
 # Force comp_main's Wayland window backend so the compositor output is an ordinary Wayland toplevel
-# (app-id "openxr") that HypXRland fullscreens on the glasses' DisplayPort output.
+# (app-id "openxr") that HypXRland fullscreens on the glasses' DisplayPort output. This is the DEFAULT
+# (window) mode. `scripts/xreal-mode.sh xr --direct` drops in monado-xreal.service.d/10-xreal-direct.conf
+# that overrides this (unsets it + sets XRT_COMPOSITOR_FORCE_WAYLAND_DIRECT=1 +
+# XRT_COMPOSITOR_WAYLAND_CONNECTOR=<connector>) to select the direct-wayland (DRM-lease) backend;
+# `flat`/window mode removes that drop-in. See docs/openxr/07-xreal.md.
 Environment=XRT_COMPOSITOR_FORCE_WAYLAND=1
 Environment=XRT_NO_STDIN=1
 EnvironmentFile=-%h/.config/xreal/monado.env

@@ -22,6 +22,7 @@ namespace Config {
         bool                       parseICC(const std::string& value);
 
         void                       setDisabled();
+        void                       setLease(); // HypXRland: mark this output leasable-on-demand (XR direct mode)
         void                       setMirror(const std::string& value);
         bool                       setReserved(const Desktop::CReservedArea& value);
 

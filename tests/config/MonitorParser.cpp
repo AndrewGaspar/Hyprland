@@ -243,6 +243,14 @@ TEST(Config, monitorParserSetDisabled) {
     EXPECT_TRUE(parser.rule().m_disabled);
 }
 
+TEST(Config, monitorParserSetLease) {
+    // HypXRland XREAL V2.2: the `lease` flag opts a named desktop output into drm-lease-v1. Default off.
+    CMonitorRuleParser parser("DP-1");
+    EXPECT_FALSE(parser.rule().m_lease);
+    parser.setLease();
+    EXPECT_TRUE(parser.rule().m_lease);
+}
+
 TEST(Config, monitorParserSetMirror) {
     CMonitorRuleParser parser("DP-1");
     parser.setMirror("HDMI-A-1");

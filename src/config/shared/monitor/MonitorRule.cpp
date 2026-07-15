@@ -12,8 +12,11 @@ eMonitorRuleComparisonResult CMonitorRule::compare(const CMonitorRule& other) co
     const auto SAME_BITNESS      = other.m_enable10bit == m_enable10bit;
     const auto SAME_DRM_MODELINE = !std::memcmp(&m_drmMode, &other.m_drmMode, sizeof(m_drmMode));
     const auto SAME_ENABLED      = other.m_disabled == m_disabled;
+    // A change to the lease flag flips the output between desktop and leased/offered — it needs the full
+    // reconfigure path (MonitorRuleManager drives the offer↔reclaim transition), so treat it as hard.
+    const auto SAME_LEASE        = other.m_lease == m_lease;
 
-    if (!SAME_ENABLED || !SAME_RES || !SAME_REFRESH || !SAME_SCALE || !SAME_BITNESS || !SAME_DRM_MODELINE)
+    if (!SAME_ENABLED || !SAME_LEASE || !SAME_RES || !SAME_REFRESH || !SAME_SCALE || !SAME_BITNESS || !SAME_DRM_MODELINE)
         return COMPARISON_NO_MATCH;
 
     // Soft props
