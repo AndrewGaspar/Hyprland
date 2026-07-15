@@ -59,6 +59,7 @@ class CDRMLeaseConnectorResource {
 
     bool                                  good();
     void                                  sendData();
+    void                                  withdraw(); // HypXRland: tell the client this connector is gone + mark dead
 
     WP<CDRMLeaseConnectorResource>        m_self;
     WP<CDRMLeaseDeviceResource>           m_parent;
@@ -100,6 +101,11 @@ class CDRMLeaseProtocol : public IWaylandProtocol {
     virtual void                           bindManager(wl_client* client, void* data, uint32_t ver, uint32_t id);
 
     void                                   offer(PHLMONITOR monitor);
+    // HypXRland (XREAL V2.2): withdraw a previously offer()'d connector when a leasable output returns to
+    // being a desktop (or is disabled). Sends `withdrawn` to lease clients and drops it from the offered
+    // set so it can never be leased out from under the desktop we are about to scan out on it. No-op (fast
+    // return) if this connector was never offered here, keeping non-lease reconfigure paths untouched.
+    void                                   reclaim(PHLMONITOR monitor);
 
     SP<Aquamarine::IBackendImplementation> getBackend();
     std::string                            getDeviceName();

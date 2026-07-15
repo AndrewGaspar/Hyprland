@@ -45,6 +45,11 @@ namespace Config {
         float                        m_scale         = -1;
         float                        m_refreshRate   = 60; // Hz
         bool                         m_disabled      = false;
+        // HypXRland (XREAL V2.2 leasable-on-demand direct mode): when set via the `lease` monitor-rule
+        // flag, this named DESKTOP output is NOT configured as a desktop and is instead offered to
+        // drm-lease-v1 clients (monado direct mode owns the flip). Default false ⇒ ordinary desktop
+        // monitor, byte-identical to stock. Toggling it reconfigures the output (see MonitorRuleManager).
+        bool                         m_lease         = false;
         wl_output_transform          m_transform     = WL_OUTPUT_TRANSFORM_NORMAL;
         std::string                  m_mirrorOf      = "";
         bool                         m_enable10bit   = false;

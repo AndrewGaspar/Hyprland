@@ -199,6 +199,13 @@ bool CDRMLeaseConnectorResource::good() {
     return m_resource->resource();
 }
 
+void CDRMLeaseConnectorResource::withdraw() {
+    if (m_dead)
+        return;
+    m_resource->sendWithdrawn();
+    m_dead = true;
+}
+
 void CDRMLeaseConnectorResource::sendData() {
     m_resource->sendName(m_monitor->m_name.c_str());
     m_resource->sendDescription(m_monitor->m_description.c_str());
@@ -350,6 +357,29 @@ void CDRMLeaseProtocol::offer(PHLMONITOR monitor) {
         m->sendConnector(monitor);
         m->m_resource->sendDone();
     }
+}
+
+void CDRMLeaseProtocol::reclaim(PHLMONITOR monitor) {
+    std::erase_if(m_offeredOutputs, [](const auto& e) { return e.expired(); });
+
+    const auto IT = std::ranges::find(m_offeredOutputs.begin(), m_offeredOutputs.end(), monitor);
+    if (IT == m_offeredOutputs.end())
+        return; // never offered on this device — strict no-op (non-lease outputs never touch lease state)
+
+    m_offeredOutputs.erase(IT);
+
+    // Tell every bound lease client the connector is gone, mark those connector resources dead, and drop
+    // them so a late lease request can no longer target this monitor (mirrors the monitor-destroy path).
+    for (auto const& m : m_managers) {
+        for (auto const& c : m->m_connectorsSent) {
+            if (c && !c->m_dead && c->m_monitor == monitor)
+                c->withdraw();
+        }
+        std::erase_if(m->m_connectorsSent, [](const auto& e) { return e.expired() || e->m_dead; });
+    }
+    std::erase_if(m_connectors, [monitor](const auto& e) { return !e || e->m_dead || e->m_monitor == monitor; });
+
+    LOGM(Log::DEBUG, "Reclaimed lease offer for {}", monitor->m_name);
 }
 
 std::string CDRMLeaseProtocol::getDeviceName() {
