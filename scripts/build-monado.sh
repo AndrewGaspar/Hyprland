@@ -135,6 +135,16 @@ if [[ $FLAVOR == xreal ]]; then
     [[ $_fail -eq 0 ]] || exit 1
 fi
 
+# Rebuilding overwrites monado-service, which silently DROPS any file capability (e.g. the
+# cap_sys_nice+ep used for a REALTIME GPU queue in XReal direct mode). Snapshot it so we can
+# remind the user to re-apply after the build — a lost cap resurfaces weeks later as
+# "why is direct mode juddery again?".
+_svc_bin=$MONADO_BUILD/src/xrt/targets/service/monado-service
+_had_sys_nice=0
+if command -v getcap >/dev/null 2>&1 && [[ -e $_svc_bin ]] && getcap "$_svc_bin" 2>/dev/null | grep -q cap_sys_nice; then
+    _had_sys_nice=1
+fi
+
 echo ">> building monado ($FLAVOR: service + OpenXR client library) ..."
 _mj=$(nproc); _mj=${HYPXRLAND_BUILD_JOBS:-$_mj}
 if [[ $FLAVOR == xreal ]]; then
@@ -150,6 +160,12 @@ for f in "${_artifacts[@]}"; do
 done
 
 echo ">> done: $MONADO_BUILD"
+if [[ $_had_sys_nice -eq 1 ]]; then
+    echo
+    echo "   !! the rebuild DROPPED monado-service's cap_sys_nice file capability (REALTIME GPU queue)."
+    echo "   !! re-apply it:  sudo setcap cap_sys_nice+ep $_svc_bin"
+    echo
+fi
 if [[ $FLAVOR == xreal ]]; then
     echo "   runtime manifest: $MONADO_BUILD/openxr_monado-dev.json"
     echo "   point the toggle at it:  hyprctl keyword openxr:runtime_json $MONADO_BUILD/openxr_monado-dev.json"
