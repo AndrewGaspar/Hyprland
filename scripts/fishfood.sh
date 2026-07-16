@@ -49,6 +49,19 @@ build() {
     echo "==> fishfood binary: $BUILD/Hyprland ($(git -C "$WORKTREE" rev-parse --short HEAD))"
 }
 
+# The XReal runtime (monado-service + libopenxr_monado.so) lives in this worktree's
+# subprojects/monado/build-xreal tree and ~/.config/xreal/monado.env points straight at it —
+# a submodule pointer bump without a rebuild leaves the SERVICE on a stale binary while the
+# sources move (the partial-deploy trap, docs/openxr/07-xreal.md). Rebuild whenever the xreal
+# flavor has been built before; build-monado.sh builds BOTH targets together and re-applies
+# the monado-service setcap via the scoped sudoers rule (sudo -n, never prompts).
+build_monado_xreal() {
+    if [[ -d $WORKTREE/subprojects/monado/build-xreal ]]; then
+        flock -w 7200 /tmp/hypxrland-build.lock \
+            env HYPXRLAND_BUILD_JOBS="$JOBS" "$WORKTREE/scripts/build-monado.sh" --xreal
+    fi
+}
+
 gen_session() {
     mkdir -p "$(dirname "$DESKTOP_OUT")"
     local launcher="$(dirname "$DESKTOP_OUT")/launch.sh"
@@ -94,8 +107,13 @@ case ${1:-} in
         ;;
     update)
         git -C "$WORKTREE" merge --ff-only "$TRACK"
+        # sync BEFORE update: submodule remotes keep whatever URL they were cloned with, so a
+        # .gitmodules URL change (e.g. monado -> the AndrewGaspar fork carrying our commits) never
+        # reaches an existing checkout without it -> "fatal: not our ref <sha>" on fetch.
+        git -C "$WORKTREE" submodule sync --recursive
         git -C "$WORKTREE" submodule update --init
         build
+        build_monado_xreal
         echo "==> done. Log out and pick HypXRland again (a running session keeps its old binary image)."
         ;;
     gen-session)
