@@ -73,11 +73,17 @@ namespace OpenXR {
     eForceLinearMode parseForceLinearMode(const std::string& s);
 
     // Pure decision (tests/xr/force_linear.cpp): should the XR-bound headless output allocate LINEAR
-    // buffers? `*Valid` say whether each DRM node's device numbers are known. AUTO forces linear only
-    // when BOTH nodes are known AND they differ (a genuine cross-GPU split) — an unknown node stays
-    // native (same-GPU is the common case and linear costs compositing throughput). ON/OFF ignore the
-    // nodes. No OpenXR/aquamarine types so hyprland_gtests can exercise it without a runtime.
-    bool shouldForceLinear(eForceLinearMode mode, bool xrValid, int64_t xrMajor, int64_t xrMinor, bool allocValid, int64_t allocMajor, int64_t allocMinor);
+    // buffers? `gpusKnown` says whether the caller could positively resolve BOTH the XR EGL device and
+    // the buffer allocator's device; `sameGpu` is their physical-device equality (the caller computes
+    // it with DRM::sameGpu → drmDevicesEqual, which is node-type agnostic — a render node and a card
+    // node of ONE GPU compare equal). AUTO forces linear only when both devices are known AND they are
+    // genuinely different GPUs — an unknown pair stays native (same-GPU is the common case and linear
+    // costs compositing throughput). ON/OFF ignore the devices. Taking a resolved `sameGpu` boolean
+    // (rather than raw major/minor) is deliberate: comparing an XR *render* node against an allocator
+    // *card* node by their device numbers always mis-reports "different GPU" on a single-GPU box and
+    // was the NVIDIA all-black root cause. No OpenXR/aquamarine types so hyprland_gtests can exercise
+    // it without a runtime.
+    bool shouldForceLinear(eForceLinearMode mode, bool gpusKnown, bool sameGpu);
 
     // openxr:runtime_json plumbing (WP-XR1). The compositor may override which OpenXR runtime the
     // session handshakes against by pointing the loader at a specific manifest — the loader ONLY reads

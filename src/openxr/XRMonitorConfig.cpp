@@ -458,19 +458,21 @@ OpenXR::eForceLinearMode OpenXR::parseForceLinearMode(const std::string& s) {
     return XR_LINEAR_AUTO; // "auto" and anything unrecognized
 }
 
-bool OpenXR::shouldForceLinear(eForceLinearMode mode, bool xrValid, int64_t xrMajor, int64_t xrMinor, bool allocValid, int64_t allocMajor, int64_t allocMinor) {
+bool OpenXR::shouldForceLinear(eForceLinearMode mode, bool gpusKnown, bool sameGpu) {
     switch (mode) {
         case XR_LINEAR_OFF: return false;
         case XR_LINEAR_ON: return true;
         case XR_LINEAR_AUTO:
         default:
             // Only force when we can positively confirm the XR EGL device differs from the buffer
-            // allocator's device. An unknown node (shared-display fallback, unstat-able fd) is treated
-            // as same-GPU and left native — the fail-closed guard in start() already refuses the truly
-            // dangerous wrong-GPU case, and forcing linear on a same-GPU setup just wastes bandwidth.
-            if (!xrValid || !allocValid)
+            // allocator's device. An unresolved device (shared-display fallback, unstat-able fd) is
+            // treated as same-GPU and left native — the fail-closed guard in start() already refuses
+            // the truly dangerous wrong-GPU case, and forcing linear on a same-GPU setup just wastes
+            // bandwidth (and, on NVIDIA, breaks entirely: its allocator can't hand back MOD_LINEAR for
+            // a scanout buffer, so the frames are dropped and the panel goes black).
+            if (!gpusKnown)
                 return false;
-            return xrMajor != allocMajor || xrMinor != allocMinor;
+            return !sameGpu;
     }
 }
 

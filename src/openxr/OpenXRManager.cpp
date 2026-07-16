@@ -36,6 +36,7 @@
 #include <sys/inotify.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <wayland-server-core.h>
 
@@ -56,6 +57,7 @@
 #include "../managers/input/InputManager.hpp"
 #include "../output/Monitor.hpp"
 #include "../state/MonitorState.hpp"
+#include "../helpers/Drm.hpp"    // DRM::sameGpu (physical-GPU compare for cross-GPU linear decision)
 #include "../helpers/Format.hpp" // NFormatUtils::drmModifierName (post-reconfigure modifier log)
 #include "../render/Renderer.hpp" // damageMonitor (force a fresh present into the re-allocated buffers)
 #include "../desktop/state/FocusState.hpp"
@@ -2129,21 +2131,39 @@ void COpenXRManager::applyCrossGpuLinear(const PHLMONITOR& mon) {
     const auto              mode   = OpenXR::parseForceLinearMode(*PFORCE); // main-thread string read (never near the frame thread)
     const auto&             xrNode = m_graphics->selectedRenderNode();
 
-    // Resolve the output's buffer-allocator DRM device (same source isMultiGPU() uses).
+    // Resolve the output's buffer-allocator DRM fd (same source isMultiGPU() uses). Keep its device
+    // numbers for the diagnostic log, but decide cross-GPU with DRM::sameGpu below — NOT by comparing
+    // device numbers. The allocator fd is a *card* node while the XR EGL fd is a *render* node, and a
+    // render node vs a card node of ONE GPU never share a minor, so a numeric compare always
+    // mis-reported "cross-GPU" on a single-GPU box (the NVIDIA all-black bug: force-linear engaged,
+    // NVIDIA returned BLOCK_LINEAR anyway, and every non-linear frame was dropped → black panel).
+    int     allocFD    = -1;
     int64_t allocMajor = -1, allocMinor = -1;
-    bool    allocValid = false;
     if (auto backend = mon->m_output->getBackend()) {
         if (auto alloc = backend->preferredAllocator(); alloc && alloc->drmFD() >= 0) {
+            allocFD = alloc->drmFD();
             struct stat st;
-            if (fstat(alloc->drmFD(), &st) == 0) {
+            if (fstat(allocFD, &st) == 0) {
                 allocMajor = (int64_t)major(st.st_rdev);
                 allocMinor = (int64_t)minor(st.st_rdev);
-                allocValid = true;
             }
         }
     }
 
-    const bool force = OpenXR::shouldForceLinear(mode, xrNode.valid, xrNode.major, xrNode.minor, allocValid, allocMajor, allocMinor);
+    // Compare the PHYSICAL GPUs (drmDevicesEqual, node-type agnostic) rather than the node numbers.
+    // Open the XR render node read-only just for the comparison — a render node needs no DRM master,
+    // and this runs only on (re)bind, so the transient fd is cheap. Both devices known ⇒ trust the
+    // result; either unresolved ⇒ leave native (shared-display fallback, unstat-able fd).
+    bool gpusKnown = false, sameGpu = true;
+    if (xrNode.valid && !xrNode.path.empty() && allocFD >= 0) {
+        Hyprutils::OS::CFileDescriptor xrFD{open(xrNode.path.c_str(), O_RDONLY | O_CLOEXEC)};
+        if (xrFD.isValid()) {
+            gpusKnown = true;
+            sameGpu   = DRM::sameGpu(xrFD.get(), allocFD);
+        }
+    }
+
+    const bool force = OpenXR::shouldForceLinear(mode, gpusKnown, sameGpu);
 
     if (mon->m_forceLinearSwapchain == force)
         return; // already in the desired state — no reconfigure churn
@@ -2168,9 +2188,9 @@ void COpenXRManager::applyCrossGpuLinear(const PHLMONITOR& mon) {
     }
 
     Log::logger->log(Log::DEBUG,
-                     "[OPENXR] XR monitor '{}' buffers: {} — negotiated modifier 0x{:x} ({}) (force_linear={}, XR drm {}:{} {}, allocator drm {}:{} {})", mon->m_name,
-                     force ? "LINEAR (cross-GPU import)" : "native tiling", negModifier, NFormatUtils::drmModifierName(negModifier), *PFORCE, xrNode.major, xrNode.minor,
-                     xrNode.valid ? "valid" : "unknown", allocMajor, allocMinor, allocValid ? "valid" : "unknown");
+                     "[OPENXR] XR monitor '{}' buffers: {} — negotiated modifier 0x{:x} ({}) (force_linear={}, XR drm {}:{}, allocator drm {}:{}, gpus {}, {})", mon->m_name,
+                     force ? "LINEAR (cross-GPU import)" : "native tiling", negModifier, NFormatUtils::drmModifierName(negModifier), *PFORCE, xrNode.major, xrNode.minor, allocMajor,
+                     allocMinor, gpusKnown ? "known" : "unresolved", gpusKnown ? (sameGpu ? "same GPU" : "cross-GPU") : "assumed same");
 
     // Force a fresh composite so the newly-allocated buffer is presented promptly (and the XR import
     // flips content: black → dmabuf without waiting for incidental desktop damage).

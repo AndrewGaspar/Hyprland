@@ -32,45 +32,48 @@ TEST(XRForceLinear, ParseOff) {
     EXPECT_EQ(parseForceLinearMode("no"), XR_LINEAR_OFF);
 }
 
-// ---- shouldForceLinear: ON / OFF ignore the nodes ----
+// The decision now takes a resolved (gpusKnown, sameGpu) pair — the caller compares the physical
+// devices with DRM::sameGpu (drmDevicesEqual), which is node-type agnostic. That replaces the old
+// raw major/minor compare, which mis-read a single-GPU box as cross-GPU because the XR *render* node
+// and the allocator *card* node of one GPU never share a device number (the NVIDIA all-black bug).
+
+// ---- shouldForceLinear: ON / OFF ignore the devices ----
 
 TEST(XRForceLinear, OnAlwaysForces) {
     // Same GPU, but ON forces regardless.
-    EXPECT_TRUE(shouldForceLinear(XR_LINEAR_ON, true, 226, 128, true, 226, 128));
-    // Even with unknown nodes.
-    EXPECT_TRUE(shouldForceLinear(XR_LINEAR_ON, false, -1, -1, false, -1, -1));
+    EXPECT_TRUE(shouldForceLinear(XR_LINEAR_ON, true, true));
+    // Even with unresolved devices.
+    EXPECT_TRUE(shouldForceLinear(XR_LINEAR_ON, false, true));
 }
 
 TEST(XRForceLinear, OffNeverForces) {
     // Different GPU, but OFF never forces (debug/escape hatch).
-    EXPECT_FALSE(shouldForceLinear(XR_LINEAR_OFF, true, 226, 128, true, 226, 129));
+    EXPECT_FALSE(shouldForceLinear(XR_LINEAR_OFF, true, false));
 }
 
 // ---- shouldForceLinear: AUTO ----
 
 TEST(XRForceLinear, AutoForcesOnCrossGpu) {
-    // The live fishfood case: XR on NVIDIA renderD128 (226:128), buffers on AMD renderD129 (226:129).
-    EXPECT_TRUE(shouldForceLinear(XR_LINEAR_AUTO, true, 226, 128, true, 226, 129));
+    // Genuine split: XR on NVIDIA, buffers allocated on the AMD iGPU. DRM::sameGpu → false.
+    EXPECT_TRUE(shouldForceLinear(XR_LINEAR_AUTO, true, false));
 }
 
 TEST(XRForceLinear, AutoLeavesSameGpuNative) {
-    // Single-GPU: identical nodes -> keep native tiling (linear costs compositing throughput).
-    EXPECT_FALSE(shouldForceLinear(XR_LINEAR_AUTO, true, 226, 128, true, 226, 128));
+    // Single-GPU: same physical device -> keep native tiling (linear costs compositing throughput,
+    // and NVIDIA can't even produce a linear scanout buffer, which black-screened the panel).
+    EXPECT_FALSE(shouldForceLinear(XR_LINEAR_AUTO, true, true));
 }
 
-TEST(XRForceLinear, AutoDiffersOnMinorOnly) {
-    EXPECT_TRUE(shouldForceLinear(XR_LINEAR_AUTO, true, 226, 128, true, 226, 130));
+TEST(XRForceLinear, AutoSameGpuAcrossNodeTypesStaysNative) {
+    // Regression for the NVIDIA all-black bug: the XR render node (226:128) and the allocator card
+    // node (226:1) are the SAME GPU. The caller's DRM::sameGpu resolves that to sameGpu=true, so even
+    // though their device numbers differ, AUTO must NOT force linear.
+    EXPECT_FALSE(shouldForceLinear(XR_LINEAR_AUTO, true, true));
 }
 
-TEST(XRForceLinear, AutoDiffersOnMajorOnly) {
-    EXPECT_TRUE(shouldForceLinear(XR_LINEAR_AUTO, true, 225, 0, true, 226, 0));
-}
-
-TEST(XRForceLinear, AutoUnknownXrNodeStaysNative) {
-    // Shared-display fallback: XR render node unknown -> can't confirm cross-GPU -> stay native.
-    EXPECT_FALSE(shouldForceLinear(XR_LINEAR_AUTO, false, -1, -1, true, 226, 129));
-}
-
-TEST(XRForceLinear, AutoUnknownAllocatorStaysNative) {
-    EXPECT_FALSE(shouldForceLinear(XR_LINEAR_AUTO, true, 226, 128, false, -1, -1));
+TEST(XRForceLinear, AutoUnknownDevicesStayNative) {
+    // Either device unresolved (shared-display fallback, unstat-able/unopenable fd) -> can't confirm
+    // cross-GPU -> stay native.
+    EXPECT_FALSE(shouldForceLinear(XR_LINEAR_AUTO, false, true));
+    EXPECT_FALSE(shouldForceLinear(XR_LINEAR_AUTO, false, false));
 }
