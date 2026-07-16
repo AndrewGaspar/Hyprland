@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -468,31 +469,88 @@ void COpenXRManager::start() {
                              !node.valid ? "XR render node unknown (shared-display fallback)" : rt.note);
     }
 
+    // --- Direct-mode session-bring-up FREEZE DIAGNOSTICS (2026-07-15 incident) ------------------
+    // Steps 4-8 below each make a SYNCHRONOUS OpenXR IPC round-trip to the runtime on THIS (the main =
+    // wayland) thread. In DRM-lease direct mode that is a latent cross-process deadlock: Monado is the
+    // DRM master of the leased connector and its render/IPC servicing is coupled to that connector's
+    // vblank (see e80e03be #3 + #1). If Monado stalls answering — e.g. the leased DP-5 link is sick, as
+    // it was at 22:10:55 on the freezing cycle — this thread blocks forever and the WHOLE desktop
+    // (eDP included) freezes; recovery needs a power-cycle. e80e03be hardened the TEARDOWN/reclaim
+    // path; the STARTUP path here has no guard.
+    //
+    // The 2026-07-15 freeze could not be localized because (a) Hyprland's own hyprland.log lives on
+    // tmpfs and dies with the power-cycle, and (b) the Monado CLIENT library emits NOTHING between
+    // xrGetSystem and teardown (verified: the working 21:27 session and the fatal 22:10:57 session are
+    // byte-identical up to "Selected devices"). So these breadcrumbs and the watchdog go to STDERR —
+    // the ONLY sink that reached the journal and survived the incident. On the next hang the journal's
+    // last [XR-START] line names the exact IPC call that deadlocked, and the watchdog stamps a loud,
+    // timestamped stall marker so the freeze is self-documenting.
+    auto xrStartStep = std::make_shared<std::atomic<int>>(0);
+    auto xrStartDone = std::make_shared<std::atomic<bool>>(false);
+    std::thread([xrStartStep, xrStartDone]() {
+        static const char* const kStepName[] = {"(entered bring-up)", "xrCreateSession",       "createSpaces",
+                                                 "initBlitGL",         "chooseSwapchainFormat", "input->init"};
+        int                      nextWarnMs = 6000;
+        int                      elapsedMs  = 0;
+        while (!xrStartDone->load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            if (xrStartDone->load(std::memory_order_acquire))
+                break;
+            elapsedMs += 500;
+            if (elapsedMs >= nextWarnMs) {
+                const int s = xrStartStep->load(std::memory_order_acquire);
+                fprintf(stderr,
+                        "[XR-START-WATCHDOG] direct-mode session bring-up BLOCKED %dms at step '%s' — probable "
+                        "cross-process deadlock with Monado on the leased connector (e80e03be #3 class, startup path). "
+                        "The desktop is frozen; a power-cycle is likely needed.\n",
+                        elapsedMs, kStepName[(s >= 0 && s <= 5) ? s : 0]);
+                fflush(stderr);
+                nextWarnMs += 3000;
+            }
+        }
+    }).detach();
+    // RAII: disarm the watchdog on EVERY exit path of steps 4-8 (success or any abortStart return).
+    struct SXrStartGuard {
+        std::shared_ptr<std::atomic<bool>> done;
+        ~SXrStartGuard() { done->store(true, std::memory_order_release); }
+    } xrStartGuard{xrStartDone};
+    const auto xrBreadcrumb = [&xrStartStep](int step, const char* name) {
+        xrStartStep->store(step, std::memory_order_release);
+        fprintf(stderr, "[XR-START] entering %s\n", name);
+        fflush(stderr);
+    };
+    // --------------------------------------------------------------------------------------------
+
     // 4. Session (XrGraphicsBindingEGLMNDX).
+    xrBreadcrumb(1, "xrCreateSession");
     if (!m_session->createSession(*m_graphics)) {
         abortStart();
         return;
     }
 
     // 5. Reference + view spaces.
+    xrBreadcrumb(2, "createSpaces");
     if (!m_session->createSpaces(*m_graphics)) {
         abortStart();
         return;
     }
 
     // 6. Blit GL resources (still on the main thread, before the frame thread exists).
+    xrBreadcrumb(3, "initBlitGL");
     if (!m_graphics->initBlitGL()) {
         abortStart();
         return;
     }
 
     // 7. Choose the swapchain format once (per-layer swapchains are created lazily in WP3).
+    xrBreadcrumb(4, "chooseSwapchainFormat");
     m_session->chooseSwapchainFormat();
 
     // 8. Action system (WP6): build the action set + bindings + action spaces and attach them to
     //    the session (attach is legal only once, and must happen before the frame loop begins).
     //    A missing interaction profile is not fatal; a genuine failure leaves input disabled but
     //    the session running (quads still composite, device anchors just take the loss path).
+    xrBreadcrumb(5, "input->init");
     m_input = makeUnique<CXRInput>();
     if (!m_input->init(*m_session, m_session->m_hasHandInteraction)) {
         Log::logger->log(Log::WARN, "[OPENXR] input action system unavailable; continuing without XR input");
@@ -512,6 +570,12 @@ void COpenXRManager::start() {
     // producer sink now that the eventfd exists and before the thread spawns.
     if (m_input)
         m_input->setEmitter([this](XRQueueItem item) { enqueue(std::move(item)); });
+
+    // All synchronous main-thread OpenXR IPC is done; the frame thread takes over the IPC from here.
+    // Stamp the journal so the next hang's last [XR-START] line unambiguously means "blocked in the
+    // named step" rather than "raced past it". (Disarms the watchdog too, via the RAII guard on return.)
+    fprintf(stderr, "[XR-START] session bring-up complete; frame thread taking over\n");
+    fflush(stderr);
 
     m_running     = true;
     m_frameThread = std::thread([this] { frameThread(); });
