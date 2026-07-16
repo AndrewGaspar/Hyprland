@@ -71,6 +71,12 @@ MONO_WIDTH=1920
 # or below 72Hz (90Hz+ at 3840 wide exceeds the 2-lane budget → out-of-range/black).
 SBS_MODELINE="${XREAL_SBS_MODELINE:-266.50 3840 3888 3920 4000 1080 1083 1093 1111 +hsync -vsync}"
 
+# XReal Air 2 Ultra USB id (the HID interface monado's prober binds). Used by the `xr` preflight
+# (cmd_xr) to refuse starting monado when the glasses are unplugged / USB-wedged, in which case
+# monado's prober silently falls back to a Simulated HMD. Overridable for other hardware.
+XREAL_USB_VID="${XREAL_USB_VID:-3318}"
+XREAL_USB_PID="${XREAL_USB_PID:-0426}"
+
 # Resolve xreal-ctl: explicit $XREAL_CTL, then PATH, then the in-repo build.
 if [[ -z $XREAL_CTL ]]; then
     if command -v xreal-ctl >/dev/null 2>&1; then
@@ -92,6 +98,21 @@ run() {
 }
 
 have_jq() { command -v jq >/dev/null 2>&1; }
+
+# Dependency-free check (no lsusb needed): is the XReal glasses' USB device enumerated?
+# Scans sysfs idVendor/idProduct so a genuinely-unplugged or USB-wedged headset is caught
+# before we (re)start monado. NOTE: this guards the unplugged/wedged case only; it would NOT
+# have prevented the 2026-07-15 starvation hang (the glasses were present and enumerated then).
+xreal_usb_present() {
+    local d vid pid
+    for d in /sys/bus/usb/devices/*; do
+        [[ -r $d/idVendor && -r $d/idProduct ]] || continue
+        read -r vid < "$d/idVendor" 2>/dev/null || continue
+        read -r pid < "$d/idProduct" 2>/dev/null || continue
+        [[ ${vid,,} == "${XREAL_USB_VID,,}" && ${pid,,} == "${XREAL_USB_PID,,}" ]] && return 0
+    done
+    return 1
+}
 
 # Auto-detect the glasses' DP connector name from hyprctl monitors (all outputs, incl. disabled).
 detect_monitor() {
@@ -219,6 +240,12 @@ enable_direct_dropin() {
 UnsetEnvironment=XRT_COMPOSITOR_FORCE_WAYLAND
 Environment=XRT_COMPOSITOR_FORCE_WAYLAND_DIRECT=1
 Environment=XRT_COMPOSITOR_WAYLAND_CONNECTOR=$mon
+# Cap the Vulkan queue global priority at MEDIUM (this is also monado's default). monado-service
+# carries cap_sys_nice+ep, so WITHOUT this cap comp_vulkan would request a REALTIME queue on the
+# shared iGPU that drives the desktop. On 2026-07-15 that starved the whole machine while direct
+# mode fail-looped waiting for the DP lease connector (hard reboot). REALTIME is strictly opt-in;
+# set XRT_COMPOSITOR_VK_GLOBAL_PRIORITY=high|realtime here ONLY with a watchdog / second machine.
+Environment=XRT_COMPOSITOR_VK_GLOBAL_PRIORITY=medium
 # Direct-scanout pacing (fake pacer; RADV exposes no VK_GOOGLE_display_timing so the
 # non-feedback pacer is the only option — it phase-locks to the VK_EXT_display_control
 # FIRST_PIXEL_OUT vblank events on the leased connector):
@@ -348,6 +375,17 @@ cmd_xr() {
     local width mon
     if [[ $MONO -eq 1 ]]; then width=$MONO_WIDTH; else width=$SBS_WIDTH; fi
     echo "== xreal-mode xr ($( [[ $MONO -eq 1 ]] && echo 'mono 1920x1080 single-view' || echo 'SBS 3840x1080 stereo' ), $( [[ $DIRECT -eq 1 ]] && echo 'DRM-lease DIRECT' || echo 'fullscreen WINDOW' ) mode) =="
+
+    # 0. USB preflight (both --direct and window mode): the glasses' USB device must be
+    #    enumerated before we (re)start monado. If it's absent/wedged, monado's prober silently
+    #    falls back to a Simulated HMD, so bail WITHOUT touching monado or the monitor rules.
+    #    (Guards the unplugged/wedged case; the 2026-07-15 starvation hang had the glasses present,
+    #    so this is a general robustness guard, not that fix. Skipped under --dry-run.)
+    if [[ $DRY_RUN -eq 0 ]] && ! xreal_usb_present; then
+        echo "!! XReal glasses USB (${XREAL_USB_VID}:${XREAL_USB_PID}) not enumerated — replug the" >&2
+        echo "   glasses (a wedged glasses state needs a physical replug), then retry. Nothing changed." >&2
+        exit 1
+    fi
 
     # 1. Require the glasses present (HID). Safe no-op when unplugged.
     if [[ -n $XREAL_CTL ]] && [[ $DRY_RUN -eq 0 ]] && ! "$XREAL_CTL" detect >/dev/null 2>&1; then
