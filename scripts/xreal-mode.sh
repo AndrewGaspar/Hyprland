@@ -387,6 +387,21 @@ cmd_xr() {
         exit 1
     fi
 
+    # 0b. DP-link health preflight (DIRECT only): refuse to lease a connector whose link training
+    #     just failed. The 2026-07-15 desktop freeze started exactly like this — `flat` re-modeset
+    #     DP-5, the kernel logged dpcd_set_link_settings/core_link_write_dpcd failures (half-wedged
+    #     glasses DP), and leasing that sick connector 2s later tipped monado's bring-up into the
+    #     latent session-start deadlock (whole desktop froze; power-cycle). A physical replug clears
+    #     the link. See docs/openxr/07-xreal.md and the [XR-START] watchdog in OpenXRManager.
+    if [[ $DIRECT -eq 1 && $DRY_RUN -eq 0 ]] &&
+        journalctl -k --since "-90 seconds" --no-pager -q 2>/dev/null | grep -q "dpcd_set_link_settings.*failed"; then
+        echo "!! DP link-training failures in the kernel log within the last 90s" >&2
+        echo "   (dpcd_set_link_settings ... failed) — the glasses' DP link is in a bad state, and" >&2
+        echo "   leasing it now risks the direct-mode session-start freeze. Physically replug the" >&2
+        echo "   glasses, wait a few seconds, then retry. Nothing changed." >&2
+        exit 1
+    fi
+
     # 1. Require the glasses present (HID). Safe no-op when unplugged.
     if [[ -n $XREAL_CTL ]] && [[ $DRY_RUN -eq 0 ]] && ! "$XREAL_CTL" detect >/dev/null 2>&1; then
         echo "!! no XREAL device detected over HID — plug the glasses in first (nothing changed)." >&2
