@@ -135,10 +135,12 @@ if [[ $FLAVOR == xreal ]]; then
     [[ $_fail -eq 0 ]] || exit 1
 fi
 
-# Rebuilding overwrites monado-service, which silently DROPS any file capability (e.g. the
-# cap_sys_nice+ep used for a REALTIME GPU queue in XReal direct mode). Snapshot it so we can
-# remind the user to re-apply after the build — a lost cap resurfaces weeks later as
-# "why is direct mode juddery again?".
+# File capabilities on monado-service are HARMFUL: any file cap makes the kernel exec the binary
+# in secure-execution mode (AT_SECURE=1) and the Vulkan loader then IGNORES VK_DRIVER_FILES /
+# VK_ICD_FILENAMES — the AMD ICD pin silently stops applying, monado selects the NVIDIA dGPU,
+# direct mode fail-loops on vkGetDrmDisplayEXT and the retry churn hitches the whole machine
+# (both 2026-07-15 incidents; docs/openxr/07-xreal.md §1.4b). Rebuilding drops file caps, which
+# is exactly what we want — detect a capped stale binary so we can tell the user it was healed.
 _svc_bin=$MONADO_BUILD/src/xrt/targets/service/monado-service
 _had_sys_nice=0
 if command -v getcap >/dev/null 2>&1 && [[ -e $_svc_bin ]] && getcap "$_svc_bin" 2>/dev/null | grep -q cap_sys_nice; then
@@ -161,17 +163,19 @@ done
 
 echo ">> done: $MONADO_BUILD"
 if [[ $_had_sys_nice -eq 1 ]]; then
-    # Try the passwordless sudoers rule first (/etc/sudoers.d/10-xreal-setcap grants exactly
-    # this command for the known build paths). -n = never prompt; fall back to a manual
-    # reminder if the rule isn't installed or the path isn't covered.
-    if sudo -n /usr/bin/setcap cap_sys_nice+ep "$_svc_bin" 2>/dev/null; then
-        echo "   re-applied cap_sys_nice+ep to monado-service (REALTIME GPU queue kept)."
+    # A capped binary breaks Vulkan GPU selection (see the comment at the snapshot above). If the
+    # build relinked, the cap is gone — good. If nothing needed rebuilding, the old capped binary
+    # survived and MUST be stripped by hand.
+    if command -v getcap >/dev/null 2>&1 && getcap "$_svc_bin" 2>/dev/null | grep -q cap_sys_nice; then
+        echo
+        echo "   !! monado-service STILL carries cap_sys_nice (build was a no-op, old binary kept)."
+        echo "   !! File caps make the Vulkan loader ignore VK_DRIVER_FILES -> wrong GPU -> direct"
+        echo "   !! mode fail-loops + system-wide hitching (docs/openxr/07-xreal.md §1.4b)."
+        echo "   !! Strip it:  sudo setcap -r $_svc_bin"
+        echo
     else
-        echo
-        echo "   !! the rebuild DROPPED monado-service's cap_sys_nice file capability (REALTIME GPU queue)."
-        echo "   !! re-apply it:  sudo setcap cap_sys_nice+ep $_svc_bin"
-        echo "   (passwordless: install the sudoers rule from docs/openxr/07-xreal.md §setcap)"
-        echo
+        echo "   note: the rebuild dropped monado-service's cap_sys_nice file capability — intended;"
+        echo "   the cap broke Vulkan GPU selection (docs/openxr/07-xreal.md §1.4b). Do not re-apply."
     fi
 fi
 if [[ $FLAVOR == xreal ]]; then
