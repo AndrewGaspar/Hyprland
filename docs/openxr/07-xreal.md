@@ -262,6 +262,49 @@ Without the rule the build script prints the manual `sudo setcap` reminder inste
 took effect (needs a monado restart): the journal shows `QUEUE_GLOBAL_PRIORITY_REALTIME` instead
 of `..._MEDIUM`.
 
+### 1.4c REALTIME starvation incident (2026-07-15) — both realtime paths now env-gated (default off)
+
+Once `cap_sys_nice+ep` was live on `monado-service` (§1.4b), two realtime paths that had never
+succeeded before became reachable, both dangerous on the **shared** AMD iGPU that also drives the
+desktop:
+
+1. **Vulkan queue global priority.** `comp_vulkan` walks `REALTIME -> HIGH -> MEDIUM`. With the cap
+   live, direct-mode bring-up fail-looped on **lease availability** — the glasses were plugged in and
+   fully enumerated (the prober selected the real `xreal_air` driver on every probe), but
+   `comp_window_direct_wayland_init` logged *"Found no connectors available for direct mode"* because
+   Hyprland had not offered the DP-5 lease connector yet. Each ~7 s retry created a fresh Vulkan
+   device with a **REALTIME** queue on the iGPU, and that churn starved the entire machine (only
+   event-driven moments of interactivity) until a hard power-cycle. Every previously validated
+   session — including the judder fix — ran **MEDIUM** because the cap was not yet live, so REALTIME
+   contributed nothing to any good result.
+2. **SCHED_FIFO priority 99.** `comp_multi_system`'s *Multi Client Module* thread calls
+   `u_linux_try_to_set_realtime_priority_on_thread` (max realtime priority). It never ran during the
+   crash (system creation kept failing) but was the next latent starvation bomb once the cap made it
+   succeed.
+
+**Fix — both paths are now env-gated in the vendored monado, defaulting to the conservative behavior:**
+
+- `XRT_COMPOSITOR_VK_GLOBAL_PRIORITY=realtime|high|medium` caps the **maximum** global priority
+  `create_device()` may request (the fallback walk down the list is unchanged — the cap only chooses
+  where it starts). **Default `medium`.** The chosen cap is logged at INFO (`VK_INFO`, visible with
+  the default `XRT_COMPOSITOR_LOG=info`): `Vulkan queue global-priority cap: QUEUE_GLOBAL_PRIORITY_MEDIUM`.
+  `xreal-mode.sh --direct` writes `Environment=XRT_COMPOSITOR_VK_GLOBAL_PRIORITY=medium` into the
+  direct-mode drop-in explicitly (self-documenting; medium is also the default).
+- `XRT_COMPOSITOR_THREAD_REALTIME=true|false` gates the SCHED_FIFO promotion. **Default `false`**; when
+  off a one-line INFO (`SCHED_FIFO promotion skipped ...`) records it (global `U_LOG_I`, so it needs
+  `XRT_LOG=info` to appear — the Vulkan cap line above is the always-visible signal).
+
+**Opting in later:** set the env var(s) in the service drop-in (or `~/.config/xreal/monado.env`). Because
+the target GPU is shared with the desktop, any REALTIME/HIGH or SCHED_FIFO experiment MUST run with a
+watchdog or on a second machine you can SSH into — a starved iGPU takes the whole session down and the
+only recovery observed on 2026-07-15 was a hard power-cycle.
+
+**USB preflight.** `xreal-mode.sh xr` now refuses to (re)start monado unless the glasses' USB device
+`3318:0426` is enumerated (dependency-free sysfs scan of `/sys/bus/usb/devices/*/id{Vendor,Product}`).
+A missing device otherwise makes monado's prober silently fall back to a Simulated HMD. This guards the
+genuinely-unplugged / USB-wedged case (which needs a physical replug) — it would NOT have prevented the
+2026-07-15 hang, where the glasses were present.
+
 ### 1.5 The 3DoF profile
 
 Source `example/xreal.conf` from your `hyprland.conf` and bind the toggle to a key:
