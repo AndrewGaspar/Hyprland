@@ -237,50 +237,54 @@ systemctl --user daemon-reload
 The unit is wholly independent of `wivrn.service` (no ordering, no `Conflicts`) — the two runtimes use
 different IPC socket names and never fight.
 
-### 1.4b setcap — REALTIME GPU queue (optional, direct mode)
+### 1.4b setcap — DO NOT cap monado-service (it breaks Vulkan GPU selection)
 
-amdgpu only grants GPU queue priorities above NORMAL to processes with `CAP_SYS_NICE`; without it
-monado runs its compositor on a MEDIUM-priority queue and heavy iGPU load can slip whole 60 Hz
-frames (motion judder in direct mode). Grant it on the service binary:
+**Do not put `cap_sys_nice` (or any file capability) on `monado-service`.** We tried it to unlock
+amdgpu's REALTIME GPU queue priority for direct mode, and it broke everything, subtly:
 
-```sh
-sudo setcap cap_sys_nice+ep subprojects/monado/build-xreal/src/xrt/targets/service/monado-service
-```
+any file capability makes the kernel exec the binary in **secure-execution mode** (`AT_SECURE=1`),
+and the Vulkan loader deliberately **ignores `VK_DRIVER_FILES` / `VK_ICD_FILENAMES` for privileged
+processes**. Our AMD ICD pin (§0) therefore silently stopped applying: monado enumerated every ICD
+and picked the NVIDIA dGPU instead of the AMD iGPU that owns DP-5. Direct mode then fail-looped on
+`vkGetDrmDisplayEXT: VK_ERROR_UNKNOWN` (AMD lease fd vs NVIDIA physical device), and the ~7 s retry
+churn of full NVIDIA device create/destroy cycles hitched/starved the whole machine (both
+2026-07-15 incidents — see §1.4c). Journal fingerprint of the broken state: `create_device` logs
+`name: NVIDIA GeForce RTX 5070 Laptop GPU` instead of `AMD Radeon 890M Graphics (RADV STRIX1)`.
 
-**Every rebuild wipes the file capability.** `scripts/build-monado.sh` detects the loss and
-re-applies it automatically via `sudo -n` if you install this passwordless sudoers rule (exact
-command + cap + paths, no wildcards — the only thing it permits is granting `cap_sys_nice` to
-these two build artifacts):
+Rebuilds drop file capabilities, so a plain `scripts/build-monado.sh --xreal` run heals a capped
+binary (the script now WARNS if it detects one instead of re-applying). If you have a leftover
+`/etc/sudoers.d/10-xreal-setcap` rule from the earlier approach, delete it; to strip a cap without
+rebuilding: `sudo setcap -r <monado-service>`.
 
-```
-# /etc/sudoers.d/10-xreal-setcap   (install -m 0440, validate with `sudo visudo -c`)
-ajg ALL=(root) NOPASSWD: /usr/bin/setcap cap_sys_nice+ep /home/ajg/code/Hyprland/subprojects/monado/build-xreal/src/xrt/targets/service/monado-service
-ajg ALL=(root) NOPASSWD: /usr/bin/setcap cap_sys_nice+ep /home/ajg/code/hypxrland/subprojects/monado/build-xreal/src/xrt/targets/service/monado-service
-```
+If a REALTIME-queue experiment is ever revisited, the capability alone is not enough — it also
+needs (a) `XRT_COMPOSITOR_VK_GLOBAL_PRIORITY=realtime` (§1.4c), (b) a **monado-level** GPU pin that
+survives secure execution (the loader env pin will not), and (c) the watchdog/second-machine rule.
+Note the judder fix (§8) was validated entirely on a MEDIUM queue — REALTIME has never contributed
+a validated improvement.
 
-Without the rule the build script prints the manual `sudo setcap` reminder instead. Verify it
-took effect (needs a monado restart): the journal shows `QUEUE_GLOBAL_PRIORITY_REALTIME` instead
-of `..._MEDIUM`.
+### 1.4c 2026-07-15 starvation incidents — root cause + the realtime env gates (default off)
 
-### 1.4c REALTIME starvation incident (2026-07-15) — both realtime paths now env-gated (default off)
+Two hitching/starvation incidents on 2026-07-15 (one ended in a hard power-cycle) both trace to the
+`cap_sys_nice+ep` experiment. **Root cause (confirmed by A/B against the journals): the capability
+broke Vulkan GPU selection**, not realtime priority per se — see §1.4b. Sequence: secure execution
+made the loader ignore the AMD ICD pin → monado selected the NVIDIA dGPU → `vkGetDrmDisplayEXT`
+failed `VK_ERROR_UNKNOWN` against the AMD DP-5 lease → direct-mode bring-up fail-looped, each ~7 s
+retry creating and destroying a full NVIDIA Vulkan device — and that churn hitched/starved the
+whole machine. A second attempt with the realtime paths gated OFF (`..._MEDIUM` confirmed in the
+journal) hitched the same way, proving the churn — not the queue priority — is the starvation
+mechanism. Uncapped binaries select `AMD Radeon 890M Graphics (RADV STRIX1)` and direct mode works.
 
-Once `cap_sys_nice+ep` was live on `monado-service` (§1.4b), two realtime paths that had never
-succeeded before became reachable, both dangerous on the **shared** AMD iGPU that also drives the
-desktop:
+The capability had also made two previously-dead realtime paths live for the first time; they are
+kept env-gated as defense in depth (REALTIME rode along on the first incident and plausibly turned
+recoverable hitching into the full hang):
 
-1. **Vulkan queue global priority.** `comp_vulkan` walks `REALTIME -> HIGH -> MEDIUM`. With the cap
-   live, direct-mode bring-up fail-looped on **lease availability** — the glasses were plugged in and
-   fully enumerated (the prober selected the real `xreal_air` driver on every probe), but
-   `comp_window_direct_wayland_init` logged *"Found no connectors available for direct mode"* because
-   Hyprland had not offered the DP-5 lease connector yet. Each ~7 s retry created a fresh Vulkan
-   device with a **REALTIME** queue on the iGPU, and that churn starved the entire machine (only
-   event-driven moments of interactivity) until a hard power-cycle. Every previously validated
-   session — including the judder fix — ran **MEDIUM** because the cap was not yet live, so REALTIME
-   contributed nothing to any good result.
+1. **Vulkan queue global priority.** `comp_vulkan` walks `REALTIME -> HIGH -> MEDIUM`; with
+   CAP_SYS_NICE the REALTIME request succeeds. Every validated session — including the judder fix —
+   ran **MEDIUM**.
 2. **SCHED_FIFO priority 99.** `comp_multi_system`'s *Multi Client Module* thread calls
-   `u_linux_try_to_set_realtime_priority_on_thread` (max realtime priority). It never ran during the
-   crash (system creation kept failing) but was the next latent starvation bomb once the cap made it
-   succeed.
+   `u_linux_try_to_set_realtime_priority_on_thread` (max realtime priority). It never engaged during
+   the incidents (system creation kept failing before the thread started) but is a latent starvation
+   bomb on any capped binary.
 
 **Fix — both paths are now env-gated in the vendored monado, defaulting to the conservative behavior:**
 
