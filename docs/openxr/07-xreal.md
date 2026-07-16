@@ -439,10 +439,17 @@ the glasses are unplugged, and it **never** touches `wivrn.service`.
   a `XREAL_AIR_MSG_P_DISPLAY_TOGGLED` (0x6C04) event (don → state `0x01` "Open OLED 2D"; doff → `0x00`
   "Close OLED"). The vendored `xreal_air` driver now advertises `XR_EXT_user_presence`
   (`base.supported.presence = true`, `get_presence` returns the debounced `display_on`), and the vendored
-  monado's multi-compositor polls that head device once per frame and broadcasts a
-  `XRT_SESSION_EVENT_USER_PRESENCE_CHANGE` on change — so don/doff reaches HypXRland live as
+  monado's multi-compositor samples that head device on a **dedicated 150 ms poll thread** and broadcasts
+  a `XRT_SESSION_EVENT_USER_PRESENCE_CHANGE` on change — so don/doff reaches HypXRland live as
   `XR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT`. (Vanilla Monado only reads `get_presence` once at
-  session begin; this per-frame poll is the generic fix, and also gives Rift CV1 / PSVR2 live presence.)
+  session begin; this live poll is the generic fix, and also gives Rift CV1 / PSVR2 live presence.)
+  The poll deliberately does NOT ride the render loop: in DRM-lease **direct mode**, doffing turns the
+  OLED off, the leased connector stops producing vblank/`FIRST_PIXEL_OUT` feedback, the pacer stalls and
+  the render loop stops iterating — an earlier per-frame poll starved there, so the doff event never
+  fired and XR-main stayed plugged. The decoupled thread (monado `eebe93e7e`) samples regardless of
+  display/pacer state; it only spins for presence-capable head devices (never null/WiVRn), logs one INFO
+  line with its cadence at startup, and `XRT_COMPOSITOR_PRESENCE_POLL=false` reverts to the per-frame
+  poll.
   The profile therefore uses **`monitors_follow_session = visible`**: doffing (set the glasses on the
   desk) idles the XR monitors — their workspaces evacuate to your laptop — after a short
   `monitor_unplug_grace_ms` (3 s anti-flap), and donning re-plugs them **immediately**, no cable pull
