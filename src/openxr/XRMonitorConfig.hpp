@@ -235,13 +235,24 @@ namespace OpenXR {
     // never busy-spin on a dead runtime forever.
     inline constexpr int XR_MAX_FRAME_FAIL_STREAK = 8;
 
-    // Bounded wait (ms) for the reconnect handshake (xrCreateInstance + xrGetSystem) that start() runs
-    // on a helper thread. The instant wivrn's socket reappears during a restart the event-driven
-    // reprobe fires start(); if the just-appeared server is not yet answering, that FIRST-contact
-    // handshake can block on the socket. Running it off the main thread with this ceiling keeps the
-    // compositor painting; on timeout start() abandons the attempt (UNAVAILABLE) and reprobes later.
-    // Generous so a healthy cold start never abandons.
+    // Diagnostic "slow handshake" threshold (ms) for the reconnect handshake (xrCreateInstance +
+    // xrGetSystem). Task #89 phase 2 (blocker B): the handshake now runs FULLY off the main thread and
+    // marshals its result back through the handshake eventfd — the main thread never parks on it, so the
+    // 30s-cadence reprobe against a cold WiVRn socket (which spawns+fails a monado child over several
+    // seconds) no longer stalls the desktop. This constant is therefore no longer an abandon deadline;
+    // it is only the threshold past which a completed handshake logs a WARN so the journal records that a
+    // runtime was slow to answer. Kept generous so a healthy cold start never trips the warning.
     inline constexpr int XR_HANDSHAKE_TIMEOUT_MS = 5000;
+
+    // Bounded wait (ms) for the direct-mode session BRING-UP (xrCreateSession + createSpaces + initBlitGL
+    // + chooseSwapchainFormat + input->init). Task #89 phase 2 (blocker A): these run on a helper thread
+    // while the main thread parks in a bounded wait (the runBoundedHandshake idiom). Bring-up happens only
+    // when a headset is actually present (a deliberate `xr --direct`), so this park is normally sub-second;
+    // the ceiling only bites on a genuine cross-process deadlock with the runtime on a sick leased
+    // connector (e80e03be #3 class). On timeout the main thread ABANDONS the helper (which self-cleans on
+    // late return) and falls back to UNAVAILABLE + reprobe — the desktop stays responsive instead of
+    // freezing. Generous (8-10s) so a healthy bring-up never abandons.
+    inline constexpr int XR_BRINGUP_TIMEOUT_MS = 10000;
 }
 
 namespace OpenXR {

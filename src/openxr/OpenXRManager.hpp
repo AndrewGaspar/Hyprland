@@ -375,21 +375,55 @@ class COpenXRManager {
     bool runtimeSocketPresent() const;
 
     // Aborts an in-progress start(), tearing down whatever was created, and lands in
-    // UNAVAILABLE. Safe to call at any failure point in start().
+    // UNAVAILABLE. Safe to call at any failure point in start()/the bring-up continuation.
     void abortStart();
 
-    // Outcome of the bounded first-contact handshake (xrCreateInstance + xrGetSystem).
-    enum eHandshakeResult {
-        HANDSHAKE_OK,               // both succeeded; caller owns `sess` and continues start()
-        HANDSHAKE_FAILED_INSTANCE,  // xrCreateInstance failed; caller owns `sess`, aborts to UNAVAILABLE
-        HANDSHAKE_FAILED_SYSTEM,    // xrGetSystem failed; caller owns `sess`, aborts (headset vs runtime wait)
-        HANDSHAKE_TIMEOUT,          // did not finish in time; ownership of `sess` moved to the helper thread
+    // --- Task #89 phase 2: keep ALL long-blocking OpenXR work off the compositor MAIN thread. ---
+    // The runtime FIRST-CONTACT handshake (xrCreateInstance + xrGetSystem) and the direct-mode session
+    // BRING-UP (xrCreateSession .. input->init) are the two blocking legs. Blocker B (the handshake) is
+    // run FULLY async: beginHandshake() spawns a detached worker and returns; the worker marshals its
+    // result back through the handshake eventfd to onHandshakeComplete() so the main thread NEVER parks
+    // (the 30s reprobe against a cold WiVRn socket used to stall the desktop 3-8s each cycle). Blocker A
+    // (bring-up) uses the runBoundedHandshake idiom: the main thread parks in a bounded wait while the
+    // helper does the work, abandoning on timeout (XR_BRINGUP_TIMEOUT_MS).
+
+    // Shared claim block for the async first-contact handshake. Decides exactly once, under its mutex,
+    // who owns `sess`: the main thread (worker finished; adopted in onHandshakeComplete) or the worker
+    // (main abandoned via abandonHandshake() -> worker deletes sess + clears m_handshakeInFlight). Full
+    // definition in the .cpp. shared_ptr member with an incomplete type — the dtor (in the .cpp) sees it.
+    struct SHandshakeClaim;
+
+    // Spawn the detached first-contact worker (createInstance + getSystem) and return immediately. Main.
+    void beginHandshake(CXRSession* sess);
+    // Main (handshake eventfd): drain the fd and, if the pending handshake finished, run its completion.
+    void onHandshakeChannelReadable();
+    // Main: adopt `sess`, classify (missing runtime / degraded / no headset), else continue to bring-up.
+    void onHandshakeComplete(std::shared_ptr<SHandshakeClaim> claim);
+    // Main: abandon an in-flight handshake (stop/dtor/abortStart) — transfer `sess` to the worker (still
+    // running) for off-main destruction, or destroy it here if the worker already finished. Idempotent.
+    void abandonHandshake();
+
+    // Post-handshake, main: create graphics, initEGL + GPU verify (both bounded/local), then run the
+    // bounded bring-up and, on success, spawn the frame thread. `sess` is raw-owned here (not yet in a
+    // UP) so a timed-out bring-up can hand it + graphics to the helper for self-cleanup.
+    void continueBringup(CXRSession* sess);
+
+    // Outcome of the bounded session bring-up (steps 4-8), run on a helper while the main thread parks.
+    enum eBringupResult {
+        BRINGUP_OK,      // all steps done in time; main adopted the input and owns sess/graphics
+        BRINGUP_FAILED,  // a fatal step returned false; main tears the raws down (synchronous)
+        BRINGUP_TIMEOUT, // exceeded XR_BRINGUP_TIMEOUT_MS; ownership of sess/graphics moved to the helper
     };
-    // Runs steps 1-2 of start() on a helper thread with a bounded wait so a not-yet-ready runtime socket
-    // (the instant-reprobe-after-restart case) cannot block the compositor main thread. On TIMEOUT the
-    // caller must NOT touch `sess` (the helper owns it) and m_handshakeInFlight stays set until the helper
-    // returns. Main thread only. See the 2026-07-14 freeze audit + XR_HANDSHAKE_TIMEOUT_MS.
-    eHandshakeResult runBoundedHandshake(CXRSession* sess);
+    // Runs steps 4-8 on a helper thread; the main thread parks up to XR_BRINGUP_TIMEOUT_MS. On OK it
+    // adopts the created CXRInput into m_input. On timeout it hands sess/graphics(+partial input) to the
+    // helper (which self-cleans on late return) and latches m_bringupInFlight. Main thread only.
+    eBringupResult runBoundedBringup(CXRSession* sess, CXRGraphics* gfx);
+
+    // Handshake completion channel (eventfd on the wl_event_loop), created in init(), torn down in the
+    // dtor — mirrors the frame->main channel. Persistent because the manager is a session-lifetime
+    // singleton; a detached worker may signal it at any time.
+    bool setupHandshakeChannel();
+    void teardownHandshakeChannel();
 
     // The XR frame thread body (owns the EGL context + XR frame loop while running).
     void frameThread();
@@ -644,12 +678,25 @@ class COpenXRManager {
     std::thread       m_frameThread;
     std::atomic<bool> m_running{false};
 
-    // Set true only when a bounded runtime handshake (runBoundedHandshake) TIMED OUT and its helper
-    // thread is still running (blocked in xrCreateInstance against a wedged runtime). While set, start()
-    // defers — never runs a second concurrent handshake (the OpenXR loader's global init is not
-    // re-entrant). The abandoned helper clears it when it finally returns. Normal fast handshakes never
-    // set it. Read on the main thread, cleared on the helper thread.
+    // Set true whenever a first-contact handshake worker is in flight (beginHandshake) OR an abandoned
+    // handshake worker is still running (blocked in xrCreateInstance against a wedged runtime). While set,
+    // start() defers — never runs a second concurrent handshake (the OpenXR loader's global init is not
+    // re-entrant). Cleared on the main thread in onHandshakeComplete, or on the worker thread if the
+    // handshake was abandoned. Read on the main thread.
     std::atomic<bool> m_handshakeInFlight{false};
+
+    // Task #89 phase 2 blocker A: latched while an ABANDONED bring-up helper is still running (blocked in
+    // an XR IPC against a wedged runtime, then self-cleaning sess/graphics off-main). While set, start()
+    // defers so a reprobe never races the loader / a live-but-doomed XrInstance. The helper clears it.
+    std::atomic<bool> m_bringupInFlight{false};
+
+    // Task #89 phase 2 blocker B: the in-flight async handshake's claim (main-thread owned), plus the
+    // completion eventfd + its wl_event_loop source. The worker signals m_handshakeFd; the source calls
+    // onHandshakeChannelReadable() on the main thread. Non-null m_pendingHandshake == a handshake awaiting
+    // its completion callback.
+    std::shared_ptr<SHandshakeClaim> m_pendingHandshake;
+    int                              m_handshakeFd     = -1;
+    wl_event_source*                 m_handshakeSource = nullptr;
 
     // XR monitor layers. m_layers is written on the main thread and snapshotted per frame by
     // the frame thread, both under m_layersMu (doc 00 handoff table). std::shared_ptr, NOT
