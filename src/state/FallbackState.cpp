@@ -115,6 +115,40 @@ void CFallbackStateKeeper::initOutput() {
         Log::logger->log(Log::ERR, "[FallbackStateKeeper] Failed to create the fallback output?!");
 }
 
+void CFallbackStateKeeper::destroyFallbackOutputDeferred() {
+    // Tear down the fallback headless output WITHOUT freeing it while a frame callback is still
+    // queued on the aquamarine backend. CHeadlessOutput::scheduleFrame() enqueues the output's own
+    // framecb (an SP<std::function<void()>> that captures the output by raw `this` and holds no
+    // liveness guard) into CBackend::idle.pending via addIdleEvent(). Neither CHeadlessOutput::
+    // destroy() nor ~CHeadlessOutput removes that pending idle event, so if the output is freed
+    // while a framecb is still queued the next CBackend::dispatchIdle() invokes it on freed memory
+    // — events.frame.emit() on a dangling CSignal — a use-after-free (observed:
+    // aquamarineFDWrite -> CBackend::dispatchIdle -> CSignalBase::emitInternal, faulting in a
+    // render pass reconstructed out of the freed+reused output block). This is the SEGV that fired
+    // when leaving fallback state as an XR monitor plugged in: the caller has already run
+    // onDisconnect() (clearing the frame listener), so once the output outlives the stale callback
+    // the emit is a harmless listener-less no-op.
+    //
+    // This mirrors COpenXRManager::destroyOutputDeferred(), which guards XR-managed outputs against
+    // the same aquamarine lifetime bug; the fallback output is destroyed by this core path and was
+    // not previously covered. We cannot remove the pending idle event (framecb is private to
+    // CHeadlessOutput) nor patch the system aquamarine library, so instead we keep a reference alive
+    // inside a sentinel idle event, enqueued AFTER any pending framecb; it is processed in the same
+    // dispatchIdle pass right after that framecb fires, dropping the last reference only once the
+    // queue has drained past it.
+    if (!m_fallbackOutput || !m_fallbackOutput->m_output)
+        return;
+
+    SP<Aquamarine::IOutput> output = m_fallbackOutput->m_output;
+    output->destroy();
+
+    if (!g_pCompositor || !g_pCompositor->m_aqBackend)
+        return; // no backend to dispatch idle again (shutdown) — release the reference now.
+
+    auto sentinel = makeShared<std::function<void(void)>>([output]() {}); // capture keeps `output` alive
+    g_pCompositor->m_aqBackend->addIdleEvent(sentinel);
+}
+
 void CFallbackStateKeeper::setFallbackActive(bool enabled) {
     if (enabled == m_fallbackActive)
         return;
@@ -135,7 +169,7 @@ void CFallbackStateKeeper::setFallbackActive(bool enabled) {
             initOutput();
         else if (m_fallbackOutput) {
             m_fallbackOutput->onDisconnect();
-            m_fallbackOutput->m_output->destroy();
+            destroyFallbackOutputDeferred();
             m_fallbackOutput.reset();
         }
     });
