@@ -27,9 +27,22 @@ TEST(loss_hardening, frame_fail_streak_is_a_small_positive_backstop) {
 }
 
 TEST(loss_hardening, handshake_timeout_is_bounded_and_generous) {
-    // The reconnect handshake (xrCreateInstance + xrGetSystem) runs off the main thread with this
-    // ceiling. Generous enough that a healthy cold start never abandons, bounded enough that a wedged
-    // runtime cannot keep the (main-thread) probe waiting forever had it not been moved off-thread.
+    // Task #89 phase 2 (blocker B): the reconnect handshake (xrCreateInstance + xrGetSystem) now runs
+    // FULLY off the main thread and marshals its result back — the main thread never parks on it, so this
+    // constant is no longer an abandon deadline but the "runtime was slow to answer" WARN threshold.
+    // Generous enough that a healthy cold start never trips the warning, bounded enough to stay meaningful.
     EXPECT_GE(XR_HANDSHAKE_TIMEOUT_MS, 1000); // a cold wivrn+encoder start can take a beat
     EXPECT_LE(XR_HANDSHAKE_TIMEOUT_MS, 30000);
+}
+
+TEST(loss_hardening, bringup_timeout_is_bounded_and_generous) {
+    // Task #89 phase 2 (blocker A): direct-mode session bring-up (xrCreateSession .. input->init) runs on a
+    // helper thread while the main thread parks in a bounded wait; on timeout the main thread abandons the
+    // helper and falls back to UNAVAILABLE, so a cross-process deadlock with the runtime on a sick leased
+    // connector no longer freezes the desktop. Generous enough that a healthy `xr --direct` never abandons,
+    // bounded enough that the main thread's park can never exceed it.
+    EXPECT_GE(XR_BRINGUP_TIMEOUT_MS, 1000);
+    EXPECT_LE(XR_BRINGUP_TIMEOUT_MS, 30000);
+    // Bring-up is the slower, headset-present leg; its ceiling should be at least the handshake threshold.
+    EXPECT_GE(XR_BRINGUP_TIMEOUT_MS, XR_HANDSHAKE_TIMEOUT_MS);
 }
