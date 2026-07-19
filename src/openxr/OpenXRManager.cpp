@@ -76,7 +76,11 @@ COpenXRManager::COpenXRManager() = default;
 
 COpenXRManager::~COpenXRManager() {
     if (m_state != XR_STATE_DISABLED)
-        stop();
+        stop(); // stop() abandons any in-flight handshake before tearing down
+    // Belt-and-suspenders: if the dtor ran while DISABLED but a handshake was somehow still pending,
+    // abandon it before the completion channel goes away (its worker signals m_handshakeFd).
+    abandonHandshake();
+    teardownHandshakeChannel();
     // Drop the grace timer from the event loop so its `this`-capturing callback can never fire on
     // freed memory (report-18 addendum). stop() only disarms it; the loop still holds an SP ref.
     if (m_unplugTimer && g_pEventLoopManager)
@@ -103,6 +107,13 @@ void COpenXRManager::init() {
     // XR footprint outside src/openxr/ stays at zero.
     m_ipc = makeUnique<CXRIpc>();
     m_ipc->registerCommands();
+
+    // Task #89 phase 2 blocker B: the persistent handshake-completion channel. Created here (once) so an
+    // async first-contact worker spawned by any start() below has a live eventfd to signal back on. Torn
+    // down in the dtor. eventfd + wl_event_loop_add_fd essentially never fail this early; start() re-checks
+    // and refuses to go async (UNAVAILABLE + reprobe) if it somehow could not be created, so a failure
+    // here never wedges the state machine.
+    setupHandshakeChannel();
 
     // React to reloads. `hyprctl keyword openxr:enabled 1` fires props_refreshed rather than
     // a full reload, so listen to both; onConfigReload() is idempotent.
@@ -248,12 +259,13 @@ void COpenXRManager::start() {
     publishHandInputPolicy(); // research/16 Part A: seed the hand-input policy from openxr:hand_input
     publishGrabStringTuning(); // task #25: seed hand_grab / hand_grab_anywhere / grab_filter_scope enums
 
-    // Concurrency guard for the off-main handshake below. A previously-abandoned handshake thread may
-    // still be blocked in xrCreateInstance against a wedged runtime; starting a second one would race
-    // the OpenXR loader's process-global init. Skip this attempt — the reprobe retries once the
-    // in-flight handshake resolves and clears the flag.
-    if (m_handshakeInFlight.load(std::memory_order_acquire)) {
-        Log::logger->log(Log::DEBUG, "[OPENXR] a prior runtime handshake is still in flight — deferring this probe");
+    // Concurrency guard for the off-main handshake below. A previously-in-flight OR abandoned handshake
+    // worker may still be blocked in xrCreateInstance against a wedged runtime, or an abandoned bring-up
+    // helper may still be self-cleaning a live-but-doomed XrInstance; starting a second attempt would race
+    // the OpenXR loader's process-global init. Skip this attempt — the reprobe retries once the in-flight
+    // worker resolves and clears its flag.
+    if (m_handshakeInFlight.load(std::memory_order_acquire) || m_bringupInFlight.load(std::memory_order_acquire)) {
+        Log::logger->log(Log::DEBUG, "[OPENXR] a prior runtime handshake/bring-up is still in flight — deferring this probe");
         abortStart();
         return;
     }
@@ -261,7 +273,7 @@ void COpenXRManager::start() {
     // WP-XR1: apply openxr:runtime_json to the loader's XR_RUNTIME_JSON before the FIRST loader call.
     // The OpenXR loader resolves the runtime manifest exclusively from getenv("XR_RUNTIME_JSON") (no
     // programmatic override exists), so this is the only lever — and it must be set on THIS thread,
-    // BEFORE runBoundedHandshake() spawns the helper that calls xrCreateInstance. setenv in a threaded
+    // BEFORE beginHandshake() spawns the helper that calls xrCreateInstance. setenv in a threaded
     // process is hazardous: glibc's setenv can realloc `environ`, which is a use-after-free against any
     // concurrent getenv on another thread. We contain that three ways: (1) we are on the main thread and
     // have already passed the m_handshakeInFlight guard above — so NO XR loader thread (the only threads
@@ -312,34 +324,160 @@ void COpenXRManager::start() {
         sess->m_overlayZ         = (uint32_t)std::max<int64_t>(0, (int64_t)*POVERLAYZ);
     }
 
-    // Steps 1-2: xrCreateInstance + xrGetSystem — the runtime FIRST-CONTACT handshake. Run on a helper
-    // thread with a bounded wait: the instant wivrn's socket reappears during a restart the event-driven
-    // reprobe fires start(), and that first IPC to a server still coming up can block. Keeping it off the
-    // main thread (with XR_HANDSHAKE_TIMEOUT_MS) is what stops that block from freezing the desktop
-    // (2026-07-14 live-restart audit; mirrors the wrong-GPU probe's bounded-thread pattern).
-    const eHandshakeResult hs = runBoundedHandshake(sess);
-    if (hs == HANDSHAKE_TIMEOUT) {
-        // Ownership of `sess` was transferred to the still-running helper thread — do NOT touch it. It
-        // will destroy the session and clear m_handshakeInFlight when it finally returns.
-        Log::logger->log(Log::WARN, "[OPENXR] runtime handshake did not complete within {}ms — finishing it off-thread; state -> unavailable", OpenXR::XR_HANDSHAKE_TIMEOUT_MS);
-        m_probeWait = XR_WAIT_RUNTIME; // the runtime is present-but-unresponsive; poll it again shortly
-        // A timed-out handshake means a server ANSWERED the connect but is still coming up (cold
-        // restart) — exactly the "runtime materializing" case: open the activity window so the next
-        // probes run at the base cadence, not the grown backoff. If it stays wedged past the window,
-        // the backoff resumes.
-        markWatchActivity();
-        m_runtimeName.clear();
-        m_systemName.clear();
-        m_runtimeGpu.clear();
+    // Task #89 phase 2 blocker B: kick the runtime FIRST-CONTACT handshake (xrCreateInstance +
+    // xrGetSystem) FULLY off the main thread and return immediately. beginHandshake() spawns a detached
+    // worker; its result marshals back through the handshake eventfd to onHandshakeComplete(). The main
+    // thread never parks — the 30s-cadence reprobe against a cold WiVRn socket (which synchronously spawns
+    // and fails a monado child over several seconds) no longer stalls the desktop. State stays STARTING
+    // until the completion lands; a re-entrant start() during that window is refused by the guard at the
+    // top (state != DISABLED/UNAVAILABLE) plus the m_handshakeInFlight check above.
+    if (m_handshakeFd < 0 && !setupHandshakeChannel()) {
+        // The completion channel could not be created (essentially impossible past init()). Refuse to go
+        // async — an unsignalled worker would wedge STARTING forever. Drop to UNAVAILABLE so the reprobe
+        // keeps retrying; the desktop is unaffected.
+        Log::logger->log(Log::ERR, "[OPENXR] handshake-completion channel unavailable; deferring probe, state -> unavailable");
+        delete sess;
         setState(XR_STATE_UNAVAILABLE);
         return;
     }
+    beginHandshake(sess);
+}
 
-    // Completed within the budget: the helper thread has exited and we own `sess`. Adopt it.
-    m_session = UP<CXRSession>(sess);
+bool COpenXRManager::setupHandshakeChannel() {
+    // Persistent eventfd + wl_event_loop source for async handshake completions (task #89 phase 2). Mirrors
+    // the frame->main channel but lives for the manager's whole lifetime (init() -> dtor): a detached
+    // handshake worker may signal it long after any single start() returns.
+    if (m_handshakeFd >= 0)
+        return true;
+    m_handshakeFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (m_handshakeFd < 0) {
+        Log::logger->log(Log::ERR, "[OPENXR] eventfd() failed for the handshake-completion channel");
+        return false;
+    }
+    m_handshakeSource = wl_event_loop_add_fd(
+        g_pCompositor->m_wlEventLoop, m_handshakeFd, WL_EVENT_READABLE,
+        [](int /*fd*/, uint32_t /*mask*/, void* data) -> int {
+            static_cast<COpenXRManager*>(data)->onHandshakeChannelReadable();
+            return 0;
+        },
+        this);
+    if (!m_handshakeSource) {
+        Log::logger->log(Log::ERR, "[OPENXR] wl_event_loop_add_fd failed for the handshake-completion channel");
+        close(m_handshakeFd);
+        m_handshakeFd = -1;
+        return false;
+    }
+    return true;
+}
 
-    // 1. Instance (extension checks; missing runtime / required extensions -> UNAVAILABLE).
-    if (hs == HANDSHAKE_FAILED_INSTANCE) {
+void COpenXRManager::teardownHandshakeChannel() {
+    if (m_handshakeSource) {
+        wl_event_source_remove(m_handshakeSource);
+        m_handshakeSource = nullptr;
+    }
+    if (m_handshakeFd >= 0) {
+        close(m_handshakeFd);
+        m_handshakeFd = -1;
+    }
+}
+
+// Shared claim block for the async first-contact handshake (see the header). Full definition here so the
+// worker lambda and the completion path share one type; the shared_ptr member's dtor is emitted in this TU.
+struct COpenXRManager::SHandshakeClaim {
+    std::mutex                            mu;
+    CXRSession*                           sess       = nullptr; // owned by the winner (main on completion, worker on abandon)
+    bool                                  done       = false;   // worker finished createInstance + getSystem
+    bool                                  abandoned  = false;   // main abandoned; worker deletes sess + clears the guard
+    bool                                  instanceOk = false;
+    bool                                  systemOk   = false;
+    std::chrono::steady_clock::time_point started;              // for the slow-handshake WARN threshold
+};
+
+void COpenXRManager::beginHandshake(CXRSession* sess) {
+    // Main thread. start()'s guard confirmed m_handshakeInFlight clear.
+    auto claim         = std::make_shared<SHandshakeClaim>();
+    claim->sess        = sess;
+    claim->started     = std::chrono::steady_clock::now();
+    m_pendingHandshake = claim;
+    m_handshakeInFlight.store(true, std::memory_order_release);
+
+    std::atomic<bool>* inflight = &m_handshakeInFlight; // stable: the manager is a session-lifetime singleton
+    const int          fd       = m_handshakeFd;
+    std::thread([sess, claim, inflight, fd]() {
+        // The two blocking FIRST-CONTACT calls. WiVRn's client lib may spawn+fail a monado child over
+        // several seconds here (no-headset case); all of it is off the main thread now.
+        const bool                  iok = sess->createInstance();
+        const bool                  sok = iok && sess->getSystem();
+        std::lock_guard<std::mutex> lg(claim->mu);
+        claim->instanceOk = iok;
+        claim->systemOk   = sok;
+        if (claim->abandoned) {
+            // Main handed us ownership (stop/dtor/abortStart while we were blocked). Destroy off-main
+            // (xrDestroyInstance frees a possibly-late-created instance + the socket fd) and release the
+            // guard. Touch NOTHING owned by main.
+            delete sess;
+            inflight->store(false, std::memory_order_release);
+        } else {
+            claim->done = true;
+            if (fd >= 0) {
+                const uint64_t        one = 1;
+                [[maybe_unused]] auto _   = write(fd, &one, sizeof(one)); // wake the main loop
+            }
+        }
+    }).detach();
+}
+
+void COpenXRManager::onHandshakeChannelReadable() {
+    // Main thread (wl_event_loop). Drain the counter, then run the completion if the worker finished.
+    uint64_t v;
+    while (read(m_handshakeFd, &v, sizeof(v)) == sizeof(v)) {}
+
+    if (!m_pendingHandshake)
+        return; // abandoned/consumed already; the wake was for a handshake we no longer track
+    {
+        std::lock_guard<std::mutex> lg(m_pendingHandshake->mu);
+        if (!m_pendingHandshake->done)
+            return; // spurious wake (or abandoned between the wake and here)
+    }
+    auto claim = m_pendingHandshake;
+    m_pendingHandshake.reset();
+    onHandshakeComplete(claim);
+}
+
+void COpenXRManager::abandonHandshake() {
+    // Main thread. Called from stop()/abortStart()/dtor to drop an in-flight handshake without ever
+    // blocking on it. Idempotent.
+    if (!m_pendingHandshake)
+        return;
+    auto                        claim = m_pendingHandshake;
+    m_pendingHandshake.reset();
+    std::lock_guard<std::mutex> lg(claim->mu);
+    if (claim->done) {
+        // Worker already finished (the runtime answered, so xrDestroyInstance is fast) — main owns sess.
+        delete claim->sess;
+        claim->sess = nullptr;
+        m_handshakeInFlight.store(false, std::memory_order_release);
+    } else {
+        // Worker still blocked in first-contact IPC. Hand it ownership; it deletes sess + clears the guard
+        // when it returns. Do NOT touch sess again.
+        claim->abandoned = true;
+    }
+}
+
+void COpenXRManager::onHandshakeComplete(std::shared_ptr<SHandshakeClaim> claim) {
+    // Main thread (handshake eventfd). The worker has exited its critical section; we own `sess`.
+    m_handshakeInFlight.store(false, std::memory_order_release);
+    CXRSession* sess = claim->sess;
+    claim->sess      = nullptr;
+
+    const auto elapsedMs = (int)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - claim->started).count();
+    if (elapsedMs >= OpenXR::XR_HANDSHAKE_TIMEOUT_MS)
+        Log::logger->log(Log::WARN, "[OPENXR] runtime handshake took {}ms (runtime slow to answer); the desktop stayed responsive throughout", elapsedMs);
+
+    // 1. Instance (extension checks; missing runtime / required extensions -> UNAVAILABLE). Adopt `sess`
+    //    into m_session so abortStart() tears it down on the failure paths (no helper is in flight here).
+    if (!claim->instanceOk) {
+        m_session = UP<CXRSession>(sess);
         // Live-evidence bug 1: a REACHABLE runtime that lacks the required extensions is WiVRn's
         // degraded pre-don mode (its main server listens on comp_ipc from service start and only
         // advertises the real extension set once the headset connects and the compositor server
@@ -357,7 +495,8 @@ void COpenXRManager::start() {
     }
 
     // 2. System.
-    if (hs == HANDSHAKE_FAILED_SYSTEM) {
+    if (!claim->systemOk) {
+        m_session = UP<CXRSession>(sess);
         // report-20 issue B1: FORM_FACTOR_UNAVAILABLE = runtime up, headset not connected/donned — the
         // spec-intended "poll me later" result. The re-probe then waits gently for the headset rather
         // than growing the backoff as it would for an absent runtime.
@@ -367,17 +506,27 @@ void COpenXRManager::start() {
         return;
     }
 
-    m_graphics = makeUnique<CXRGraphics>();
+    // Handshake OK: hand `sess` (still raw) to the bring-up continuation, which keeps it raw so a
+    // timed-out bring-up can transfer it to the helper for self-cleanup.
+    continueBringup(sess);
+}
+
+void COpenXRManager::continueBringup(CXRSession* sess) {
+    // Main thread. `sess` is raw-owned (not yet in m_session). Graphics is likewise kept raw until bring-up
+    // succeeds — both must be transferable to the bring-up helper on a timeout (CUniquePointer has no
+    // release()). On any SYNCHRONOUS failure below (no helper in flight) we adopt the raws into the members
+    // and reuse abortStart()'s tested teardown.
+    auto* gfx = new CXRGraphics();
 
     // report-19: latch whether this runtime+device can drive the plug gate on user presence (else the
     // `visible` mode falls back to visibility + the first-plug blip guard). Fresh session -> clear the
     // per-session presence/first-plug bookkeeping before any plug decision runs.
-    m_userPresenceSupported = m_session->m_supportsUserPresence;
+    m_userPresenceSupported = sess->m_supportsUserPresence;
     resetPresenceState();
 
     // Publish runtime/system names for `hyprctl openxr status` as soon as we have them.
-    m_runtimeName = m_session->runtimeName();
-    m_systemName  = m_session->systemName();
+    m_runtimeName = sess->runtimeName();
+    m_systemName  = sess->systemName();
 
     // Select the environment blend mode (doc 01) from openxr:blend_mode against the runtime's
     // enumerated list (getSystem filled m_blendModes in preference order). Read once at session
@@ -385,8 +534,8 @@ void COpenXRManager::start() {
     // preferred mode; an explicit mode the runtime doesn't advertise falls back with a WARN.
     {
         static auto      PBLEND = CConfigValue<std::string>("openxr:blend_mode");
-        const auto       pick   = OpenXR::pickBlendMode(m_session->m_blendModes, *PBLEND);
-        m_session->m_blendMode  = xrBlendModeToXr(pick.mode);
+        const auto       pick   = OpenXR::pickBlendMode(sess->m_blendModes, *PBLEND);
+        sess->m_blendMode       = xrBlendModeToXr(pick.mode);
         if (pick.requestedUnsupported)
             Log::logger->log(Log::WARN, "[OPENXR] openxr:blend_mode '{}' is not supported by this runtime; falling back to '{}'", *PBLEND,
                              OpenXR::blendModeToString(pick.mode));
@@ -397,8 +546,10 @@ void COpenXRManager::start() {
     // 3. EGL/GBM display + context on the right GPU.
     static auto       PGPU = CConfigValue<std::string>("openxr:gpu");
     const std::string gpu  = *PGPU;
-    if (!m_graphics->initEGL(gpu)) {
+    if (!gfx->initEGL(gpu)) {
         Log::logger->log(Log::ERR, "[OPENXR] EGL/GBM init failed, state -> unavailable");
+        m_session  = UP<CXRSession>(sess); // adopt so abortStart() tears both down (synchronous failure)
+        m_graphics = UP<CXRGraphics>(gfx);
         abortStart();
         return;
     }
@@ -413,9 +564,9 @@ void COpenXRManager::start() {
     // (best-effort: an undeterminable result proceeds with a warning rather than blocking a setup
     // that might be fine). Runs on the main thread, before the frame thread — no interop yet.
     {
-        const auto&         node = m_graphics->selectedRenderNode();
+        const auto&         node = gfx->selectedRenderNode();
         OpenXR::SRuntimeGpu rt;
-        if (m_session->m_hasVulkanEnable2) {
+        if (sess->m_hasVulkanEnable2) {
             // Run the probe on a THROWAWAY thread with a bounded wait. vkCreateInstance inside it
             // can deadlock indefinitely against the runtime's own in-process Vulkan usage (observed
             // hanging forever vs Monado's null compositor), and this must NEVER freeze the
@@ -426,8 +577,8 @@ void COpenXRManager::start() {
             auto             result  = std::make_shared<OpenXR::SRuntimeGpu>();
             auto             done    = std::make_shared<std::atomic<bool>>(false);
             auto             abandon = std::make_shared<std::atomic<bool>>(false);
-            const XrInstance inst    = m_session->m_instance;
-            const XrSystemId sys     = m_session->m_systemId;
+            const XrInstance inst    = sess->m_instance;
+            const XrSystemId sys     = sess->m_systemId;
             std::thread([result, done, abandon, inst, sys]() {
                 auto r = OpenXR::probeRuntimeRenderNode(inst, sys, abandon.get());
                 if (!abandon->load(std::memory_order_acquire))
@@ -458,6 +609,8 @@ void COpenXRManager::start() {
                              "crashes the graphics driver and would take the whole session down, so XR is refusing to start. Point openxr:gpu at the "
                              "runtime's GPU (or unset it). Desktop session unaffected.",
                              node.path, node.major, node.minor, m_runtimeName, rt.deviceName.empty() ? "another GPU" : rt.deviceName, rt.drmMajor, rt.drmMinor);
+            m_session  = UP<CXRSession>(sess); // adopt so abortStart() tears both down (synchronous refusal)
+            m_graphics = UP<CXRGraphics>(gfx);
             abortStart();
             return;
         }
@@ -471,92 +624,42 @@ void COpenXRManager::start() {
                              !node.valid ? "XR render node unknown (shared-display fallback)" : rt.note);
     }
 
-    // --- Direct-mode session-bring-up FREEZE DIAGNOSTICS (2026-07-15 incident) ------------------
-    // Steps 4-8 below each make a SYNCHRONOUS OpenXR IPC round-trip to the runtime on THIS (the main =
-    // wayland) thread. In DRM-lease direct mode that is a latent cross-process deadlock: Monado is the
-    // DRM master of the leased connector and its render/IPC servicing is coupled to that connector's
-    // vblank (see e80e03be #3 + #1). If Monado stalls answering — e.g. the leased DP-5 link is sick, as
-    // it was at 22:10:55 on the freezing cycle — this thread blocks forever and the WHOLE desktop
-    // (eDP included) freezes; recovery needs a power-cycle. e80e03be hardened the TEARDOWN/reclaim
-    // path; the STARTUP path here has no guard.
-    //
-    // The 2026-07-15 freeze could not be localized because (a) Hyprland's own hyprland.log lives on
-    // tmpfs and dies with the power-cycle, and (b) the Monado CLIENT library emits NOTHING between
-    // xrGetSystem and teardown (verified: the working 21:27 session and the fatal 22:10:57 session are
-    // byte-identical up to "Selected devices"). So these breadcrumbs and the watchdog go to STDERR —
-    // the ONLY sink that reached the journal and survived the incident. On the next hang the journal's
-    // last [XR-START] line names the exact IPC call that deadlocked, and the watchdog stamps a loud,
-    // timestamped stall marker so the freeze is self-documenting.
-    auto xrStartStep = std::make_shared<std::atomic<int>>(0);
-    auto xrStartDone = std::make_shared<std::atomic<bool>>(false);
-    std::thread([xrStartStep, xrStartDone]() {
-        static const char* const kStepName[] = {"(entered bring-up)", "xrCreateSession",       "createSpaces",
-                                                 "initBlitGL",         "chooseSwapchainFormat", "input->init"};
-        int                      nextWarnMs = 6000;
-        int                      elapsedMs  = 0;
-        while (!xrStartDone->load(std::memory_order_acquire)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            if (xrStartDone->load(std::memory_order_acquire))
-                break;
-            elapsedMs += 500;
-            if (elapsedMs >= nextWarnMs) {
-                const int s = xrStartStep->load(std::memory_order_acquire);
-                fprintf(stderr,
-                        "[XR-START-WATCHDOG] direct-mode session bring-up BLOCKED %dms at step '%s' — probable "
-                        "cross-process deadlock with Monado on the leased connector (e80e03be #3 class, startup path). "
-                        "The desktop is frozen; a power-cycle is likely needed.\n",
-                        elapsedMs, kStepName[(s >= 0 && s <= 5) ? s : 0]);
-                fflush(stderr);
-                nextWarnMs += 3000;
-            }
-        }
-    }).detach();
-    // RAII: disarm the watchdog on EVERY exit path of steps 4-8 (success or any abortStart return).
-    struct SXrStartGuard {
-        std::shared_ptr<std::atomic<bool>> done;
-        ~SXrStartGuard() { done->store(true, std::memory_order_release); }
-    } xrStartGuard{xrStartDone};
-    const auto xrBreadcrumb = [&xrStartStep](int step, const char* name) {
-        xrStartStep->store(step, std::memory_order_release);
-        fprintf(stderr, "[XR-START] entering %s\n", name);
-        fflush(stderr);
-    };
-    // --------------------------------------------------------------------------------------------
-
-    // 4. Session (XrGraphicsBindingEGLMNDX).
-    xrBreadcrumb(1, "xrCreateSession");
-    if (!m_session->createSession(*m_graphics)) {
-        abortStart();
+    // --- Direct-mode session BRING-UP (steps 4-8), task #89 phase 2 blocker A -------------------
+    // Each of xrCreateSession / createSpaces / chooseSwapchainFormat / input->init makes a SYNCHRONOUS
+    // OpenXR IPC round-trip; initBlitGL is pure GL on the XR context. In DRM-lease direct mode the IPC is
+    // a latent cross-process deadlock: Monado is the DRM master of the leased connector and its render/IPC
+    // servicing is coupled to that connector's vblank (see e80e03be #3 + #1). On 2026-07-15 a sick leased
+    // DP link stalled Monado mid-bring-up and the WHOLE desktop (eDP included) froze until a power-cycle.
+    // runBoundedBringup() now runs ALL of steps 4-8 on a HELPER thread while THIS (main) thread parks in a
+    // bounded wait (XR_BRINGUP_TIMEOUT_MS); on timeout the main thread ABANDONS the helper (which
+    // self-cleans sess/graphics off-main) and falls back to UNAVAILABLE — the desktop stays responsive.
+    // The [XR-START] step breadcrumbs (stamped by the helper) and the [XR-START-WATCHDOG] stall marker
+    // (stamped by main's park loop) still go to STDERR — the only sink that reached the journal and
+    // survived the incident — so a future stall still self-documents the exact blocked IPC call.
+    const eBringupResult br = runBoundedBringup(sess, gfx);
+    if (br == BRINGUP_TIMEOUT) {
+        // Ownership of sess + gfx (and any partially-created input) was transferred to the still-running
+        // helper — do NOT touch them. m_bringupInFlight is latched; the helper clears it on late return.
+        Log::logger->log(Log::WARN, "[OPENXR] session bring-up did not complete within {}ms — finishing it off-thread; state -> unavailable", OpenXR::XR_BRINGUP_TIMEOUT_MS);
+        m_probeWait = XR_WAIT_RUNTIME; // the runtime is present-but-unresponsive; poll it again shortly
+        markWatchActivity();           // treat as "runtime materializing": next probes at base cadence
+        m_runtimeName.clear();
+        m_systemName.clear();
+        m_runtimeGpu.clear();
+        setState(XR_STATE_UNAVAILABLE);
         return;
     }
 
-    // 5. Reference + view spaces.
-    xrBreadcrumb(2, "createSpaces");
-    if (!m_session->createSpaces(*m_graphics)) {
+    // Completed within the budget — the helper has exited and we own sess + gfx. Adopt them into the
+    // members so the finish below (and abortStart() on BRINGUP_FAILED) operates on the manager's objects.
+    m_session  = UP<CXRSession>(sess);
+    m_graphics = UP<CXRGraphics>(gfx);
+
+    if (br == BRINGUP_FAILED) {
+        // A fatal step (createSession / createSpaces / initBlitGL) returned false. Any CXRInput the helper
+        // created was already adopted into m_input by runBoundedBringup; abortStart() tears the lot down.
         abortStart();
         return;
-    }
-
-    // 6. Blit GL resources (still on the main thread, before the frame thread exists).
-    xrBreadcrumb(3, "initBlitGL");
-    if (!m_graphics->initBlitGL()) {
-        abortStart();
-        return;
-    }
-
-    // 7. Choose the swapchain format once (per-layer swapchains are created lazily in WP3).
-    xrBreadcrumb(4, "chooseSwapchainFormat");
-    m_session->chooseSwapchainFormat();
-
-    // 8. Action system (WP6): build the action set + bindings + action spaces and attach them to
-    //    the session (attach is legal only once, and must happen before the frame loop begins).
-    //    A missing interaction profile is not fatal; a genuine failure leaves input disabled but
-    //    the session running (quads still composite, device anchors just take the loss path).
-    xrBreadcrumb(5, "input->init");
-    m_input = makeUnique<CXRInput>();
-    if (!m_input->init(*m_session, m_session->m_hasHandInteraction)) {
-        Log::logger->log(Log::WARN, "[OPENXR] input action system unavailable; continuing without XR input");
-        m_input.reset();
     }
 
     // 9. Bind any layers whose monitor still exists (created while disabled — doc 02), then
@@ -573,9 +676,9 @@ void COpenXRManager::start() {
     if (m_input)
         m_input->setEmitter([this](XRQueueItem item) { enqueue(std::move(item)); });
 
-    // All synchronous main-thread OpenXR IPC is done; the frame thread takes over the IPC from here.
-    // Stamp the journal so the next hang's last [XR-START] line unambiguously means "blocked in the
-    // named step" rather than "raced past it". (Disarms the watchdog too, via the RAII guard on return.)
+    // All bring-up OpenXR IPC is done (it ran on the bring-up helper; the main thread only parked). Stamp
+    // the journal so the next hang's last [XR-START] line unambiguously means "blocked in the named step"
+    // rather than "raced past it". The frame thread now owns all subsequent runtime IPC.
     fprintf(stderr, "[XR-START] session bring-up complete; frame thread taking over\n");
     fflush(stderr);
 
@@ -633,52 +736,141 @@ void COpenXRManager::abortStart() {
     setState(XR_STATE_UNAVAILABLE);
 }
 
-COpenXRManager::eHandshakeResult COpenXRManager::runBoundedHandshake(CXRSession* sess) {
-    // Runs the two blocking first-contact calls (xrCreateInstance + xrGetSystem) on a detached helper
-    // thread and waits at most XR_HANDSHAKE_TIMEOUT_MS. The shared claim block decides EXACTLY ONCE, under
-    // a mutex, who owns `sess`: the main thread (helper finished in time) or the helper thread (main timed
-    // out -> ownership transferred, helper deletes it + clears the concurrency guard when it returns).
-    struct SClaim {
-        std::mutex mu;
-        bool       threadDone = false; // helper finished within the wait; main still owns sess
-        bool       abandoned  = false; // main timed out; helper now owns + deletes sess + clears inflight
-        bool       instanceOk = false;
-        bool       systemOk    = false;
+COpenXRManager::eBringupResult COpenXRManager::runBoundedBringup(CXRSession* sess, CXRGraphics* gfx) {
+    // Task #89 phase 2 blocker A. Runs steps 4-8 on a detached helper while the MAIN thread parks in a
+    // bounded busy-wait (XR_BRINGUP_TIMEOUT_MS) — the runBoundedHandshake idiom. The shared claim decides
+    // EXACTLY ONCE, under its mutex, who owns sess + gfx (+ any created input): the main thread (helper
+    // finished in time -> BRINGUP_OK/FAILED, main adopts) or the helper (main timed out -> ownership
+    // transferred; the helper tears everything down off-main in doc-01 order and clears m_bringupInFlight).
+    //
+    // Threading safety. (1) SP refcounts: sess/gfx are RAW (not CUniquePointer, which has no release()),
+    // and no hyprutils SP/WP refcount op happens on the helper — ownership genuinely transfers on abandon.
+    // (2) EGL: while main parks it does ZERO EGL/GL and never touches sess/gfx, so the helper owns the XR
+    // EGL context uninterrupted (createSession/createSpaces bind then unbind it; initBlitGL uses
+    // CScopedGLContext which restores the prior — here empty — binding). The context is unbound again
+    // before the helper returns, so the frame thread can claim it, and the main thread's own renderer EGL
+    // binding is never disturbed (the helper only ever touches its OWN thread's binding). (3) STRING
+    // config: none is read on the helper — CXRInput::init/suggestBindings/createActionSpaces are pure XR
+    // IPC; all string tuning was pre-parsed to atomics on the main thread in start().
+    struct SBringupClaim {
+        std::mutex       mu;
+        CXRSession*      session   = nullptr;
+        CXRGraphics*     graphics  = nullptr;
+        CXRInput*        input     = nullptr; // created by the helper; adopted by main on success
+        std::atomic<int> step{0};             // last-entered step index, for the watchdog breadcrumb
+        bool             done      = false;
+        bool             ok        = false;
+        bool             abandoned = false;
     };
-    auto              claim    = std::make_shared<SClaim>();
-    std::atomic<bool>* inflight = &m_handshakeInFlight; // stable: the manager is a process-lifetime singleton
+    auto               claim    = std::make_shared<SBringupClaim>();
+    claim->session              = sess;
+    claim->graphics             = gfx;
+    std::atomic<bool>* inflight = &m_bringupInFlight; // stable: the manager is a session-lifetime singleton
 
-    std::thread([sess, claim, inflight]() {
-        const bool iok = sess->createInstance();
-        const bool sok = iok && sess->getSystem();
+    std::thread([claim, inflight]() {
+        auto*      s     = claim->session;
+        auto*      g     = claim->graphics;
+        const auto crumb = [&](int idx, const char* name) {
+            claim->step.store(idx, std::memory_order_release);
+            fprintf(stderr, "[XR-START] entering %s\n", name); // survives a power-cycle in the journal
+            fflush(stderr);
+        };
+
+        // Steps 4-7 (fatal on failure). 4 = xrCreateSession (IPC + binds the EGL context to the runtime),
+        // 5 = reference/view spaces (IPC), 6 = blit GL resources (pure GL on the XR context), 7 = swapchain
+        // format (IPC). initBlitGL runs here (not on main) so the whole leg is a SINGLE bounded park.
+        crumb(1, "xrCreateSession");
+        bool ok = s->createSession(*g);
+        if (ok) {
+            crumb(2, "createSpaces");
+            ok = s->createSpaces(*g);
+        }
+        if (ok) {
+            crumb(3, "initBlitGL");
+            ok = g->initBlitGL();
+        }
+        if (ok) {
+            crumb(4, "chooseSwapchainFormat");
+            s->chooseSwapchainFormat();
+        }
+
+        // Step 8 (WP6 action system): NON-fatal — a session with no input still composites quads.
+        CXRInput* in = nullptr;
+        if (ok) {
+            crumb(5, "input->init");
+            in = new CXRInput();
+            if (!in->init(*s, s->m_hasHandInteraction)) {
+                Log::logger->log(Log::WARN, "[OPENXR] input action system unavailable; continuing without XR input");
+                in->destroy();
+                delete in;
+                in = nullptr;
+            }
+        }
+
         std::lock_guard<std::mutex> lg(claim->mu);
-        claim->instanceOk = iok;
-        claim->systemOk   = sok;
+        claim->input = in;
+        claim->ok    = ok;
         if (claim->abandoned) {
-            // Main gave us ownership on timeout. Destroy off the main thread (xrDestroyInstance frees a
-            // possibly-late-created instance + the socket fd), then release the concurrency guard.
-            delete sess;
+            // Main timed out and handed us ownership of session + graphics (+ any input). Tear down in the
+            // doc-01 order (GL -> input/XR handles -> EGL) off the main thread, then release the guard.
+            // Touch NOTHING owned by main. These teardown IPC calls are bounded by monado's client-side
+            // timeout (phase 1); we do NOT retry into the dead connection.
+            if (in) {
+                in->destroy();
+                delete in;
+            }
+            g->destroyGL();
+            s->destroy();
+            g->destroyEGL();
+            delete g;
+            delete s;
             inflight->store(false, std::memory_order_release);
         } else
-            claim->threadDone = true;
+            claim->done = true;
     }).detach();
 
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(OpenXR::XR_HANDSHAKE_TIMEOUT_MS);
+    const auto deadline   = std::chrono::steady_clock::now() + std::chrono::milliseconds(OpenXR::XR_BRINGUP_TIMEOUT_MS);
+    const auto started    = std::chrono::steady_clock::now();
+    int        nextWarnMs = 6000;
     for (;;) {
         {
             std::lock_guard<std::mutex> lg(claim->mu);
-            if (claim->threadDone)
-                return !claim->instanceOk ? HANDSHAKE_FAILED_INSTANCE : (!claim->systemOk ? HANDSHAKE_FAILED_SYSTEM : HANDSHAKE_OK);
+            if (claim->done) {
+                if (claim->input)
+                    m_input = UP<CXRInput>(claim->input); // adopt the action system (may be null = input disabled)
+                return claim->ok ? BRINGUP_OK : BRINGUP_FAILED;
+            }
         }
-        if (std::chrono::steady_clock::now() >= deadline) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
             std::lock_guard<std::mutex> lg(claim->mu);
-            if (claim->threadDone) // finished right at the boundary — reclaim ownership
-                return !claim->instanceOk ? HANDSHAKE_FAILED_INSTANCE : (!claim->systemOk ? HANDSHAKE_FAILED_SYSTEM : HANDSHAKE_OK);
-            // Transfer ownership of `sess` to the helper thread and latch the guard so no second
-            // handshake starts until the helper returns and clears it.
+            if (claim->done) { // finished right at the boundary — reclaim ownership
+                if (claim->input)
+                    m_input = UP<CXRInput>(claim->input);
+                return claim->ok ? BRINGUP_OK : BRINGUP_FAILED;
+            }
+            // Transfer ownership of session + graphics (+ any partial input) to the helper and latch the
+            // guard so no reprobe starts a second attempt until the helper self-cleans and clears it.
             claim->abandoned = true;
-            m_handshakeInFlight.store(true, std::memory_order_release);
-            return HANDSHAKE_TIMEOUT;
+            m_bringupInFlight.store(true, std::memory_order_release);
+            return BRINGUP_TIMEOUT;
+        }
+        // Watchdog: stamp the journal if the (bounded) park runs unusually long, naming the step the helper
+        // is stuck on. Main WILL abandon at the deadline, so — unlike before phase 2 — the desktop no longer
+        // freezes here; this marker is now purely a diagnostic breadcrumb for a slow/wedged runtime.
+        const int elapsedMs = (int)std::chrono::duration_cast<std::chrono::milliseconds>(now - started).count();
+        if (elapsedMs >= nextWarnMs) {
+            static const char* const kStepName[] = {"(entered bring-up)", "xrCreateSession",       "createSpaces",
+                                                     "initBlitGL",         "chooseSwapchainFormat", "input->init"};
+            const int                st          = claim->step.load(std::memory_order_acquire);
+            fprintf(stderr,
+                    "[XR-START-WATCHDOG] direct-mode session bring-up BLOCKED %dms at step '%s' — probable cross-process "
+                    "deadlock with the runtime on the leased connector (e80e03be #3 class, startup path). It runs on a helper "
+                    "thread; the main thread's bounded wait abandons it at %dms and falls back to UNAVAILABLE, so the desktop "
+                    "stays responsive.\n",
+                    elapsedMs, kStepName[(st >= 0 && st <= 5) ? st : 0], OpenXR::XR_BRINGUP_TIMEOUT_MS);
+            fflush(stderr);
+            nextWarnMs += 3000;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
@@ -687,6 +879,13 @@ COpenXRManager::eHandshakeResult COpenXRManager::runBoundedHandshake(CXRSession*
 void COpenXRManager::stop() {
     if (m_state == XR_STATE_DISABLED)
         return;
+
+    // A first-contact handshake may still be in flight if stop() lands during STARTING (e.g. a `hyprctl
+    // openxr stop` or an openxr:enabled=0 reload while the async handshake is running). Abandon it here so
+    // its late completion cannot resurrect a session we are tearing down. `sess` was never adopted into
+    // m_session while in flight, so nothing below double-frees it. An abandoned bring-up helper (if any)
+    // owns its own sess/graphics and self-cleans — m_session/m_graphics are already null in that case.
+    abandonHandshake();
 
     // Whether stop was ultimately triggered by instance loss decides the final state.
     const bool lost = m_session && m_session->m_instanceLost;
