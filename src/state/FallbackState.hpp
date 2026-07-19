@@ -21,6 +21,9 @@ namespace State {
       private:
         void                initSignals();
         void                initOutput();
+        // Tear down m_fallbackOutput's aquamarine output, deferring the free past any framecb still
+        // queued on the backend idle list (aquamarine headless-output lifetime bug — see the .cpp).
+        void                destroyFallbackOutputDeferred();
 
         void                setFallbackActive(bool enabled);
 
