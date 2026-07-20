@@ -125,7 +125,7 @@ detect_monitor() {
     [[ -n $json ]] || return 1
     if have_jq; then
         name="$(printf '%s' "$json" | jq -r '
-            [ .[] | select((.description // "") | test("Air 2 Ultra|Nreal|XREAL|MRG"; "i")) ] | (.[0].name // empty)')"
+            [ .[] | select((.description // "") | test("Air 2 Ultra|Nreal|XREAL|MRG"; "i")) ] | (.[0].name // empty)' 2>/dev/null)" || name=""
     else
         # jq-less fallback: pair up "name"/"description" and match. Best-effort.
         name="$(printf '%s' "$json" | tr ',' '\n' | grep -iE '"(name|description)"' \
@@ -193,15 +193,21 @@ render_node_for_connector() {
     return 1
 }
 
-# Width Hyprland currently reports for a monitor (0 if absent).
+# Width Hyprland currently reports for a monitor (0 if absent). Never fails: hyprctl can return
+# non-JSON (an error string, or truncated output while the connector is mid-renegotiation right
+# after a mode switch) and a raw jq parse error under set -e would abort the whole script — which
+# once killed a flat teardown at the harmless final verification step. Treat any parse failure as
+# "width unknown" (0).
 monitor_width() {
-    local mon="$1" json
+    local mon="$1" json w
     json="$(hyprctl -j monitors all 2>/dev/null || hyprctl -j monitors 2>/dev/null || true)"
     if have_jq; then
-        printf '%s' "$json" | jq -r --arg m "$mon" 'first(.[] | select(.name==$m) | .width) // 0'
+        w="$(printf '%s' "$json" | jq -r --arg m "$mon" 'first(.[] | select(.name==$m) | .width) // 0' 2>/dev/null)" || w=0
     else
-        printf '%s' "$json" | tr ',' '\n' | grep -A2 "\"name\": *\"$mon\"" | grep -oE '"width": *[0-9]+' | head -n1 | grep -oE '[0-9]+' || echo 0
+        w="$(printf '%s' "$json" | tr ',' '\n' | grep -A2 "\"name\": *\"$mon\"" | grep -oE '"width": *[0-9]+' | head -n1 | grep -oE '[0-9]+')" || w=0
     fi
+    [[ $w =~ ^[0-9]+$ ]] || w=0
+    echo "$w"
 }
 
 # Is the glasses' DP connector physically present ("connected") at the kernel DRM layer?
