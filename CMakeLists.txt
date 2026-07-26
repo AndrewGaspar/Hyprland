@@ -181,6 +181,15 @@ pkg_check_modules(hyprgraphics_dep REQUIRED IMPORTED_TARGET hyprgraphics>=${HYPR
 # symbol's signature changed, so the vendored headers stay ABI-compatible with the
 # system-linked libhyprutils.so -- nothing extra is compiled or linked. Mirrors the
 # wayland-protocols frozen-mirror fallback.
+#
+# NOTE (hyprutils 0.14.0): 41fb809 landed in the 0.14.0 release, so the dataPointer
+# probe below PASSES on 0.14 and the shadow does NOT engage -- pure system headers
+# are used. Keep the block for frozen mirrors still on 0.13.1. Be aware that 0.14
+# is not merely 0.13.1+41fb809: CWeakPointer::lock() gained a hard
+# HYPRUTILS_ASSERT_MSG(impl_->lockable()) (std::terminate) where 0.13.1 silently
+# returned an empty CSharedPointer, so a lock() over a CUniquePointer-owned object
+# is now an abort rather than a no-op. The vendored 0.13.1 tree still has the old
+# permissive behaviour, i.e. it would MASK such bugs -- do not rely on it.
 set(HYPRUTILS_MEMFIX_HEADER "${CMAKE_SYSROOT}/usr/include/hyprutils/memory/ImplBase.hpp")
 if(NOT EXISTS "${HYPRUTILS_MEMFIX_HEADER}")
   # non-standard prefix: ask pkg-config where the headers live
