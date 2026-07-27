@@ -300,7 +300,15 @@ required). The cases, by file:
 
 **Idle, teardown, overlay** (`idle.cpp`, `teardown.cpp`, `overlay.cpp`)
 - `xr_idle_inhibit` — with `inhibit_idle` on and a focused session, an idle client is not idled;
-  turning it off lets idle fire; restoring resumes on the next XR input.
+  turning it off lets idle fire; restoring resumes on the next XR input. Uses the **legacy boolean**
+  spellings on purpose, so it doubles as the migration regression test (`1` → `focused`, `0` → `off`).
+- `xr_idle_inhibit_modes` — the `off | focused | present` mode surface (research/20 phase 2):
+  `idleInhibitMode` in status resolves each spelling (including legacy `1`/`true` → `focused` and an
+  unrecognized value → the `present` default), and `present` on the harness' presence-less runtime
+  falls back to the `focused` predicate end-to-end (holds the bit while focused, releases on `off`).
+  **Coverage limit:** the null/remote driver cannot script don/doff, so every presence-*supported*
+  row (worn-but-not-focused inhibits, doff releases despite WiVRn's sticky presence, absent before
+  the first event) is gtest-only — `tests/xr/idle_inhibit.cpp`.
 - `xr_disable_teardown` — `hyprctl openxr disable`/`enable` round-trips through the full state
   machine without crashing and restores the declared monitors.
 - `xr_overlay_composition` — **opt-in**, gated on `$HYPRTESTER_HYPXRPAPER` (a path to a

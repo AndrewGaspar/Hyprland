@@ -130,6 +130,54 @@ namespace OpenXR {
     //   standby bug. The first-plug settle (xrDeferFirstPlug) still guards the create-time blip.
     bool wantXRMonitorsPlugged(eXRMonitorFollowMode mode, bool sessionUp, bool sessionVisible, bool presenceSupported, bool presenceKnown, bool userPresent);
 
+    // ---- idle-inhibit policy (research/20 phase 2) ----
+
+    // openxr:inhibit_idle mode. Governs WHEN a live XR session raises the compositor's
+    // ext-idle-notify inhibit bit (hypridle & co stop counting down).
+    enum eXRIdleInhibitMode : uint8_t {
+        XR_INHIBIT_OFF = 0,  // never inhibit from XR. Legacy 0/false/no.
+        XR_INHIBIT_FOCUSED,  // inhibit while the session is FOCUSED — the pre-research/20 behavior,
+                             // and what an explicit legacy `inhibit_idle = true` still means.
+        XR_INHIBIT_PRESENT,  // inhibit while the headset is actually WORN (default). See
+                             // wantXRIdleInhibit for the exact signal fold + the no-presence fallback.
+    };
+
+    // Parse the openxr:inhibit_idle config string. Accepts the new "off"|"focused"|"present"
+    // spellings AND the legacy boolean spellings for config compat:
+    //   0/false/no/off/none                  -> OFF
+    //   1/true/yes/focused/focus             -> FOCUSED  (an existing `inhibit_idle = true` keeps its
+    //                                                     exact old meaning — no silent widening)
+    //   present/worn/presence/user_presence  -> PRESENT
+    // Anything unrecognized (including empty) -> PRESENT (the default). Case/whitespace-insensitive. Pure.
+    eXRIdleInhibitMode parseIdleInhibitMode(const std::string& v);
+
+    // "off" | "focused" | "present" — the config/IPC string form (surfaced in `hyprctl openxr status`).
+    std::string        idleInhibitModeToString(eXRIdleInhibitMode mode);
+
+    // Idle-inhibit predicate (research/20 §5 option D, phase 2). Pure and unconditional so
+    // hyprland_gtests can exercise it (tests/xr/idle_inhibit.cpp) — the monado null/remote driver the
+    // hyprtester suite runs against cannot script don/doff, so this truth table IS the presence coverage.
+    //   OFF     => false.
+    //   FOCUSED => sessionFocused (VISIBLE alone deliberately does not inhibit — the old semantics).
+    //   PRESENT => a live session AND the headset is worn:
+    //     * no session                      -> false.
+    //     * runtime WITHOUT XR_EXT_user_presence (null runtime, XREAL over direct Monado, remote
+    //       drivers) -> fall back to FOCUSED semantics exactly. There is no wear signal to gate on and
+    //       "session exists" would pin the inhibit on forever.
+    //     * runtime WITH presence -> require the CONJUNCTION of BOTH real signals, exactly like the
+    //       plug gate (wantXRMonitorsPlugged): sessionVisible AND presenceKnown AND userPresent.
+    //       Presence alone is NOT sufficient: WiVRn's user_presence STICKS 'present' while the headset
+    //       sits doffed in standby (the empirically-established fact behind report-20 issue D), so a
+    //       presence-only gate would hold the desktop awake forever on a doffed headset — reinstating,
+    //       on the Wayland side, precisely the bug phase 1 fixes on the logind side. Requiring
+    //       visibility too means a doff releases the inhibit even when presence is stuck; requiring
+    //       presence too means the session-create visibility sprint (WiVRn reaches VISIBLE within ~40ms
+    //       even doffed) does not raise it. Before the first presence event we read as ABSENT.
+    //   Note PRESENT is strictly WIDER than FOCUSED in the worn case: it also covers worn-but-not-focused
+    //   (runtime dashboard in front, overlay mode with another app focused) — the hole research/20 §5.D
+    //   set out to close.
+    bool wantXRIdleInhibit(eXRIdleInhibitMode mode, bool sessionUp, bool sessionVisible, bool sessionFocused, bool presenceSupported, bool presenceKnown, bool userPresent);
+
     // First-plug settle guard (report-20 issue D). Whether a would-be plug must be DEFERRED because it
     // is the first plug of the session and visibility has not yet been sustained past the session-start
     // blip window. Applies to the visibility side REGARDLESS of presence support: at session creation a

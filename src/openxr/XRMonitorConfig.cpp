@@ -367,6 +367,50 @@ bool OpenXR::wantXRMonitorsPlugged(eXRMonitorFollowMode mode, bool sessionUp, bo
     return true;                             // no presence ext: visibility alone is the signal
 }
 
+OpenXR::eXRIdleInhibitMode OpenXR::parseIdleInhibitMode(const std::string& v) {
+    // Same normalization as parseMonitorFollowMode: lower-case, strip whitespace.
+    std::string s;
+    s.reserve(v.size());
+    for (const unsigned char c : v)
+        if (!std::isspace(c))
+            s += (char)std::tolower(c);
+
+    if (s == "off" || s == "0" || s == "false" || s == "no" || s == "none")
+        return XR_INHIBIT_OFF;
+    // Legacy `inhibit_idle = true/1` maps to FOCUSED, NOT to the new default: an existing config that
+    // explicitly opted in keeps byte-for-byte the behavior it opted into (doc 05 §7). Only configs
+    // that never mention inhibit_idle at all get the widened `present` default.
+    if (s == "1" || s == "true" || s == "yes" || s == "focused" || s == "focus" || s == "on")
+        return XR_INHIBIT_FOCUSED;
+    if (s == "present" || s == "worn" || s == "presence" || s == "user_presence")
+        return XR_INHIBIT_PRESENT;
+    return XR_INHIBIT_PRESENT; // default (research/20 phase 2)
+}
+
+std::string OpenXR::idleInhibitModeToString(eXRIdleInhibitMode mode) {
+    switch (mode) {
+        case XR_INHIBIT_OFF: return "off";
+        case XR_INHIBIT_FOCUSED: return "focused";
+        case XR_INHIBIT_PRESENT: return "present";
+    }
+    return "present";
+}
+
+bool OpenXR::wantXRIdleInhibit(eXRIdleInhibitMode mode, bool sessionUp, bool sessionVisible, bool sessionFocused, bool presenceSupported, bool presenceKnown, bool userPresent) {
+    // research/20 §5 option D (phase 2). See the header for the full contract + why PRESENT requires
+    // BOTH visibility and presence on a presence-capable runtime (WiVRn's presence sticks in standby).
+    switch (mode) {
+        case XR_INHIBIT_OFF: return false;
+        case XR_INHIBIT_FOCUSED: return sessionFocused;
+        case XR_INHIBIT_PRESENT: break;
+    }
+    if (!sessionUp)
+        return false; // no session -> nothing to inhibit for
+    if (!presenceSupported)
+        return sessionFocused; // no wear signal at all -> exactly the FOCUSED semantics
+    return sessionVisible && presenceKnown && userPresent;
+}
+
 bool OpenXR::xrDeferFirstPlug(bool everPlugged, int64_t visibleSustainedMs, int64_t blipMs) {
     // First-plug settle guard (report-20 issue D): the FIRST plug of a session must wait until
     // visibility has been continuously sustained past the session-create blip window, so a runtime
