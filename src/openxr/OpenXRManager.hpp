@@ -88,10 +88,15 @@ class COpenXRManager {
     // openxr:overlay request — false when no session exists or the runtime lacked the extension.
     bool               isOverlay() const;
 
-    // Idle-inhibit predicate (doc 05 §6.1). Main thread only. True iff openxr:inhibit_idle is
-    // set AND the session currently has input focus (FOCUSED). CInputManager::recheckIdleInhibitorStatus()
-    // is the sole writer of the inhibit bit; it consults this before its final setInhibit(false).
-    bool               shouldInhibitIdle();
+    // Idle-inhibit predicate (doc 05 §6.1 + research/20 phase 2). MAIN THREAD ONLY — it reads the
+    // STRING config value openxr:inhibit_idle, which must never happen off-main.
+    // CInputManager::recheckIdleInhibitorStatus() is the sole writer of the inhibit bit; it consults
+    // this before its final setInhibit(false). See OpenXR::wantXRIdleInhibit for the mode contract.
+    bool                       shouldInhibitIdle();
+    // The parsed openxr:inhibit_idle mode, and its "off"|"focused"|"present" string form for
+    // `hyprctl openxr status`. Main thread only (string config read), same as shouldInhibitIdle().
+    OpenXR::eXRIdleInhibitMode idleInhibitMode();
+    std::string                idleInhibitModeName();
 
     // Monitor create/destroy funnel (main thread). createXRMonitor works in EVERY manager
     // state (including DISABLED) so monitors created without a session become plain headless
