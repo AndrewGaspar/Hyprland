@@ -194,11 +194,27 @@ std::array<COpenXRManager::SXRHandInputInfo, 2> COpenXRManager::handInputInfos()
     return out;
 }
 
+OpenXR::eXRIdleInhibitMode COpenXRManager::idleInhibitMode() {
+    // MAIN THREAD ONLY — CConfigValue<std::string> off the main thread is a session-killer (the
+    // hyprlang value store is not thread-safe and a string read races config reloads). Every caller
+    // of this and of shouldInhibitIdle() is main-thread: CInputManager::recheckIdleInhibitorStatus(),
+    // the hyprctl status handler, and the config-reload/keyword hooks.
+    static auto PINHIBIT = CConfigValue<std::string>("openxr:inhibit_idle");
+    return OpenXR::parseIdleInhibitMode(*PINHIBIT);
+}
+
 bool COpenXRManager::shouldInhibitIdle() {
-    // doc 05 §6.1. FOCUSED (and only FOCUSED) inhibits: the headset is on and this session has
-    // input focus. VISIBLE (e.g. runtime dashboard in front) intentionally does not inhibit.
-    static auto PINHIBIT = CConfigValue<Hyprlang::INT>("openxr:inhibit_idle");
-    return *PINHIBIT && m_state == XR_STATE_RUNNING_FOCUSED;
+    // doc 05 §6.1 + research/20 phase 2. `off` never inhibits; `focused` is the historical predicate
+    // (FOCUSED only — VISIBLE, e.g. a runtime dashboard in front, deliberately does not inhibit);
+    // `present` (default) gates on the real worn signal when the runtime exposes XR_EXT_user_presence
+    // and falls back to the `focused` predicate when it does not. Pure policy lives in
+    // OpenXR::wantXRIdleInhibit (gtested); this only supplies the live facts. Main thread only.
+    return OpenXR::wantXRIdleInhibit(idleInhibitMode(), sessionExists(), sessionVisible(), m_state == XR_STATE_RUNNING_FOCUSED, m_userPresenceSupported, m_presenceKnown,
+                                     m_userPresent);
+}
+
+std::string COpenXRManager::idleInhibitModeName() {
+    return OpenXR::idleInhibitModeToString(idleInhibitMode());
 }
 
 void COpenXRManager::setState(eXRManagerState newState) {
@@ -1054,6 +1070,16 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
             m_userPresent   = e.a != 0;
             Log::logger->log(Log::DEBUG, "[OPENXR] user {} — re-evaluating monitor plug state", m_userPresent ? "present (donned)" : "absent (doffed)");
             updateMonitorsPlugged(/*allowGrace=*/true);
+            // research/20 phase 2: presence is now an INPUT to shouldInhibitIdle() under
+            // openxr:inhibit_idle = present, so the don/doff edge must re-fold the Wayland
+            // idle-inhibit bit. Without this the bit would only move on session-state transitions,
+            // and a doff that does not change the session state would leave the desktop pinned awake.
+            // Unlike the plug gate there is NO grace here on purpose: releasing the inhibit does not
+            // fire a pending idle event (CIdleNotifyProtocol::setInhibit(false) restarts the FULL
+            // timeout — research/20 §3.4), so a doff already buys the listener's whole countdown and
+            // a re-don inside it silently cancels.
+            if (g_pInputManager)
+                g_pInputManager->recheckIdleInhibitorStatus();
             break;
         case eXRStateEventType::LAYER_REMOVED:
             // Removal barrier step 3: the frame thread released a layer's resources and acked.

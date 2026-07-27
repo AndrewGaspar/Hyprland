@@ -59,7 +59,7 @@ Every variable, grouped by area. The "applies" column notes when a change takes 
 | `blend_mode` | string | `auto` | Environment blend mode: `auto` (runtime's preferred) / `opaque` (monitors over a black void) / `alpha` (**passthrough** — monitors over your real room, on runtimes that support it, e.g. WiVRn on Quest 3) / `additive` (optical see-through). An explicit mode the runtime doesn't advertise falls back to the preferred one with a warning. | start |
 | `overlay` | bool | `false` | Run as an `XR_EXTX_overlay` session so monitors composite **on top of another VR app** (a game, or `hypxrpaper`) instead of owning the view. Needs a runtime with the extension — Monado and WiVRn have it; SteamVR-Linux does not (downgrades to a normal exclusive session with a warning). See §8. | start |
 | `overlay_z` | int | `1` | Overlay stacking order (`sessionLayersPlacement`); higher composites later / on top. The primary app is always beneath. Only meaningful with `overlay = true`. | start |
-| `inhibit_idle` | bool | `true` | Inhibit idle (hypridle etc.) while the session is `focused` (§7). | hot |
+| `inhibit_idle` | string | `present` | **When** a live session inhibits idle (hypridle etc.) — `off` \| `focused` \| `present` (§7). `focused` = the session has input focus (the pre-research/20 behavior). `present` = the headset is actually **worn**, which also covers worn-but-not-focused (runtime dashboard in front, overlay mode). Legacy values still parse: `0`/`false` → `off`, `1`/`true` → **`focused`** (an existing explicit opt-in keeps its exact old meaning). | hot |
 | `floor_offset` | float (m) | `1.5` | Fallback eye height, used only when the runtime lacks `XR_EXT_local_floor`. | start |
 
 ### Monitors & plug lifecycle
@@ -489,6 +489,7 @@ JSON (`hyprctl -j openxr`) — all keys always present:
     "reprobePendingMs": -1,
     "reprobeWatching": false,
     "inhibitingIdle": true,
+    "idleInhibitMode": "present",
     "input": {
         "left":  { "kind": "controllers", "gesture": "grasp", "filtered": false },
         "right": { "kind": "hands",       "gesture": "pinch", "filtered": true  }
@@ -542,8 +543,12 @@ Field notes:
   (`openxr:reprobe_watch`, `$XDG_RUNTIME_DIR` resolvable). When `true`, a socket/pid trigger
   (`monado_comp_ipc`, `wivrn/comp_ipc`, `monado.pid`, `wivrn.pid` created or rewritten) fires a
   probe within ~150ms and `reprobePendingMs` is only the fallback timer.
-- `inhibitingIdle` — whether XR currently raises the idle-inhibit bit (mirrors
-  `openxr:inhibit_idle && state == focused`).
+- `inhibitingIdle` — whether XR currently raises the idle-inhibit bit **right now** (the live
+  fold of `idleInhibitMode` with `state` / `visible` / `userPresence`; text form:
+  `idle inhibited: yes (mode present)`).
+- `idleInhibitMode` — the resolved `openxr:inhibit_idle` mode (`off` | `focused` | `present`),
+  after legacy-boolean normalization. Together with `visible` and `userPresence` this makes
+  "why is it (not) inhibiting" answerable from one status call.
 - `input.left` / `input.right` — each hand's active device (`controllers` or `hands`), the
   grab gesture, and whether the 1-euro carry filter applies to it.
 - Per monitor: `id` (Hyprland monitor ID, `-1` if unmapped), `plugged` (backing output
@@ -601,13 +606,64 @@ socat -U - "UNIX-CONNECT:$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.soc
 
 ## 7. Idle integration
 
-Nothing to configure for the default behavior: `openxr:inhibit_idle = true` raises the
-compositor's normal idle-inhibit bit while the session is `focused` (headset on, this session
-has input focus — `visible` alone, e.g. a runtime dashboard in front, deliberately does not
-inhibit). hypridle obeys inhibitors by default via `ext-idle-notify-v1`, so screens don't
-blank and the lock doesn't kick in while you're in the headset. Using XR controllers also
-resets idle timers exactly like a physical mouse, because the ray pointer injects through the
-normal input-device path.
+Nothing to configure for the default behavior: `openxr:inhibit_idle = present` raises the
+compositor's normal idle-inhibit bit while the headset is **actually being worn**. hypridle
+obeys inhibitors by default via `ext-idle-notify-v1`, so screens don't blank and the lock
+doesn't kick in while you're in the headset. Using XR controllers also resets idle timers
+exactly like a physical mouse, because the ray pointer injects through the normal input-device
+path.
+
+### 7.1 Modes
+
+`openxr:inhibit_idle` takes a **mode**, not a boolean (research/20 phase 2):
+
+| Value | Inhibits while… |
+|---|---|
+| `off` | never. XR never raises the bit (window rules and the Wayland idle-inhibit protocol still do). |
+| `focused` | a session exists **and** it has input focus (`state == focused`). This is the historical behavior: `visible` alone — a runtime dashboard in front, an overlay session with another app focused — deliberately does **not** inhibit. |
+| `present` (default) | the headset is **worn**. On a runtime that exposes `XR_EXT_user_presence` (WiVRn does) this means `visible` **and** `userPresence == yes`; on a runtime that does not (stock Monado on an XREAL rig, null/remote drivers) it falls back to exactly the `focused` predicate. |
+
+Why `present` requires **both** visibility and presence: WiVRn's `user_presence` *sticks* at
+`yes` while the headset sits doffed in standby (the same finding that shaped the
+`monitors_follow_session = visible` plug gate). Presence alone would therefore pin the desktop
+awake forever on a doffed headset. Visibility is the reliable doff signal; presence is what
+keeps the session-create visibility sprint (WiVRn hits `visible` within ~40 ms, even doffed)
+from raising the bit. Both must agree. Read them straight off `hyprctl openxr status`:
+
+```
+$ hyprctl openxr status | grep -E 'state|visible|presence|idle'
+state: focused
+visible: yes
+presence: yes
+idle inhibited: yes (mode present)
+```
+
+`present` is strictly **wider** than `focused` in the worn case: it closes the gap where you
+are wearing the headset reading a runtime dashboard (or running in `overlay` mode under a VR
+app) and the desktop quietly counts down to a lock behind you.
+
+**Legacy configs.** The variable used to be a bool. Old values still parse, and `true` maps to
+`focused`, *not* to the new default — an existing explicit `inhibit_idle = true` keeps exactly
+the behavior it opted into:
+
+| Old value | Now means |
+|---|---|
+| `0`, `false`, `no`, `off`, `none` | `off` |
+| `1`, `true`, `yes`, `on` | `focused` |
+| anything unrecognized / unset | `present` |
+
+Only a config that never mentioned `inhibit_idle` picks up the widened default. `hyprctl
+keyword openxr:inhibit_idle <mode>` applies live (it triggers an idle recheck), and so does a
+don/doff edge — the presence event re-folds the bit directly.
+
+**Interaction with WiVRn's own inhibitor.** `wivrn-server` holds a logind
+`Inhibit("sleep:idle", …, "block")` for the whole TCP-connected lifetime of a session, and
+hypridle honours that regardless of what the compositor does — so while an unpatched WiVRn is
+connected, this setting has no observable effect at all (the desktop never idles, donned or
+doffed). See `docs/openxr/research/20-wivrn-idle-inhibit.md`: the server-side half (phase 1)
+splits that inhibitor and wear-gates only its `idle` component; `inhibit_idle = present` is the
+compositor-side belt-and-braces half, and also the *only* protection on rigs with no WiVRn at
+all (XREAL over direct Monado).
 
 Want the opposite, or extra behavior? Script off the events:
 

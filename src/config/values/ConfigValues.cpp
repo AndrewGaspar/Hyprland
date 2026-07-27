@@ -891,7 +891,13 @@ std::vector<SP<IValue>> Values::getConfigValues() {
                   "aim min-cutoff multiplier while a press/pinch is RAMPING UP (below the trigger threshold): lower = more smoothing so committing a click/grab doesn't yank the "
                   "aim off-target on the commit frame (the documented Meta behavior). 1 disables onset damping",
                   0.4, {.min = 0.0, .max = 1.0}),
-        MS<Bool>("openxr:inhibit_idle", "inhibit idle (hypridle etc.) while the XR session is focused", true),
+        MS<String>("openxr:inhibit_idle",
+                   "when a live XR session inhibits idle (hypridle etc.). off = never; focused = while the session has input focus (the pre-research/20 behavior — a runtime "
+                   "dashboard in front does NOT inhibit); present (default) = while the headset is actually WORN, which also covers worn-but-not-focused (runtime dashboard, "
+                   "overlay mode). present needs XR_EXT_user_presence: with a presence-capable runtime it requires the session VISIBLE and the user present (both, because "
+                   "WiVRn's presence sticks 'present' in standby), and with a runtime that has no presence signal it falls back to focused. Legacy 0/false => off, 1/true => "
+                   "focused (an explicit opt-in keeps its old meaning)",
+                   "present"),
         MS<String>("openxr:monitors_follow_session",
                    "when XR-created virtual monitors behave like UNPLUGGED external monitors (held disabled — workspaces evacuate to the remaining monitors exactly like a "
                    "physical unplug, then return by name when re-plugged). off = never (the old always-present behavior); session = while no OpenXR session exists; visible "
