@@ -526,8 +526,9 @@ bind = SUPER ALT, h,        xrmonitor, anchor active head
 No extra code drives idle activity. Every listener installed by `CPointerManager::attachPointer` —
 motion, motionAbsolute, button, axis — calls `PROTO::idle->onActivity()` after dispatching, and
 `CXRPointerDevice` is attached through that exact path, so XR pointer input resets idle timers for
-free, identically to a physical mouse. Idle **inhibition** while the session is FOCUSED
-(`openxr:inhibit_idle`) is a separate mechanism owned by the configuration page.
+free, identically to a physical mouse. Idle **inhibition** while the headset is worn or the session
+is FOCUSED (`openxr:inhibit_idle = off | focused | present`) is a separate mechanism owned by the
+configuration page (doc 05 §7).
 
 ## 13. Constants
 

@@ -46,10 +46,12 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     // no queryable surface for "is the compositor's idle-inhibit bit currently raised because of
     // XR" — CIdleNotifyProtocol::isInhibited is private with no getter, and it's a fold of every
     // inhibitor source, not XR-specific anyway. This mirrors shouldInhibitIdle()'s own predicate
-    // (openxr:inhibit_idle && FOCUSED) rather than adding a new getter to IdleNotify.hpp, keeping
-    // the touched surface to this one file (WP12 test infra needs it to assert idle-inhibit
-    // end-to-end without polling wall-clock idle timers).
+    // rather than adding a new getter to IdleNotify.hpp, keeping the touched surface to this one file
+    // (WP12 test infra needs it to assert idle-inhibit end-to-end without polling wall-clock idle
+    // timers). research/20 phase 2: report the resolved MODE alongside, so "why is it not inhibiting"
+    // is answerable in one command (mode + visible + presence are now all on the same status page).
     const bool         INHIBITING_IDLE = g_pOpenXRManager->shouldInhibitIdle();
+    const std::string  INHIBIT_MODE    = g_pOpenXRManager->idleInhibitModeName();
 
     // research/16 Part A/B: conditional hand-input gate + gaze grab state.
     const auto        HANDIN = g_pOpenXRManager->handInputStatus();
@@ -121,6 +123,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "reprobePendingMs": {},
     "reprobeWatching": {},
     "inhibitingIdle": {},
+    "idleInhibitMode": "{}",
     "handInput": {{ "mode": "{}", "state": "{}" }},
     "gaze": {{ "source": "{}", "hoveredMonitor": {}, "hoveredName": "{}", "carrying": {}, "carryMonitor": "{}", "distM": {:.3f} }},
     "input": {{
@@ -130,7 +133,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "monitors": [{}{}]
 }}
 )#",
-                           STATE, RUNTIME, SYSTEM, RTGPU, RTJSON, BLEND, OVERLAY ? "true" : "false", SELECTED, FOLLOW, UNPLUG_PEND, PRESENCE, VISIBLE, REPROBE_WAIT, REPROBE_MS, REPROBE_WATCH ? "true" : "false", INHIBITING_IDLE ? "true" : "false",
+                           STATE, RUNTIME, SYSTEM, RTGPU, RTJSON, BLEND, OVERLAY ? "true" : "false", SELECTED, FOLLOW, UNPLUG_PEND, PRESENCE, VISIBLE, REPROBE_WAIT, REPROBE_MS, REPROBE_WATCH ? "true" : "false", INHIBITING_IDLE ? "true" : "false", INHIBIT_MODE,
                            HANDIN.mode, HANDIN.state, GAZE.source, GAZE.hoveredMonitor, GAZE.hoveredName, GAZE.carrying ? "true" : "false", GAZE.carryMonitor, GAZE.dist,
                            HANDS[0].hands ? "hands" : "controllers", HANDS[0].gesture,
                            HANDS[0].filtered ? "true" : "false", HANDS[1].hands ? "hands" : "controllers", HANDS[1].gesture, HANDS[1].filtered ? "true" : "false",
@@ -147,10 +150,10 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
                                                 : (GAZE.hoveredMonitor >= 0 ? std::format("looking at {}", GAZE.hoveredName) : "idle");
     std::string       out = std::format(
         "state: {}\nruntime: {}\nsystem: {}\nruntime gpu: {}\nruntime json: {}\nblend mode: {}\noverlay: {}\nselected: {}\nmonitors follow session: {}\nvisible: {}\npresence: {}\nidle "
-        "inhibited: {}\nhand input: {} "
+        "inhibited: {} (mode {})\nhand input: {} "
         "({})\ngaze ({}): {}\ninput: left {}, right {}\n",
         STATELINE, RUNTIME, SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, RTJSON.empty() ? "(loader default)" : RTJSON, BLEND, OVERLAY ? "yes" : "no", SELECTED.empty() ? "(none)" : SELECTED, FOLLOWLINE, VISIBLE, PRESENCE,
-        INHIBITING_IDLE ? "yes" : "no", HANDIN.state, HANDIN.mode, GAZE.source, GAZELINE, handLabel(HANDS[0]), handLabel(HANDS[1]));
+        INHIBITING_IDLE ? "yes" : "no", INHIBIT_MODE, HANDIN.state, HANDIN.mode, GAZE.source, GAZELINE, handLabel(HANDS[0]), handLabel(HANDS[1]));
     for (const auto& m : MONS) {
         out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} ({}) hovered: {} ({}) plugged: {} content: {}{}", m.name,
                            m.id, m.w, m.h, m.refresh, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.grabbed ? "yes" : "no", m.grabKind, m.hovered ? "yes" : "no", m.region,

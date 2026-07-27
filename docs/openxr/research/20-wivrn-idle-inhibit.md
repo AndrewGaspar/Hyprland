@@ -1,6 +1,16 @@
 # Research: idle/sleep-inhibition policy for WiVRn sessions
 
-**Status:** research / decision-support. **Nothing implemented.** This memo maps the design
+**Status:** research / decision-support. **Phase 2 (§7, the compositor half of option D) is now
+implemented** — `openxr:inhibit_idle` is a `off | focused | present` mode, default `present`
+(`src/openxr/XRMonitorConfig.cpp` `parseIdleInhibitMode`/`wantXRIdleInhibit`, wired through
+`COpenXRManager::shouldInhibitIdle()` and the `USER_PRESENCE` recheck; docs 05 §7;
+`tests/xr/idle_inhibit.cpp` + hyprtester `xr_idle_inhibit_modes`). One deliberate refinement over
+§5.D's sketch: `present` requires session **visibility** as well as `userPresent` on a
+presence-capable runtime, because WiVRn's presence sticks at `present` in standby (the issue-D
+finding baked into `wantXRMonitorsPlugged`) — a presence-only gate would have pinned the desktop
+awake on a doffed headset, i.e. reinstated the very bug phase 1 fixes. **Phase 1 (the WiVRn-side
+A′/C patch) is still unimplemented**, and until it lands phase 2 has no observable effect while a
+WiVRn session is connected. This memo maps the design
 space for *when a headset session should stop the desktop from dimming, locking and
 suspending*, and recommends a policy. It follows the house style of
 `docs/openxr/research/`: honest pro/con per approach, a behaviour matrix, upstreamability and
