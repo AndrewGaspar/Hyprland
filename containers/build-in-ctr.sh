@@ -53,8 +53,16 @@ cmake -S "$SRC" -B "$BUILD" -G Ninja \
     -DCMAKE_C_COMPILER_LAUNCHER=ccache \
     -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
-echo "==> Building targets: Hyprland hyprtester"
-cmake --build "$BUILD" --target Hyprland hyprtester -j"$JOBS"
+# hyprtester spawns small Wayland helper CLIENTS (hyprtester/CMakeLists.txt `clientNew()`) as
+# separate executables out of the same build dir; nothing links them into `hyprtester`, so a
+# --target list that omits them leaves them missing. Tests that need one then SKIP — and a skip
+# counts as a PASS in this harness, so the suite stays green while silently losing coverage
+# (xr_idle_inhibit / xr_idle_inhibit_modes need `idle-notify`, xr_plugged_* need `pointer-scroll`).
+# Build them explicitly.
+HYPRTESTER_CLIENTS=(pointer-warp surface-scale-transform pointer-scroll child-window xdg-interactive shortcut-inhibitor keyboard-modifiers idle-notify)
+
+echo "==> Building targets: Hyprland hyprtester ${HYPRTESTER_CLIENTS[*]}"
+cmake --build "$BUILD" --target Hyprland hyprtester "${HYPRTESTER_CLIENTS[@]}" -j"$JOBS"
 
 echo "==> Building vendored Monado into $BUILD/monado (redirected out of read-only source)"
 MONADO_BUILD="$BUILD/monado" EIGEN_BUILD="$BUILD/eigen" bash "$SRC/scripts/build-monado.sh"
