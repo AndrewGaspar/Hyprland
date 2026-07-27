@@ -198,6 +198,17 @@ with it (no `IDR frame dropped` lines in the current session).
 #644/#652/#653) means losing a *non-reference* P no longer forces a full IDR reset. Already in our
 tree.
 
+**ERRATUM (2026-07-27, lever-A implementation follow-up).** The paragraph above is wrong in one
+load-bearing place: WiVRn **does** enable intra-refresh — `video_encoder_nvenc.cpp` sets
+`intraRefreshPeriod = 100, intraRefreshCnt = 50` for all three codecs (upstream `62543863`). That
+is a rolling refresh wave at a **50% duty cycle, forever**, and A/B measurement during the lever-A
+work showed it accounts for **~97% of the steady-state cost of a static frame** (static desktop,
+min-qp 18: 3.32 Mbit/s with the wave vs 0.10 Mbit/s without). Its purpose is error resilience,
+which `tcp-only` largely obviates. Raising `intraRefreshPeriod` (100 → several hundred) is a
+one-line change and plausibly a **larger lever than A** — filed as its own investigation (robustness
+trade-off: recovery latency after a genuinely corrupted stream on UDP transports must be evaluated
+before touching the default).
+
 ### 1.4 Three encoders, and how the budget is split
 
 `server/driver/configuration.h:67` — `std::array<encoder, 3> encoders; // left, right, alpha`.
