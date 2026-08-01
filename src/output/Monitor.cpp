@@ -421,7 +421,9 @@ void CMonitor::onDisconnect(bool destroy) {
     // Cleanup everything. Move windows back, snap cursor, shit.
     PHLMONITOR BACKUPMON = nullptr;
     for (auto const& m : State::monitorState()->monitors()) {
-        if (m.get() != this) {
+        // never evacuate onto a monitor that can't show anything either — a soft disconnect
+        // (monitor=...,disable, or the XR plug/unplug applicator) leaves the CMonitor alive.
+        if (m.get() != this && m->m_enabled) {
             BACKUPMON = m;
             break;
         }
@@ -477,6 +479,15 @@ void CMonitor::onDisconnect(bool destroy) {
     if (m_activeWorkspace)
         m_activeWorkspace->setVisible(false);
     m_activeWorkspace.reset();
+
+    // A monitor that is going away must not keep claiming a special workspace. Workspace evacuation
+    // (State::Workspace::monitorDisconnected above) never clears it when there is no backup monitor —
+    // and setSpecialWorkspace() would then skip its `m_activeSpecialWorkspace == pWorkspace` early-out
+    // and walk the hide path on a monitor whose m_activeWorkspace has already been reset to nullptr.
+    if (m_activeSpecialWorkspace)
+        m_activeSpecialWorkspace->setVisible(false);
+    m_activeSpecialWorkspace.reset();
+    setSpecialWorkspaceVisualState(false);
 
     if (m_output) {
         m_output->state->resetExplicitFences();
@@ -1495,7 +1506,8 @@ void CMonitor::setSpecialWorkspace(const PHLWORKSPACE& pWorkspace, bool noFocus)
 
         if (!(noFocus && Desktop::focusState()->monitor() != m_self) &&
             !(Desktop::focusState()->window() && (Desktop::focusState()->window()->m_state & WINDOW_STATE_PINNED) && Desktop::focusState()->window()->m_monitor == m_self)) {
-            if (const auto PLAST = m_activeWorkspace->getLastFocusedWindow(); PLAST)
+            // m_activeWorkspace is legitimately null on a disconnected/disabled monitor.
+            if (const auto PLAST = m_activeWorkspace ? m_activeWorkspace->getLastFocusedWindow() : PHLWINDOW{}; PLAST)
                 Desktop::focusState()->fullWindowFocus(PLAST, Desktop::FOCUS_REASON_TOGGLE_SPECIAL_WORKSPACE);
             else
                 g_pInputManager->refocus();
