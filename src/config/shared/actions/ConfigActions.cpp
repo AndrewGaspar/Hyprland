@@ -948,9 +948,18 @@ ActionResult Actions::changeWorkspace(PHLWORKSPACE ws) {
         return {};
     }
 
-    const auto PMONITORWORKSPACEOWNER = PMONITOR == ws->m_monitor ? PMONITOR : ws->m_monitor.lock();
+    auto PMONITORWORKSPACEOWNER = PMONITOR == ws->m_monitor ? PMONITOR : ws->m_monitor.lock();
     if (!PMONITORWORKSPACEOWNER)
         return actionError("Workspace has no monitor", eActionErrorLevel::WARNING, eActionErrorCode::INVALID_STATE);
+
+    // The owner may be a monitor that was soft-disconnected while it was the only one around (no
+    // backup to evacuate to), leaving this workspace welded to an output that can never show it.
+    // Adopt it onto the focused monitor instead of focusing a disabled monitor.
+    if (!PMONITORWORKSPACEOWNER->m_enabled) {
+        Log::logger->log(Log::DEBUG, "changeWorkspace: workspace {} is stranded on disabled monitor {}, adopting onto {}", ws->m_id, PMONITORWORKSPACEOWNER->m_name, PMONITOR->m_name);
+        State::workspacePlacementController()->moveWorkspaceToMonitor(ws, PMONITOR);
+        PMONITORWORKSPACEOWNER = PMONITOR;
+    }
 
     updateRelativeCursorCoords();
 

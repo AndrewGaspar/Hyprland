@@ -338,10 +338,21 @@ void CMonitor::onConnect(bool noRule) {
             continue;
 
         const auto CURRENTMON = ws->m_monitor.lock();
-        const bool ORPHANED   = !CURRENTMON || std::ranges::none_of(State::monitorState()->monitors(), [&](const auto& mon) { return mon == CURRENTMON; });
-        const bool RETURNING  = ws->m_lastMonitor == m_name;
-        const bool RECOVERY   = ORPHANED &&
-            std::ranges::count_if(State::monitorState()->monitors(), [](const auto& mon) { return !mon->m_isUnsafeFallback; }) == 1; // temporarily recover orphaned workspaces
+        // A *disabled* owner counts as orphaned too. A soft disconnect (monitor=...,disable, or the
+        // XR plug/unplug applicator) keeps the CMonitor object alive while dropping it from
+        // monitors(), so ws->m_monitor.lock() still resolves — to a monitor that can never show the
+        // workspace again. Without this the workspace stays welded to a dead output forever.
+        const bool ORPHANED = !CURRENTMON || !CURRENTMON->m_enabled ||
+            std::ranges::none_of(State::monitorState()->monitors(), [&](const auto& mon) { return mon == CURRENTMON; });
+        const bool RETURNING = ws->m_lastMonitor == m_name;
+        // temporarily recover orphaned workspaces when there is at most one *other* real monitor.
+        // NOTE the `mon.get() != this` and the `<= 1`: monitor.added — which is what registers us in
+        // monitors() — is emitted *after* onConnect returns, so the old `count_if(...) == 1` read 0
+        // whenever we were the first real monitor coming back, i.e. exactly the case it needed to
+        // catch (last monitor soft-disconnected -> fallback -> real monitor returns). This is a
+        // strict widening of the old predicate by the zero case.
+        const bool RECOVERY = ORPHANED &&
+            std::ranges::count_if(State::monitorState()->monitors(), [this](const auto& mon) { return !mon->m_isUnsafeFallback && mon.get() != this; }) <= 1;
 
         if (RETURNING || RECOVERY) {
             State::workspacePlacementController()->moveWorkspaceToMonitor(ws, m_self.lock());
@@ -434,7 +445,9 @@ void CMonitor::onDisconnect(bool destroy) {
     // Cleanup everything. Move windows back, snap cursor, shit.
     PHLMONITOR BACKUPMON = nullptr;
     for (auto const& m : State::monitorState()->monitors()) {
-        if (m.get() != this) {
+        // never evacuate onto a monitor that can't show anything either — a soft disconnect
+        // (monitor=...,disable, or the XR plug/unplug applicator) leaves the CMonitor alive.
+        if (m.get() != this && m->m_enabled) {
             BACKUPMON = m;
             break;
         }
@@ -505,6 +518,15 @@ void CMonitor::onDisconnect(bool destroy) {
     if (m_activeWorkspace)
         m_activeWorkspace->m_visible = false;
     m_activeWorkspace.reset();
+
+    // A monitor that is going away must not keep claiming a special workspace. If BACKUPMON was
+    // null the evacuation loop above never ran, so nothing cleared it — and setSpecialWorkspace()
+    // would then skip its `m_activeSpecialWorkspace == pWorkspace` early-out and walk the hide path
+    // on a monitor whose m_activeWorkspace has already been reset to nullptr.
+    if (m_activeSpecialWorkspace)
+        m_activeSpecialWorkspace->m_visible = false;
+    m_activeSpecialWorkspace.reset();
+    setSpecialWorkspaceVisualState(false);
 
     if (m_output) {
         m_output->state->resetExplicitFences();
@@ -1601,7 +1623,8 @@ void CMonitor::setSpecialWorkspace(const PHLWORKSPACE& pWorkspace) {
         g_layoutManager->recalculateMonitor(m_self.lock(), Layout::CLayoutManager::RECALCULATE_MONITOR_REASON_TOGGLE_SPECIAL_WORKSPACE);
 
         if (!(Desktop::focusState()->window() && Desktop::focusState()->window()->m_pinned && Desktop::focusState()->window()->m_monitor == m_self)) {
-            if (const auto PLAST = m_activeWorkspace->getLastFocusedWindow(); PLAST)
+            // m_activeWorkspace is legitimately null on a disconnected/disabled monitor.
+            if (const auto PLAST = m_activeWorkspace ? m_activeWorkspace->getLastFocusedWindow() : PHLWINDOW{}; PLAST)
                 Desktop::focusState()->fullWindowFocus(PLAST, Desktop::FOCUS_REASON_TOGGLE_SPECIAL_WORKSPACE);
             else
                 g_pInputManager->refocus();
