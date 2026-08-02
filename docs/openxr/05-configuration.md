@@ -143,6 +143,52 @@ you walk away, and re-docks when you return — see the anchoring doc. All hot-l
 | `chrome_col_hover` | color | `0xcc66aaff` | Chrome color for the element (bar or corner) the ray points at. |
 | `chrome_col_grab` | color | `0xff66aaff` | Chrome color while the quad is grabbed. |
 
+### Luma-keyed transparency ("black-as-alpha")
+
+Turns the dark parts of your desktop see-through, so a monitor reads as an **AR overlay** on your
+real room instead of an opaque panel: each content pixel's alpha is derived from its own Rec.709
+luma, so black dissolves while text and windows stay solid. Both variables are hot — tune them
+in-headset with `hyprctl keyword` and the monitors re-blit immediately.
+
+| Variable | Type | Default | Meaning | Applies |
+|---|---|---|---|---|
+| `black_alpha` | float | `1.0` | Alpha given to **pure black** content pixels. `1.0` = feature **off** (every pixel opaque, exactly the historic behavior); `0.0` = black is fully transparent; in between = translucent black. Brighter pixels are untouched (see `black_alpha_knee`). | hot |
+| `black_alpha_knee` | float | `0.10` | The luma at which content becomes **fully opaque**. Pure black gets `black_alpha`, luma ≥ this is left alone, `smoothstep` ramp between. Lower = only near-black dissolves; higher = dark greys go see-through too. | hot |
+
+The curve is `alpha = mix(black_alpha, 1.0, smoothstep(0.0, black_alpha_knee, luma))`, and the
+result is written **premultiplied** (rgb is scaled by the same alpha) because XR quads composite
+premultiplied — this is what keeps a transparent monitor from glowing additively over passthrough.
+
+**Blend-mode gating (read this first).** Transparency only *reveals* something when the runtime
+composites our layers over something other than a black void, i.e. `blend_mode = alpha`
+(passthrough) or `additive`. Under `blend_mode = opaque` — including WiVRn's usual auto-picked mode
+— the runtime paints black behind the layers, so keying would only make monitors look dim and
+dirty. It is therefore **force-disabled under `opaque`**, with one warning in the log, and
+`hyprctl openxr status` says so:
+
+```
+blend mode: opaque
+black alpha: off — 0.20 ignored under blend mode opaque
+```
+
+To actually use it: set `openxr:blend_mode = alpha` and restart the session
+(`hyprctl openxr disable && hyprctl openxr enable`) — `blend_mode` is read once at session start.
+
+Caveats:
+
+- **Dark themes lose contrast.** A `#1a1a1a` terminal background sits near the default knee, so
+  most dark themes will go partly see-through and text contrast drops against a bright room. Lower
+  `black_alpha_knee` (e.g. `0.04`) to dissolve only near-black, or raise `black_alpha` (e.g. `0.5`)
+  to keep a dimming scrim behind the text.
+- **Text fringes.** Antialiased glyph edges are dark-grey pixels blended toward the background, so
+  they land on the ramp and become partly transparent — thin text over passthrough can look thinner
+  or haloed. A low knee keeps the fringe pixels opaque; subpixel/heavier fonts help.
+- **Chrome is never keyed.** The move-bar and corner handles are drawn into the transparent margin
+  at their configured `chrome_col_*` alpha, so a fully-dissolved monitor still has grabbable chrome.
+- Any content that is *actually* black loses its ability to occlude: video letterboxing, a black
+  wallpaper or a not-yet-painted monitor become windows onto the room. That is the feature working.
+- **Global, not per-monitor**, in this version.
+
 ### Ray aim assist (cursor, magnetism, sticky hover, aim filter)
 
 See [`04-input.md` §6.1](04-input.md). All hot (read per-frame).
@@ -450,6 +496,7 @@ system: Simulated HMD
 runtime gpu: AMD Radeon Graphics (drm 226:128)
 runtime json: (loader default)
 blend mode: opaque
+black alpha: off
 overlay: no
 selected: XR-code
 monitors follow session: visible
@@ -479,6 +526,7 @@ JSON (`hyprctl -j openxr`) — all keys always present:
     "runtimeGpu": "AMD Radeon Graphics (drm 226:128)",
     "runtimeJson": "",
     "blendMode": "opaque",
+    "blackAlpha": { "configured": 1.000, "effective": 1.000, "knee": 0.100, "active": false, "gatedOff": false },
     "overlay": false,
     "selected": "XR-code",
     "monitorsFollowSession": "visible",
@@ -521,6 +569,12 @@ Field notes:
 - `runtimeGpu` — the GPU the runtime composites on, resolved by the cross-GPU probe (see the
   session/graphics doc); empty when undeterminable (text form shows `unknown`).
 - `blendMode` — the active environment blend mode (`opaque` when there is no session).
+- `blackAlpha` — the luma-keyed transparency state: `configured` is `openxr:black_alpha` as set,
+  `effective` is what the blit is actually applying (forced to `1.0` unless the blend mode shows
+  through), `knee` is `openxr:black_alpha_knee`, `active` means the key is really keying, and
+  `gatedOff` means a value < 1 is being ignored because the blend mode is `opaque`. The text form
+  collapses this to one `black alpha:` line — `0.20 (knee 0.10)`, `off`, or
+  `off — 0.20 ignored under blend mode opaque`.
 - `overlay` — the **actual** session type, not the config request: `false` with no session, or
   when an overlay request was downgraded to exclusive.
 - `selected` — the concrete monitor an `active`/omitted target resolves to right now (explicit

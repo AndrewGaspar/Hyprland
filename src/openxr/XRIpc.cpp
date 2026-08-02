@@ -23,6 +23,10 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     const std::string RTJSON  = g_pOpenXRManager->runtimeJson();
     const std::string BLEND   = g_pOpenXRManager->blendModeName();
     const bool        OVERLAY = g_pOpenXRManager->isOverlay();
+    // report 09: luma-keyed transparency ("black-as-alpha"). Reports the CONFIGURED value, the
+    // EFFECTIVE one (forced off unless the blend mode composites over passthrough/additive) and the
+    // knee, so "why is my desktop still opaque" is answerable in one command.
+    const auto        BLACK   = g_pOpenXRManager->blackAlphaStatus();
     const auto        MONS    = g_pOpenXRManager->monitorInfos();
     // report-18 addendum: the plugged-state follow mode and, when the headset has just been
     // doffed under `visible` mode, the ms remaining before the anti-flap grace-unplug fires (-1
@@ -113,6 +117,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "runtimeGpu": "{}",
     "runtimeJson": "{}",
     "blendMode": "{}",
+    "blackAlpha": {{ "configured": {:.3f}, "effective": {:.3f}, "knee": {:.3f}, "active": {}, "gatedOff": {} }},
     "overlay": {},
     "selected": "{}",
     "monitorsFollowSession": "{}",
@@ -133,7 +138,8 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "monitors": [{}{}]
 }}
 )#",
-                           STATE, RUNTIME, SYSTEM, RTGPU, RTJSON, BLEND, OVERLAY ? "true" : "false", SELECTED, FOLLOW, UNPLUG_PEND, PRESENCE, VISIBLE, REPROBE_WAIT, REPROBE_MS, REPROBE_WATCH ? "true" : "false", INHIBITING_IDLE ? "true" : "false", INHIBIT_MODE,
+                           STATE, RUNTIME, SYSTEM, RTGPU, RTJSON, BLEND, BLACK.configured, BLACK.effective, BLACK.knee, BLACK.active ? "true" : "false",
+                           BLACK.gatedOff ? "true" : "false", OVERLAY ? "true" : "false", SELECTED, FOLLOW, UNPLUG_PEND, PRESENCE, VISIBLE, REPROBE_WAIT, REPROBE_MS, REPROBE_WATCH ? "true" : "false", INHIBITING_IDLE ? "true" : "false", INHIBIT_MODE,
                            HANDIN.mode, HANDIN.state, GAZE.source, GAZE.hoveredMonitor, GAZE.hoveredName, GAZE.carrying ? "true" : "false", GAZE.carryMonitor, GAZE.dist,
                            HANDS[0].hands ? "hands" : "controllers", HANDS[0].gesture,
                            HANDS[0].filtered ? "true" : "false", HANDS[1].hands ? "hands" : "controllers", HANDS[1].gesture, HANDS[1].filtered ? "true" : "false",
@@ -148,11 +154,17 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
         : std::format("{} (waiting for {}, retrying in {}ms{})", STATE, REPROBE_WAIT, REPROBE_MS < 0 ? 0 : REPROBE_MS, REPROBE_WATCH ? ", watching socket" : "");
     const std::string GAZELINE = GAZE.carrying ? std::format("carrying {} at {:.2f}m", GAZE.carryMonitor, GAZE.dist)
                                                 : (GAZE.hoveredMonitor >= 0 ? std::format("looking at {}", GAZE.hoveredName) : "idle");
+    // "black alpha: 0.20 (knee 0.10)" when the luma key is live; "off" when unconfigured; and an
+    // explicit reason when a configured value is being ignored because the blend mode is opaque.
+    const std::string BLACKLINE = BLACK.active ? std::format("{:.2f} (knee {:.2f})", BLACK.effective, BLACK.knee)
+        : BLACK.gatedOff                       ? std::format("off — {:.2f} ignored under blend mode {}", BLACK.configured, BLEND)
+                                               : "off";
     std::string       out = std::format(
-        "state: {}\nruntime: {}\nsystem: {}\nruntime gpu: {}\nruntime json: {}\nblend mode: {}\noverlay: {}\nselected: {}\nmonitors follow session: {}\nvisible: {}\npresence: {}\nidle "
+        "state: {}\nruntime: {}\nsystem: {}\nruntime gpu: {}\nruntime json: {}\nblend mode: {}\nblack alpha: {}\noverlay: {}\nselected: {}\nmonitors follow session: {}\nvisible: "
+        "{}\npresence: {}\nidle "
         "inhibited: {} (mode {})\nhand input: {} "
         "({})\ngaze ({}): {}\ninput: left {}, right {}\n",
-        STATELINE, RUNTIME, SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, RTJSON.empty() ? "(loader default)" : RTJSON, BLEND, OVERLAY ? "yes" : "no", SELECTED.empty() ? "(none)" : SELECTED, FOLLOWLINE, VISIBLE, PRESENCE,
+        STATELINE, RUNTIME, SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, RTJSON.empty() ? "(loader default)" : RTJSON, BLEND, BLACKLINE, OVERLAY ? "yes" : "no", SELECTED.empty() ? "(none)" : SELECTED, FOLLOWLINE, VISIBLE, PRESENCE,
         INHIBITING_IDLE ? "yes" : "no", INHIBIT_MODE, HANDIN.state, HANDIN.mode, GAZE.source, GAZELINE, handLabel(HANDS[0]), handLabel(HANDS[1]));
     for (const auto& m : MONS) {
         out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} ({}) hovered: {} ({}) plugged: {} content: {}{}", m.name,

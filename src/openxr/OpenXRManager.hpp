@@ -88,6 +88,19 @@ class COpenXRManager {
     // openxr:overlay request — false when no session exists or the runtime lacked the extension.
     bool               isOverlay() const;
 
+    // ---- luma-keyed transparency, "black-as-alpha" (openxr:black_alpha, report 09) ----
+    // Live state for `hyprctl openxr status`: the CONFIGURED alpha-for-black, the EFFECTIVE one the
+    // frame thread is applying (== configured while the blend mode shows through, 1.0 = off otherwise),
+    // and the luma knee. Readable from any thread (plain atomics).
+    struct SXRBlackAlpha {
+        float configured = 1.F;
+        float effective  = 1.F;
+        float knee       = 0.1F;
+        bool  active     = false; // effective < 1 -> the key is actually keying
+        bool  gatedOff   = false; // configured < 1 but the blend mode is opaque -> ignored
+    };
+    SXRBlackAlpha blackAlphaStatus() const;
+
     // Idle-inhibit predicate (doc 05 §6.1 + research/20 phase 2). MAIN THREAD ONLY — it reads the
     // STRING config value openxr:inhibit_idle, which must never happen off-main.
     // CInputManager::recheckIdleInhibitorStatus() is the sole writer of the inhibit bit; it consults
@@ -527,6 +540,27 @@ class COpenXRManager {
     std::atomic<uint8_t> m_handGrabMode{OpenXR::XR_HANDGRAB_BOTH};            // openxr:hand_grab (shipped default "both")
     std::atomic<uint8_t> m_handGrabAnyMode{OpenXR::XR_HANDGRAB_ANY_GRASP};    // openxr:hand_grab_anywhere (default "grasp")
     std::atomic<bool>    m_grabFilterScopeAll{true};                         // openxr:grab_filter_scope != "hands" (default "all")
+
+    // ---- luma-keyed transparency ("black-as-alpha", openxr:black_alpha — report 09) ----
+    // openxr:black_alpha / :black_alpha_knee are NUMERIC configs, so the frame thread could read them
+    // directly — but the EFFECTIVE value also depends on the session's environment blend mode (which
+    // lives on m_session, main-thread-owned) and must be clamped, and a value that is ignored under an
+    // opaque blend mode should say so exactly once. So they are resolved on the MAIN thread here and
+    // published as plain atomics the frame loop reads once per frame, the same publish pattern as
+    // publishAdaptiveStringTuning/publishGrabStringTuning. Refreshed from start() (both before the
+    // frame thread launches AND right after the blend mode is picked), onConfigReload(), and the
+    // legacy-keyword special-case in ConfigManager.cpp (a bare `hyprctl keyword` fires neither
+    // config.reloaded nor props_refreshed). A CHANGE also damages every XR monitor so a static desktop
+    // re-blits through the new key instead of sitting on the previously-keyed swapchain image.
+    // modeOverride: use this blend mode for the gate instead of m_session's (start() calls it with the
+    // freshly-picked mode before the session object is adopted). nullopt + no session = gate closed.
+    void               publishBlackAlphaTuning(std::optional<OpenXR::eXRBlendMode> modeOverride = std::nullopt); // main thread only
+    std::atomic<float> m_blackAlpha{1.F};         // EFFECTIVE alpha for pure black; 1.0 = feature off
+    std::atomic<float> m_blackAlphaKnee{0.1F};    // luma at which content is fully opaque
+    std::atomic<float> m_blackAlphaConfigured{1.F};
+    // Main thread only: the configured value we have already warned about being ignored under an
+    // opaque blend mode (-1 = nothing warned / re-armed), so the WARN fires once per config set.
+    float              m_blackAlphaWarnedFor = -1.F;
 
     // ---- conditional hand input (research/16 Part A) ----
     // m_handPolicy is the openxr:hand_input baseline (config + `handinput on|off|auto`); m_handForce
