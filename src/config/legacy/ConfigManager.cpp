@@ -1173,6 +1173,14 @@ std::string CConfigManager::parseKeyword(const std::string& COMMAND, const std::
     // reloaded nor props_refreshed, so re-publish explicitly here.
     if ((COMMAND == "openxr:hand_grab" || COMMAND == "openxr:hand_grab_anywhere" || COMMAND == "openxr:grab_filter_scope") && g_pOpenXRManager)
         g_pOpenXRManager->onConfigReload();
+
+    // openxr:black_alpha / :black_alpha_knee (report 09 luma key) are numeric, but their EFFECTIVE
+    // values are resolved on the main thread (clamp + blend-mode gate) in
+    // onConfigReload()->publishBlackAlphaTuning(), which also damages the XR monitors so a static
+    // desktop re-blits through the new key at once. Same legacy-keyword gap as the vars above — this
+    // is what makes `hyprctl keyword openxr:black_alpha 0.2` a live, in-headset tuning knob.
+    if (COMMAND.starts_with("openxr:black_alpha") && g_pOpenXRManager)
+        g_pOpenXRManager->onConfigReload();
 #endif
 
     // Update window border colors
