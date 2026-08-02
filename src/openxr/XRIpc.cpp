@@ -218,6 +218,17 @@ static std::string openxrGaze(eHyprCtlOutputFormat format, const std::string& ar
         "ageMs": {}
     }})#",
                                 G.requestedTimestampMs, G.matchedTimestampMs, G.ageMs);
+        // hypxrvoice GAP 4: OPTIONAL hit fields, emitted only when the gaze ray actually met the
+        // SELECTED monitor's quad. `hitPoint` is LOCAL_FLOOR meters — the exact space
+        // `openxr place <name> at x,y,z` consumes, so a voice daemon feeds it straight back with no
+        // conversion. Absent (the daemon falls back to its head-forward projection) when nothing is
+        // selected, or on a mid-dwell sample that still names a monitor the ray has already left.
+        std::string hit;
+        if (G.hitValid)
+            hit = std::format(R"#(,
+        "hitPoint": [{:.4f}, {:.4f}, {:.4f}],
+        "hitDistM": {:.4f})#",
+                              G.hitPoint.x, G.hitPoint.y, G.hitPoint.z, G.hitDist);
         return std::format(R"#({{
     "ok": true,
     "timestampMs": {},
@@ -231,12 +242,12 @@ static std::string openxrGaze(eHyprCtlOutputFormat format, const std::string& ar
         "monitorId": {},
         "name": "{}",
         "selected": {},
-        "dwellSec": {:.3f}
+        "dwellSec": {:.3f}{}
     }}{}
 }}
 )#",
                            G.timestampMs, G.viewValid ? "true" : "false", G.headPos.x, G.headPos.y, G.headPos.z, G.headRot.x, G.headRot.y, G.headRot.z, G.headRot.w, G.headForward.x,
-                           G.headForward.y, G.headForward.z, G.gazeMonitorId, G.gazeName, G.selected ? "true" : "false", G.dwell, query);
+                           G.headForward.y, G.headForward.z, G.gazeMonitorId, G.gazeName, G.selected ? "true" : "false", G.dwell, hit, query);
     }
 
     if (!G.ok)
@@ -245,6 +256,8 @@ static std::string openxrGaze(eHyprCtlOutputFormat format, const std::string& ar
                                             : "looking at passthrough (no monitor)";
     std::string       out       = std::format("gaze: {}\n  timestampMs: {}  viewValid: {}\n  head pos [{:.3f}, {:.3f}, {:.3f}]  forward [{:.3f}, {:.3f}, {:.3f}]\n", GAZELINE,
                                               G.timestampMs, G.viewValid ? "yes" : "no", G.headPos.x, G.headPos.y, G.headPos.z, G.headForward.x, G.headForward.y, G.headForward.z);
+    if (G.hitValid)
+        out += std::format("  hit [{:.3f}, {:.3f}, {:.3f}] at {:.3f}m\n", G.hitPoint.x, G.hitPoint.y, G.hitPoint.z, G.hitDist);
     if (G.matched)
         out += std::format("  query: requested {}  matched {}  age {}ms\n", G.requestedTimestampMs, G.matchedTimestampMs, G.ageMs);
     return out;

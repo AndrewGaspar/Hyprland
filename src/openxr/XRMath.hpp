@@ -407,6 +407,36 @@ namespace OpenXR {
         return s.stable;
     }
 
+    // hypxrvoice GAP 4. The reported gaze candidate is the DWELL-STABLE id, but the cheap hit the
+    // selection pass keeps is the NEAREST one (`rawId`), which differs from the stable id exactly
+    // during a dwell transition. So the hit point belonging to the REPORTED candidate has to be
+    // picked between the two intersections the pass saw this frame. stepGazeSelect() can only leave
+    // `stable` at one of two values — the pre-step stable, or (on a commit) `pending`, which IS
+    // `rawId` — so those two candidates are sufficient; no third quad ever needs re-intersecting.
+    //
+    // Pure so the pick is gtestable without a runtime (tests/xr/gaze_hit.cpp). `t` is the ray
+    // parameter (distance along a unit direction); the caller turns it into a world point.
+    struct SXRGazeHitPick {
+        bool  valid = false;
+        float t     = 0.F;
+    };
+
+    inline SXRGazeHitPick pickGazeHitT(int64_t stable, int64_t rawId, bool rawValid, float rawT, int64_t prevStable, bool prevValid, float prevT) {
+        SXRGazeHitPick out;
+        if (stable < 0)
+            return out; // looking at passthrough — nothing is selected, so nothing was hit
+        if (rawValid && stable == rawId) {
+            out.valid = true;
+            out.t     = rawT;
+            return out;
+        }
+        if (prevValid && stable == prevStable) {
+            out.valid = true;
+            out.t     = prevT;
+        }
+        return out;
+    }
+
     // ---- timestamped head-pose / gaze history ring (hypxrvoice WP-V1) ----
     //
     // A voice daemon (docs/openxr/research/VOICE-CONTROL.md) resolves deixis like "drop this
@@ -435,6 +465,15 @@ namespace OpenXR {
         int64_t gazeMonitorId = -1;    // dwell-stable gazed-at monitor id (-1 = passthrough / none)
         int64_t gazeRawId     = -1;    // instantaneous nearest-hit monitor id this frame (pre-dwell)
         float   gazeDwell     = 0.F;   // seconds accumulated toward the pending dwell switch
+        // hypxrvoice GAP 4: where the gaze ray actually MET the dwell-stable monitor's quad, in the
+        // same LOCAL_FLOOR meters `openxr place <name> at x,y,z` consumes. Plain values captured on
+        // the frame thread by the pass that already does the intersection — the main thread never
+        // recomputes it (that would mean reading live quad poses off refcounted layers). gazeHitValid
+        // is false whenever the ray is not currently ON the stable monitor: looking at passthrough,
+        // or mid-dwell while the selection still names the monitor the user has looked AWAY from.
+        bool    gazeHitValid  = false;
+        Vec3    gazeHitPoint;          // LOCAL_FLOOR meters
+        float   gazeHitDist   = 0.F;   // ray distance (meters) from the gaze origin to gazeHitPoint
     };
 
     // Fixed-capacity single-writer ring. Power-of-two capacity so the index math is a mask.
