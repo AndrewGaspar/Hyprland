@@ -3362,7 +3362,8 @@ void COpenXRManager::gazeSelectPass(const std::vector<SXRPointerTarget>& targets
     if (!viewValid) {
         m_gazeSel.reset();
         m_gazeFilter.reset();
-        m_gazeHitId = -1;
+        m_gazeHitId    = -1;
+        m_gazeHitValid = false;
         m_gazeHoveredId.store(-1, std::memory_order_release);
         publishClear(/*keepCarry=*/true);
         return;
@@ -3379,9 +3380,15 @@ void COpenXRManager::gazeSelectPass(const std::vector<SXRPointerTarget>& targets
     const float        hystTan = std::tan(std::clamp((float)*PGHYST, 0.f, 15.f) * (float)M_PI / 180.f);
 
     // Nearest-hit monitor; the currently-stable target gets extra angular slack (sticky selection).
-    int64_t  rawHit = -1;
-    float    bestT  = std::numeric_limits<float>::max();
-    Vector2D hitUV;
+    // hypxrvoice GAP 4: also keep the intersection against the PRE-STEP stable target, whatever depth
+    // it is at — stepGazeSelect() below can only leave the selection at that id or at rawHit, so
+    // those two are the complete candidate set for the hit point of the REPORTED candidate.
+    const int64_t prevStable = m_gazeSel.stable;
+    int64_t       rawHit     = -1;
+    float         bestT      = std::numeric_limits<float>::max();
+    Vector2D      hitUV;
+    bool          prevStableHit = false;
+    float         prevStableT   = 0.f;
     for (const auto& t : targets) {
         float slack = 0.f;
         if (t.id == m_gazeSel.stable && hystTan > 0.f) {
@@ -3389,7 +3396,13 @@ void COpenXRManager::gazeSelectPass(const std::vector<SXRPointerTarget>& targets
             slack         = hystTan * d;
         }
         const OpenXR::SXRQuadHit hit = OpenXR::rayQuadIntersect(t.worldPose, origin, dir, t.w, t.h, slack);
-        if (hit.hit && hit.t < bestT) {
+        if (!hit.hit)
+            continue;
+        if (t.id == prevStable) {
+            prevStableHit = true;
+            prevStableT   = hit.t;
+        }
+        if (hit.t < bestT) {
             bestT  = hit.t;
             rawHit = t.id;
             hitUV  = Vector2D{std::clamp(hit.u, 0.f, 1.f), std::clamp(hit.v, 0.f, 1.f)};
@@ -3401,6 +3414,14 @@ void COpenXRManager::gazeSelectPass(const std::vector<SXRPointerTarget>& targets
     m_gazeHitId            = rawHit;
     m_gazeHitUV           = hitUV;
     m_gazeHoveredId.store(stable, std::memory_order_release);
+
+    // The hit point that belongs to `stable`, along the SAME (1€-filtered) ray the selection used —
+    // so the reported point is exactly the surface point that chose gaze.monitorId. Plain floats;
+    // recordPoseSample copies them into the ring for the main-thread IPC to serialize.
+    const OpenXR::SXRGazeHitPick pick = OpenXR::pickGazeHitT(stable, rawHit, rawHit >= 0, bestT, prevStable, prevStableHit, prevStableT);
+    m_gazeHitValid                    = pick.valid;
+    m_gazeHitDist                     = pick.valid ? pick.t : 0.f;
+    m_gazeHitPoint                    = pick.valid ? origin + dir * pick.t : OpenXR::Vec3{};
 
     // Publish per-layer highlight + gaze cursor.
     static auto PGCUR = CConfigValue<Hyprlang::INT>("openxr:gaze_cursor");
@@ -4330,6 +4351,11 @@ void COpenXRManager::recordPoseSample(const OpenXR::SXRPose& view, bool viewVali
     s.gazeMonitorId = m_gazeHoveredId.load(std::memory_order_acquire); // dwell-stable id (frame->main atomic)
     s.gazeRawId     = m_gazeHitId;                                     // frame-thread-only, same thread
     s.gazeDwell     = m_gazeSel.dwell;                                 // frame-thread-only, same thread
+    // hypxrvoice GAP 4 — the ray/quad hit on the stable candidate, computed by gazeSelectPass this
+    // same frame on this same thread. Plain floats, so the ring stays a POD the main thread can copy.
+    s.gazeHitValid  = m_gazeHitValid;
+    s.gazeHitPoint  = m_gazeHitPoint;
+    s.gazeHitDist   = m_gazeHitDist;
 
     std::scoped_lock lock(m_poseRingMu);
     m_poseRing.push(s);
@@ -4356,6 +4382,9 @@ COpenXRManager::SXRGazeSample COpenXRManager::gazeSampleNow() {
     out.gazeMonitorId    = s.gazeMonitorId;
     out.selected         = s.gazeMonitorId >= 0;
     out.dwell            = s.gazeDwell;
+    out.hitValid         = s.gazeHitValid && out.selected;
+    out.hitPoint         = s.gazeHitPoint;
+    out.hitDist          = s.gazeHitDist;
     if (s.gazeMonitorId >= 0)
         if (auto l = layerByMonitorID((MONITORID)s.gazeMonitorId))
             out.gazeName = l->m_monitorName;
@@ -4383,6 +4412,9 @@ COpenXRManager::SXRGazeSample COpenXRManager::gazeSampleAt(int64_t requestedTime
     out.gazeMonitorId        = s.gazeMonitorId;
     out.selected             = s.gazeMonitorId >= 0;
     out.dwell                = s.gazeDwell;
+    out.hitValid             = s.gazeHitValid && out.selected;
+    out.hitPoint             = s.gazeHitPoint;
+    out.hitDist              = s.gazeHitDist;
     if (s.gazeMonitorId >= 0)
         if (auto l = layerByMonitorID((MONITORID)s.gazeMonitorId))
             out.gazeName = l->m_monitorName;

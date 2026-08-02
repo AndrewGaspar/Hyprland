@@ -285,6 +285,13 @@ class COpenXRManager {
         std::string gazeName;          // resolved name of gazeMonitorId ("" if none/gone)
         bool        selected = false;  // a dwell-stable monitor is currently gazed at
         float       dwell    = 0.F;    // seconds toward the pending dwell switch
+        // hypxrvoice GAP 4: the gaze-ray/quad intersection on the selected monitor, LOCAL_FLOOR
+        // meters — the same space `openxr place <name> at x,y,z` consumes, so a voice daemon can
+        // feed it straight back. `hitValid` implies `selected`, but not the converse: a mid-dwell
+        // sample still names the old monitor while the ray has already left its quad.
+        bool         hitValid = false;
+        OpenXR::Vec3 hitPoint;
+        float        hitDist  = 0.F;   // meters along the gaze ray to hitPoint
         // Only meaningful for gazeSampleAt(): how the query resolved against the ring.
         bool        matched          = false; // resolved via a timestamp query (vs "now")
         int64_t     requestedTimestampMs = 0;
@@ -605,6 +612,13 @@ class COpenXRManager {
     OpenXR::SXRGazeSelect  m_gazeSel;
     int64_t                m_gazeHitId = -1;
     Vector2D               m_gazeHitUV;
+    // hypxrvoice GAP 4: the ray/quad intersection that belongs to the DWELL-STABLE candidate, in
+    // LOCAL_FLOOR meters. Computed by gazeSelectPass from the intersections it already performs and
+    // copied into the pose ring by recordPoseSample (same thread, plain values). The MAIN thread must
+    // never re-derive this — it would have to read live quad poses off refcounted layers.
+    bool                   m_gazeHitValid = false;
+    OpenXR::Vec3           m_gazeHitPoint;
+    float                  m_gazeHitDist = 0.F;
     // The gaze-hover + selection + gaze-cursor pass (frame thread). Casts the (optionally filtered)
     // gaze ray over the pointer targets, advances the dwell selector, publishes m_gazeHoveredId + the
     // per-layer m_gazeSelected highlight, and packs the gaze cursor onto the carried layer. `active`
