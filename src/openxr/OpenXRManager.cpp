@@ -274,6 +274,7 @@ void COpenXRManager::start() {
     publishAdaptiveStringTuning();
     publishHandInputPolicy(); // research/16 Part A: seed the hand-input policy from openxr:hand_input
     publishGrabStringTuning(); // task #25: seed hand_grab / hand_grab_anywhere / grab_filter_scope enums
+    publishBlackAlphaTuning(); // report 09: seed the luma key (re-published below once the blend mode is picked)
 
     // Concurrency guard for the off-main handshake below. A previously-in-flight OR abandoned handshake
     // worker may still be blocked in xrCreateInstance against a wedged runtime, or an abandoned bring-up
@@ -558,6 +559,12 @@ void COpenXRManager::continueBringup(CXRSession* sess) {
         else
             Log::logger->log(Log::DEBUG, "[OPENXR] environment blend mode: {} (openxr:blend_mode = {})", OpenXR::blendModeToString(pick.mode), *PBLEND);
     }
+
+    // The luma key (openxr:black_alpha) is gated on the blend mode we just picked — re-publish now
+    // that it is known, so the first frame already carries the right value (and an ignored setting
+    // warns at session start rather than at the next reload). m_session is not adopted yet, so pass
+    // the picked mode explicitly.
+    publishBlackAlphaTuning(xrBlendModeFromXr(sess->m_blendMode));
 
     // 3. EGL/GBM display + context on the right GPU.
     static auto       PGPU = CConfigValue<std::string>("openxr:gpu");
@@ -1490,8 +1497,14 @@ void COpenXRManager::frameThread() {
 
             if (imgIdx < l->m_swapchainImages.size()) {
                 const XR_GLuint dst = l->m_swapchainImages[imgIdx];
+                // Luma key ("black-as-alpha", report 09): plain atomics resolved on the main thread by
+                // publishBlackAlphaTuning (clamped + blend-mode gated), read once here. 1.0 = off, and
+                // the blit path is then bit-identical to the old forced-opaque behavior. Global for
+                // now; the value is per-blit-call, so a per-monitor override would slot in here.
+                const float blackAlpha = m_blackAlpha.load(std::memory_order_relaxed);
+                const float blackKnee  = m_blackAlphaKnee.load(std::memory_order_relaxed);
                 if (buf) {
-                    m_graphics->blitBuffer(buf, *l, dst);
+                    m_graphics->blitBuffer(buf, *l, dst, blackAlpha, blackKnee);
                     if (!l->m_hasContent)
                         Log::logger->log(Log::DEBUG, "[OPENXR] first blit landed for XR monitor '{}' ({}x{})", l->m_monitorName, (int)l->m_swapchainSize.x,
                                          (int)l->m_swapchainSize.y);
@@ -1506,7 +1519,7 @@ void COpenXRManager::frameThread() {
                     // restore the last content into this (possibly different) image, then re-overlay.
                     m_graphics->restoreSnapshot(*l, dst);
                 } else
-                    m_graphics->clearTex(dst, l->m_swapchainSize, 0.0f, 0.0f, 0.0f);
+                    m_graphics->clearTex(dst, l->m_swapchainSize, 0.0f, 0.0f, 0.0f, blackAlpha, blackKnee);
 
                 // Chrome pass (WP-G2): draw the move-bar + corner handles into the transparent
                 // margin over the content. No-op when disabled or fully faded out; drawChrome never
@@ -3108,6 +3121,9 @@ void COpenXRManager::onConfigReload() {
     // task #25: re-parse hand_grab / hand_grab_anywhere / grab_filter_scope so a hot re-tune applies
     // live AND the frame thread never derefs the backing strings (the corrupted-heap-at-teardown crash).
     publishGrabStringTuning();
+    // report 09: re-resolve the luma key (openxr:black_alpha / :black_alpha_knee) — clamped, gated on
+    // the session blend mode, and damaging the XR monitors so a live re-tune shows up immediately.
+    publishBlackAlphaTuning();
 
     static auto PENABLED = CConfigValue<Hyprlang::INT>("openxr:enabled");
     const bool  enabled  = *PENABLED;
@@ -3193,6 +3209,66 @@ void COpenXRManager::publishAdaptiveStringTuning() {
     static auto PADROAM = CConfigValue<std::string>("openxr:adaptive_roam_mode");
     m_adEase.store(OpenXR::xrParseEase(*PADEASE), std::memory_order_relaxed);
     m_adRoamMode.store(*PADROAM == "head" ? OpenXR::XR_ANCHOR_HEAD : OpenXR::XR_ANCHOR_BODY, std::memory_order_relaxed);
+}
+
+void COpenXRManager::publishBlackAlphaTuning(std::optional<OpenXR::eXRBlendMode> modeOverride) {
+    // MAIN-THREAD ONLY. Resolve openxr:black_alpha / :black_alpha_knee (clamp + blend-mode gate) and
+    // publish them as atomics for the frame loop. See the header for why numeric values still go
+    // through a publish. Called from start() (twice: before the frame thread launches, and again once
+    // the blend mode is known — that call passes modeOverride because m_session is not adopted yet),
+    // onConfigReload(), and the keyword special-case in ConfigManager.
+    static auto PBLACK = CConfigValue<Hyprlang::FLOAT>("openxr:black_alpha");
+    static auto PKNEE  = CConfigValue<Hyprlang::FLOAT>("openxr:black_alpha_knee");
+    const float want   = std::clamp((float)*PBLACK, 0.F, 1.F);
+    const float knee   = std::clamp((float)*PKNEE, OpenXR::XR_BLACK_ALPHA_KNEE_MIN, 1.F);
+
+    // Gate: keying only REVEALS something when the runtime composites us over passthrough (alpha) or
+    // an additive display. Under opaque it would just make monitors look dim and dirty (report 09
+    // §3.1), so force it off there and say so once per config set. No session yet = nothing to key.
+    const std::optional<OpenXR::eXRBlendMode> mode =
+        modeOverride ? modeOverride : (m_session ? std::optional<OpenXR::eXRBlendMode>(xrBlendModeFromXr(m_session->m_blendMode)) : std::nullopt);
+    const bool  showsThrough = mode && OpenXR::blendModeShowsThrough(*mode);
+    const float eff          = showsThrough ? want : 1.F;
+
+    if (OpenXR::xrBlackKeyActive(want) && mode && !showsThrough) {
+        if (m_blackAlphaWarnedFor != want) {
+            m_blackAlphaWarnedFor = want;
+            Log::logger->log(Log::WARN,
+                             "[OPENXR] openxr:black_alpha = {:.2f} has no effect under blend mode '{}': luma-keyed transparency needs a see-through composite. Set "
+                             "openxr:blend_mode = alpha (passthrough) or additive and restart the session (hyprctl openxr disable && hyprctl openxr enable)",
+                             want, OpenXR::blendModeToString(*mode));
+        }
+    } else
+        m_blackAlphaWarnedFor = -1.F; // re-arm
+
+    const float prevA = m_blackAlpha.exchange(eff, std::memory_order_relaxed);
+    const float prevK = m_blackAlphaKnee.exchange(knee, std::memory_order_relaxed);
+    m_blackAlphaConfigured.store(want, std::memory_order_relaxed);
+
+    // A live re-tune must be visible immediately, even on a completely static desktop: the frame loop
+    // only re-blits a layer when a NEW buffer arrives (an animation-only frame just restores the
+    // already-keyed snapshot). Force a fresh composite per XR monitor so the new key lands now.
+    if ((prevA != eff || prevK != knee) && m_running.load(std::memory_order_acquire) && g_pHyprRenderer) {
+        std::vector<PHLMONITOR> mons;
+        {
+            std::scoped_lock lock(m_layersMu);
+            for (auto& l : m_layers)
+                if (auto mon = l->m_monitor.lock())
+                    mons.push_back(mon);
+        }
+        for (auto& mon : mons)
+            g_pHyprRenderer->damageMonitor(mon);
+    }
+}
+
+COpenXRManager::SXRBlackAlpha COpenXRManager::blackAlphaStatus() const {
+    SXRBlackAlpha s;
+    s.configured = m_blackAlphaConfigured.load(std::memory_order_relaxed);
+    s.effective  = m_blackAlpha.load(std::memory_order_relaxed);
+    s.knee       = m_blackAlphaKnee.load(std::memory_order_relaxed);
+    s.active     = OpenXR::xrBlackKeyActive(s.effective);
+    s.gatedOff   = OpenXR::xrBlackKeyActive(s.configured) && !s.active;
+    return s;
 }
 
 void COpenXRManager::publishGrabStringTuning() {

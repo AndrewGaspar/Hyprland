@@ -1283,4 +1283,57 @@ namespace OpenXR {
         ru                = quadWm > 0.F ? 0.5F * diamM * scale / quadWm : 0.F;
         rv                = quadHm > 0.F ? 0.5F * diamM * scale / quadHm : 0.F;
     }
+
+    // ---- luma-keyed transparency, a.k.a. "black-as-alpha" (openxr:black_alpha, report 09 §2.2) ----
+    //
+    // The blit normally pins content alpha to 1.0 so XRGB garbage alpha can't punch holes under
+    // ALPHA_BLEND passthrough. With black_alpha < 1 we instead DERIVE the alpha from the pixel's own
+    // Rec.709 luma: pure black gets `blackAlpha`, anything at or above `knee` stays fully opaque, with
+    // a smoothstep ramp between — so a dark desktop reads as an AR overlay (the room shows through the
+    // black, the pixels stay solid).
+    //
+    // KEEP IN SYNC with the GLSL in CXRGraphics::initBlitGL — this is the host-side reference the
+    // gtests exercise (tests/xr/black_alpha.cpp); the shader must compute the identical curve.
+
+    inline constexpr float XR_BLACK_ALPHA_KNEE_MIN = 0.001F; // avoid a divide-by-zero / infinite step
+
+    // The alpha to write for a pixel of luma `luma`. blackAlpha >= 1 (the default) short-circuits to a
+    // fully opaque 1.0, so the feature-off path is bit-identical to the old "force alpha 1" behavior.
+    inline float xrLumaKeyAlphaFromLuma(float luma, float blackAlpha, float knee) {
+        const float ba = std::clamp(blackAlpha, 0.F, 1.F);
+        if (ba >= 1.F)
+            return 1.F;
+        const float k = std::max(knee, XR_BLACK_ALPHA_KNEE_MIN);
+        float       t = std::clamp(luma / k, 0.F, 1.F);
+        t             = t * t * (3.F - 2.F * t); // smoothstep(0, knee, luma)
+        return ba + (1.F - ba) * t;
+    }
+
+    // Rec.709 luma of a 0..1 RGB triple (the same weights the blit shader's dot() uses).
+    inline float xrRec709Luma(float r, float g, float b) {
+        return 0.2126F * r + 0.7152F * g + 0.0722F * b;
+    }
+
+    inline float xrLumaKeyAlpha(float r, float g, float b, float blackAlpha, float knee) {
+        return xrLumaKeyAlphaFromLuma(xrRec709Luma(r, g, b), blackAlpha, knee);
+    }
+
+    // Premultiplied output for a solid fill of color (r,g,b) under the key. Our quads are submitted
+    // PREMULTIPLIED (no XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT), so rgb must be scaled by the
+    // computed alpha too — scaling alpha alone leaves rgb > a and the runtime's `src=ONE,
+    // dst=ONE_MINUS_SRC_ALPHA` blend then adds the content at full brightness over passthrough (the
+    // classic additive-halo bug, report 09 §2.1).
+    inline void xrLumaKeyPremultiplied(float r, float g, float b, float blackAlpha, float knee, float& outR, float& outG, float& outB, float& outA) {
+        const float a = xrLumaKeyAlpha(r, g, b, blackAlpha, knee);
+        outR          = r * a;
+        outG          = g * a;
+        outB          = b * a;
+        outA          = a;
+    }
+
+    // Is the key doing anything at all? (Cheap frame-thread guard; also the "feature active" predicate
+    // `hyprctl openxr status` reports.)
+    inline bool xrBlackKeyActive(float blackAlpha) {
+        return blackAlpha < 1.F;
+    }
 }
