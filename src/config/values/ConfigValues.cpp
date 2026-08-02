@@ -843,6 +843,17 @@ std::vector<SP<IValue>> Values::getConfigValues() {
         MS<Color>("openxr:chrome_col_idle", "XR monitor chrome color at rest (visible while hovering the quad; premultiplied over passthrough)", 0x66aaaaaa),
         MS<Color>("openxr:chrome_col_hover", "XR monitor chrome color for the element (bar or corner) the ray is pointing at", 0xcc66aaff),
         MS<Color>("openxr:chrome_col_grab", "XR monitor chrome color while the quad is grabbed", 0xff66aaff),
+        // ---- luma-keyed transparency, "black-as-alpha" (docs/openxr/research/archive/09-monitor-transparency.md) ----
+        MS<Float>("openxr:black_alpha",
+                  "luma-keyed transparency: the alpha given to PURE BLACK content pixels, so a dark desktop turns into an AR-style overlay you can see the room through. 1.0 "
+                  "(default) = feature off, every pixel stays opaque; 0.0 = black is fully transparent; in between = translucent black. Brighter pixels stay opaque (see "
+                  "black_alpha_knee). Only has an effect when the session's environment blend mode is alpha (passthrough) or additive — under opaque the runtime paints black "
+                  "behind us, so it is force-disabled with a warning. Chrome (move-bar/handles) is never keyed",
+                  1.0, {.min = 0.0, .max = 1.0}),
+        MS<Float>("openxr:black_alpha_knee",
+                  "luma-keyed transparency: the Rec.709 luma at which content becomes FULLY opaque. Pure black gets openxr:black_alpha, luma >= this is untouched, with a "
+                  "smoothstep ramp between. Lower = only near-black dissolves (dark themes keep their contrast); higher = dark greys go see-through too",
+                  0.10, {.min = 0.001, .max = 1.0}),
         // ---- ray aim / cursor / hover assist (docs/openxr/research/INTERACTION.md, report 14) ----
         MS<Bool>("openxr:cursor",
                  "draw a small endpoint cursor where each hand's aim ray hits an XR monitor (report 14: HypXRland drew no ray/cursor, the dominant 'hard to aim' cause). "

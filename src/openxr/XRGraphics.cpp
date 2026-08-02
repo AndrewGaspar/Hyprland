@@ -24,6 +24,7 @@
 #include "../config/ConfigValue.hpp"
 #include "XRMonitorLayer.hpp"
 #include "XRDmabufImport.hpp"
+#include "XRMath.hpp" // OpenXR::xrLumaKeyAlpha / xrLumaKeyPremultiplied (the luma-key reference curve)
 #include <aquamarine/buffer/Buffer.hpp>
 
 // EGL/GL extension procs — loaded once in initEGL. Kept at file scope (the WIP pattern);
@@ -291,22 +292,48 @@ bool CXRGraphics::initBlitGL() {
         }
     )";
 
-    // Fragment shader: sample the external OES texture (DMA-BUF import).
-    const char* fsSrc = R"(
-        #version 300 es
-        #extension GL_OES_EGL_image_external_essl3 : require
-        precision mediump float;
-        uniform samplerExternalOES uTex;
+    // Fragment shader: sample the source texture and derive the output alpha.
+    //
+    // Default (uBlackKey.x >= 1.0): alpha is pinned to 1.0 — Hyprland monitor buffers are typically
+    // XRGB (undefined alpha), and under XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND (passthrough) garbage
+    // alpha would punch see-through holes in monitors (doc 01). rgb * 1.0 is a no-op, so the
+    // feature-off path is bit-identical to the old `fragColor.a = 1.0`.
+    //
+    // Luma key / "black-as-alpha" (uBlackKey.x < 1.0, openxr:black_alpha): alpha comes from the
+    // pixel's own Rec.709 luma — pure black gets uBlackKey.x, anything at/above the knee
+    // (uBlackKey.y) stays fully opaque, smoothstep between. The result is written PREMULTIPLIED
+    // (rgb *= a) because the quad carries no XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT and the
+    // runtime blends src=ONE, dst=ONE_MINUS_SRC_ALPHA; scaling alpha alone would leave rgb > a and
+    // add the content at full brightness over passthrough (additive halo — report 09 §2.1). Keep
+    // this curve in sync with OpenXR::xrLumaKeyAlpha (XRMath.hpp), which the gtests pin.
+    //
+    // Two programs are built from one body: samplerExternalOES for the DMA-BUF path, sampler2D for
+    // the CPU-staging path (which otherwise uses a plain glBlitFramebuffer).
+    const char* fsBody = R"(
         in vec2 vUV;
         out vec4 fragColor;
+        uniform vec2 uBlackKey; // x = alpha for pure black (1.0 = keying off), y = luma knee
         void main() {
-            fragColor = texture(uTex, vUV);
-            // Force alpha opaque: Hyprland monitor buffers are typically XRGB (undefined alpha).
-            // Under XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND (passthrough) garbage alpha would punch
-            // see-through holes in monitors — pin it to 1.0 so quads stay fully opaque (doc 01).
-            fragColor.a = 1.0;
+            vec3 rgb = texture(uTex, vUV).rgb;
+            float a = 1.0;
+            if (uBlackKey.x < 1.0) {
+                float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+                a = mix(uBlackKey.x, 1.0, smoothstep(0.0, max(uBlackKey.y, 0.001), luma));
+            }
+            fragColor = vec4(rgb * a, a);
         }
     )";
+    const std::string fsExtSrc = std::string(R"(
+        #version 300 es
+        #extension GL_OES_EGL_image_external_essl3 : require
+        precision highp float;
+        uniform samplerExternalOES uTex;
+    )") + fsBody;
+    const std::string fs2DSrc = std::string(R"(
+        #version 300 es
+        precision highp float;
+        uniform sampler2D uTex;
+    )") + fsBody;
 
     auto compileShader = [](GLenum type, const char* src) -> GLuint {
         GLuint s = glCreateShader(type);
@@ -324,31 +351,42 @@ bool CXRGraphics::initBlitGL() {
         return s;
     };
 
-    GLuint vs = compileShader(GL_VERTEX_SHADER, vsSrc);
-    GLuint fs = compileShader(GL_FRAGMENT_SHADER, fsSrc);
-    if (!vs || !fs) {
+    auto linkProgram = [&](const char* fsSrc) -> GLuint {
+        GLuint vs = compileShader(GL_VERTEX_SHADER, vsSrc);
+        GLuint fs = compileShader(GL_FRAGMENT_SHADER, fsSrc);
+        if (!vs || !fs) {
+            glDeleteShader(vs);
+            glDeleteShader(fs);
+            return 0;
+        }
+        GLuint prog = glCreateProgram();
+        glAttachShader(prog, vs);
+        glAttachShader(prog, fs);
+        glLinkProgram(prog);
         glDeleteShader(vs);
         glDeleteShader(fs);
-        return false;
-    }
 
-    m_blitProg = glCreateProgram();
-    glAttachShader(m_blitProg, vs);
-    glAttachShader(m_blitProg, fs);
-    glLinkProgram(m_blitProg);
-    glDeleteShader(vs);
-    glDeleteShader(fs);
+        GLint linked = 0;
+        glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+        if (!linked) {
+            char log[512] = {};
+            glGetProgramInfoLog(prog, sizeof(log), nullptr, log);
+            Log::logger->log(Log::ERR, "[OPENXR] shader link error: {}", log);
+            glDeleteProgram(prog);
+            return 0;
+        }
+        return prog;
+    };
 
-    GLint linked = 0;
-    glGetProgramiv(m_blitProg, GL_LINK_STATUS, &linked);
-    if (!linked) {
-        char log[512] = {};
-        glGetProgramInfoLog(m_blitProg, sizeof(log), nullptr, log);
-        Log::logger->log(Log::ERR, "[OPENXR] shader link error: {}", log);
-        glDeleteProgram(m_blitProg);
-        m_blitProg = 0;
+    m_blitProg = linkProgram(fsExtSrc.c_str());
+    if (!m_blitProg)
         return false;
-    }
+
+    // The sampler2D twin is only used by the CPU-staging fallback WITH luma keying on. A failure here
+    // is not fatal — that path then keeps its plain glBlitFramebuffer (opaque) behavior.
+    m_blitProg2D = linkProgram(fs2DSrc.c_str());
+    if (!m_blitProg2D)
+        Log::logger->log(Log::WARN, "[OPENXR] sampler2D blit program failed to build — the CPU fallback path will ignore openxr:black_alpha");
 
     glGenVertexArrays(1, &m_blitVAO);
 
@@ -356,9 +394,17 @@ bool CXRGraphics::initBlitGL() {
     return true;
 }
 
-void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer& layer, XR_GLuint dstTex) {
+void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer& layer, XR_GLuint dstTex, float blackAlpha, float knee) {
     const int dstW = (int)layer.m_swapchainSize.x; // FULL swapchain (content + chrome margins)
     const int dstH = (int)layer.m_swapchainSize.y;
+
+    // Luma key ("black-as-alpha", openxr:black_alpha). Already gated on the blend mode + clamped on
+    // the main thread — here it is just two numbers. Only the CONTENT is keyed; the chrome margins are
+    // drawn separately by drawChrome and stay exactly as configured (a ghosted monitor must keep a
+    // grabbable bar). blackAlpha >= 1 short-circuits every path back to the old opaque behavior.
+    const bool  keyed   = OpenXR::xrBlackKeyActive(blackAlpha);
+    const float keyBA   = std::clamp(blackAlpha, 0.f, 1.f);
+    const float keyKnee = std::max(knee, OpenXR::XR_BLACK_ALPHA_KNEE_MIN);
 
     // Chrome margins (WP-G1): the desktop content blits into the INNER content rect; the surrounding
     // margin is left fully transparent (alpha 0) so it never covers anything under XR passthrough.
@@ -425,13 +471,15 @@ void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer
             glBindFramebuffer(GL_FRAMEBUFFER, fbo);
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
             // Draw the content into the INNER content rect only (the viewport confines the
-            // fullscreen triangle); the shader pins content alpha to 1.0. Margin stays transparent.
+            // fullscreen triangle); the shader pins content alpha to 1.0 (or luma-keys it when
+            // openxr:black_alpha < 1). Margin stays transparent.
             glViewport(contentX, contentGL, (GLsizei)contentW, (GLsizei)contentH);
 
             glUseProgram(m_blitProg);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_extTex);
             glUniform1i(glGetUniformLocation(m_blitProg, "uTex"), 0);
+            glUniform2f(glGetUniformLocation(m_blitProg, "uBlackKey"), keyBA, keyKnee);
             glBindVertexArray(m_blitVAO);
             glDrawArrays(GL_TRIANGLES, 0, 3);
             glBindVertexArray(0);
@@ -475,6 +523,30 @@ void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)buf->size.x, (GLsizei)buf->size.y, GL_BGRA_EXT, GL_UNSIGNED_BYTE, data);
             buf->endDataPtr();
 
+            if (keyed && m_blitProg2D) {
+                // Luma-keying needs a per-pixel alpha, which glBlitFramebuffer cannot produce — draw
+                // the staging texture through the sampler2D twin of the dmabuf shader instead. Same
+                // geometry (the vertex shader's v flip == the blit's inverted source Y) and same
+                // GL_LINEAR minification, so this is pixel-equivalent to the blit path plus the key.
+                GLuint fbo = 0;
+                glGenFramebuffers(1, &fbo);
+                glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
+                glDisable(GL_SCISSOR_TEST);
+                glViewport(contentX, contentGL, (GLsizei)contentW, (GLsizei)contentH);
+                glUseProgram(m_blitProg2D);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, layer.m_cpuTex);
+                glUniform1i(glGetUniformLocation(m_blitProg2D, "uTex"), 0);
+                glUniform2f(glGetUniformLocation(m_blitProg2D, "uBlackKey"), keyBA, keyKnee);
+                glBindVertexArray(m_blitVAO);
+                glDrawArrays(GL_TRIANGLES, 0, 3);
+                glBindVertexArray(0);
+                glDeleteFramebuffers(1, &fbo);
+                layer.m_contentPath.store(OpenXR::XR_CONTENT_CPU, std::memory_order_relaxed);
+                return;
+            }
+
             GLuint srcFBO = 0, dstFBO = 0;
             glGenFramebuffers(1, &srcFBO);
             glGenFramebuffers(1, &dstFBO);
@@ -505,31 +577,40 @@ void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer
     // --- 3. Clear fallback (black in production; WIP used cyan as a debug sentinel) ---
     // Transparent margin, opaque-black content rect (both blit paths failed). `hyprctl openxr status`
     // now reports contentPath "black" so this silent-black-quad state is diagnosable in one command.
+    // Under the luma key this flat black is exactly the color the key is meant to dissolve, so it
+    // honors it too (premultiplied: rgb is 0, so only alpha moves).
     layer.m_contentPath.store(OpenXR::XR_CONTENT_BLACK, std::memory_order_relaxed);
     clearMargin();
     {
+        float cr = 0.f, cg = 0.f, cb = 0.f, ca = 1.f;
+        OpenXR::xrLumaKeyPremultiplied(0.f, 0.f, 0.f, keyBA, keyKnee, cr, cg, cb, ca);
         GLuint fbo = 0;
         glGenFramebuffers(1, &fbo);
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
         glEnable(GL_SCISSOR_TEST);
         glScissor(contentX, contentGL, (GLsizei)contentW, (GLsizei)contentH);
-        glClearColor(0.f, 0.f, 0.f, 1.f);
+        glClearColor(cr, cg, cb, ca);
         glClear(GL_COLOR_BUFFER_BIT);
         glDisable(GL_SCISSOR_TEST);
         glDeleteFramebuffers(1, &fbo);
     }
 }
 
-void CXRGraphics::clearTex(XR_GLuint dstTex, const Vector2D& size, float r, float g, float b) {
+void CXRGraphics::clearTex(XR_GLuint dstTex, const Vector2D& size, float r, float g, float b, float blackAlpha, float knee) {
     GLuint fbo = 0;
     glGenFramebuffers(1, &fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
     glViewport(0, 0, (GLsizei)size.x, (GLsizei)size.y);
-    // Alpha pinned to 1.0: a cleared quad (no content / clear fallback) must be fully opaque so it
-    // does not become see-through under XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND passthrough (doc 01).
-    glClearColor(r, g, b, 1.0f);
+    // Alpha pinned to 1.0 by default: a cleared quad (no content / clear fallback) must be fully
+    // opaque so it does not become see-through under XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
+    // passthrough (doc 01). With the luma key on (openxr:black_alpha < 1) the SAME rule the content
+    // gets applies to the flat fill instead — a black placeholder quad dissolves like a black
+    // desktop would — and the fill is written premultiplied so the composite stays correct.
+    float cr = r, cg = g, cb = b, ca = 1.f;
+    OpenXR::xrLumaKeyPremultiplied(r, g, b, blackAlpha, knee, cr, cg, cb, ca);
+    glClearColor(cr, cg, cb, ca);
     glClear(GL_COLOR_BUFFER_BIT);
     glDeleteFramebuffers(1, &fbo);
 }
@@ -791,6 +872,10 @@ void CXRGraphics::destroyGL() {
     if (m_blitProg) {
         glDeleteProgram(m_blitProg);
         m_blitProg = 0;
+    }
+    if (m_blitProg2D) {
+        glDeleteProgram(m_blitProg2D);
+        m_blitProg2D = 0;
     }
 }
 

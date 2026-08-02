@@ -27,6 +27,14 @@ namespace OpenXR {
     // "opaque" | "alpha" | "additive" — the config/IPC string form (doc 05).
     std::string blendModeToString(eXRBlendMode mode);
 
+    // Does this blend mode composite our layers over anything but a black void? Luma-keyed
+    // transparency (openxr:black_alpha) only REVEALS something under alpha (passthrough) or additive;
+    // under OPAQUE the runtime paints black behind us, so keying would just make monitors look dim and
+    // dirty. The manager gates the feature on this and warns once (report 09 §3.1).
+    inline bool blendModeShowsThrough(eXRBlendMode mode) {
+        return mode == XR_BLEND_ALPHA || mode == XR_BLEND_ADDITIVE;
+    }
+
     // Result of pickBlendMode: the chosen mode plus whether the user's explicit request could not
     // be honored (so the caller can emit the unsupported->fallback WARN — doc 01).
     struct SXRBlendModePick {
