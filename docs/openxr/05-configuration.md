@@ -463,7 +463,9 @@ JSON (`gaze at` adds the `query` block; a bare `gaze` omits it):
         "monitorId": 3,
         "name": "XR-1",
         "selected": true,
-        "dwellSec": 0.000
+        "dwellSec": 0.000,
+        "hitPoint": [0.2100, 1.3300, -2.1400],
+        "hitDistM": 2.1400
     },
     "query": {
         "requestedTimestampMs": 84212300,
@@ -479,11 +481,29 @@ Text form:
 gaze: looking at XR-1 (id 3, dwell 0.00s)
   timestampMs: 84213765  viewValid: yes
   head pos [0.012, 1.430, -0.005]  forward [0.707, 0.000, -0.707]
+  hit [0.210, 1.330, -2.140] at 2.140m
   query: requested 84212300  matched 84213765  age -1465ms
 ```
 
 `monitorId` is `-1` (`selected:false`, text "looking at passthrough") when the gaze ray misses
 every quad. `pos`/`forward` are in `LOCAL_FLOOR` space (meters); `quat` is `[x,y,z,w]`.
+
+**`hitPoint` / `hitDistM` (optional).** Where the gaze ray actually *met* the selected monitor's
+quad — `hitPoint` in `LOCAL_FLOOR` meters, `hitDistM` the distance along the ray to it. This is
+the exact space and units `xrmonitor place <name> at x,y,z` consumes, so "put it where I was
+looking" is a straight hand-off with no projection and no conversion. Both fields are **omitted**
+(and the `hit` line is absent from the text form) unless the ray was on the selected quad in that
+sample, so a consumer must treat them as optional:
+
+- nothing is selected (`selected:false`) — there is no surface to report; or
+- the sample is mid-dwell: the ray has already left the selected monitor but the dwell switch
+  hasn't committed yet, so `monitorId` still names the old one while nothing is being hit.
+
+When they're absent the caller falls back to projecting along `head.forward` at its own preferred
+distance. The point is computed on the frame thread from the same (1€-filtered) ray that chose
+`monitorId`, so it is always consistent with the reported candidate — a mid-dwell sample reports
+the *selected* monitor's intersection, never a nearer quad's. A caller placing a monitor there
+should still clamp the distance from `head.pos`: a hit point can be closer than is comfortable.
 
 ### `status` output
 
