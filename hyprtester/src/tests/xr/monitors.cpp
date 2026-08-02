@@ -9,6 +9,7 @@
 #include "../shared.hpp"    // Tests:: client helpers (spawnKitty, processAlive — destroy-survival test)
 
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -82,6 +83,64 @@ TEST_CASE(xr_monitor_create_destroy) {
            true);
 
     NLog::green("xr_monitor_create_destroy: create+destroy round-trip verified in both j/monitors and j/openxr");
+}
+
+// xr_monitor_create_mode — live 2026-08-01: `hyprctl openxr create XR-2 2560x1440@60` produced a
+// monitor RUNNING 1920x1080. createXRMonitor does install a persistent monitor rule carrying the
+// requested mode (report-20 issue E), but a config reparse CLEARS the rule manager and only
+// reconcileDeclaredMonitors() reinstalls those rules — for `xrmonitor =` DECLARED layers. A
+// runtime-created monitor is deliberately outside reconciliation, so after any `hyprctl reload` its
+// mode was un-owned and fell back to the headless preferred mode (or to a `monitor = NAME,
+// preferred` line, which is exactly what the report's config had). Assert the APPLIED mode from
+// j/monitors — not the requested one echoed back by j/openxr, which was right the whole time —
+// both before and after a reload.
+TEST_CASE(xr_monitor_create_mode) {
+    XR_SKIP_IF_UNAVAILABLE();
+    SArtifactGuard guard{this->failed, name(), {}};
+
+    if (!gateUp()) {
+        XR::logSkip(name(), "session never reached focused/visible (known env instability)");
+        return;
+    }
+
+    const std::string mon        = XR::monitorName(14);
+    const std::string nameMarker = "\"name\": \"" + mon + "\"";
+    // Deliberately neither the headless default nor the 1280x720 the other tests use, so a fallback
+    // to either is unmistakable.
+    ASSERT(getFromSocket("/openxr create " + mon + " 1600x900@75"), std::string("ok"));
+    guard.monitorNames.push_back(mon);
+
+    const auto modeIs = [&](const std::string& r) {
+        const auto p = XR::findAfter(r, nameMarker);
+        if (p == std::string::npos)
+            return false;
+        return XR::toFloatOr(XR::fieldAfter(r, p, "width"), -1.f) == 1600.f && XR::toFloatOr(XR::fieldAfter(r, p, "height"), -1.f) == 900.f &&
+            std::abs(XR::toFloatOr(XR::fieldAfter(r, p, "refreshRate"), -1.f) - 75.f) < 1.5f;
+    };
+
+    // A monitor created inside the first-plug settle window starts UNPLUGGED (report-20 issue D) and
+    // only enters j/monitors on the plug edge — the same environmental gate xr_mirror SKIPs on.
+    if (!XR::waitForJson(
+            "j/monitors", [&](const std::string& r) { return r.contains(nameMarker); }, std::chrono::milliseconds(15000))) {
+        XR::logSkip(name(), "XR monitor never got plugged (monitors_follow_session gate never satisfied in this environment)");
+        return;
+    }
+    ASSERT(XR::waitForJson("j/monitors", modeIs, std::chrono::milliseconds(10000)), true);
+    NLog::green("xr_monitor_create_mode: create applied 1600x900@75");
+
+    // The regression: reload, and the requested mode must still own the output.
+    ASSERT(getFromSocket("/reload"), std::string("ok"));
+    ASSERT(XR::waitForJson(
+               "j/monitors", [&](const std::string& r) { return r.contains(nameMarker); }, std::chrono::milliseconds(15000)),
+           true);
+    ASSERT(XR::waitForJson("j/monitors", modeIs, std::chrono::milliseconds(10000)), true);
+
+    // ...and stays owned: ensureMonitorStatus runs on a later render pass, so a rule that lost the
+    // mode reverts a beat after the reload settles, not instantly.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    ASSERT(modeIs(getFromSocket("j/monitors")), true);
+
+    NLog::green("xr_monitor_create_mode: 1600x900@75 survived a config reload");
 }
 
 // xr_force_linear_realloc — Defect A (2026-07-12): a bare multigpu flip was swallowed by aquamarine's

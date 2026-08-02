@@ -2301,6 +2301,36 @@ void COpenXRManager::registerDeclaredMonitorRule(const PHLMONITOR& mon, const PX
     Config::monitorRuleMgr()->add(std::move(rule));
 }
 
+void COpenXRManager::reassertMonitorModeRules() {
+    // Main thread, on the config-reload edge. CConfigManager::reload() clears the rule manager and
+    // re-parses the file, which drops the mode rules we installed; reconcileDeclaredMonitors()
+    // re-installs them only for `xrmonitor =` DECLARED layers (by design — runtime-created monitors
+    // are never touched by declaration reconciliation, doc 05 §2.5). That left the mode of a
+    // `hyprctl openxr create NAME 2560x1440@60` monitor un-owned after any reload: the user's
+    // `monitor = NAME, preferred` line (or the headless preferred mode) took it back to 1920x1080,
+    // which is what the live 2026-08-01 report saw. Re-install for every live layer that requested a
+    // mode; registerDeclaredMonitorRule() itself skips layers whose mode the user pinned.
+    //
+    // add() schedules an ensureMonitorStatus() pass, and that pass compares before applying, so this
+    // costs no modeset when the effective mode is already right.
+    if (!Config::monitorRuleMgr())
+        return;
+
+    std::vector<std::pair<PHLMONITOR, PXRLAYER>> pending;
+    {
+        std::scoped_lock lock(m_layersMu);
+        for (auto& l : m_layers) {
+            if (!l || l->m_pendingRemoval.load(std::memory_order_acquire) || !l->m_reqResolution)
+                continue;
+            if (auto mon = l->m_monitor.lock())
+                pending.emplace_back(mon, l);
+        }
+    }
+    // Outside m_layersMu: the rule manager runs listeners of its own.
+    for (auto& [mon, layer] : pending)
+        registerDeclaredMonitorRule(mon, layer);
+}
+
 void COpenXRManager::bindExistingLayers() {
     // Main thread, on start(): layers created while disabled bind to their still-live monitor
     // and get marked dirty; layers whose named monitor disappeared are dropped (doc 02).
@@ -3140,6 +3170,13 @@ void COpenXRManager::onConfigReload() {
     else
         reconcileDeclaredMonitors(); // no state edge: still reconcile the declared set
 
+    // A reparse wiped the rule manager, taking our requested-mode rules with it. reconcile above
+    // re-installed them for DECLARED layers only; do the same for runtime-created ones (which
+    // reconciliation deliberately never touches) so `openxr create NAME 2560x1440@60` keeps its mode
+    // across a reload instead of snapping back to the headless preferred mode. Idempotent, so the
+    // no-reparse callers of onConfigReload() (the openxr:enabled keyword special-case) are unharmed.
+    reassertMonitorModeRules();
+
     // Hot-toggle the ray pointer device (doc 04 §8: openxr:pointer = 0 removes it live).
     if (m_running.load()) {
         static auto PPOINTER = CConfigValue<Hyprlang::INT>("openxr:pointer");
@@ -3644,11 +3681,13 @@ std::expected<void, std::string> COpenXRManager::cmdCreate(const std::string& ar
 
     // Defaults (doc 05 §3.1): mode 1920x1080@60; anchor:local placed along gaze at default
     // distance/size (WP4 keeps WP3's static pose — full placement solve is WP5).
-    if (!parsed->m_resolution) {
+    // The refresh default is applied whether or not a resolution was given, so `create NAME
+    // 2560x1440` pins @60 into the rule we register instead of inheriting whatever refresh the
+    // matched rule happened to carry.
+    if (!parsed->m_resolution)
         parsed->m_resolution = Vector2D{1920, 1080};
-        if (!parsed->m_refreshRate)
-            parsed->m_refreshRate = 60.f;
-    }
+    if (!parsed->m_refreshRate)
+        parsed->m_refreshRate = 60.f;
 
     auto res = createXRMonitor(*parsed);
     if (!res)

@@ -253,6 +253,10 @@ required). The cases, by file:
 **Virtual monitors** (`monitors.cpp`)
 - `xr_monitor_create_destroy` — create/destroy a runtime XR monitor via the dispatcher; assert it
   appears/disappears in `j/openxr` and `j/monitors` with the expected size.
+- `xr_monitor_create_mode` — the mode passed to `openxr create` is the mode the output actually
+  RUNS (asserted from `j/monitors`, not the requested mode echoed back by `j/openxr`), and it
+  survives a config reload — a reparse clears the rule manager, and reconciliation only reinstalls
+  rules for config-*declared* monitors, so a runtime-created one used to snap back to 1920x1080.
 - `xr_force_linear_realloc` — toggling the `force_linear` swapchain policy reallocates the
   monitor's swapchains.
 - `xr_config_declared` — the two declared fixtures exist with correct anchors; a config reload

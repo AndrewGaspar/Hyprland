@@ -319,6 +319,30 @@ config line. Declared monitors materialize even with no session and bind their q
 starts. A dynamic `hyprctl keyword xrmonitor ...` also reconciles (batched, so a
 `hyprctl --batch` of several lines reconciles once).
 
+### 3.1 Pixel-mode precedence (`monitor =` vs the requested mode)
+
+An XR monitor's pixel mode can be asked for in three places. The order, highest first:
+
+1. **An explicit mode in a `monitor =` rule matching the name** — `monitor = XR-code,
+   2560x1440@90, auto, 1.25`. If such a rule exists *when the monitor is created*, it owns the
+   mode outright and nothing below is applied. (`preferred` / `highres` / `highrr` / `maxwidth`
+   are **not** explicit modes — they defer, so `monitor = XR-2, preferred, auto, 1.25` is the
+   normal way to set scale without claiming the mode.)
+2. **The mode on the `xrmonitor =` line, or the create args** — `xrmonitor = XR-code,
+   2560x1440@90, …` and `hyprctl openxr create XR-2 2560x1440@60` are equivalent here. The
+   compositor installs this as a persistent named monitor rule so it survives plug/unplug cycles
+   **and config reloads**, for declared and runtime-created monitors alike. Non-mode fields of a
+   matching `monitor =` rule (scale, transform, VRR, …) are preserved — only the mode is taken
+   over.
+3. **The headless default**, 1920x1080@60, when no mode was requested anywhere.
+
+Refresh is optional wherever a mode is: `2560x1440` means `2560x1440@60`.
+
+Scale is deliberately *not* an `xrmonitor` / `create` argument — `monitor = <name>, preferred,
+auto, <scale>` is the mechanism, and it composes with rule 2 above. Pre-declaring such a line for
+names a script or voice daemon will mint later is harmless while the monitor doesn't exist and
+gives the created monitor a sane scale the moment it appears.
+
 ### Mirroring onto a physical screen
 
 No XR-specific mechanism — the ordinary mirror recipe, matched by name:
@@ -350,7 +374,7 @@ transports, one implementation.
 
 | Verb | Args | Effect |
 |---|---|---|
-| `create` | `<name> [WxH[@Hz]] [anchor-spec]` | Create a runtime-owned XR monitor. Mode defaults to 1920x1080@60; anchor defaults to `anchor:local` placed at `openxr:default_distance` facing you. |
+| `create` | `<name> [WxH[@Hz]] [anchor-spec]` | Create a runtime-owned XR monitor. Mode defaults to 1920x1080@60 and is durable across reloads (§3.1 for how it ranks against a `monitor =` rule); anchor defaults to `anchor:local` placed at `openxr:default_distance` facing you. |
 | `destroy` | `<name\|active>` | Destroy the named monitor, or the selected one. |
 | `select` | `<name\|next\|prev>` | Set the explicit selection target for the verbs below. |
 | `anchor` | `<name\|active> <mode-spec>` | Re-anchor without moving the quad visually: `local`, `head [offset:x,y,z]`, `body [offset:x,y,z]`, `device:left\|right [offset:x,y,z]`. |
