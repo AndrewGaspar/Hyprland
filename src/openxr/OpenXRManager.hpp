@@ -466,6 +466,14 @@ class COpenXRManager {
     // default). No-op when the layer has no declared resolution or the user supplied their own mode
     // (layer->m_userProvidedMode). Idempotent; re-asserted from createXRMonitor + reconcileDeclaredMonitors.
     void registerDeclaredMonitorRule(const PHLMONITOR& mon, const PXRLAYER& layer);
+    // Main thread: re-install the requested-mode rule for EVERY live layer that asked for a pixel
+    // mode, declared or runtime-created. A config reparse clears the whole rule manager
+    // (CConfigManager::reload -> monitorRuleMgr()->clear()), and reconcileDeclaredMonitors only walks
+    // the `xrmonitor =` set — so a monitor born from `hyprctl openxr create NAME 2560x1440@60`
+    // silently lost its mode on the next reload and fell back to the user's `monitor = NAME,
+    // preferred` line / the headless default 1920x1080 (live 2026-08-01). Idempotent, and still a
+    // no-op for any layer whose mode the user pinned themselves (m_userProvidedMode).
+    void reassertMonitorModeRules();
     // Main thread: decide (openxr:force_linear + the XR EGL node vs this output's buffer allocator
     // node) whether the XR-bound headless output must allocate LINEAR buffers for cross-GPU import,
     // set CMonitor::m_forceLinearSwapchain accordingly, and reconfigure the swapchain if it changed.
