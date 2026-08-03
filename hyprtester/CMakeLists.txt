@@ -170,6 +170,8 @@ protocolnew("stable/xdg-shell" "xdg-shell" false)
 protocolnew("unstable/keyboard-shortcuts-inhibit" "keyboard-shortcuts-inhibit-unstable-v1" false)
 # docs/openxr/06-testing.md §6 row 8 (WP12): idle-notify test client.
 protocolnew("staging/ext-idle-notify" "ext-idle-notify-v1" false)
+# layer-shell test client (hyprtester/clients/layer-surface.cpp) — the XML lives in the repo root.
+protocolnew("../protocols" "wlr-layer-shell-unstable-v1" true)
 
 clientNew("pointer-warp" PROTOS "pointer-warp-v1" "xdg-shell")
 clientNew("surface-scale-transform" PROTOS "fractional-scale-v1" "xdg-shell")
@@ -179,3 +181,4 @@ clientNew("xdg-interactive" PROTOS "xdg-shell")
 clientNew("shortcut-inhibitor" PROTOS "xdg-shell" "keyboard-shortcuts-inhibit-unstable-v1")
 clientNew("keyboard-modifiers" PROTOS "xdg-shell")
 clientNew("idle-notify" PROTOS "ext-idle-notify-v1")
+clientNew("layer-surface" PROTOS "wlr-layer-shell-unstable-v1" "xdg-shell") # layer-shell references xdg_popup
