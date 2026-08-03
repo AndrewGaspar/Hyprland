@@ -388,6 +388,19 @@ bool CXRGraphics::initBlitGL() {
     if (!m_blitProg2D)
         Log::logger->log(Log::WARN, "[OPENXR] sampler2D blit program failed to build — the CPU fallback path will ignore openxr:black_alpha");
 
+    // Uniform per-monitor alpha (doc 05 §xrrule): a flat-color program used ONLY as a multiply pass
+    // over the finished swapchain image (see fadeTex). Textureless — the fade is pure blend state.
+    const char* fsFadeSrc = R"(
+        #version 300 es
+        precision highp float;
+        out vec4 fragColor;
+        uniform float uAlpha;
+        void main() { fragColor = vec4(uAlpha, uAlpha, uAlpha, uAlpha); }
+    )";
+    m_fadeProg            = linkProgram(fsFadeSrc);
+    if (!m_fadeProg)
+        Log::logger->log(Log::WARN, "[OPENXR] fade program failed to build — per-monitor `alpha` effects will be ignored (monitors stay opaque)");
+
     glGenVertexArrays(1, &m_blitVAO);
 
     Log::logger->log(Log::DEBUG, "[OPENXR] blit GL resources initialized");
@@ -612,6 +625,42 @@ void CXRGraphics::clearTex(XR_GLuint dstTex, const Vector2D& size, float r, floa
     OpenXR::xrLumaKeyPremultiplied(r, g, b, blackAlpha, knee, cr, cg, cb, ca);
     glClearColor(cr, cg, cb, ca);
     glClear(GL_COLOR_BUFFER_BIT);
+    glDeleteFramebuffers(1, &fbo);
+}
+
+void CXRGraphics::fadeTex(XR_GLuint dstTex, const Vector2D& size, float alpha) {
+    // Uniform per-monitor alpha (doc 05 §xrrule / report 09 §2.1 + §3.3). Runs LAST, over the fully
+    // composed image (content + chrome + cursors), so a ghosted monitor ghosts ENTIRELY — a solid
+    // move-bar under a near-invisible screen looks broken.
+    //
+    // The image is already valid premultiplied — content is (rgb*a, a), the margin is (0,0,0,0), the
+    // chrome fills are (rgb*ea, ea). Multiplying ALL FOUR channels by the same f keeps it valid
+    // premultiplied and is exactly the crossfade the runtime's src=ONE, dst=ONE_MINUS_SRC_ALPHA
+    // blend then resolves to `content*f + background*(1-f)`. Scaling alpha alone would leave rgb > a
+    // and add the content at full brightness (the additive-halo bug).
+    //
+    // Implemented as blend state, not a texture read: draw a flat (f,f,f,f) fullscreen triangle with
+    // glBlendFunc(GL_ZERO, GL_SRC_COLOR), i.e. dst = dst * src — one op, no sampling, no copy.
+    if (!m_fadeProg || alpha >= 1.F || size.x < 1 || size.y < 1)
+        return;
+
+    GLuint fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glViewport(0, 0, (GLsizei)size.x, (GLsizei)size.y);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ZERO, GL_SRC_COLOR);
+    glUseProgram(m_fadeProg);
+    glUniform1f(glGetUniformLocation(m_fadeProg, "uAlpha"), std::clamp(alpha, 0.f, 1.f));
+    glBindVertexArray(m_blitVAO);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glBindVertexArray(0);
+    glDisable(GL_BLEND); // every other pass here writes unblended (clear/scissor fills, blits)
+
     glDeleteFramebuffers(1, &fbo);
 }
 

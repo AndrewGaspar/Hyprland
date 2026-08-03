@@ -54,15 +54,22 @@ class CXRGraphics {
     // data-pointer fallback, then a black clear. Uses/updates the per-layer m_lastEGLImg +
     // m_cpuTex (sized to the source mode). See doc 01 "Blit pipeline".
     //
-    // blackAlpha/knee are the luma-key ("black-as-alpha") parameters resolved on the MAIN thread by
-    // COpenXRManager::publishBlackAlphaTuning (gated on the blend mode, clamped) and read from its
-    // atomics by the frame loop. blackAlpha >= 1 = feature off: content alpha is pinned to 1.0 exactly
-    // as before. Below 1, each pixel's alpha comes from its Rec.709 luma (OpenXR::xrLumaKeyAlpha) and
-    // rgb is PREMULTIPLIED by it.
+    // blackAlpha/knee are the luma-key ("black-as-alpha") parameters resolved PER MONITOR on the MAIN
+    // thread by COpenXRManager::resolveMonitorEffects (defaults -> xrrules -> manual override, gated
+    // on the blend mode, clamped, eased) and read from the layer's atomics by the frame loop.
+    // blackAlpha >= 1 = keying off: content alpha is pinned to 1.0 exactly as before. Below 1, each
+    // pixel's alpha comes from its Rec.709 luma (OpenXR::xrLumaKeyAlpha) and rgb is PREMULTIPLIED by
+    // it. The monitor's UNIFORM alpha is NOT applied here — it is a separate multiply pass (fadeTex)
+    // over the finished image so it also covers chrome and survives an animation-only frame.
     void blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer& layer, XR_GLuint dstTex, float blackAlpha = 1.F, float knee = 0.1F);
     // Frame thread, inside a CScopedGLContext. Clear an image to a solid color (luma-keyed +
     // premultiplied when blackAlpha < 1, so a content-less monitor honors the key too).
     void clearTex(XR_GLuint dstTex, const Vector2D& size, float r, float g, float b, float blackAlpha = 1.F, float knee = 0.1F);
+    // Frame thread, inside a CScopedGLContext. Uniform per-monitor alpha (doc 05 §xrrule): multiply
+    // the WHOLE composed swapchain image (content + chrome + cursors) by `alpha` on all four
+    // channels, keeping it valid premultiplied. Must run LAST in the frame's draw sequence. No-op at
+    // alpha >= 1, so the default path costs nothing.
+    void fadeTex(XR_GLuint dstTex, const Vector2D& size, float alpha);
     // Delete a layer's per-layer GL objects (EGLImage + CPU staging tex + chrome snapshot tex).
     // Context must be current.
     void destroyLayerGL(XR_EGLImageKHR img, XR_GLuint cpuTex, XR_GLuint contentTex);
@@ -133,6 +140,7 @@ class CXRGraphics {
     // Shared blit resources (all in the m_xrContext share group).
     XR_GLuint m_blitProg   = 0; // external-OES -> FBO program
     XR_GLuint m_blitProg2D = 0; // same shader over a sampler2D — the CPU-staging path when luma keying
+    XR_GLuint m_fadeProg   = 0; // flat (f,f,f,f) fill — the uniform per-monitor alpha multiply pass
     XR_GLuint m_blitVAO    = 0; // dummy VAO for the fullscreen triangle
     XR_GLuint m_extTex     = 0; // GL_TEXTURE_EXTERNAL_OES, rebound per DMA-BUF blit
 
