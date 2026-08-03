@@ -154,7 +154,8 @@ pkg_check_modules(hyprcursor_dep REQUIRED IMPORTED_TARGET hyprcursor>=${HYPRCURS
 pkg_check_modules(hyprutils_dep REQUIRED IMPORTED_TARGET hyprutils>=${HYPRUTILS_MINIMUM_VERSION})
 pkg_check_modules(hyprgraphics_dep REQUIRED IMPORTED_TARGET hyprgraphics>=${HYPRGRAPHICS_MINIMUM_VERSION})
 
-# hyprutils 0.13.1 (the version on Omarchy's frozen mirror, and the CMake minimum)
+# hyprutils 0.13.1 (the version on Omarchy's frozen mirror; it was the CMake minimum
+# until upstream d30bb955 raised HYPRUTILS_MINIMUM_VERSION to 0.14.0)
 # miscompiles CSharedPointer/CWeakPointer casts across *virtual* inheritance: the
 # converting ctors/assignments and dynamicPointerCast copy the raw stored void*
 # without applying the base-subobject pointer adjustment, so a SP<Derived> viewed
@@ -184,7 +185,10 @@ pkg_check_modules(hyprgraphics_dep REQUIRED IMPORTED_TARGET hyprgraphics>=${HYPR
 #
 # NOTE (hyprutils 0.14.0): 41fb809 landed in the 0.14.0 release, so the dataPointer
 # probe below PASSES on 0.14 and the shadow does NOT engage -- pure system headers
-# are used. Keep the block for frozen mirrors still on 0.13.1. Be aware that 0.14
+# are used. Since upstream d30bb955 the pkg_check_modules REQUIRED minimum is 0.14.0,
+# so a frozen mirror still on 0.13.1 now fails configure *before* reaching this block;
+# to build there, drop HYPRUTILS_MINIMUM_VERSION back to 0.13.1 and the shadow engages
+# exactly as before. The machinery is kept for that case. Be aware that 0.14
 # is not merely 0.13.1+41fb809: CWeakPointer::lock() gained a hard
 # HYPRUTILS_ASSERT_MSG(impl_->lockable()) (std::terminate) where 0.13.1 silently
 # returned an empty CSharedPointer, so a lock() over a CUniquePointer-owned object
