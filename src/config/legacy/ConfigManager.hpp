@@ -13,6 +13,7 @@
 
 #include "../ConfigManager.hpp"
 #include "../../openxr/XRMonitorConfig.hpp"
+#include "../../openxr/XRRule.hpp"
 
 #include <hyprlang.hpp>
 
@@ -86,10 +87,18 @@ namespace Config::Legacy {
         std::optional<std::string> handleExecShutdown(const std::string&, const std::string&);
         std::optional<std::string> handleMonitor(const std::string&, const std::string&);
         std::optional<std::string> handleXRMonitor(const std::string&, const std::string&);
+        std::optional<std::string> handleXRRule(const std::string&, const std::string&);
 
         // Declared XR monitors from the most recent parse (doc 05 §2.5 reconciliation source).
         const std::vector<SXRMonitorParams>& declaredXRMonitors() const {
             return m_declaredXRMonitors;
+        }
+
+        // Declared `xrrule` transparency rules from the most recent parse, in CONFIG ORDER — the
+        // order is load-bearing (a later matching rule overrides an earlier one PER EFFECT;
+        // doc 05 §xrrule). COpenXRManager snapshots this on reload.
+        const std::vector<OpenXR::SXRRule>& declaredXRRules() const {
+            return m_declaredXRRules;
         }
         std::optional<std::string> handleBind(const std::string&, const std::string&);
         std::optional<std::string> handleUnbind(const std::string&, const std::string&);
@@ -148,6 +157,11 @@ namespace Config::Legacy {
         // scratch on every parse (cleared in resetHLConfig); COpenXRManager reconciles the
         // live set against this after a successful reload. Compiles unconditionally.
         std::vector<SXRMonitorParams>                    m_declaredXRMonitors;
+
+        // Situational per-monitor transparency rules declared via the `xrrule` keyword (doc 05
+        // §xrrule). Rebuilt from scratch on every parse (cleared in resetHLConfig) and kept in
+        // CONFIG ORDER — unlike xrmonitor there is no name key, every rule is evaluated.
+        std::vector<OpenXR::SXRRule>                     m_declaredXRRules;
 
         bool                                             m_isFirstLaunch = true; // For exec-once
 

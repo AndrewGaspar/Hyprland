@@ -854,6 +854,10 @@ std::vector<SP<IValue>> Values::getConfigValues() {
                   "luma-keyed transparency: the Rec.709 luma at which content becomes FULLY opaque. Pure black gets openxr:black_alpha, luma >= this is untouched, with a "
                   "smoothstep ramp between. Lower = only near-black dissolves (dark themes keep their contrast); higher = dark greys go see-through too",
                   0.10, {.min = 0.001, .max = 1.0}),
+        MS<Int>("openxr:transparency_blend_ms",
+                "how long a per-monitor transparency change (uniform alpha or luma key, from an `xrrule` match, a manual `hyprctl openxr alpha` or a config reload) takes to "
+                "ease in. Nothing ever pops: the value rides a smoothstep envelope, and an interrupted transition restarts from wherever it currently is. 0 = snap instantly",
+                600, {.min = 0, .max = 5000}),
         // ---- ray aim / cursor / hover assist (docs/openxr/research/INTERACTION.md, report 14) ----
         MS<Bool>("openxr:cursor",
                  "draw a small endpoint cursor where each hand's aim ray hits an XR monitor (report 14: HypXRland drew no ray/cursor, the dominant 'hard to aim' cause). "

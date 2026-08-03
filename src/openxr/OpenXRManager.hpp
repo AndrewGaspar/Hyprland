@@ -18,6 +18,7 @@
 #include "../helpers/time/Time.hpp" // Time::steady_tp (presence blip window)
 #include "../desktop/DesktopTypes.hpp" // PHLMONITOR (applyCrossGpuLinear)
 #include "XRMonitorConfig.hpp"
+#include "XRRule.hpp"  // situational transparency: SXRRule / SXRRuleContext / SXREffects (unguarded)
 #include "XRInput.hpp" // SXRInputEvent / SXRStateEvent / XRQueueItem / CXRQueue / CXRInput
 
 struct wl_event_source;
@@ -100,6 +101,26 @@ class COpenXRManager {
         bool  gatedOff   = false; // configured < 1 but the blend mode is opaque -> ignored
     };
     SXRBlackAlpha blackAlphaStatus() const;
+
+    // ---- situational per-monitor transparency: the `xrrule` engine (doc 05 §xrrule, report 09) ----
+    // MAIN THREAD ONLY (rule evaluation touches config strings, compiled regexes and PHLWINDOW/
+    // PHLMONITOR refcounts — none of which the frame thread may ever see).
+    //
+    // reloadXRRules() re-snapshots CConfigManager's declared rule list and re-evaluates; called from
+    // onConfigReload() and from the dynamic `hyprctl keyword xrrule` path.
+    // requestEffectEval() is the COALESCED re-evaluation entry point every trigger uses (focus /
+    // fullscreen / title / anchor state / monitor add-remove / manual verb): it defers ONE evaluation
+    // to the end of the current event-loop iteration, so a burst of events costs a single pass.
+    void                             reloadXRRules();
+    void                             requestEffectEval();
+    // The deferred body requestEffectEval() schedules. Public only because the doLater callback
+    // reaches it through g_pOpenXRManager (never a captured `this` — see requestEffectEval).
+    void                             onEffectEvalDue();
+    // `hyprctl openxr alpha <name|active> <0..1|auto>` / `blackalpha <name|active> <0..1|off|auto>`.
+    // Sets (or clears, with `auto`) the manual override — the TOP precedence layer, sticky until
+    // cleared, mirroring the shipped `handinput` manual-over-auto latch.
+    std::expected<void, std::string> cmdAlpha(const std::string& args);
+    std::expected<void, std::string> cmdBlackAlpha(const std::string& args);
 
     // Idle-inhibit predicate (doc 05 §6.1 + research/20 phase 2). MAIN THREAD ONLY — it reads the
     // STRING config value openxr:inhibit_idle, which must never happen off-main.
@@ -227,6 +248,20 @@ class COpenXRManager {
         std::string adaptiveRoamMode = "body";   // head | body
         float       adaptiveSeatDist = 0.f;      // current XZ distance from the desk seat (m)
         float       adaptiveT        = 0.f;      // transition envelope parameter [0,1]
+        // Situational transparency (doc 05 §xrrule). The LIVE (eased) values the frame loop is
+        // applying, their resolved TARGETS, and the provenance of each — "default" | "rule" |
+        // "manual" — so `hyprctl openxr status` answers "why is this monitor ghosted" outright.
+        // anchorState is the state the rules matched against ("docked"|"follow"|"carried").
+        float       fxAlpha          = 1.f;
+        float       fxAlphaTarget    = 1.f;
+        std::string fxAlphaSrc       = "default";
+        float       fxBlackAlpha     = 1.f;
+        float       fxBlackAlphaTarget = 1.f;
+        std::string fxBlackAlphaSrc  = "default";
+        float       fxKnee           = 0.1f;
+        std::string fxKneeSrc        = "default";
+        bool        fxTransitioning  = false;
+        std::string anchorState      = "docked";
     };
     std::vector<SXRMonitorInfo> monitorInfos();
 
@@ -576,6 +611,47 @@ class COpenXRManager {
     // Main thread only: the configured value we have already warned about being ignored under an
     // opaque blend mode (-1 = nothing warned / re-armed), so the WARN fires once per config set.
     float              m_blackAlphaWarnedFor = -1.F;
+
+    // ---- situational per-monitor transparency: the `xrrule` engine (doc 05 §xrrule) ----
+    // MAIN THREAD ONLY, all of it. m_xrRules is a snapshot of CConfigManager's declared list taken at
+    // reload (config order is load-bearing: later matches override earlier ones per effect).
+    // m_rulesUseTitle short-circuits the window-title trigger when no rule actually looks at titles —
+    // titles change on every tab switch and we refuse to pay for that unless it can matter.
+    std::vector<OpenXR::SXRRule> m_xrRules;
+    bool                         m_rulesUseTitle    = false;
+    bool                         m_effectEvalQueued = false; // one deferred evaluation is already pending
+    bool                         m_fxKeyGateWarned  = false; // warned once that a rule's blackalpha is gated off
+
+    // Re-resolve every layer's effects from its OWN context tuple and retarget its envelopes. Never
+    // call directly from a trigger — go through requestEffectEval() so bursts coalesce.
+    void                   evaluateMonitorEffects();
+    // The context tuple for one layer: its name, its anchor state, and the class/title/fullscreen of
+    // its focused window (the fullscreen window on the monitor's active workspace if any, else that
+    // workspace's last-focused window — doc 05 §xrrule).
+    OpenXR::SXRRuleContext buildRuleContext(const PXRLAYER& layer);
+    // docked | follow | carried, folded from the layer's live anchor mode + grab + adaptive phase.
+    OpenXR::eXRAnchorState layerAnchorState(const PXRLAYER& layer);
+    // Publish one layer's CURRENT (eased) effect values to the atomics the frame loop reads.
+    void                   publishLayerEffects(const PXRLAYER& layer);
+    // 8ms main-thread envelope tick: advance every layer's transition, republish, and damage the
+    // monitors whose LUMA KEY is mid-transition (the key is baked into the blit, so a static desktop
+    // needs a fresh buffer to re-key — the uniform alpha needs no damage at all, it is a post pass
+    // over the already-composed image). Self-disarming once every envelope has settled.
+    void                onEffectEnvelopeTick();
+    void                armEffectEnvelopeTimer();
+    SP<CEventLoopTimer> m_fxTimer;
+    Time::steady_tp     m_fxLastTick{};
+    bool                m_fxTickRunning = false; // false = the next tick seeds dt instead of using it
+
+    // Re-evaluation triggers (doc 05 §xrrule). Anchor-state changes ride the EXISTING frame->main
+    // GRAB/ADAPTIVE state events (dispatchStateEvent), so they need no listener of their own.
+    CHyprSignalListener m_fxWindowActiveListener;
+    CHyprSignalListener m_fxWindowFullscreenListener;
+    CHyprSignalListener m_fxWindowTitleListener;
+    CHyprSignalListener m_fxWindowCloseListener;
+    CHyprSignalListener m_fxWorkspaceActiveListener;
+    CHyprSignalListener m_fxMonitorAddedListener;
+    CHyprSignalListener m_fxMonitorRemovedListener;
 
     // ---- conditional hand input (research/16 Part A) ----
     // m_handPolicy is the openxr:hand_input baseline (config + `handinput on|off|auto`); m_handForce
