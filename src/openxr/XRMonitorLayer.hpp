@@ -102,6 +102,22 @@ class CXRMonitorLayer {
     bool                    m_userProvidedMode = false;
     bool                    m_hovered = false; // last ray-hovered (WP7 sets this; status field)
 
+    // ---- 2D-plane sync (report 12 WP-S2) — MAIN THREAD ONLY, under COpenXRManager::m_layersMu ----
+    // m_l2dUserPinned mirrors m_userProvidedMode for POSITION: true iff an explicit user
+    // `monitor=NAME,...,<x>x<y>,...` rule gave this output a layout offset when it was created. Such a
+    // monitor is excluded from the projection entirely — the user's rule keeps it where they put it,
+    // arrange() places it first (explicitPosition wins), and the auto-placed XR block attaches clear
+    // of it. Captured once at create, exactly like m_userProvidedMode, so the flag cannot be confused
+    // by the offset the sync engine itself writes.
+    bool                    m_l2dUserPinned = false;
+    // The placement the projection last assigned, kept so registerDeclaredMonitorRule can carry it
+    // into the persistent monitor rule (durability across a rule refresh) and so `hyprctl openxr
+    // status` can show WHY a monitor sits where it does.
+    bool                    m_l2dPlaced = false;
+    Vector2D                m_l2dOffset;
+    int                     m_l2dCol = 0, m_l2dRow = 0;
+    float                   m_l2dAzDeg = 0.f, m_l2dElDeg = 0.f;
+
     // ---- main -> frame handoff (doc 00 table) ----
     std::mutex              m_bufMu;
     SP<Aquamarine::IBuffer> m_latestBuffer;          // written under m_bufMu on presented

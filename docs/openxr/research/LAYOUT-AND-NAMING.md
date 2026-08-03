@@ -86,16 +86,24 @@ a name generator, or a projection — all pure, testable, and built on that tran
 - Sequencing: implement naming (WP-N1) **before** the auto-layout placement WP so the latter
   can assume a name is always present.
 
-### 2D-plane sync (from 12)
-- XR monitors land in a dumb right-appended row today (default monitor rule → auto-offset →
+### 2D-plane sync (from 12) — **SHIPPED** (WP-S1 + WP-S2)
+- XR monitors used to land in a dumb right-appended row (default monitor rule → auto-offset →
   `CMonitorPositionController::arrange` appends flush-right in creation order); the 2D position
-  has nothing to do with the 3D pose.
+  had nothing to do with the 3D pose.
 - **Design: viewer-centric unwrap** — project each quad's pose to angular (yaw/pitch)
   coordinates around the viewer, scale by `PX_PER_DEG`, then normalize/compact to a valid
   Hyprland layout. Latch a **reference frame** for world monitors + a follow frame for
   head/body, merged; **freeze-on-event** recompute (debounced) rather than per-frame.
-- Two WPs: WP-S1 pure projection+normalization math (gtests, no deps); WP-S2 reference-frame
-  capture, debounced recompute funnel, offset injection, `hyprctl openxr` verb.
+- Implemented in `src/openxr/XRLayout2D.{hpp,cpp}` (pure, unconditional, `tests/xr/layout2d.cpp`)
+  + `COpenXRManager::syncLayout2D()`. User surface: `openxr:layout2d:*`, `hyprctl openxr
+  sync-layout [freeze|thaw]` / `xrmonitor sync`, an `xrlayout2dsync` event, and a `layout2d` block
+  in `hyprctl openxr status`. Documented in [`../05-configuration.md`](../05-configuration.md)
+  §2 "2D-plane sync".
+- Open questions from report 12 §9, as answered by the implementation: default **on**; vertical
+  **elevation** (with `world_height` available); `px_per_degree` **35**; recompute on grab release
+  **automatically** (debounced, never mid-carry); attach seam **right**, auto-`around` in a
+  headset-only session; physical monitors **untouched** (they have no room pose); the arc-slot
+  fast path (§7) waits on research/08 landing — until then every monitor takes the angular path.
 
 ### Shared threading & config contract
 Planner, reflow, projection, and name-minting all run **main-thread** under `m_layersMu`; the
@@ -137,18 +145,21 @@ parallel.
 | L2 | Auto-assignment planner (pure): `assignSlots(...)` with §4 rules | M · dep G1 |
 | L3+ | Per-anchor-class engines, slot-mode flag on the layer, `reflowLayout()` funnel, `openxr:layout:*` config, `xrlayout` keyword, dispatchers/events | M–L · dep G2, N1 |
 
-### Phase 4 — 2D-plane sync (report 12) — parallel-able
+### Phase 4 — 2D-plane sync (report 12) — **DONE**
 | WP | What | Effort |
 |----|------|--------|
-| S1 | Pure projection + normalization math (viewer-centric unwrap, `PX_PER_DEG`, compaction), gtests, no deps | M |
-| S2 | Reference-frame capture, debounced recompute funnel, offset injection into the monitor layout, `hyprctl openxr` verb | M · dep S1 |
+| ~~S1~~ | ~~Pure projection + normalization math (viewer-centric unwrap, `PX_PER_DEG`, compaction), gtests, no deps~~ **shipped** — `XRLayout2D.{hpp,cpp}`, `tests/xr/layout2d.cpp` (24 cases incl. a randomized structural sweep) | M |
+| ~~S2~~ | ~~Reference-frame capture, debounced recompute funnel, offset injection into the monitor layout, `hyprctl openxr` verb~~ **shipped** — `syncLayout2D()`, `openxr:layout2d:*`, `sync-layout`/`xrmonitor sync`, `xrlayout2dsync`, `hyprtester/src/tests/xr/layout2d.cpp` | M · dep S1 |
+| S3 | *(follow-up)* slot fast path — when research/08 places monitors into arc/grid slots, mirror `(col,row)` straight to 2D and skip the angular path for those monitors (report 12 §7) | S · dep 08 |
 
 ### Seams between the four
 - **Naming ↔ auto-layout:** N1 first so placement can assume a name always exists (11 §6).
 - **Grids ↔ auto-layout:** auto-layout's cluster is the *reason* grids exist; L1 is the only
   auto-layout piece that ships without grids.
 - **Layout ↔ 2D-sync:** 08 decides where quads go in 3D; 12 keeps the 2D plane in sync with
-  wherever they land (recompute on the same dock/undock/reflow events).
+  wherever they land (recompute on the same dock/undock/reflow events). 12 has shipped, so 08's
+  reflow only needs to call `requestLayout2DSync()` when it moves a quad — the funnel already
+  exists and is already wired to dock/undock.
 - **Adaptive anchoring (shipped, `archive/13`)** already fires dock/undock events that 12's
   recompute funnel and 08's reflow should subscribe to.
 
@@ -161,5 +172,7 @@ parallel.
 - Grid-grab trigger: modifier-grab-any-member vs a rendered grabbable grid handle/frame?
 - Collision policy on `cell`/`cellmove`/span-grow: tiling-WM swap vs reject/keep-gaps?
 - Naming: confirm monotonic (never-reuse) over lowest-free; ship the prefix var vs hardcode?
-- 2D-sync: recompute triggers and whether world monitors freeze on a latched reference frame
-  (recommended) vs live-track.
+- ~~2D-sync: recompute triggers and whether world monitors freeze on a latched reference frame
+  (recommended) vs live-track.~~ **Answered by the shipped WP-S2:** latched reference frame,
+  event-driven debounced recompute, never mid-carry. Remaining taste question after living with
+  it: is `px_per_degree = 35` / `row_merge_deg = 10` the right feel for a real desk arrangement?

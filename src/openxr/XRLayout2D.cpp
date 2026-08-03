@@ -85,6 +85,32 @@ std::vector<SXRLayout2DPrev> OpenXR::xrLayout2DPrevOf(const SXRLayout2DResult& r
     return out;
 }
 
+void OpenXR::xrLayout2DAttachOrigin(const std::vector<SXRLayout2DAnchorBox>& anchors, int blockW, int blockH, eXRLayout2DAttach attach, int& outX, int& outY) {
+    outX = 0;
+    outY = 0;
+    if (attach == XR_L2D_ATTACH_AROUND || anchors.empty())
+        return;
+
+    int  maxR = 0, minT = 0, maxB = 0;
+    bool first = true;
+    for (const auto& a : anchors) {
+        if (first) {
+            maxR  = a.x + a.w;
+            minT  = a.y;
+            maxB  = a.y + a.h;
+            first = false;
+        } else {
+            maxR = std::max(maxR, a.x + a.w);
+            minT = std::min(minT, a.y);
+            maxB = std::max(maxB, a.y + a.h);
+        }
+    }
+
+    outX = maxR;                                    // flush right of the anchored block
+    outY = minT + ((maxB - minT) - blockH) / 2;     // vertically centered on it
+    (void)blockW;
+}
+
 SXRLayout2DResult OpenXR::xrProjectLayout2D(const std::vector<SXRLayout2DInput>& mons, const SXRLayout2DRef& ref, const SXRLayout2DConfig& cfg, const std::vector<SXRLayout2DPrev>& prev) {
     SXRLayout2DResult out;
     if (mons.empty())
