@@ -280,7 +280,7 @@ recompute is **event-driven and debounced**, never per-frame and never mid-carry
 
 | Variable | Type | Default | Meaning |
 |---|---|---|---|
-| `layout2d:enabled` | bool | `true` | Derive the 2D layout from the 3D arrangement. `false` = the historic append-right behavior. | hot |
+| `layout2d:enabled` | bool | `true` | Derive the 2D layout from the 3D arrangement. `false` = the historic append-right behavior; toggling it off at runtime hands every XR monitor straight back to auto placement rather than leaving it pinned where the last sync put it. | hot |
 | `layout2d:px_per_degree` | float | `35` | Angular → pixel scale for monitor **centres**. 35 is a 1080p reference monitor at the default distance/size. Compaction is authoritative for adjacency, so this mostly sets how proportional the spacing feels. | hot |
 | `layout2d:vertical` | string | `elevation` | Row placement: `elevation` (angular — a clean spherical unwrap with one constant) or `world_height` (metric; better when the monitors sit at wildly different distances). | hot |
 | `layout2d:px_per_meter` | float | `1000` | `vertical=world_height` only: layout px per metre of world height. | hot |
