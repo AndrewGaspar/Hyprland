@@ -61,6 +61,10 @@
 #include "../helpers/Format.hpp" // NFormatUtils::drmModifierName (post-reconfigure modifier log)
 #include "../render/Renderer.hpp" // damageMonitor (force a fresh present into the re-allocated buffers)
 #include "../desktop/state/FocusState.hpp"
+#include "../desktop/Workspace.hpp"                     // xrrule: the monitor's active workspace + last-focused window
+#include "../desktop/view/Window.hpp"                   // xrrule: m_class / m_title of the focused window
+#include "../managers/fullscreen/FullscreenController.hpp" // xrrule: the fullscreen window of a monitor
+#include "../managers/eventLoop/EventLoopTimer.hpp"     // xrrule: the transition-envelope tick
 #include "../config/shared/monitor/MonitorRuleManager.hpp"
 #include "../config/shared/monitor/MonitorRule.hpp"
 #include "../config/legacy/ConfigManager.hpp"
@@ -100,6 +104,10 @@ COpenXRManager::~COpenXRManager() {
     if (m_watchDebounceTimer && g_pEventLoopManager)
         g_pEventLoopManager->removeTimer(m_watchDebounceTimer);
     m_watchDebounceTimer.reset();
+    // Same for the transparency transition-envelope tick (doc 05 §xrrule).
+    if (m_fxTimer && g_pEventLoopManager)
+        g_pEventLoopManager->removeTimer(m_fxTimer);
+    m_fxTimer.reset();
 }
 
 void COpenXRManager::init() {
@@ -120,12 +128,35 @@ void COpenXRManager::init() {
     m_configReloadListener   = Event::bus()->m_events.config.reloaded.listen([this] { onConfigReload(); });
     m_propsRefreshedListener = Event::bus()->m_events.config.props_refreshed.listen([this] { onConfigReload(); });
 
+    // Situational per-monitor transparency (doc 05 §xrrule): the re-evaluation triggers. Each one
+    // only REQUESTS an evaluation — requestEffectEval() coalesces a burst into a single pass at the
+    // end of the loop iteration, and the pass is a few RE2 matches per XR monitor. The remaining
+    // triggers need no listener: anchor-state changes ride the existing frame->main GRAB/ADAPTIVE
+    // state events (dispatchStateEvent), and config reloads go through onConfigReload().
+    m_fxWindowActiveListener     = Event::bus()->m_events.window.active.listen([this](PHLWINDOW, Desktop::eFocusReason) { requestEffectEval(); });
+    m_fxWindowFullscreenListener = Event::bus()->m_events.window.fullscreen.listen([this](PHLWINDOW) { requestEffectEval(); });
+    m_fxWindowCloseListener      = Event::bus()->m_events.window.close.listen([this](PHLWINDOW) { requestEffectEval(); });
+    m_fxWorkspaceActiveListener  = Event::bus()->m_events.workspace.active.listen([this](PHLWORKSPACE) { requestEffectEval(); });
+    m_fxMonitorAddedListener     = Event::bus()->m_events.monitor.added.listen([this](PHLMONITOR) { requestEffectEval(); });
+    m_fxMonitorRemovedListener   = Event::bus()->m_events.monitor.removed.listen([this](PHLMONITOR) { requestEffectEval(); });
+    // Titles fire on every browser tab switch and every terminal `cd`, so this one is gated: unless
+    // some rule actually carries a focustitle: condition (m_rulesUseTitle, computed at rule load),
+    // the callback is a single bool test and nothing else happens.
+    m_fxWindowTitleListener = Event::bus()->m_events.window.title.listen([this](PHLWINDOW) {
+        if (m_rulesUseTitle)
+            requestEffectEval();
+    });
+
     // Materialize any monitors declared in the config as plain headless outputs (doc 02 lazy
     // binding). Their quads bind when a session later starts. Done before start() so start()'s
     // bindExistingLayers() picks them up. With openxr:monitors_follow_session (default) they are
     // created UNPLUGGED (disabled) and only plug in when a session actually starts (research/18)
     // — no phantom monitors on a sessionless desktop login.
     reconcileDeclaredMonitors();
+
+    // Seed the rule snapshot + resolve the freshly-created monitors' effects (init() runs after the
+    // first config parse, so the declared list is already populated).
+    reloadXRRules();
 
     // Honor openxr:enabled at startup.
     static auto PENABLED = CConfigValue<Hyprlang::INT>("openxr:enabled");
@@ -565,6 +596,9 @@ void COpenXRManager::continueBringup(CXRSession* sess) {
     // warns at session start rather than at the next reload). m_session is not adopted yet, so pass
     // the picked mode explicitly.
     publishBlackAlphaTuning(xrBlendModeFromXr(sess->m_blendMode));
+    // Same for the per-monitor resolution (doc 05 §xrrule): an xrrule's `blackalpha` rides the same
+    // blend-mode gate. Deferred, so by the time it runs m_session is adopted and the gate is live.
+    requestEffectEval();
 
     // 3. EGL/GBM display + context on the right GPU.
     static auto       PGPU = CConfigValue<std::string>("openxr:gpu");
@@ -1097,11 +1131,16 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
             // carries a race with the layer-removed ack otherwise — doc 05 §5). Post verbatim.
             if (!e.str.empty() && g_pEventManager)
                 g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitorgrab", e.str + (e.a ? ",1" : ",0")});
+            // doc 05 §xrrule: a grab begin/end IS an anchor-state transition (-> carried / back).
+            requestEffectEval();
             break;
         case eXRStateEventType::ADAPTIVE:
             // research/13 §6.4: the terminal dock/undock edge (a = 1 undocked / 0 docked).
             if (!e.str.empty() && g_pEventManager)
                 g_pEventManager->postEvent(SHyprIPCEvent{e.a ? "xrmonitorundocked" : "xrmonitordocked", e.str});
+            // doc 05 §xrrule: the docked <-> follow transition — the trigger the walking rule
+            // (`xrrule = alpha 0.55, anchorstate:follow`) rides.
+            requestEffectEval();
             break;
         case eXRStateEventType::TRACKING: Log::logger->log(Log::DEBUG, "[OPENXR] device-lock tracking {} (monitor {})", e.a ? "gained" : "lost", e.str); break;
         case eXRStateEventType::SCHEDULE_FRAMES: {
@@ -1436,10 +1475,20 @@ void COpenXRManager::frameThread() {
             const bool     cursorChanged = OpenXR::xrCursorRedrawNeeded(l->m_cursorDrawn[0], curL, curEps) ||
                 OpenXR::xrCursorRedrawNeeded(l->m_cursorDrawn[1], curR, curEps) ||
                 OpenXR::xrCursorRedrawNeeded(l->m_gazeCursorDrawn, curGaze, curEps);
+            // Situational transparency (doc 05 §xrrule): the per-monitor effect values the MAIN
+            // thread resolved (defaults -> rules -> manual), eased by its envelope tick and published
+            // as plain atomics. Read once here. blackAlpha/knee go into the blit (the luma key is
+            // per-pixel, so it must be baked while we have the source buffer); fxAlpha is the uniform
+            // monitor alpha, applied LAST as a multiply over the finished image so chrome ghosts with
+            // the content and an animation-only frame can re-apply it from the snapshot alone.
+            const float    blackAlpha = l->m_fxBlackAlpha.load(std::memory_order_relaxed);
+            const float    blackKnee  = l->m_fxKnee.load(std::memory_order_relaxed);
+            const float    fxAlpha    = l->m_fxAlpha.load(std::memory_order_relaxed);
             // Snapshot the clean content whenever chrome OR any cursor may draw over it, so an
             // animation-only frame (chrome fade or a moving cursor with no new desktop buffer) can
-            // restore the content before re-drawing the overlay.
-            const bool     snapOn = chromeOn || cursorEnabled || gazeCurEnabled;
+            // restore the content before re-drawing the overlay. A monitor with a uniform fade needs
+            // it too: that is what lets the fade animate over a completely static desktop.
+            const bool     snapOn = chromeOn || cursorEnabled || gazeCurEnabled || OpenXR::xrUniformAlphaActive(fxAlpha);
 
             const int64_t nowNs = fs.predictedDisplayTime;
             if (activeNow)
@@ -1460,7 +1509,12 @@ void COpenXRManager::frameThread() {
             // This is what keeps a static desktop with hidden chrome at zero GPU cost — the quad
             // re-presents the most recently released image every runtime frame (doc 01).
             const bool chromeVisualChanged = newAlpha != l->m_chromeDrawnAlpha || hoverReg != l->m_chromeDrawnRegion || grabbedNow != l->m_chromeDrawnGrab;
-            const bool wantAnimTick        = l->m_hasContent && ((chromeOn && chromeVisualChanged && (newAlpha > 0.f || l->m_chromeDrawnAlpha > 0.f)) || ((cursorEnabled || gazeCurEnabled) && cursorChanged));
+            // The uniform fade is its own animation source: while it eases, the composed image must
+            // be rebuilt each frame even with no new desktop buffer and no chrome. Once settled the
+            // comparison is exact and this costs nothing.
+            const bool fadeVisualChanged   = fxAlpha != l->m_fxAlphaDrawn;
+            const bool wantAnimTick        = l->m_hasContent &&
+                ((chromeOn && chromeVisualChanged && (newAlpha > 0.f || l->m_chromeDrawnAlpha > 0.f)) || ((cursorEnabled || gazeCurEnabled) && cursorChanged) || fadeVisualChanged);
 
             if (!buf && !wantAnimTick && l->m_hasContent)
                 continue;
@@ -1497,12 +1551,6 @@ void COpenXRManager::frameThread() {
 
             if (imgIdx < l->m_swapchainImages.size()) {
                 const XR_GLuint dst = l->m_swapchainImages[imgIdx];
-                // Luma key ("black-as-alpha", report 09): plain atomics resolved on the main thread by
-                // publishBlackAlphaTuning (clamped + blend-mode gated), read once here. 1.0 = off, and
-                // the blit path is then bit-identical to the old forced-opaque behavior. Global for
-                // now; the value is per-blit-call, so a per-monitor override would slot in here.
-                const float blackAlpha = m_blackAlpha.load(std::memory_order_relaxed);
-                const float blackKnee  = m_blackAlphaKnee.load(std::memory_order_relaxed);
                 if (buf) {
                     m_graphics->blitBuffer(buf, *l, dst, blackAlpha, blackKnee);
                     if (!l->m_hasContent)
@@ -1540,6 +1588,11 @@ void COpenXRManager::frameThread() {
                     l->m_cursorDrawn[1]   = cursorEnabled ? curR : 0;
                     l->m_gazeCursorDrawn  = curGaze;
                 }
+
+                // Uniform monitor alpha (doc 05 §xrrule) — LAST, over content + chrome + cursors, so
+                // a ghosted monitor ghosts ENTIRELY (report 09 §3.3). No-op at 1.0.
+                m_graphics->fadeTex(dst, l->m_swapchainSize, fxAlpha);
+                l->m_fxAlphaDrawn = fxAlpha;
             }
 
             XrSwapchainImageReleaseInfo relInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -2165,6 +2218,11 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
 
     // 8. Layer cap: a new quad may push the oldest past maxLayerCount (doc 02 recency policy).
     recomputeQuadActive();
+
+    // 9. doc 05 §xrrule: resolve the new monitor's transparency effects — its name and anchor state
+    //    may match rules the moment it exists. Coalesced, so a config declaring five monitors still
+    //    costs a single evaluation pass.
+    requestEffectEval();
 
     Log::logger->log(Log::DEBUG, "[OPENXR] created XR monitor '{}' (seq {}, size {}m)", params.m_name, layer->m_seq, sizeMeters);
     return layer;
@@ -3154,6 +3212,9 @@ void COpenXRManager::onConfigReload() {
     // report 09: re-resolve the luma key (openxr:black_alpha / :black_alpha_knee) — clamped, gated on
     // the session blend mode, and damaging the XR monitors so a live re-tune shows up immediately.
     publishBlackAlphaTuning();
+    // doc 05 §xrrule: re-snapshot the declared transparency rules and re-resolve every monitor. Must
+    // run AFTER publishBlackAlphaTuning — the black_alpha globals are the DEFAULT layer it folds on.
+    reloadXRRules();
 
     static auto PENABLED = CConfigValue<Hyprlang::INT>("openxr:enabled");
     const bool  enabled  = *PENABLED;
@@ -3306,6 +3367,246 @@ COpenXRManager::SXRBlackAlpha COpenXRManager::blackAlphaStatus() const {
     s.active     = OpenXR::xrBlackKeyActive(s.effective);
     s.gatedOff   = OpenXR::xrBlackKeyActive(s.configured) && !s.active;
     return s;
+}
+
+// ---- situational per-monitor transparency: the `xrrule` engine (doc 05 §xrrule, report 09) ----
+
+void COpenXRManager::reloadXRRules() {
+    // MAIN THREAD. Snapshot the declared list (config order is load-bearing) and re-evaluate. The
+    // snapshot is a copy so a later reload rebuilding CConfigManager's vector can never pull the
+    // ground out from under an in-flight evaluation.
+    m_xrRules = Config::Legacy::mgr() ? Config::Legacy::mgr()->declaredXRRules() : std::vector<OpenXR::SXRRule>{};
+
+    // Titles change on every browser tab switch; only pay for that trigger if a rule can act on it.
+    m_rulesUseTitle = std::ranges::any_of(m_xrRules, [](const OpenXR::SXRRule& r) { return (bool)r.conds.focusTitleRe; });
+
+    if (!m_xrRules.empty())
+        Log::logger->log(Log::DEBUG, "[OPENXR] {} xrrule(s) loaded (title trigger: {})", m_xrRules.size(), m_rulesUseTitle ? "on" : "off");
+
+    requestEffectEval();
+}
+
+void COpenXRManager::requestEffectEval() {
+    // Coalesce: every trigger funnels here, and a burst (focus change -> workspace change -> title
+    // change, all in one keypress) collapses into ONE evaluation at the end of the loop iteration.
+    if (m_effectEvalQueued || !g_pEventLoopManager)
+        return;
+    m_effectEvalQueued = true;
+    // Capture NOTHING and re-check the global: a deferred callback must never run against a
+    // destroyed manager (the same discipline as the xrmonitor reconcile doLater in ConfigManager).
+    g_pEventLoopManager->doLater([] {
+        if (!g_pOpenXRManager)
+            return;
+        g_pOpenXRManager->onEffectEvalDue();
+    });
+}
+
+void COpenXRManager::onEffectEvalDue() {
+    m_effectEvalQueued = false;
+    evaluateMonitorEffects();
+}
+
+OpenXR::eXRAnchorState COpenXRManager::layerAnchorState(const PXRLAYER& layer) {
+    // MAIN THREAD, caller holds m_layersMu. The three states a user reasons about, in priority
+    // order. A hand/gaze carry outranks everything (it is what the monitor is doing RIGHT NOW);
+    // then "leashed to me" — an adaptive monitor that has left its desk pose, or a persistently
+    // head/body/device-anchored one; else world-fixed.
+    if (layer->m_anchor.grabbed() || layer->m_anchor.gazeGrabbed())
+        return OpenXR::XR_ANCHORSTATE_CARRIED;
+    if (layer->m_anchor.adaptiveEnabled() && layer->m_anchor.adaptivePhase() != OpenXR::XRAD_DOCKED)
+        return OpenXR::XR_ANCHORSTATE_FOLLOW;
+    switch (layer->m_anchor.state().mode) {
+        case OpenXR::XR_ANCHOR_HEAD:
+        case OpenXR::XR_ANCHOR_BODY:
+        case OpenXR::XR_ANCHOR_DEVICE: return OpenXR::XR_ANCHORSTATE_FOLLOW;
+        default: return OpenXR::XR_ANCHORSTATE_DOCKED;
+    }
+}
+
+OpenXR::SXRRuleContext COpenXRManager::buildRuleContext(const PXRLAYER& layer) {
+    // MAIN THREAD, caller holds m_layersMu. Each monitor is evaluated with its OWN tuple — that is
+    // what makes `monitor:` a filter rather than a selector.
+    OpenXR::SXRRuleContext ctx;
+    ctx.monitorName = layer->m_monitorName;
+    ctx.anchorState = layerAnchorState(layer);
+
+    const auto mon = layer->m_monitor.lock();
+    if (!mon)
+        return ctx;
+
+    // "The focused window OF a monitor" (doc 05 §xrrule): the fullscreen window on the monitor's
+    // active workspace if there is one — a fullscreen window IS what you are looking at, even if
+    // focus technically sits on a floating overlay — else that workspace's last-focused window.
+    // Hyprland tracks focus per workspace (CWorkspace::m_lastFocusedWindow), so this stays correct
+    // for an XR monitor that is not the compositor's globally-focused one, which is the whole point:
+    // every XR monitor must resolve its own situation, not the global focus.
+    PHLWINDOW win = Fullscreen::controller() ? Fullscreen::controller()->getFullscreenWindow(mon) : nullptr;
+    if (!win && mon->m_activeWorkspace)
+        win = mon->m_activeWorkspace->getLastFocusedWindow();
+    if (!win)
+        return ctx;
+
+    ctx.hasFocus   = true;
+    ctx.focusClass = win->m_class;
+    ctx.focusTitle = win->m_title;
+    ctx.fullscreen = Fullscreen::controller() && Fullscreen::controller()->isFullscreen(win);
+    return ctx;
+}
+
+void COpenXRManager::publishLayerEffects(const PXRLAYER& layer) {
+    // MAIN THREAD, caller holds m_layersMu. Plain floats into plain atomics — the frame loop reads
+    // exactly these three numbers and nothing else (no strings, no refcounts).
+    layer->m_fxAlpha.store(layer->m_fxAlphaEnv.value(), std::memory_order_relaxed);
+    layer->m_fxBlackAlpha.store(layer->m_fxBlackAlphaEnv.value(), std::memory_order_relaxed);
+    layer->m_fxKnee.store(layer->m_fxKneeEnv.value(), std::memory_order_relaxed);
+}
+
+void COpenXRManager::evaluateMonitorEffects() {
+    // MAIN THREAD. Resolve defaults -> rules -> manual for EVERY layer, retarget the envelopes, and
+    // damage any monitor whose targets actually moved (see below). Cheap: a handful of RE2 matches
+    // per monitor, and only on real events.
+    static auto        PBLACK = CConfigValue<Hyprlang::FLOAT>("openxr:black_alpha");
+    static auto        PKNEE  = CConfigValue<Hyprlang::FLOAT>("openxr:black_alpha_knee");
+
+    // Layer 1 — defaults. The uniform alpha default is 1.0 (fully opaque, the historic behavior);
+    // the luma-key defaults are the EXISTING globals, which is what keeps every pre-xrrule config
+    // behaving bit-identically.
+    OpenXR::SXREffects defaults;
+    defaults.alpha      = 1.F;
+    defaults.blackAlpha = std::clamp((float)*PBLACK, 0.F, 1.F);
+    defaults.blackKnee  = std::clamp((float)*PKNEE, OpenXR::XR_BLACK_ALPHA_KNEE_MIN, 1.F);
+
+    // The luma key only REVEALS anything when the runtime composites us over passthrough/additive
+    // (report 09 §3.1) — under opaque it just looks dim and dirty, so it is forced off there for
+    // rules exactly as it is for the global. The UNIFORM alpha is NOT gated: dimming toward the
+    // background is a legitimate de-emphasis cue under any blend mode.
+    const bool showsThrough = m_session && OpenXR::blendModeShowsThrough(xrBlendModeFromXr(m_session->m_blendMode));
+    bool       gatedAnyKey  = false;
+
+    std::vector<PHLMONITOR> damage;
+    {
+        std::scoped_lock lock(m_layersMu);
+        for (auto& l : m_layers) {
+            if (l->m_pendingRemoval.load(std::memory_order_acquire))
+                continue;
+
+            const auto ctx      = buildRuleContext(l);
+            auto       resolved = OpenXR::xrResolveEffects(defaults, m_xrRules, ctx, l->m_manualFx);
+
+            if (!showsThrough && OpenXR::xrBlackKeyActive(resolved.blackAlpha)) {
+                gatedAnyKey        = true;
+                resolved.blackAlpha = 1.F;
+            }
+
+            const bool moved = resolved.alpha != l->m_fxAlphaEnv.to || resolved.blackAlpha != l->m_fxBlackAlphaEnv.to || resolved.blackKnee != l->m_fxKneeEnv.to;
+            l->m_fxResolved  = resolved;
+            l->m_fxAlphaEnv.retarget(resolved.alpha);
+            l->m_fxBlackAlphaEnv.retarget(resolved.blackAlpha);
+            l->m_fxKneeEnv.retarget(resolved.blackKnee);
+            publishLayerEffects(l);
+
+            // A change needs ONE fresh composite to start from: the frame loop only re-blits a layer
+            // when a new desktop buffer arrives, and an animation-only frame needs a content snapshot
+            // that may not exist yet on a monitor that had no effects at all. Damaging the monitor
+            // once produces both. The ongoing luma-key transition keeps damaging from the envelope
+            // tick (the key is baked into the blit); the uniform alpha needs nothing further.
+            if (moved) {
+                if (auto mon = l->m_monitor.lock())
+                    damage.push_back(mon);
+            }
+        }
+    }
+
+    if (showsThrough)
+        m_fxKeyGateWarned = false; // re-arm: a later session on an opaque blend mode should warn again
+    // Only complain once a session EXISTS — before start() there is no blend mode to be wrong about,
+    // and the rules are (correctly) resolved with keying off until one is picked.
+    else if (gatedAnyKey && m_session && !m_fxKeyGateWarned) {
+        m_fxKeyGateWarned = true;
+        Log::logger->log(Log::WARN,
+                         "[OPENXR] an xrrule (or manual override) asks for luma-keyed transparency, but the session blend mode is '{}': keying needs a see-through composite and "
+                         "is ignored. Set openxr:blend_mode = alpha (passthrough) or additive and restart the session. Uniform `alpha` still applies (as a dim)",
+                         blendModeName());
+    }
+
+    if (g_pHyprRenderer)
+        for (auto& mon : damage)
+            g_pHyprRenderer->damageMonitor(mon);
+
+    armEffectEnvelopeTimer();
+}
+
+void COpenXRManager::armEffectEnvelopeTimer() {
+    // MAIN THREAD. One-shot 8ms tick, re-armed from the callback while anything is still moving
+    // (the codebase timer idiom). Nothing in flight = the timer is disarmed and costs nothing, so a
+    // settled desktop pays zero for this feature.
+    bool moving = false;
+    {
+        std::scoped_lock lock(m_layersMu);
+        for (auto& l : m_layers)
+            if (!l->m_fxAlphaEnv.settled() || !l->m_fxBlackAlphaEnv.settled() || !l->m_fxKneeEnv.settled()) {
+                moving = true;
+                break;
+            }
+    }
+
+    if (!moving) {
+        m_fxTickRunning = false;
+        if (m_fxTimer)
+            m_fxTimer->updateTimeout(std::nullopt);
+        return;
+    }
+
+    const auto dur = std::chrono::milliseconds(OpenXR::XR_FX_TICK_MS);
+    if (!m_fxTimer) {
+        m_fxTimer = makeShared<CEventLoopTimer>(
+            dur, [this](SP<CEventLoopTimer> self, void*) { onEffectEnvelopeTick(); }, nullptr);
+        if (g_pEventLoopManager)
+            g_pEventLoopManager->addTimer(m_fxTimer);
+    } else
+        m_fxTimer->updateTimeout(dur);
+}
+
+void COpenXRManager::onEffectEnvelopeTick() {
+    // MAIN THREAD. Advance every envelope by the wall-clock delta since the last tick and republish.
+    static auto PBLENDMS = CConfigValue<Hyprlang::INT>("openxr:transparency_blend_ms");
+    const float durSec   = std::max(0, (int)*PBLENDMS) / 1000.F;
+
+    const auto  now = Time::steadyNow();
+    float       dt  = 0.F;
+    if (m_fxTickRunning)
+        dt = std::min(0.25F, (float)std::chrono::duration_cast<std::chrono::microseconds>(now - m_fxLastTick).count() / 1e6F);
+    m_fxLastTick    = now;
+    m_fxTickRunning = true;
+
+    std::vector<PHLMONITOR> damage;
+    {
+        std::scoped_lock lock(m_layersMu);
+        for (auto& l : m_layers) {
+            // The LUMA KEY is baked into the blit, so a static desktop must be re-rendered for each
+            // step of a key transition to actually re-key. Sample the "was moving" bit BEFORE the
+            // advance so the final settling step damages too. The uniform alpha needs no damage: it
+            // is a post-multiply over the already-composed image, so the frame loop can re-apply it
+            // from the content snapshot on an animation-only frame.
+            const bool keyMoving = !l->m_fxBlackAlphaEnv.settled() || !l->m_fxKneeEnv.settled();
+
+            l->m_fxAlphaEnv.advance(dt, durSec);
+            l->m_fxBlackAlphaEnv.advance(dt, durSec);
+            l->m_fxKneeEnv.advance(dt, durSec);
+            publishLayerEffects(l);
+
+            if (keyMoving) {
+                if (auto mon = l->m_monitor.lock())
+                    damage.push_back(mon);
+            }
+        }
+    }
+
+    if (g_pHyprRenderer)
+        for (auto& mon : damage)
+            g_pHyprRenderer->damageMonitor(mon);
+
+    armEffectEnvelopeTimer(); // re-arm or disarm
 }
 
 void COpenXRManager::publishGrabStringTuning() {
@@ -3798,6 +4099,18 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
         info.adaptiveRoamMode = l->m_anchor.adaptiveRoamMode() == OpenXR::XR_ANCHOR_HEAD ? "head" : "body";
         info.adaptiveSeatDist = l->m_anchor.adaptiveSeatDist();
         info.adaptiveT        = l->m_anchor.adaptiveTransitionT();
+        // Situational transparency (doc 05 §xrrule): the live (eased) values, their resolved targets
+        // and the provenance of each. m_fxResolved is main-thread state under this same lock.
+        info.fxAlpha            = l->m_fxAlpha.load(std::memory_order_relaxed);
+        info.fxAlphaTarget      = l->m_fxResolved.alpha;
+        info.fxAlphaSrc         = OpenXR::xrEffectSourceName(l->m_fxResolved.alphaSrc);
+        info.fxBlackAlpha       = l->m_fxBlackAlpha.load(std::memory_order_relaxed);
+        info.fxBlackAlphaTarget = l->m_fxResolved.blackAlpha;
+        info.fxBlackAlphaSrc    = OpenXR::xrEffectSourceName(l->m_fxResolved.blackAlphaSrc);
+        info.fxKnee             = l->m_fxKnee.load(std::memory_order_relaxed);
+        info.fxKneeSrc          = OpenXR::xrEffectSourceName(l->m_fxResolved.blackKneeSrc);
+        info.fxTransitioning    = !l->m_fxAlphaEnv.settled() || !l->m_fxBlackAlphaEnv.settled() || !l->m_fxKneeEnv.settled();
+        info.anchorState        = OpenXR::xrAnchorStateName(layerAnchorState(l));
         if (l->m_reqResolution) {
             info.w = (int)l->m_reqResolution->x;
             info.h = (int)l->m_reqResolution->y;
@@ -3977,6 +4290,9 @@ std::expected<void, std::string> COpenXRManager::cmdAnchor(const std::string& ar
 
     if (modeChanged && g_pEventManager)
         g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitoranchor", layer->m_monitorName + "," + OpenXR::anchorModeToString(newMode, hand)});
+    // doc 05 §xrrule: local <-> head/body/device IS a docked <-> follow transition.
+    if (modeChanged)
+        requestEffectEval();
     return {};
 }
 
@@ -4026,6 +4342,64 @@ std::expected<void, std::string> COpenXRManager::cmdRotate(const std::string& ar
     constexpr float  DEG2RAD = (float)M_PI / 180.f;
     std::scoped_lock lock(m_layersMu);
     layer->m_anchor.applyRotate(*yaw * DEG2RAD, pitch * DEG2RAD, ctx);
+    return {};
+}
+
+std::expected<void, std::string> COpenXRManager::cmdAlpha(const std::string& args) {
+    const auto tokens = splitWs(args);
+    if (tokens.size() != 2)
+        return std::unexpected<std::string>("alpha: expected <name|active> <0..1|auto>");
+
+    const std::string& target = tokens[0];
+    PXRLAYER           layer  = target == "active" ? resolveSelected() : layerByName(target);
+    if (!layer)
+        return std::unexpected<std::string>(target == "active" ? "no XR monitor selected" : "no XR monitor named '" + target + "'");
+
+    const std::string val = tokens[1];
+    std::optional<float> want;
+    if (val != "auto") {
+        auto f = parseFloatArg(val);
+        if (!f || *f < 0.F || *f > 1.F)
+            return std::unexpected<std::string>("alpha: expected a number in 0..1, or `auto` to hand the monitor back to the rules");
+        want = *f;
+    }
+
+    {
+        std::scoped_lock lock(m_layersMu);
+        layer->m_manualFx.alpha = want; // nullopt == `auto` == back under rule control
+    }
+    // Re-resolve now: the manual layer sits ABOVE the rules, and clearing it must immediately fall
+    // back to whatever the rules say for the monitor's CURRENT situation.
+    requestEffectEval();
+    return {};
+}
+
+std::expected<void, std::string> COpenXRManager::cmdBlackAlpha(const std::string& args) {
+    const auto tokens = splitWs(args);
+    if (tokens.size() != 2)
+        return std::unexpected<std::string>("blackalpha: expected <name|active> <0..1|off|auto>");
+
+    const std::string& target = tokens[0];
+    PXRLAYER           layer  = target == "active" ? resolveSelected() : layerByName(target);
+    if (!layer)
+        return std::unexpected<std::string>(target == "active" ? "no XR monitor selected" : "no XR monitor named '" + target + "'");
+
+    const std::string    val = tokens[1];
+    std::optional<float> want;
+    if (val == "off")
+        want = 1.F; // off == every pixel opaque == no keying
+    else if (val != "auto") {
+        auto f = parseFloatArg(val);
+        if (!f || *f < 0.F || *f > 1.F)
+            return std::unexpected<std::string>("blackalpha: expected a number in 0..1, `off`, or `auto` to hand the monitor back to the rules");
+        want = *f;
+    }
+
+    {
+        std::scoped_lock lock(m_layersMu);
+        layer->m_manualFx.blackAlpha = want;
+    }
+    requestEffectEval();
     return {};
 }
 
@@ -4147,6 +4521,7 @@ std::expected<void, std::string> COpenXRManager::cmdAdaptive(const std::string& 
         return std::unexpected<std::string>("adaptive: expected on|off|toggle");
 
     layer->m_anchor.adaptiveSetEnabled(en);
+    requestEffectEval(); // doc 05 §xrrule: adaptive on/off can change the docked/follow state
     return {};
 }
 
@@ -4166,6 +4541,7 @@ std::expected<void, std::string> COpenXRManager::cmdDock(const std::string& args
         layer->m_anchor.adaptiveDockHere();
     else
         layer->m_anchor.adaptiveForceDock();
+    requestEffectEval(); // doc 05 §xrrule: forced dock -> anchorstate docked
     return {};
 }
 
@@ -4178,6 +4554,7 @@ std::expected<void, std::string> COpenXRManager::cmdUndock() {
     if (!layer->m_anchor.adaptiveEnabled())
         return std::unexpected<std::string>("undock: adaptive anchoring is not enabled on this monitor");
     layer->m_anchor.adaptiveForceUndock();
+    requestEffectEval(); // doc 05 §xrrule: forced undock -> anchorstate follow
     return {};
 }
 

@@ -17,6 +17,7 @@
 
 #include "XRGraphics.hpp"      // XR_GLuint / XR_EGLImageKHR aliases + CXRGraphics
 #include "XRMonitorConfig.hpp" // SXRMonitorParams / OpenXR::SXRAnchorSpec (unguarded)
+#include "XRRule.hpp"          // SXREffects / SXRResolvedEffects / SXRFxEnv (unguarded)
 #include "../helpers/memory/Memory.hpp"
 #include "../helpers/signal/Signal.hpp"
 #include "../helpers/math/Math.hpp"
@@ -206,6 +207,32 @@ class CXRMonitorLayer {
     // `hyprctl openxr status` (contentPath field) under m_layersMu. Plain atomic — never a refcount op.
     // "black" pinpoints a silent black-quad session (e.g. cross-GPU import failure) in one command.
     std::atomic<uint8_t> m_contentPath{0 /* OpenXR::XR_CONTENT_NONE */};
+
+    // ---- situational transparency (doc 05 §xrrule; report 09) ----
+    //
+    // MAIN THREAD ONLY (under COpenXRManager::m_layersMu). m_manualFx is the sticky manual override
+    // set by `hyprctl openxr alpha|blackalpha <name> <v>` and cleared by `auto` — it is the TOP
+    // precedence layer, above the rules, mirroring the shipped hand_input "manual over auto"
+    // pattern. m_fxResolved is the last full resolution (defaults -> rules -> manual) kept for
+    // `hyprctl openxr status` provenance, and the three envelopes ease the LIVE values toward it so
+    // no effect change ever pops (COpenXRManager::advanceEffectEnvelopes on an 8ms main-thread tick).
+    OpenXR::SXREffects         m_manualFx;
+    OpenXR::SXRResolvedEffects m_fxResolved;
+    OpenXR::SXRFxEnv           m_fxAlphaEnv{1.F, 1.F, 1.F};
+    OpenXR::SXRFxEnv           m_fxBlackAlphaEnv{1.F, 1.F, 1.F};
+    OpenXR::SXRFxEnv           m_fxKneeEnv{0.1F, 0.1F, 1.F};
+
+    // The EASED values the frame loop applies this frame: uniform monitor alpha (a premultiplied
+    // multiply over the whole composed swapchain image, so chrome ghosts WITH the content — report
+    // 09 §3.3) and the per-monitor luma-key parameters handed to blitBuffer/clearTex. Written by the
+    // main thread's envelope tick, read once per frame by the blit loop. Plain atomics — never a
+    // hyprutils refcount op, never a string (XRMonitorLayer.hpp threading rule + task #25).
+    std::atomic<float> m_fxAlpha{1.F};
+    std::atomic<float> m_fxBlackAlpha{1.F};
+    std::atomic<float> m_fxKnee{0.1F};
+    // What the uniform fade last RENDERED into the swapchain (frame thread only, redraw diff): a
+    // change means an animation-only frame must recompose even with no new desktop buffer.
+    float              m_fxAlphaDrawn = 1.F;
 
     // Fade-envelope state (frame thread only; only the blit loop touches these). Alpha is advanced
     // every frame from predicted-display-time deltas via OpenXR::chromeFadeAdvance; the *Drawn*

@@ -99,11 +99,24 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
                 "roamMode": "{}",
                 "seatDistM": {:.3f},
                 "transitionT": {:.3f}
+            }},
+            "anchorState": "{}",
+            "transparency": {{
+                "alpha": {:.3f},
+                "alphaTarget": {:.3f},
+                "alphaSource": "{}",
+                "blackAlpha": {:.3f},
+                "blackAlphaTarget": {:.3f},
+                "blackAlphaSource": "{}",
+                "knee": {:.3f},
+                "kneeSource": "{}",
+                "transitioning": {}
             }}
         }})#",
                                 m.name, m.id, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.quatX, m.quatY, m.quatZ, m.quatW, m.grabbed ? "true" : "false",
                                 m.grabKind, m.hovered ? "true" : "false", m.region, m.plugged ? "true" : "false", m.contentPath, m.linear ? "true" : "false", m.adaptiveEnabled ? "true" : "false", m.adaptivePhase,
-                                m.adaptiveRoamMode, m.adaptiveSeatDist, m.adaptiveT);
+                                m.adaptiveRoamMode, m.adaptiveSeatDist, m.adaptiveT, m.anchorState, m.fxAlpha, m.fxAlphaTarget, m.fxAlphaSrc, m.fxBlackAlpha, m.fxBlackAlphaTarget,
+                                m.fxBlackAlphaSrc, m.fxKnee, m.fxKneeSrc, m.fxTransitioning ? "true" : "false");
             if (i + 1 < MONS.size())
                 mons += ",\n";
             else
@@ -173,6 +186,14 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
         if (m.adaptiveEnabled)
             out += std::format(" adaptive: {} (roam {}, seat {:.2f}m)", m.adaptivePhase, m.adaptiveRoamMode, m.adaptiveSeatDist);
         out += "\n";
+        // Situational transparency (doc 05 §xrrule): the effective values + WHERE each came from, so
+        // "why is this monitor ghosted" is answerable in one command. `-> x` shows a live transition.
+        const std::string ALINE = m.fxTransitioning && m.fxAlpha != m.fxAlphaTarget ? std::format("{:.2f} -> {:.2f}", m.fxAlpha, m.fxAlphaTarget) : std::format("{:.2f}", m.fxAlpha);
+        const std::string BLINE = m.fxBlackAlpha >= 1.f && m.fxBlackAlphaTarget >= 1.f
+            ? std::string("off")
+            : (m.fxTransitioning && m.fxBlackAlpha != m.fxBlackAlphaTarget ? std::format("{:.2f} -> {:.2f}", m.fxBlackAlpha, m.fxBlackAlphaTarget)
+                                                                          : std::format("{:.2f}", m.fxBlackAlpha));
+        out += std::format("  {}: alpha {} ({}), blackalpha {} ({}, knee {:.2f}), anchorstate {}\n", m.name, ALINE, m.fxAlphaSrc, BLINE, m.fxBlackAlphaSrc, m.fxKnee, m.anchorState);
     }
     return out;
 }
@@ -335,6 +356,17 @@ static std::string openxrRequest(eHyprCtlOutputFormat format, std::string reques
         return r ? "ok" : r.error();
     }
 
+    // Situational transparency manual overrides (doc 05 §xrrule). `auto` hands the monitor back to
+    // the rules; anything else is sticky and outranks every rule until it is cleared.
+    if (SUBCOMMAND == "alpha") {
+        auto r = g_pOpenXRManager->cmdAlpha(ARGS);
+        return r ? "ok" : r.error();
+    }
+    if (SUBCOMMAND == "blackalpha") {
+        auto r = g_pOpenXRManager->cmdBlackAlpha(ARGS);
+        return r ? "ok" : r.error();
+    }
+
     // Adaptive anchoring verbs (research/13 §6.3).
     if (SUBCOMMAND == "adaptive") {
         auto r = g_pOpenXRManager->cmdAdaptive(ARGS);
@@ -376,8 +408,8 @@ static std::string openxrRequest(eHyprCtlOutputFormat format, std::string reques
     if (SUBCOMMAND == "gaze")
         return openxrGaze(format, ARGS);
 
-    return std::format("unknown openxr subcommand '{}'. Valid: status, enable, disable, create, destroy, select, anchor, move, rotate, scale, distance, center, place, adaptive, dock, "
-                       "undock, roam, gazegrab, gazerelease, gazepush, handinput, gaze, layout",
+    return std::format("unknown openxr subcommand '{}'. Valid: status, enable, disable, create, destroy, select, anchor, move, rotate, scale, distance, center, place, alpha, "
+                       "blackalpha, adaptive, dock, undock, roam, gazegrab, gazerelease, gazepush, handinput, gaze, layout",
                        SUBCOMMAND);
 }
 
