@@ -50,7 +50,7 @@ Runtimes exercised: **Monado** (including its null compositor for headless testi
 | `02-virtual-monitors.md` | the per-monitor layer, buffer handoff, pacing, mode changes, cross-GPU linear buffers, mirroring, the plug/unplug follow lifecycle |
 | `03-anchoring.md` | the four anchor modes, pose/leash math, adaptive anchoring, recenter, layout persistence |
 | `04-input.md` | action sets, the ray pointer, the grab state machine, grabbable chrome, hand pinch/grasp |
-| `05-configuration.md` | user reference: every `openxr:*` var, the `xrmonitor` keyword, the dispatcher, `hyprctl openxr`, socket2 events, idle integration, consumer recipes, overlay/hypxrpaper |
+| `05-configuration.md` | user reference: every `openxr:*` var, the `xrmonitor` + `xrrule` keywords, the dispatcher, `hyprctl openxr`, socket2 events, idle integration, consumer recipes, overlay/hypxrpaper |
 | `06-testing.md` | pure-math gtests, the Monado-backed integration suite, the containerized runner |
 | `07-xreal.md` | the XREAL Air 2 Ultra 3DoF display rig (WP-XR1): udev, the xreal Monado build flavor, the `xreal-ctl` HID helper, the flat↔XR toggle, the 3DoF profile, and the live checklist |
 
