@@ -188,14 +188,35 @@ GPU_DRIVER="$(node_driver "${HYPXR_GPU_NODE:-none}")"
 HYPXR_VAAPI_DRIVER="${HYPXR_VAAPI_DRIVER:-$(vaapi_for_driver "$GPU_DRIVER")}"
 HYPXR_VK_ICD="${HYPXR_VK_ICD:-$(icd_for_driver "$GPU_DRIVER" || true)}"
 
-# The system VA driver directory. Arch: /usr/lib/dri. Fedora: /usr/lib64/dri.
-# libva itself is the authority; the distro guess is only a fallback.
+# The system VA driver search path. Arch: /usr/lib/dri. Fedora: /usr/lib64/dri —
+# BUT Fedora's libva.pc deliberately hides the truth: libva is compiled to search
+# dri-nonfree:dri-freeworld:dri while `pkg-config --variable=driverdir` is sed'd
+# back to the bare dri, which holds a codec-STRIPPED driver (the full RPM Fusion
+# build lives in a sibling). Naming only the bare dir here fed a broken
+# LIBVA_DRIVERS_PATH into the wivrn override (hevc_vaapi "No usable encoding
+# profile" at session create — bit the thinkpad on 2026-08-03). So: expand every
+# candidate dir to its -nonfree/-freeworld siblings first, keeping only dirs
+# that exist. Same trap + same fix as hypxrva's shim resolver (bba2c5f).
+expand_dri_siblings() {
+    local out= dir sib
+    for dir in "$@"; do
+        for sib in "$dir-nonfree" "$dir-freeworld" "$dir"; do
+            [[ -d $sib && ":$out:" != *":$sib:"* ]] && out="${out:+$out:}$sib"
+        done
+    done
+    echo "$out"
+}
 default_libva_dir() {
-    local d
+    local d p
     d=$(pkg-config --variable=driverdir libva 2>/dev/null)
-    [[ -n $d && -d $d ]] && { echo "$d"; return; }
-    [[ -d /usr/lib64/dri ]] && { echo /usr/lib64/dri; return; }
-    echo /usr/lib/dri
+    # Fedora may someday stop hiding the list; split whatever we got and expand.
+    if [[ -n $d ]]; then
+        IFS=: read -ra p <<<"$d"
+        d=$(expand_dri_siblings "${p[@]}")
+        [[ -n $d ]] && { echo "$d"; return; }
+    fi
+    d=$(expand_dri_siblings /usr/lib64/dri /usr/lib/dri)
+    echo "${d:-/usr/lib/dri}"
 }
 HYPXR_LIBVA_DRIVERS_PATH="${HYPXR_LIBVA_DRIVERS_PATH:-$(default_libva_dir)}"
 
@@ -1450,9 +1471,15 @@ comp_va() {
     # driver (amdgpu -> radeonsi, i915/xe -> iHD/i965, ...), so no per-machine
     # configuration is needed here — but the SEARCH path is distro-shaped.
     ok "delegation target for this GPU: ${HYPXR_VAAPI_DRIVER:-<unknown>} (kernel driver ${GPU_DRIVER:-?})"
-    [[ -e $HYPXR_LIBVA_DRIVERS_PATH/${HYPXR_VAAPI_DRIVER}_drv_video.so ]] \
-        && ok "real driver found: $HYPXR_LIBVA_DRIVERS_PATH/${HYPXR_VAAPI_DRIVER}_drv_video.so" \
-        || warn "no ${HYPXR_VAAPI_DRIVER}_drv_video.so in $HYPXR_LIBVA_DRIVERS_PATH — install the GPU's VA driver"
+    # HYPXR_LIBVA_DRIVERS_PATH is a colon list (Fedora nonfree/freeworld siblings).
+    local _vadir _vafound= _vadirs
+    IFS=: read -ra _vadirs <<<"$HYPXR_LIBVA_DRIVERS_PATH"
+    for _vadir in "${_vadirs[@]}"; do
+        [[ -e $_vadir/${HYPXR_VAAPI_DRIVER}_drv_video.so ]] && { _vafound=$_vadir; break; }
+    done
+    [[ -n $_vafound ]] \
+        && ok "real driver found: $_vafound/${HYPXR_VAAPI_DRIVER}_drv_video.so" \
+        || warn "no ${HYPXR_VAAPI_DRIVER}_drv_video.so anywhere in $HYPXR_LIBVA_DRIVERS_PATH — install the GPU's VA driver"
 
     # The watcher is autostarted by the compositor config, not by systemd.
     if [[ -r $XRCONF ]] && grep -q 'hypxrva-watcher' "$XRCONF"; then
