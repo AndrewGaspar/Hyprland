@@ -308,7 +308,8 @@ scripts/hypxr-setup.sh monado
 
 This is the common case, not the rare one, and it has one sharp edge:
 
-> **The `hypxrland` branch has been force-pushed** (the v0.56.0 upstream rebase), and so has the
+> **The `hypxrland` branch gets force-pushed on every upstream rebase** (most recently onto
+> v0.56.1; before that v0.56.0), and so has the
 > WiVRn patch branch on every retag. `git pull` / `merge --ff-only` **cannot** cross a history
 > rewrite. The documented update is fetch + hard reset.
 
