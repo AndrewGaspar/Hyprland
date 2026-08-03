@@ -15,7 +15,9 @@
 #   hypxr-setup.sh monado               the OPTIONAL XREAL runtime (opt-in only)
 #
 # Components (in dependency order):
-#   deps        build prerequisites — PRINTS the package command, never runs it
+#   deps        build prerequisites — probes every pkg-config module the whole
+#               stack needs in one pass, then PRINTS one install command for
+#               what is missing. Never runs it.
 #   dotfiles    ~/.config/hypr (device branch) + setup-xr-display.sh
 #   env         ~/.config/uwsm/env session-environment additions
 #   compositor  ~/code/hypxrland worktree + build + the wayland-session entry
@@ -80,7 +82,7 @@ OPTIONAL_COMPONENTS=(monado)
 CHECK_ONLY=0
 declare -a WANT=()
 
-usage() { sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; }
+usage() { sed -n '2,48p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -424,6 +426,233 @@ cmake_build() {  # cmake_build <src> <build> <target...> -- <extra cmake args>
 # deps — packages. Printed, never installed.
 # ===========================================================================
 
+# ---------------------------------------------------------------------------
+# The pre-flight dependency probe
+# ---------------------------------------------------------------------------
+#
+# The first Fedora bring-up (ThinkPad X1 / fc44, 2026-08-03) cost eight
+# staggered failures, six of which were nothing but a missing .pc file found
+# one cmake-configure at a time: run a component, read one error, install one
+# package, run the next component, repeat. Everything the whole stack's
+# CMakeLists ask for is enumerated here instead, probed in a single pass before
+# any component runs, and what is missing comes out as ONE install command.
+#
+# Each row is:  <probe>  <component>  <arch package>  <fedora package>
+#
+#   probe   a pkg-config module name, or
+#           any:a|b|c   satisfied when ANY of those modules exists, or
+#           hdr:/path   a header/file that must exist, or
+#           bin:name    a program that must be on PATH
+#   fedora  the package name, or @ffmpeg — a group with two valid answers, so
+#           it gets the prose treatment below instead of a name in a list.
+#
+# Keep this table honest: it is the only place that knows the mapping, and a
+# wrong name here sends someone down exactly the rabbit hole it exists to
+# prevent. Sources: this repo's CMakeLists.txt, ~/code/{hypxrvoice,hypxrhud,
+# hypxrva,hypxrpaper}/CMakeLists.txt and the WiVRn tree's top-level CMakeLists.
+DEP_PROBES=(
+  # ---- compositor (this repo's REQUIRED pkg_check_modules) ---------------
+  "xkbcommon             compositor  libxkbcommon        libxkbcommon-devel"
+  "uuid                  compositor  util-linux-libs     libuuid-devel"
+  "wayland-server        compositor  wayland             wayland-devel"
+  "cairo                 compositor  cairo               cairo-devel"
+  "pango                 compositor  pango               pango-devel"
+  "pangocairo            compositor  pango               pango-devel"
+  "pixman-1              compositor  pixman              pixman-devel"
+  "xcursor               compositor  libxcursor          libXcursor-devel"
+  "libdrm                compositor  libdrm              libdrm-devel"
+  "libinput              compositor  libinput            libinput-devel"
+  # libeis-1.0 is THE Fedora trap: libei-devel does NOT ship libeis-1.0.pc.
+  # The .pc for the *server* half lives in libeis-devel, a separate package.
+  "libeis-1.0            compositor  libei               libeis-devel"
+  "gbm                   compositor  mesa                mesa-libgbm-devel"
+  "gio-2.0               compositor  glib2               glib2-devel"
+  "re2                   compositor  re2                 re2-devel"
+  "muparser              compositor  muparser            muparser-devel"
+  "lcms2                 compositor  lcms2               lcms2-devel"
+  "any:lua55|lua5.5|lua-5.5|lua   compositor  lua        lua-devel"
+  "aquamarine            compositor  aquamarine          aquamarine-devel"
+  "hyprlang              compositor  hyprlang            hyprlang-devel"
+  "hyprcursor            compositor  hyprcursor          hyprcursor-devel"
+  "hyprutils             compositor  hyprutils           hyprutils-devel"
+  "hyprgraphics          compositor  hyprgraphics        hyprgraphics-devel"
+  "bin:hyprwayland-scanner compositor hyprwayland-scanner hyprwayland-scanner"
+  "hdr:/usr/include/glslang/Public/ShaderLang.h  compositor  glslang  glslang-devel"
+  # Xwayland is on unless the build sets NO_XWAYLAND.
+  "xcb                   compositor  libxcb              libxcb-devel"
+  "xcb-render            compositor  libxcb              libxcb-devel"
+  "xcb-xfixes            compositor  libxcb              libxcb-devel"
+  "xcb-composite         compositor  libxcb              libxcb-devel"
+  "xcb-res               compositor  libxcb              libxcb-devel"
+  "xcb-icccm             compositor  xcb-util-wm         xcb-util-wm-devel"
+  "xcb-errors            compositor  xcb-util-errors     xcb-util-errors-devel"
+  # ---- shared XR client stack (compositor, hud, paper, hypxrvoice) -------
+  "openxr                xr          openxr              openxr-devel"
+  "vulkan                xr          vulkan-icd-loader   vulkan-loader-devel"
+  "egl                   xr          libglvnd            mesa-libEGL-devel"
+  "glesv2                xr          libglvnd            mesa-libGLESv2-devel"
+  "libsystemd            xr          systemd-libs        systemd-devel"
+  # ---- wivrn server ------------------------------------------------------
+  "libavcodec            wivrn       ffmpeg              @ffmpeg"
+  "libavutil             wivrn       ffmpeg              @ffmpeg"
+  "libavfilter           wivrn       ffmpeg              @ffmpeg"
+  "libswscale            wivrn       ffmpeg              @ffmpeg"
+  # x264 exists ONLY in RPM Fusion on Fedora — another vote for §ffmpeg (a).
+  "x264                  wivrn       x264                x264-devel"
+  "avahi-client          wivrn       avahi               avahi-devel"
+  "avahi-glib            wivrn       avahi               avahi-glib-devel"
+  "gio-unix-2.0          wivrn       glib2               glib2-devel"
+  "bin:gdbus-codegen     wivrn       glib2-devel         glib2-devel"
+  "libnotify             wivrn       libnotify           libnotify-devel"
+  "librsvg-2.0           wivrn       librsvg             librsvg2-devel"
+  "libarchive            wivrn       libarchive          libarchive-devel"
+  "libpng                wivrn       libpng              libpng-devel"
+  "openssl               wivrn       openssl             openssl-devel"
+  "nlohmann_json         wivrn       nlohmann-json       json-devel"
+  "CLI11                 wivrn       cli11               cli11-devel"
+  # Boost ships no .pc — WiVRn finds it with CMake's FindBoost, so probe the
+  # one header every Boost install has.
+  "hdr:/usr/include/boost/version.hpp  wivrn  boost  boost-devel"
+  # WiVRn FetchContent's Monado, whose Linux path adds two REQUIRED finds of
+  # its own — invisible in WiVRn's own CMakeLists and therefore a classic
+  # second-stagger. udev is pkg-config'able; Eigen3 is a CONFIG package, so
+  # probe its header (and the CMake user package registry, which is how a box
+  # with a hand-built eigen in some other tree quietly satisfies it — a good
+  # thing to know is happening rather than to depend on).
+  "libudev               wivrn       systemd-libs        systemd-devel"
+  "hdr:/usr/include/eigen3/Eigen/Core|/usr/include/Eigen/Core|$HOME/.cmake/packages/Eigen3  wivrn  eigen  eigen3-devel"
+  # ---- hypxrvoice --------------------------------------------------------
+  "libpipewire-0.3       voice       libpipewire         pipewire-devel"
+  "libspa-0.2            voice       libpipewire         pipewire-devel"
+  "sndfile               voice       libsndfile          libsndfile-devel"
+  # ---- hypxrhud (and hypxrvoice's NDJSON wire format) --------------------
+  "jansson               hud         jansson             jansson-devel"
+  # ---- hypxrva -----------------------------------------------------------
+  "libva                 va          libva               libva-devel"
+  "libva-drm             va          libva               libva-devel"
+)
+
+probe_satisfied() {
+    local p="$1" one; local -a alts=()
+    case "$p" in
+        any:*)  IFS='|' read -r -a alts <<<"${p#any:}"
+                for one in "${alts[@]}"; do
+                    pkg-config --exists "$one" 2>/dev/null && return 0
+                done
+                return 1 ;;
+        hdr:*)  IFS='|' read -r -a alts <<<"${p#hdr:}"
+                for one in "${alts[@]}"; do
+                    [[ -e $one ]] && return 0
+                done
+                return 1 ;;
+        bin:*)  have "${p#bin:}" ;;
+        *)      pkg-config --exists "$p" 2>/dev/null ;;
+    esac
+}
+
+# The name to show for a probe (strip the any:/hdr:/bin: machinery, and show
+# only the first alternative of a multi-way probe — the rest is noise here).
+probe_label() {
+    local p="$1"
+    case "$p" in
+        any:*)  p="${p#any:}"; printf '%s' "${p%%|*}" ;;
+        hdr:*)  p="${p#hdr:}"; printf '%s (file)' "${p%%|*}" ;;
+        bin:*)  printf '%s (program)' "${p#bin:}" ;;
+        *)      printf '%s' "$p" ;;
+    esac
+}
+
+# ffmpeg on Fedora is TWO valid answers, and the recommended one is not the
+# obvious one — so it gets prose, not a package name in a list. $1 is note or
+# manual (i.e. "reference material" vs "you actually have to do this").
+FFMPEG_ADVICE_SHOWN=0
+fedora_ffmpeg_advice() {
+    local emit="$1"
+    FFMPEG_ADVICE_SHOWN=1
+    note "ffmpeg on Fedora is SPLIT: the free build ships one -free-devel package per library."
+    note "(a) RECOMMENDED — RPM Fusion's full ffmpeg. WiVRn's VAAPI path needs the h264_vaapi /"
+    note "    hevc_vaapi ENCODERS at runtime and ffmpeg-free is built without them; x264-devel"
+    note "    exists only here; and the freeworld intel-media-driver you need for Intel ENCODE"
+    note "    entrypoints comes from the same repo. One repo solves all three."
+    $emit 'sudo dnf install -y "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm"'
+    $emit "sudo dnf swap ffmpeg-free ffmpeg --allowerasing"
+    $emit "sudo dnf install -y ffmpeg-devel"
+    note "(b) MINIMAL — headers only, from the free repo:"
+    note "      sudo dnf install -y libavcodec-free-devel libavutil-free-devel \\"
+    note "                          libavfilter-free-devel libswscale-free-devel"
+    note "    caveat: this satisfies the BUILD, and hardware encode can still be dead at"
+    note "    RUNTIME. Either way, verify with the encode check below before donning."
+    note "verify hw encode:  vainfo | grep -i enc"
+}
+
+# One pass over DEP_PROBES; one consolidated install command at the end.
+probe_pkgconfig_deps() {
+    local -a missing_rows=() pkgs=()
+    local row probe comp apkg fpkg pkg ffmpeg_missing=0 total=0
+
+    for row in "${DEP_PROBES[@]}"; do
+        # shellcheck disable=SC2086
+        set -- $row
+        probe="$1" comp="$2" apkg="$3" fpkg="$4"
+        total=$((total + 1))
+        probe_satisfied "$probe" && continue
+        # Tab-separated: a probe string may itself contain '|' alternatives.
+        missing_rows+=("$probe	$comp")
+        case "$DISTRO" in
+            arch)   pkg="$apkg" ;;
+            fedora) pkg="$fpkg" ;;
+            *)      pkg="" ;;
+        esac
+        [[ $pkg == "@ffmpeg" ]] && { ffmpeg_missing=1; continue; }
+        [[ -n $pkg ]] && pkgs+=("$pkg")
+    done
+
+    if [[ ${#missing_rows[@]} -eq 0 ]]; then
+        ok "pre-flight: all $total build dependencies present (compositor, xr, wivrn, voice, hud, va)"
+        return 0
+    fi
+
+    fail "pre-flight: ${#missing_rows[@]} of $total build dependencies are MISSING"
+    note "each one of these is a cmake-configure failure waiting to happen, in this component:"
+    for row in "${missing_rows[@]}"; do
+        printf '      %-46s %s\n' "$(probe_label "${row%%	*}")" "${DIM}(${row##*	})${R}"
+    done
+
+    # Dedupe while keeping the table's order readable.
+    local -a uniq=()
+    if [[ ${#pkgs[@]} -gt 0 ]]; then
+        while IFS= read -r pkg; do uniq+=("$pkg"); done < <(printf '%s\n' "${pkgs[@]}" | sort -u)
+    fi
+    if [[ ${#uniq[@]} -gt 0 ]]; then
+        case "$DISTRO" in
+            arch)   manual "sudo pacman -S --needed ${uniq[*]}" ;;
+            fedora) manual "sudo dnf install -y ${uniq[*]}"
+                    note "if dnf cannot find one of those names, resolve it from the .pc file itself:"
+                    note "  dnf provides '*/pkgconfig/<module>.pc'" ;;
+            *)      warn "unrecognized distro — install the equivalents of: ${uniq[*]}" ;;
+        esac
+    fi
+    for row in "${missing_rows[@]}"; do
+        case "${row%%	*}" in
+          libeis-1.0)
+            note "TRAP: on Fedora this is libeis-devel, NOT libei-devel — libei-devel ships only the"
+            note "  CLIENT .pc (libei-1.0.pc). Installing it and re-running fails identically." ;;
+          x264)
+            [[ $DISTRO == fedora ]] || continue
+            note "x264-devel is in RPM FUSION FREE ONLY — Fedora proper does not carry it, so the"
+            note "  dnf line above cannot resolve until the repo is enabled. Do that first:"
+            note "    sudo dnf install -y \\"
+            note "      \"https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-\$(rpm -E %fedora).noarch.rpm\""
+            note "  (Arch carries x264 in the main repos, which is why the reference box never hit this.)" ;;
+        esac
+    done
+    ((ffmpeg_missing)) && case "$DISTRO" in
+        fedora) fedora_ffmpeg_advice manual ;;
+        arch)   manual "sudo pacman -S --needed ffmpeg" ;;
+    esac
+    return 1
+}
+
 comp_deps() {
     header "deps — build prerequisites ($DISTRO)"
 
@@ -445,6 +674,10 @@ comp_deps() {
     have vainfo && ok "vainfo present (VA-API introspection)" \
                 || note "vainfo not installed (libva-utils) — install it to verify hw ENCODE entrypoints"
 
+    # The pre-flight probe: everything every downstream component's CMake will
+    # ask for, checked here so a bring-up is one install command, not eight.
+    probe_pkgconfig_deps || missing=1
+
     # Package commands are reference material on a box that already has
     # everything; they only become action items when something is missing.
     local pkg=note; ((missing)) && pkg=manual
@@ -463,14 +696,24 @@ comp_deps() {
         $pkg "sudo dnf copr enable -y agaspar/omedora-4   # (already on if this box runs omedora)"
         $pkg "sudo dnf builddep -y hyprland"
         $pkg "sudo dnf install -y git cmake ninja-build ccache gcc-c++ openxr-devel vulkan-headers vulkan-loader-devel libva-devel libva-utils inotify-tools jq"
-        note "UNVERIFIED from this box: the exact Fedora name of the OpenXR loader devel package."
+        note "\`dnf builddep hyprland\` does NOT cover the six non-compositor components, and it"
+        note "missed libeis-devel even for the compositor — the pre-flight probe above is the"
+        note "authority, not the spec."
+        note "VERIFIED on Fedora 44 (thinkpad-x1, 2026-08-03): boost-devel pipewire-devel"
+        note "  jansson-devel libva-devel libsndfile-devel libeis-devel — all correct names,"
+        note "  all installed cleanly, all satisfied the build they were needed for."
+        note "  libeis-devel is the one that burned us: libei-devel does NOT ship libeis-1.0.pc."
+        note "STILL UNVERIFIED: the exact Fedora name of the OpenXR loader devel package (that box"
+        note "  already had a loader, so 'openxr-devel' above has never actually been installed)."
         note "  verify with:  dnf provides '*/pkgconfig/openxr.pc'"
         note "WiVRn is NOT packaged for Fedora — the wivrn component builds it from source and"
         note "installs the user unit + OpenXR manifest itself. Its build deps are in the WiVRn"
         note "tree at docs/building.md; \`dnf builddep\` has no spec to work from."
+        ((FFMPEG_ADVICE_SHOWN)) || fedora_ffmpeg_advice note
         note "Intel media: stock intel-media-driver may lack H.264/H.265 ENCODE entrypoints."
         note "  verify with:  vainfo | grep -i 'EncSlice\\|EncSliceLP'"
-        note "  if absent, install RPM Fusion's freeworld build of intel-media-driver."
+        note "  if absent, install RPM Fusion's freeworld build of intel-media-driver — which is"
+        note "  the same repo option (a) above already turns on."
         ;;
       *)
         warn "unrecognized distro — install the equivalents of: openxr loader+headers, vulkan"
@@ -677,6 +920,14 @@ comp_compositor() {
                 || fail "build has NO OpenXR support — the loader was missing at configure time"
         fi
     else
+        # CMakeLists.txt stamps the version banner from `git describe --tags`.
+        # A fork clone with no tags makes that print
+        #     fatal: No names found, cannot describe anything
+        # in the middle of the configure — harmless, but it reads exactly like a
+        # build failure and cost a real "is this broken?" detour on the first
+        # Fedora bring-up. Fetching the tags is the fix at the right layer: the
+        # message comes from CMake, not from this script.
+        git -C "$FISHFOOD" fetch --tags origin >/dev/null 2>&1 || true
         cmake -S "$FISHFOOD" -B "$build" -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache >/dev/null \
@@ -1159,8 +1410,22 @@ comp_va() {
         exe_present "$HOME/.local/bin/hypxrva-watcher" "hypxrva-watcher"
         exe_present "$HOME/.local/bin/hypxrva-vaprobe" "hypxrva-vaprobe"
     else
-        "$VA_DIR/install.sh" >/dev/null && did "hypxrva built and installed under ~/.local" \
-                                       || { fail "hypxrva install.sh failed"; return 1; }
+        # install.sh ALREADY runs `ctest --output-on-failure` — but ctest writes
+        # the failing test's output to STDOUT, and sending that to /dev/null left
+        # "Errors while running CTest" on stderr as the only surviving clue. Keep
+        # the quiet happy path, keep the whole log when it goes wrong.
+        local log; log=$(mktemp)
+        if "$VA_DIR/install.sh" >"$log" 2>&1; then
+            rm -f "$log"
+            did "hypxrva built and installed under ~/.local"
+        else
+            fail "hypxrva install.sh failed — its output follows"
+            tail -n 60 "$log" | sed 's/^/      /'
+            rm -f "$log"
+            note "re-run it directly for the full log: $(tilde "$VA_DIR")/install.sh"
+            note "or, to install anyway while a test is being fixed: $(tilde "$VA_DIR")/install.sh --skip-tests"
+            return 1
+        fi
     fi
 
     # The shim directory must contain NOTHING else: LIBVA_DRIVERS_PATH points at it.
@@ -1240,7 +1505,11 @@ comp_monado() {
 
     if [[ ! -d $sub/.git && ! -f $sub/.git ]]; then
         fail "the monado submodule is not initialized in $(tilde "$FISHFOOD")"
-        manual "git -C $(tilde "$FISHFOOD") submodule update --init subprojects/monado"
+        # sync BEFORE update. A submodule's remote URL is frozen into
+        # .git/config at first init, so the .gitmodules move of monado to the
+        # AndrewGaspar fork never reaches an existing checkout on its own — the
+        # next fetch dies with "fatal: remote error: upload-pack: not our ref".
+        manual "git -C $(tilde "$FISHFOOD") submodule sync --recursive && git -C $(tilde "$FISHFOOD") submodule update --init subprojects/monado"
         return 1
     fi
     ok "monado submodule present ($(git -C "$sub" rev-parse --short HEAD 2>/dev/null))"
