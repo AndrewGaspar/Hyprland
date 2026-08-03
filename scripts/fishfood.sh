@@ -13,6 +13,15 @@
 #
 # The session file install needs root; this script never runs sudo itself —
 # it prints the command for the user to run.
+#
+# SCOPE: this script owns the COMPOSITOR only, and `update` is a fast-forward.
+# For the whole HypXRland stack (WiVRn, hypxrvoice, hypxrhud, hypxrva,
+# hypxrpaper, the dotfiles device branch, the session environment), and for the
+# update path that survives a force-push of the hypxrland branch — fetch + hard
+# reset + stale-build-tree removal — use scripts/hypxr-setup.sh instead. It
+# shares this script's worktree/branch/config/jobs environment variables
+# (HYPXRLAND_FISHFOOD*), so the two agree about where things live.
+# See docs/openxr/08-machine-setup.md.
 
 set -euo pipefail
 
