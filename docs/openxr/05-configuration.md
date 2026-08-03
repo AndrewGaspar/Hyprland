@@ -152,7 +152,7 @@ in-headset with `hyprctl keyword` and the monitors re-blit immediately.
 
 | Variable | Type | Default | Meaning | Applies |
 |---|---|---|---|---|
-| `black_alpha` | float | `1.0` | Alpha given to **pure black** content pixels. `1.0` = feature **off** (every pixel opaque, exactly the historic behavior); `0.0` = black is fully transparent; in between = translucent black. Brighter pixels are untouched (see `black_alpha_knee`). **This is the DEFAULT layer** for per-monitor resolution — an `xrrule` or a manual override can change it per monitor (see [§xrrule](#the-xrrule-keyword--situational-per-monitor-transparency)). | hot |
+| `black_alpha` | float | `1.0` | Alpha given to **pure black** content pixels. `1.0` = feature **off** (every pixel opaque, exactly the historic behavior); `0.0` = black is fully transparent; in between = translucent black. Brighter pixels are untouched (see `black_alpha_knee`). **This is the DEFAULT layer** for per-monitor resolution — an `xrrule` or a manual override can change it per monitor (see [§xrrule](#35-the-xrrule-keyword--situational-per-monitor-transparency)). | hot |
 | `black_alpha_knee` | float | `0.10` | The luma at which content becomes **fully opaque**. Pure black gets `black_alpha`, luma ≥ this is left alone, `smoothstep` ramp between. Lower = only near-black dissolves; higher = dark greys go see-through too. Also the default layer for per-monitor resolution. | hot |
 | `transparency_blend_ms` | int | `600` | How long any per-monitor transparency change (uniform `alpha` or luma key, from a rule, a manual verb or a reload) takes to ease in. Nothing pops: the value rides a smoothstep envelope and an interrupted transition continues from wherever it is. `0` = snap. | hot |
 
