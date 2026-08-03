@@ -57,6 +57,7 @@
 #include "../managers/input/InputManager.hpp"
 #include "../output/Monitor.hpp"
 #include "../state/MonitorState.hpp"
+#include "../state/MonitorLayoutController.hpp" // 2D-plane sync: scheduleRecheck() after moving XR monitors
 #include "../helpers/Drm.hpp"    // DRM::sameGpu (physical-GPU compare for cross-GPU linear decision)
 #include "../helpers/Format.hpp" // NFormatUtils::drmModifierName (post-reconfigure modifier log)
 #include "../render/Renderer.hpp" // damageMonitor (force a fresh present into the re-allocated buffers)
@@ -108,6 +109,10 @@ COpenXRManager::~COpenXRManager() {
     if (m_fxTimer && g_pEventLoopManager)
         g_pEventLoopManager->removeTimer(m_fxTimer);
     m_fxTimer.reset();
+    // ...and for the 2D-plane-sync debounce (report 12 WP-S2).
+    if (m_l2dTimer && g_pEventLoopManager)
+        g_pEventLoopManager->removeTimer(m_l2dTimer);
+    m_l2dTimer.reset();
 }
 
 void COpenXRManager::init() {
@@ -1133,6 +1138,11 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
                 g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitorgrab", e.str + (e.a ? ",1" : ",0")});
             // doc 05 §xrrule: a grab begin/end IS an anchor-state transition (-> carried / back).
             requestEffectEval();
+            // report 12 §4: re-derive the 2D plane on the RELEASE edge only. Never on grab-begin —
+            // the layout must not churn mid-drag, and syncLayout2D() refuses to run while anything
+            // is carried anyway. Debounced, so a flurry of releases costs one relayout.
+            if (!e.a)
+                requestLayout2DSync();
             break;
         case eXRStateEventType::ADAPTIVE:
             // research/13 §6.4: the terminal dock/undock edge (a = 1 undocked / 0 docked).
@@ -1141,6 +1151,11 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
             // doc 05 §xrrule: the docked <-> follow transition — the trigger the walking rule
             // (`xrrule = alpha 0.55, anchorstate:follow`) rides.
             requestEffectEval();
+            // report 12 §4 / LAYOUT-AND-NAMING "seams": adaptive dock/undock is a spatial change, so
+            // the plane re-derives on the terminal edge. An adaptive monitor is projected from its
+            // SAVED desk pose either way (see syncLayout2D), so this settles the plane back onto the
+            // desk arrangement after a roam rather than tracking you around the room.
+            requestLayout2DSync();
             break;
         case eXRStateEventType::TRACKING: Log::logger->log(Log::DEBUG, "[OPENXR] device-lock tracking {} (monitor {})", e.a ? "gained" : "lost", e.str); break;
         case eXRStateEventType::SCHEDULE_FRAMES: {
@@ -2144,6 +2159,18 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
     if (layer->m_createdByXR)
         mon->m_xrManagedPlug = true;
 
+    // report 12 §4 per-monitor opt-out: capture ONCE, before the sync engine has ever written an
+    // offset for this output, whether an explicit user `monitor=NAME,...,<x>x<y>,...` rule owns its
+    // POSITION (the same shape as m_userProvidedMode owning its MODE). Such a monitor is excluded
+    // from the projection for good — checking explicitPosition() later would be useless, because by
+    // then the sync engine's own offset is sitting in exactly that field.
+    if (Config::monitorRuleMgr()) {
+        const auto USERRULE      = Config::monitorRuleMgr()->get(mon);
+        layer->m_l2dUserPinned   = USERRULE.m_offset != Vector2D{-INT32_MAX, -INT32_MAX};
+        if (layer->m_l2dUserPinned)
+            Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}' is pinned by an explicit monitor= offset — excluded from 2D-plane sync", params.m_name);
+    }
+
     // 4. Bind: cache the monitor + wire listeners. The onGone callback runs the removal
     //    barrier when the monitor is externally destroyed (path B).
     layer->bindToMonitor(mon, [this, name = params.m_name]() {
@@ -2224,6 +2251,11 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
     //    costs a single evaluation pass.
     requestEffectEval();
 
+    // 10. report 12 §4: the monitor SET changed, so the 2D plane must be re-derived. Debounced, so a
+    //     config declaring five monitors still costs a single relayout — and it lands after all five
+    //     exist, which is what makes the projection see the whole arrangement instead of a prefix.
+    requestLayout2DSync();
+
     Log::logger->log(Log::DEBUG, "[OPENXR] created XR monitor '{}' (seq {}, size {}m)", params.m_name, layer->m_seq, sizeMeters);
     return layer;
 }
@@ -2300,6 +2332,10 @@ void COpenXRManager::finalizeLayerRemoval(const std::string& name) {
     if (g_pEventManager)
         g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitorremoved", name});
 
+    // report 12 §4: the set changed. Without this the survivors keep the offsets that were computed
+    // when the departed monitor still occupied a column, leaving a hole in the middle of the plane.
+    requestLayout2DSync();
+
     Log::logger->log(Log::DEBUG, "[OPENXR] destroyed XR monitor '{}'", name);
 }
 
@@ -2346,13 +2382,26 @@ void COpenXRManager::registerDeclaredMonitorRule(const PHLMONITOR& mon, const PX
     // layer->m_userProvidedMode, so we never clobber it. Building the rule from get(mon) preserves any
     // other user-set fields (scale/transform) while we override only the mode. add() replaces our own
     // prior rule by name (idempotent) and schedules an ensureMonitorStatus pass to apply it.
-    if (!mon || !layer || !layer->m_reqResolution || layer->m_userProvidedMode || !Config::monitorRuleMgr())
+    if (!mon || !layer || !Config::monitorRuleMgr())
+        return;
+    const bool wantMode = layer->m_reqResolution && !layer->m_userProvidedMode;
+    // report 12 WP-S2 durability: once the 2D-plane sync owns this monitor's POSITION, the offset
+    // rides the persistent rule too. syncLayout2D writes m_activeMonitorRule.m_offset directly (the
+    // light path — no rule-manager traffic, no mode re-apply), but a rule refresh from any other
+    // source re-derives m_activeMonitorRule from the rule MANAGER, which would otherwise hand back
+    // the {-INT32_MAX,-INT32_MAX} "auto" sentinel and drop us back to append-right.
+    const bool wantOffset = layer->m_l2dPlaced;
+    if (!wantMode && !wantOffset)
         return;
     Config::CMonitorRule rule = Config::monitorRuleMgr()->get(mon);
     rule.m_name               = mon->m_name;
-    rule.m_resolution         = *layer->m_reqResolution;
-    if (layer->m_reqRefresh)
-        rule.m_refreshRate = *layer->m_reqRefresh;
+    if (wantMode) {
+        rule.m_resolution = *layer->m_reqResolution;
+        if (layer->m_reqRefresh)
+            rule.m_refreshRate = *layer->m_reqRefresh;
+    }
+    if (wantOffset)
+        rule.m_offset = layer->m_l2dOffset;
     // Keep the output ENABLED in the rule — the unplug lifecycle is driven separately through
     // onConnect/onDisconnect + the m_xrManagedPlug guard (issue A), not the rule's disabled bit.
     rule.m_disabled = false;
@@ -3166,6 +3215,13 @@ void COpenXRManager::setMonitorsPlugged(bool plugged) {
             mon->onConnect(true);
         else
             mon->onDisconnect();
+
+        // report 12 §4: a plug edge changes WHICH monitors are in the layout, so the plane has to be
+        // re-derived — an unplugged monitor must not keep a reserved column (a hole the cursor falls
+        // into), and a re-plugged one must get its spatial slot back rather than land append-right
+        // via the ordinary hotplug path. Debounced, so donning the headset with six monitors costs
+        // one relayout.
+        requestLayout2DSync();
     }
 }
 
@@ -3262,6 +3318,13 @@ void COpenXRManager::onConfigReload() {
     // Re-run so that toggling openxr:inhibit_idle takes effect immediately (WP9 hook).
     if (g_pInputManager)
         g_pInputManager->recheckIdleInhibitorStatus();
+
+    // report 12 §1.2 + §4: a reload RE-PARSES the monitor rules, so any runtime offset we injected is
+    // gone by the time this listener runs (CConfigManager::reloadRules clears and re-adds, then
+    // ensureMonitorStatus re-applies). Re-inject. This also picks up a hot-edited openxr:layout2d:*
+    // knob, since the projection reads its config fresh on every pass. Debounced like every other
+    // trigger, so a reload that changes nothing costs one no-op pass.
+    requestLayout2DSync();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4111,6 +4174,21 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
         info.fxKneeSrc          = OpenXR::xrEffectSourceName(l->m_fxResolved.blackKneeSrc);
         info.fxTransitioning    = !l->m_fxAlphaEnv.settled() || !l->m_fxBlackAlphaEnv.settled() || !l->m_fxKneeEnv.settled();
         info.anchorState        = OpenXR::xrAnchorStateName(layerAnchorState(l));
+        // 2D-plane sync (report 12): where the projection put this monitor and the angles it used, so
+        // "why does my cursor cross there" is answerable in one command.
+        info.l2dSource          = l->m_l2dUserPinned ? "pinned" : (l->m_l2dPlaced ? "auto" : "off");
+        info.l2dCol             = l->m_l2dCol;
+        info.l2dRow             = l->m_l2dRow;
+        info.l2dX               = l->m_l2dOffset.x;
+        info.l2dY               = l->m_l2dOffset.y;
+        info.l2dAzDeg           = l->m_l2dAzDeg;
+        info.l2dElDeg           = l->m_l2dElDeg;
+        if (l->m_l2dUserPinned) {
+            if (auto mon = l->m_monitor.lock()) {
+                info.l2dX = mon->m_position.x;
+                info.l2dY = mon->m_position.y;
+            }
+        }
         if (l->m_reqResolution) {
             info.w = (int)l->m_reqResolution->x;
             info.h = (int)l->m_reqResolution->y;
@@ -4184,6 +4262,339 @@ std::string COpenXRManager::layoutDump() {
     for (auto& ln : lines)
         out += ln + "\n";
     return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 2D-plane sync (report 12 WP-S2): keep Hyprland's native monitor-layout plane in sync with where
+// the XR quads actually float, so the cursor leaves XR-main's right edge and lands on XR-side
+// exactly where your eyes expect. Everything here is MAIN THREAD: the pure projection lives in
+// XRLayout2D (WP-S1), and the pose snapshot is taken under m_layersMu exactly as layoutDump() takes
+// it — the frame thread already publishes CXRAnchor::lastWorld() for status, so this needs no new
+// cross-thread plumbing and does zero refcount work off-main.
+// ---------------------------------------------------------------------------------------------
+
+bool COpenXRManager::layout2DEnabled() {
+    static auto PEN = CConfigValue<Hyprlang::INT>("openxr:layout2d:enabled");
+    return *PEN != 0;
+}
+
+OpenXR::SXRLayout2DConfig COpenXRManager::readLayout2DConfig() {
+    // MAIN THREAD ONLY — two of these are STRING config values, which the frame thread may never
+    // touch (XRMonitorLayer.hpp threading rule). Nothing here ever runs off-main.
+    static auto PPXDEG   = CConfigValue<Hyprlang::FLOAT>("openxr:layout2d:px_per_degree");
+    static auto PPXM     = CConfigValue<Hyprlang::FLOAT>("openxr:layout2d:px_per_meter");
+    static auto PVERT    = CConfigValue<std::string>("openxr:layout2d:vertical");
+    static auto POVERLAP = CConfigValue<Hyprlang::INT>("openxr:layout2d:min_overlap_px");
+    static auto PROWMRG  = CConfigValue<Hyprlang::FLOAT>("openxr:layout2d:row_merge_deg");
+    static auto PHYST    = CConfigValue<Hyprlang::FLOAT>("openxr:layout2d:reorder_hysteresis_deg");
+
+    OpenXR::SXRLayout2DConfig cfg;
+    cfg.pxPerDegree          = (float)*PPXDEG;
+    cfg.pxPerMeter           = (float)*PPXM;
+    cfg.vertical             = OpenXR::xrParseLayout2DVertical(*PVERT).value_or(OpenXR::XR_L2D_VERT_ELEVATION);
+    cfg.minOverlapPx         = (int)*POVERLAP;
+    cfg.rowMergeDeg          = (float)*PROWMRG;
+    cfg.reorderHysteresisDeg = (float)*PHYST;
+    return cfg;
+}
+
+OpenXR::eXRLayout2DAttach COpenXRManager::readLayout2DAttach() {
+    static auto PATTACH = CConfigValue<std::string>("openxr:layout2d:attach");
+    return OpenXR::xrParseLayout2DAttach(*PATTACH).value_or(OpenXR::XR_L2D_ATTACH_RIGHT);
+}
+
+void COpenXRManager::latchLayout2DReference() {
+    // §3a: world-anchored monitors are measured against a LATCHED "desk orientation", never the live
+    // head yaw — turning your chair must not re-map your mouse. Re-latched only at moments that mean
+    // "this is how I'm sitting now": session start, `center`/recenter, an explicit `sync-layout`.
+    const auto ctx = currentVerbContext();
+    if (!ctx.viewValid)
+        return; // no tracking yet — keep whatever we had (possibly nothing; the sync then no-ops)
+
+    // The reference yaw in the projection's RIGHT-POSITIVE convention, straight from the forward
+    // vector. NOT qYawOf(), which is atan2(-f.x, -f.z) — the negation — and would mirror the layout.
+    const OpenXR::Vec3 fwd = OpenXR::poseForward(ctx.view.rot);
+    const float        horiz = std::sqrt(fwd.x * fwd.x + fwd.z * fwd.z);
+
+    m_l2dRef.eye   = ctx.view.pos;
+    m_l2dRef.yaw   = horiz < 1e-4F ? m_l2dRef.yaw : std::atan2(fwd.x, -fwd.z); // looking straight up/down: keep the last yaw
+    m_l2dRef.valid = true;
+    Log::logger->log(Log::DEBUG, "[OPENXR] 2D-plane sync: reference frame latched (eye [{:.2f}, {:.2f}, {:.2f}], yaw {:.1f} deg)", m_l2dRef.eye.x, m_l2dRef.eye.y, m_l2dRef.eye.z,
+                     m_l2dRef.yaw * 57.29578F);
+}
+
+void COpenXRManager::requestLayout2DSync() {
+    // The debounced funnel every trigger uses. Re-arming (rather than only arming) is what makes a
+    // burst — five monitors declared in a config, or a flurry of grab releases — cost ONE relayout:
+    // the timer only fires once the events stop. NEVER call syncLayout2D() straight from a trigger.
+    if (!g_pEventLoopManager || !layout2DEnabled() || m_l2dFrozen)
+        return;
+
+    static auto PDEB = CConfigValue<Hyprlang::INT>("openxr:layout2d:debounce_ms");
+    const auto  dur  = std::chrono::milliseconds(std::max(0, (int)*PDEB));
+
+    if (!m_l2dTimer) {
+        m_l2dTimer = makeShared<CEventLoopTimer>(
+            dur, [](SP<CEventLoopTimer>, void*) {
+                // Capture NOTHING and re-check the global: a deferred callback must never run
+                // against a destroyed manager (same discipline as requestEffectEval).
+                if (g_pOpenXRManager)
+                    g_pOpenXRManager->onLayout2DSyncDue();
+            },
+            nullptr);
+        g_pEventLoopManager->addTimer(m_l2dTimer);
+    } else
+        m_l2dTimer->updateTimeout(dur);
+}
+
+void COpenXRManager::onLayout2DSyncDue() {
+    if (m_l2dTimer)
+        m_l2dTimer->updateTimeout(std::nullopt); // one-shot; requestLayout2DSync re-arms
+    syncLayout2D(false);
+}
+
+void COpenXRManager::syncLayout2D(bool force) {
+    // MAIN THREAD. One pass: snapshot poses -> project -> attach the block -> write the offsets ->
+    // let the ordinary arrange() pipeline do placement, xdg-output and monitor.layoutChanged.
+    if (!layout2DEnabled())
+        return;
+    if (m_l2dFrozen && !force)
+        return;
+
+    if (!m_l2dRef.valid)
+        latchLayout2DReference();
+    if (!m_l2dRef.valid) {
+        // No tracked head pose has ever been seen (no session, or tracking not up). Falling back to
+        // today's auto-append-right is the correct behaviour, not an error: we have nothing to
+        // measure azimuths against, and guessing would produce a layout that changes the moment
+        // tracking arrives.
+        return;
+    }
+
+    const auto cfg    = readLayout2DConfig();
+    const auto attach = readLayout2DAttach();
+
+    std::vector<OpenXR::SXRLayout2DInput> in;
+    std::vector<PXRLAYER>                 chosen;
+    bool                                  carrying = false;
+    int                                   pinned   = 0;
+    {
+        std::scoped_lock lock(m_layersMu);
+
+        // FREEZE while anything is being carried (§4, "NEVER mid-grab"). Moving the plane under a
+        // live carry would yank the cursor and re-tile windows in the middle of a drag, and the pose
+        // we'd measure is the transient grip pose, not where the monitor is going to end up. Retry
+        // after the debounce instead of dropping the request, so the release still gets its relayout
+        // even if the release event itself is missed.
+        for (auto& l : m_layers) {
+            if (l->m_pendingRemoval.load(std::memory_order_acquire))
+                continue;
+            if (l->m_anchor.grabbed() || l->m_anchor.gazeGrabbed()) {
+                carrying = true;
+                break;
+            }
+        }
+
+        if (!carrying) {
+            for (auto& l : m_layers) {
+                if (l->m_pendingRemoval.load(std::memory_order_acquire))
+                    continue;
+
+                // An adopted pre-existing output (m_createdByXR == false) is one of the user's REAL
+                // monitors that an xrmonitor line mirrors into XR — its 2D position belongs to the
+                // physical layout and must never be driven from a quad pose. Same guard as
+                // setMonitorsPlugged's.
+                if (!l->m_createdByXR)
+                    continue;
+
+                // An explicit user `monitor=` offset OWNS that monitor's position: the sync engine
+                // never fights it (§4 per-monitor opt-out). arrange() places explicit-position
+                // monitors first, and the attach seam below puts our block clear of them.
+                if (l->m_l2dUserPinned) {
+                    ++pinned;
+                    continue;
+                }
+
+                // A controller-locked quad is a hand-held palette, not a desktop (§3, DEVICE
+                // excluded) — it has no stable place in a mouse-crossing plane.
+                const auto& st = l->m_anchor.state();
+                if (st.mode == OpenXR::XR_ANCHOR_DEVICE)
+                    continue;
+
+                // Only monitors that are actually in the layout: a monitor held UNPLUGGED (headset
+                // doffed, research/18) is not in monitorState()->monitors(), so reserving a box for
+                // it would leave a hole the cursor falls into.
+                auto mon = l->m_monitor.lock();
+                if (!mon || !mon->m_enabled)
+                    continue;
+
+                OpenXR::SXRLayout2DInput m;
+                m.name = l->m_monitorName;
+                // Same live-vs-declared choice layoutDump() makes, for the same reasons: a LOCAL
+                // monitor reports its live solved world pose, but an ADAPTIVE one reports its SAVED
+                // desk pose even while roaming — the desk pose is the persistent identity, and
+                // mapping the mouse to wherever a monitor followed you to would churn the plane
+                // every time you stood up.
+                const bool useLive = st.mode == OpenXR::XR_ANCHOR_LOCAL && !st.adaptive.enabled && l->m_anchor.hasLastWorld();
+                m.pose             = useLive ? l->m_anchor.lastWorld() : st.anchorPose;
+                // head/body offsets are already expressed in their own (stable) follow frame and are
+                // merged onto the same plane (§3b): the 2D map represents the arrangement as seen
+                // from the reference pose, where the desk frame and the view frame coincide.
+                m.followFrame      = st.mode == OpenXR::XR_ANCHOR_HEAD || st.mode == OpenXR::XR_ANCHOR_BODY;
+                // LOGICAL size — the unit CMonitorPositionController::arrange works in.
+                m.w                = (int)mon->m_size.x;
+                m.h                = (int)mon->m_size.y;
+
+                in.push_back(m);
+                chosen.push_back(l);
+            }
+        }
+    }
+
+    if (carrying) {
+        requestLayout2DSync();
+        return;
+    }
+    if (in.empty()) {
+        m_l2dPlacedCount = 0;
+        m_l2dRows        = 0;
+        m_l2dWidth       = 0;
+        m_l2dHeight      = 0;
+        return;
+    }
+
+    const auto res = OpenXR::xrProjectLayout2D(in, m_l2dRef, cfg, m_l2dPrev);
+
+    // ---- attach the block to the physical/pinned monitors (§2.5) ----
+    // Physical outputs have NO room pose — they aren't in XR space — so we can only arrange XR
+    // monitors among themselves and translate the finished block to a seam. Only EXPLICITLY
+    // positioned monitors may feed that computation; see xrLayout2DAttachOrigin for why (arrange()
+    // appends auto monitors downstream of our block, so measuring one would measure our own previous
+    // output and the layout would march rightwards a block-width per event).
+    std::vector<OpenXR::SXRLayout2DAnchorBox> anchors;
+    for (const auto& mon : State::monitorState()->monitors()) {
+        if (std::ranges::any_of(chosen, [&](const PXRLAYER& l) { return l->m_monitorName == mon->m_name; }))
+            continue; // one of ours: it is being placed by this very pass
+        if (!mon->explicitPosition().has_value())
+            continue; // auto: its position is downstream of ours
+        anchors.push_back(OpenXR::SXRLayout2DAnchorBox{(int)mon->m_position.x, (int)mon->m_position.y, (int)mon->m_size.x, (int)mon->m_size.y});
+    }
+
+    int ox = 0, oy = 0;
+    OpenXR::xrLayout2DAttachOrigin(anchors, res.width, res.height, attach, ox, oy);
+    const Vector2D origin{(double)ox, (double)oy};
+
+    // ---- write the offsets ----
+    // The report's "cleanest integration" (§5): set each XR monitor's rule offset (so
+    // explicitPosition() reports it and every future arrange() honours it) and let the existing
+    // pipeline do the rest. moveTo() then shifts floating windows by the delta, re-arranges the
+    // monitor's LAYER SURFACES (c3bdf3aa — layers cache GLOBAL geometry and would otherwise be
+    // stranded outside their own monitor), relayouts tiled windows, and re-clamps the cursor.
+    bool changed = false;
+    {
+        std::scoped_lock lock(m_layersMu);
+
+        // Hand back any monitor we used to place but no longer do (it re-anchored to a controller,
+        // or the user pinned it). Leaving our stale offset on it would freeze it at a position
+        // nothing maintains any more; clearing to the "auto" sentinel returns it to the ordinary
+        // append-right path, which is exactly what an unmanaged XR monitor should do.
+        for (auto& l : m_layers) {
+            if (!l->m_l2dPlaced || std::ranges::any_of(chosen, [&](const PXRLAYER& c) { return c == l; }))
+                continue;
+            l->m_l2dPlaced = false;
+            if (auto mon = l->m_monitor.lock())
+                mon->m_activeMonitorRule.m_offset = Vector2D{-INT32_MAX, -INT32_MAX};
+            changed = true;
+        }
+
+        for (size_t i = 0; i < chosen.size(); ++i) {
+            const auto&    slot = res.slots[i];
+            const Vector2D pos{origin.x + (double)slot.x, origin.y + (double)slot.y};
+            auto&          l = chosen[i];
+
+            if (!l->m_l2dPlaced || l->m_l2dOffset != pos)
+                changed = true;
+
+            l->m_l2dPlaced = true;
+            l->m_l2dOffset = pos;
+            l->m_l2dCol    = slot.col;
+            l->m_l2dRow    = slot.row;
+            l->m_l2dAzDeg  = slot.azDeg;
+            l->m_l2dElDeg  = slot.elDeg;
+
+            if (auto mon = l->m_monitor.lock())
+                mon->m_activeMonitorRule.m_offset = pos;
+        }
+    }
+
+    m_l2dPrev        = OpenXR::xrLayout2DPrevOf(res);
+    m_l2dPlacedCount = (int)chosen.size();
+    m_l2dRows        = res.rows;
+    m_l2dWidth       = res.width;
+    m_l2dHeight      = res.height;
+
+    if (!changed)
+        return; // the common case: a trigger fired but nothing actually moved (hysteresis held)
+
+    Log::logger->log(Log::DEBUG, "[OPENXR] 2D-plane sync: placed {} monitor(s) in {} row(s), block {}x{} at [{}, {}]{}", chosen.size(), res.rows, res.width, res.height, origin.x,
+                     origin.y, pinned > 0 ? std::format(" ({} pinned by monitor= rules)", pinned) : "");
+
+    State::monitorLayoutController()->scheduleRecheck();
+    if (g_pEventManager)
+        g_pEventManager->postEvent(SHyprIPCEvent{"xrlayout2dsync", std::format("{}", chosen.size())});
+}
+
+COpenXRManager::SXRLayout2DStatus COpenXRManager::layout2DStatus() {
+    SXRLayout2DStatus s;
+    s.enabled = layout2DEnabled();
+    s.frozen  = m_l2dFrozen;
+    if (!s.enabled)
+        return s;
+    const auto cfg  = readLayout2DConfig();
+    s.refValid      = m_l2dRef.valid;
+    s.refYawDeg     = m_l2dRef.yaw * 57.29578F;
+    s.placed        = m_l2dPlacedCount;
+    s.rows          = m_l2dRows;
+    s.width         = m_l2dWidth;
+    s.height        = m_l2dHeight;
+    s.vertical      = OpenXR::xrLayout2DVerticalName(cfg.vertical);
+    s.attach        = OpenXR::xrLayout2DAttachName(readLayout2DAttach());
+    s.pxPerDegree   = cfg.pxPerDegree;
+    return s;
+}
+
+std::expected<void, std::string> COpenXRManager::cmdSyncLayout(const std::string& args) {
+    // At most one token; trimmed here rather than through splitWs, which is defined further down
+    // with the rest of the verb helpers.
+    std::string arg = args;
+    while (!arg.empty() && std::isspace((unsigned char)arg.front()))
+        arg.erase(arg.begin());
+    while (!arg.empty() && std::isspace((unsigned char)arg.back()))
+        arg.pop_back();
+
+    if (arg.empty()) {
+        if (!layout2DEnabled())
+            return std::unexpected<std::string>("2D-plane sync is off (set openxr:layout2d:enabled = true)");
+        // An explicit sync is also the natural "re-sync my layout to how I'm sitting NOW" moment, so
+        // it re-latches the desk orientation before projecting (§4) — same as `center`.
+        latchLayout2DReference();
+        if (!m_l2dRef.valid)
+            return std::unexpected<std::string>("no head tracking yet — cannot latch a reference frame");
+        syncLayout2D(/*force=*/true);
+        return {};
+    }
+    if (arg == "freeze") {
+        m_l2dFrozen = true;
+        if (m_l2dTimer)
+            m_l2dTimer->updateTimeout(std::nullopt);
+        return {};
+    }
+    if (arg == "thaw") {
+        m_l2dFrozen = false;
+        requestLayout2DSync();
+        return {};
+    }
+    return std::unexpected<std::string>("sync-layout: unknown argument '" + arg + "' (expected freeze|thaw)");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4293,6 +4704,9 @@ std::expected<void, std::string> COpenXRManager::cmdAnchor(const std::string& ar
     // doc 05 §xrrule: local <-> head/body/device IS a docked <-> follow transition.
     if (modeChanged)
         requestEffectEval();
+    // report 12 §3: re-anchoring changes WHICH frame the monitor is measured in (world vs follow vs
+    // excluded-entirely for device), and an explicit offset moves it outright.
+    requestLayout2DSync();
     return {};
 }
 
@@ -4310,10 +4724,13 @@ std::expected<void, std::string> COpenXRManager::cmdMove(const std::string& args
     if (!layer)
         return std::unexpected<std::string>("no XR monitor selected");
 
-    const auto       ctx = currentVerbContext();
-    std::scoped_lock lock(m_layersMu);
-    if (!layer->m_anchor.applyMove(OpenXR::Vec3{*dx, *dy, *dz}, ctx))
-        return std::unexpected<std::string>("move: head tracking (or controller for device anchors) unavailable");
+    const auto ctx = currentVerbContext();
+    {
+        std::scoped_lock lock(m_layersMu);
+        if (!layer->m_anchor.applyMove(OpenXR::Vec3{*dx, *dy, *dz}, ctx))
+            return std::unexpected<std::string>("move: head tracking (or controller for device anchors) unavailable");
+    }
+    requestLayout2DSync(); // report 12 §4: a pose verb moved a quad -> re-derive the plane (debounced)
     return {};
 }
 
@@ -4340,8 +4757,11 @@ std::expected<void, std::string> COpenXRManager::cmdRotate(const std::string& ar
 
     const auto       ctx     = currentVerbContext();
     constexpr float  DEG2RAD = (float)M_PI / 180.f;
-    std::scoped_lock lock(m_layersMu);
-    layer->m_anchor.applyRotate(*yaw * DEG2RAD, pitch * DEG2RAD, ctx);
+    {
+        std::scoped_lock lock(m_layersMu);
+        layer->m_anchor.applyRotate(*yaw * DEG2RAD, pitch * DEG2RAD, ctx);
+    }
+    requestLayout2DSync();
     return {};
 }
 
@@ -4418,9 +4838,12 @@ std::expected<void, std::string> COpenXRManager::cmdScale(const std::string& arg
     if (!layer)
         return std::unexpected<std::string>("no XR monitor selected");
 
-    std::scoped_lock lock(m_layersMu);
-    layer->m_anchor.applyScale(isDelta, *f);
-    layer->m_sizeMeters = layer->m_anchor.state().widthMeters;
+    {
+        std::scoped_lock lock(m_layersMu);
+        layer->m_anchor.applyScale(isDelta, *f);
+        layer->m_sizeMeters = layer->m_anchor.state().widthMeters;
+    }
+    requestLayout2DSync();
     return {};
 }
 
@@ -4436,10 +4859,13 @@ std::expected<void, std::string> COpenXRManager::cmdDistance(const std::string& 
     if (!layer)
         return std::unexpected<std::string>("no XR monitor selected");
 
-    const auto       ctx = currentVerbContext();
-    std::scoped_lock lock(m_layersMu);
-    if (!layer->m_anchor.applyDistance(*dm, ctx))
-        return std::unexpected<std::string>("distance: head tracking unavailable or no current pose");
+    const auto ctx = currentVerbContext();
+    {
+        std::scoped_lock lock(m_layersMu);
+        if (!layer->m_anchor.applyDistance(*dm, ctx))
+            return std::unexpected<std::string>("distance: head tracking unavailable or no current pose");
+    }
+    requestLayout2DSync();
     return {};
 }
 
@@ -4448,11 +4874,17 @@ std::expected<void, std::string> COpenXRManager::cmdCenter() {
     if (!layer)
         return std::unexpected<std::string>("no XR monitor selected");
 
-    static auto      PDEFDIST = CConfigValue<Hyprlang::FLOAT>("openxr:default_distance");
-    const auto       ctx      = currentVerbContext();
-    std::scoped_lock lock(m_layersMu);
-    if (!layer->m_anchor.applyCenter(ctx, (float)*PDEFDIST))
-        return std::unexpected<std::string>("center: head tracking unavailable");
+    static auto PDEFDIST = CConfigValue<Hyprlang::FLOAT>("openxr:default_distance");
+    const auto  ctx      = currentVerbContext();
+    {
+        std::scoped_lock lock(m_layersMu);
+        if (!layer->m_anchor.applyCenter(ctx, (float)*PDEFDIST))
+            return std::unexpected<std::string>("center: head tracking unavailable");
+    }
+    // report 12 §3a/§4: `center` is a "this is how I'm sitting now" moment, so it RE-LATCHES the desk
+    // orientation the whole world-monitor projection is measured against, then re-derives the plane.
+    latchLayout2DReference();
+    requestLayout2DSync();
     return {};
 }
 
@@ -4490,6 +4922,7 @@ std::expected<void, std::string> COpenXRManager::cmdPlace(const std::string& arg
     // (and any bar) sees the mode transition.
     if (g_pEventManager)
         g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitoranchor", layer->m_monitorName + ",local"});
+    requestLayout2DSync();
     return {};
 }
 

@@ -868,6 +868,13 @@ static SDispatchResult xrmonitorDispatch(const std::string& args) {
     if (verb == "handinput")
         return wrapExp(g_pOpenXRManager->cmdHandInput(rest));
 
+    // 2D-plane sync (report 12 WP-S2): re-derive Hyprland's 2D monitor layout from where the quads
+    // actually float, so mouse crossing and directional focus match what you see. Bindable, so
+    // "re-sync my mouse mapping to how I'm sitting now" is one keystroke; `sync freeze|thaw` pauses
+    // and resumes the automatic recompute while you rearrange quads.
+    if (verb == "sync")
+        return wrapExp(g_pOpenXRManager->cmdSyncLayout(rest));
+
     return {.success = false, .error = "unknown xrmonitor verb '" + verb + "'"};
 #endif
 }
