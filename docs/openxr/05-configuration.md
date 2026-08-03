@@ -263,6 +263,88 @@ Feedback: the dwell-stable monitor you're looking at is highlighted via the norm
 move-bar lights up in the hover color); a gaze-carried monitor glows in the grab color and shows the
 gaze cursor. A gaze carry and a hand/controller grab can't fight over one monitor — first wins.
 
+### 2D-plane sync (`layout2d:*`)
+
+Derives Hyprland's **native 2D monitor layout** from where the XR quads actually float, so mouse
+crossing and directional focus match spatial intuition: a monitor floating to your upper-right in the
+headset sits upper-right in the 2D plane, and the cursor leaves `XR-main`'s right edge and lands on
+`XR-side` where your eyes expect. Without it, XR monitors are appended flush-right in **creation
+order** and their 2D position has nothing to do with their pose.
+
+How it works, in one paragraph: each quad's centre is projected to an (azimuth, elevation) pair about
+a **latched reference eye**, both angles are scaled by `px_per_degree`, and the resulting arrangement
+is **compacted** into rows and columns that are edge-touching and overlap-free — because Hyprland's
+directional focus needs the facing edges within 2px *and* a perpendicular overlap, and the pointer is
+clamped to the union of monitor boxes, so a raw angular map would leave walls and cursor jumps. The
+recompute is **event-driven and debounced**, never per-frame and never mid-carry.
+
+| Variable | Type | Default | Meaning |
+|---|---|---|---|
+| `layout2d:enabled` | bool | `true` | Derive the 2D layout from the 3D arrangement. `false` = the historic append-right behavior. | hot |
+| `layout2d:px_per_degree` | float | `35` | Angular → pixel scale for monitor **centres**. 35 is a 1080p reference monitor at the default distance/size. Compaction is authoritative for adjacency, so this mostly sets how proportional the spacing feels. | hot |
+| `layout2d:vertical` | string | `elevation` | Row placement: `elevation` (angular — a clean spherical unwrap with one constant) or `world_height` (metric; better when the monitors sit at wildly different distances). | hot |
+| `layout2d:px_per_meter` | float | `1000` | `vertical=world_height` only: layout px per metre of world height. | hot |
+| `layout2d:attach` | string | `right` | Where the XR block attaches to the physical monitors: `right` (flush right of the physical layout, vertically centred) or `around` (the XR block *is* the layout). `around` is used automatically when no non-XR monitor is enabled. | hot |
+| `layout2d:min_overlap_px` | int | `64` | Minimum perpendicular overlap forced between neighbours, so directional focus resolves and the cursor isn't threading a hairline seam. | hot |
+| `layout2d:row_merge_deg` | float | `10` | Elevation window within which monitors share a row/tier. | hot |
+| `layout2d:reorder_hysteresis_deg` | float | `4` | How far a monitor must move before the layout is allowed to change. Below this it keeps its previous placement, so a slightly bumped quad never reshuffles your mouse mapping. `0` disables the dead band. | hot |
+| `layout2d:debounce_ms` | int | `300` | Coalescing window for recompute triggers — a burst of grab releases costs one relayout. | hot |
+
+**When it recomputes.** Only on discrete events, never per frame: an XR monitor is created or
+destroyed, a monitor plugs or unplugs (donning/doffing the headset), a **grab RELEASE** (never a grab
+*begin* — the plane stays frozen for the whole carry), an adaptive dock/undock, any of the pose verbs
+(`move`/`rotate`/`scale`/`distance`/`center`/`place`/`anchor`), a config reload, or an explicit
+`hyprctl openxr sync-layout`. Everything funnels through one debounced pass.
+
+**The reference frame.** World (`anchor:local`) monitors are measured against a **latched desk
+orientation** — the head pose captured at session start, at `center`/recenter, and at an explicit
+`sync-layout` — *not* the live head yaw. Turning your chair must not re-map your mouse. `head`/`body`
+monitors are measured in their own follow frame (their angle relative to you is constant by
+construction) and merged onto the same plane: the map represents the arrangement **as seen from the
+reference pose**, where the two frames coincide. `device`-anchored quads are a hand-held palette, not
+a desktop, and are excluded entirely. An **adaptive** monitor is projected from its saved *desk* pose
+even while roaming, so walking around the room doesn't drag your mouse mapping with you.
+
+**Physical monitors keep their arrangement.** They have no room pose — they aren't in XR space — so
+only the XR block is auto-placed, and it is attached at the `attach` seam. There is no way to
+spatially interleave a physical output into the XR arrangement.
+
+The seam is measured **only from monitors with an explicit `monitor =` position**, and that is
+deliberate: Hyprland's `arrange()` places explicit-position monitors first and then appends the
+`auto` ones flush to their right, so once the XR monitors carry an offset, an `auto` monitor lands to
+the right of *them*. Measuring the seam from an `auto` monitor would therefore be measuring the
+engine's own previous output, and the whole layout would march rightwards a block-width per event.
+Practically:
+
+- **You have `monitor = DP-1, …, 0x0, 1` (an explicit position).** DP-1 does not move at all, and the
+  XR block sits flush to its right, vertically centred on it. This is the case the default is
+  written for.
+- **All your monitors are `auto`.** The XR block takes the origin and your physical monitors append
+  to its right. Their arrangement *relative to each other* is unchanged; the whole physical block is
+  translated. Give one monitor an explicit position if you want the XR block on the other side.
+- **Headset-only session (no other enabled output).** The XR block *is* the layout, at the origin —
+  the same result `attach = around` forces.
+
+**Per-monitor opt-out.** An XR monitor with an explicit user `monitor = XR-1, …, <x>x<y>, 1` rule
+offset is **pinned**: the sync engine never touches it, `arrange()` places it first (explicit
+positions always win), and the auto-placed block is attached clear of it. Pin one, auto-flow the
+rest. A `monitor =` rule that only sets a *mode* (with `auto` position) does not pin — that monitor is
+still auto-placed. `hyprctl openxr status` labels each monitor `auto`, `pinned` or `off`.
+
+```ini
+openxr {
+    layout2d {
+        enabled = true
+        px_per_degree = 35
+        # Pause auto-recompute while you rearrange, then resume:
+        #   hyprctl openxr sync-layout freeze  …  hyprctl openxr sync-layout thaw
+    }
+}
+
+# Re-sync the mouse mapping to how you are sitting right now (also re-latches the reference frame).
+bind = SUPER SHIFT, Home, xrmonitor, sync
+```
+
 ---
 
 ## 3. The `xrmonitor` keyword
@@ -562,6 +644,7 @@ transports, one implementation.
 | `handinput` | `on\|off\|auto\|toggle` | Set the conditional hand-input policy (§2). `toggle` is the key-chord to flip hands on/off at the keyboard. |
 | `alpha` | `<name\|active> <0..1\|auto>` | Manual uniform-transparency override (§3.5). Sticky — outranks every `xrrule` until cleared with `auto`. |
 | `blackalpha` | `<name\|active> <0..1\|off\|auto>` | Manual luma-key override (§3.5). `off` disables keying on that monitor; `auto` hands it back to the rules. |
+| `sync` | *(none)* \| `freeze` \| `thaw` | 2D-plane sync. Bare: re-latch the desk orientation and re-derive the 2D layout **now**. `freeze` pauses the automatic recompute (rearrange quads without your mouse mapping moving under you); `thaw` resumes it and catches up. Same implementation as `hyprctl openxr sync-layout`. |
 
 **Selected-target resolution** (for `active` / omitted targets): explicit `select` > last
 ray-hovered monitor > focused-monitor-if-XR — else the verb errors with "no XR monitor
@@ -578,6 +661,7 @@ binde = SUPER,       minus,        xrmonitor, distance +0.25
 bind  = SUPER,       H,            xrmonitor, anchor active head
 bind  = SUPER,       L,            xrmonitor, anchor active local
 bind  = SUPER,       A,            xrmonitor, adaptive toggle
+bind  = SUPER SHIFT, Home,         xrmonitor, sync
 ```
 
 (`binde` = repeat-on-hold, natural for `distance`/`scale`/`rotate`.)
@@ -594,8 +678,14 @@ hyprctl openxr <verb> …        # the §4 verbs: create destroy select anchor m
                                #   scale distance center place alpha blackalpha adaptive
                                #   dock undock roam gazegrab gazerelease gazepush handinput
 hyprctl openxr gaze [at <ms>]  # read-only head ray + timestamped gaze history (see below)
-hyprctl openxr layout          # dump the CURRENT live layout as paste-ready xrmonitor= lines
+hyprctl openxr layout          # dump the CURRENT live 3D layout as paste-ready xrmonitor= lines
+hyprctl openxr sync-layout [freeze|thaw]
+                               # re-derive the 2D monitor plane from the 3D arrangement
 ```
+
+`hyprctl openxr layout` and `hyprctl openxr sync-layout` are unrelated despite the names:
+`layout` dumps the **3D** arrangement as config lines and is unaffected by 2D-plane sync;
+`sync-layout` drives the **2D** projection (see [§2 layout2d](#2d-plane-sync-layout2d)).
 
 `hyprctl openxr layout` walks every live XR monitor (declared and runtime-created) and prints
 lines you can paste straight into your config to reproduce the arrangement — including a
@@ -717,7 +807,9 @@ visible: yes
 presence: yes
 idle inhibited: yes
 input: left controllers, right hands (pinch, filtered)
+2d-plane sync: 2 monitor(s) in 1 row(s), block 4480x1440, ref yaw 0 deg, 35 px/deg, vertical elevation, attach right
 monitor XR-code (ID 3): 2560x1440@90.00 size 1.80m anchor local pos [0.00, 1.40, -1.50] grabbed: no (none) hovered: yes (body) plugged: yes content: <path>
+  XR-code: 2d [1920, 0] col 0 row 0 (auto) from az -12.4 deg, el -3.1 deg
 ```
 
 While dormant the state line carries the reprobe hint, e.g.
@@ -768,9 +860,15 @@ JSON (`hyprctl -j openxr`) — all keys always present:
             "plugged": true,
             "contentPath": "",
             "linear": false,
-            "adaptive": { "enabled": false, "phase": "docked", "roamMode": "body", "seatDistM": 0.0, "transitionT": 0.0 }
+            "adaptive": { "enabled": false, "phase": "docked", "roamMode": "body", "seatDistM": 0.0, "transitionT": 0.0 },
+            "layout2d": { "source": "auto", "col": 0, "row": 0, "x": 1920, "y": 0, "azDeg": -12.40, "elDeg": -3.10 }
         }
-    ]
+    ],
+    "layout2d": {
+        "enabled": true, "frozen": false, "referenceLatched": true, "referenceYawDeg": 0.0,
+        "placed": 2, "rows": 1, "blockWidth": 4480, "blockHeight": 1440,
+        "vertical": "elevation", "attach": "right", "pxPerDegree": 35.0
+    }
 }
 ```
 
@@ -795,6 +893,17 @@ Field notes:
   resolves. Lets a consumer name the verb target without replicating the resolution order.
 - `monitorsFollowSession` / `monitorUnplugPendingMs` — the active follow mode, and ms until a
   pending grace-period unplug fires (`-1` when none pending).
+- `layout2d` (top level) — the 2D-plane-sync engine (see [§2](#2d-plane-sync-layout2d)).
+  `referenceLatched` is false until a tracked head pose has been seen, in which case the layout
+  falls back to the historic append-right; `frozen` is the `sync-layout freeze` latch; `placed` /
+  `rows` / `blockWidth` / `blockHeight` describe the block the projection last emitted. The text
+  form collapses this to the `2d-plane sync:` line (`off`, `on (waiting for tracking)`, or the
+  summary, prefixed `frozen — ` while frozen).
+- `layout2d` (per monitor) — where the projection put this monitor and the angles it used.
+  `source` is `auto` (the projection owns its position), `pinned` (an explicit user `monitor=`
+  offset does — see the per-monitor opt-out in §2) or `off` (2D-plane sync disabled, or nothing
+  placed yet). `azDeg`/`elDeg` are measured about the latched reference eye, azimuth
+  right-positive. This is the answer to "why does my cursor cross there".
 - `userPresence` — the `XR_EXT_user_presence` signal driving the `visible`-mode plug gate:
   `yes`/`no` (donned/doffed) when the runtime supports it, `unknown` before the first presence
   event of a session, `unsupported` otherwise.
@@ -844,6 +953,7 @@ Posted on the compositor's socket2 (`.socket2.sock`), standard `EVENT>>DATA` wir
 | `xrmonitorquad` | `<name>,1` / `<name>,0` | A monitor's quad was reactivated / suspended under the runtime layer cap (the monitor keeps rendering as a headless output). |
 | `xrmonitorundocked` | `<name>` | An adaptive monitor picked itself up and began following. |
 | `xrmonitordocked` | `<name>` | An adaptive monitor re-docked to its desk pose. |
+| `xrlayout2dsync` | `<n>` | 2D-plane sync placed `<n>` XR monitors and the layout actually changed. The stock `monitor.layoutChanged` fires too (via `arrange()`), so a bar can just re-read `hyprctl monitors`; this event says *why*. Not posted when a recompute resolves to the same layout. |
 
 ### Bar recipe (polling)
 

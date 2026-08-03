@@ -118,6 +118,30 @@ namespace {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Config enum round-trip (openxr:layout2d:vertical / :attach)
+// ---------------------------------------------------------------------------------------------
+
+// The two string knobs round-trip, and an unknown value is rejected so the caller can fall back to
+// the documented default instead of silently picking whichever enumerator happens to be 0.
+TEST(Layout2D, ConfigEnumsRoundTrip) {
+    EXPECT_STREQ(xrLayout2DVerticalName(XR_L2D_VERT_ELEVATION), "elevation");
+    EXPECT_STREQ(xrLayout2DVerticalName(XR_L2D_VERT_WORLD_HEIGHT), "world_height");
+    EXPECT_STREQ(xrLayout2DAttachName(XR_L2D_ATTACH_RIGHT), "right");
+    EXPECT_STREQ(xrLayout2DAttachName(XR_L2D_ATTACH_AROUND), "around");
+
+    EXPECT_EQ(xrParseLayout2DVertical("elevation"), XR_L2D_VERT_ELEVATION);
+    EXPECT_EQ(xrParseLayout2DVertical("world_height"), XR_L2D_VERT_WORLD_HEIGHT);
+    EXPECT_FALSE(xrParseLayout2DVertical("Elevation").has_value());
+    EXPECT_FALSE(xrParseLayout2DVertical("").has_value());
+    EXPECT_FALSE(xrParseLayout2DVertical("nonsense").has_value());
+
+    EXPECT_EQ(xrParseLayout2DAttach("right"), XR_L2D_ATTACH_RIGHT);
+    EXPECT_EQ(xrParseLayout2DAttach("around"), XR_L2D_ATTACH_AROUND);
+    EXPECT_FALSE(xrParseLayout2DAttach("follow-primary").has_value()); // §2.5 deferred, not silently accepted
+    EXPECT_FALSE(xrParseLayout2DAttach("left").has_value());
+}
+
+// ---------------------------------------------------------------------------------------------
 // The angular unwrap (§2.2)
 // ---------------------------------------------------------------------------------------------
 

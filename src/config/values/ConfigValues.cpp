@@ -967,6 +967,40 @@ std::vector<SP<IValue>> Values::getConfigValues() {
         MS<Bool>("openxr:gaze_cursor", "draw a distinct cursor dot at the gaze point on the carried monitor while a gaze carry is active (the dwell candidate is shown via the chrome highlight)", true),
         MS<Color>("openxr:gaze_cursor_col", "color of the gaze cursor dot (premultiplied over the quad)", 0xffcc66ff),
 
+        // ---- 2D-plane sync (docs/openxr/research/archive/12-spatial-2d-layout.md) ----
+        MS<Bool>("openxr:layout2d:enabled",
+                 "derive Hyprland's 2D monitor layout from where the XR quads actually float, so mouse crossing and directional focus match spatial intuition (a monitor to your "
+                 "upper-right in the headset sits upper-right in the 2D plane). Off = the historic behavior, XR monitors appended flush-right in creation order. Recomputed only "
+                 "on discrete events (monitor add/remove/plug, grab RELEASE, dock/undock, place/distance verbs, config reload), never per-frame and never mid-carry",
+                 true),
+        MS<Float>("openxr:layout2d:px_per_degree",
+                  "angular -> pixel scale used to place monitor CENTERS in the 2D plane. 35 is a 1080p reference monitor at the default distance/size, so quads that are "
+                  "angularly adjacent in 3D come out nearly edge-touching before compaction. Compaction is authoritative for adjacency, so this mostly sets how proportional the "
+                  "spacing feels",
+                  35.0, {.min = 1.0, .max = 500.0}),
+        MS<String>("openxr:layout2d:vertical",
+                   "how a monitor's row placement is derived: elevation (angular, a clean spherical unwrap with one constant — default) | world_height (metric, better when the "
+                   "monitors sit at wildly different distances)",
+                   "elevation"),
+        MS<Float>("openxr:layout2d:px_per_meter", "openxr:layout2d:vertical=world_height only: metres of world height per layout pixel of vertical offset", 1000.0,
+                  {.min = 1.0, .max = 20000.0}),
+        MS<String>("openxr:layout2d:attach",
+                   "where the XR block attaches to the physical monitors — physical outputs have no room pose, so XR monitors are arranged among themselves and the block is "
+                   "attached at a seam: right (flush right of the physical layout, vertically centered — default) | around (the XR block IS the layout; auto-selected anyway when "
+                   "no non-XR monitor is enabled)",
+                   "right"),
+        MS<Int>("openxr:layout2d:min_overlap_px",
+                "minimum perpendicular overlap forced between neighbouring monitors. Hyprland's directional focus needs the facing edges within 2px AND a non-zero overlap on the "
+                "other axis; a real minimum also stops the cursor having to thread a hairline seam",
+                64, {.min = 0, .max = 4000}),
+        MS<Float>("openxr:layout2d:row_merge_deg", "elevation window, in degrees, within which monitors are treated as one row/tier", 10.0, {.min = 0.0, .max = 90.0}),
+        MS<Float>("openxr:layout2d:reorder_hysteresis_deg",
+                  "how far (degrees) a monitor must move before the 2D layout is allowed to change. Below this it keeps its previous placement, so a slightly bumped quad never "
+                  "reshuffles your mouse mapping. 0 disables the dead band",
+                  4.0, {.min = 0.0, .max = 45.0}),
+        MS<Int>("openxr:layout2d:debounce_ms", "coalescing window for 2D-plane-sync recompute triggers, in milliseconds — a burst of grab releases costs one relayout", 300,
+                {.min = 0, .max = 5000}),
+
         /*
          * experimental:
          */
