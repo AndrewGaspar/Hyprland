@@ -1776,6 +1776,18 @@ void CMonitor::moveTo(const Vector2D& pos) {
 
         w->layoutTarget()->setPositionGlobal(w->layoutTarget()->position().translate(DELTA));
     }
+
+    // Layer surfaces cache their geometry in GLOBAL coordinates (arrangeLayerArray anchors them to
+    // pMonitor->m_position), so a monitor that moves leaves every one of its layers behind at the old
+    // absolute coords — off its own new box, hence invisible: no wallpaper, no bar, an empty output.
+    // Nothing else re-derives them: monitor.layoutChanged only reaches CSpace (windows), and
+    // CLayerSurface::onCommit re-arranges only when the client commits layer-shell *state* (a plain
+    // buffer commit — waybar redrawing its clock — does not), so a stranded layer stays stranded
+    // forever. Live 2026-08-02: `hyprctl openxr destroy XR-6`/`XR-7` shifted XR-8 12288 -> 8192 while
+    // its wallpaper + waybar stayed at 12288, and the XR quad rendered flat gray. Any unplug of a
+    // monitor left of others hits this — the XR path just makes it a keybind away.
+    if (g_pHyprRenderer)
+        g_pHyprRenderer->arrangeLayersForMonitor(m_id);
 }
 
 Vector2D CMonitor::middle() const {
