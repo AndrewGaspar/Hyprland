@@ -96,6 +96,65 @@ scripts/hypxr-setup.sh --check deps
 
 prints exactly what is missing and the command for your distro.
 
+#### The pre-flight probe
+
+The first Fedora bring-up (ThinkPad X1 / fc44, 2026-08-03) cost **eight staggered failures**, six of
+which were nothing but a missing `.pc` file discovered one `cmake` configure at a time: run a
+component, read one error, install one package, run the next component, hit the next missing module.
+CMake stops at the *first* unmet dependency, so a fresh box surfaces them strictly one per attempt.
+
+The `deps` component therefore probes **every** pkg-config module the whole stack's CMakeLists ask
+for — compositor, the shared XR client trio, WiVRn (including the Monado it `FetchContent`s), voice,
+hud and va — in one pass, before any component runs, and emits **one** consolidated install command
+for exactly what is absent. On a box that already has everything it collapses to a single line:
+
+```
+✓ pre-flight: all 61 build dependencies present (compositor, xr, wivrn, voice, hud, va)
+```
+
+The table lives in `DEP_PROBES` in `scripts/hypxr-setup.sh`; it is the only place that knows the
+module → package mapping, and the place to extend when a component gains a dependency. Modules that
+ship no `.pc` (Boost, Eigen3, glslang, `hyprwayland-scanner`, `gdbus-codegen`) are probed by header
+or by program instead.
+
+Two mappings in it are traps, both learned the hard way:
+
+| Module | Fedora | Why it bites |
+|---|---|---|
+| `libeis-1.0` | **`libeis-devel`** | `libei-devel` is the obvious guess and is **wrong** — it ships only the *client* `libei-1.0.pc`. Installing it and re-running fails identically, which reads like the probe is broken. |
+| `x264` | **`x264-devel`** | RPM Fusion **free only**; Fedora proper does not carry it at all, so `dnf install x264-devel` fails until the repo is enabled. Arch has it in the main repos, which is why the reference box never saw this. |
+
+#### ffmpeg on Fedora: two answers, and the obvious one is the worse one
+
+Fedora's free ffmpeg is **split per library** (`libavcodec-free-devel`, `libavutil-free-devel`, …).
+Both routes below satisfy the *build*; only one of them gives you a working *stream*.
+
+**(a) Recommended — RPM Fusion's full ffmpeg.** WiVRn's VAAPI path needs the `h264_vaapi` /
+`hevc_vaapi` encoders **at runtime**, and `ffmpeg-free` is built without them. `x264-devel` exists
+only here. And the freeworld `intel-media-driver` you need for Intel ENCODE entrypoints comes from
+the same repo. One repo enable solves all three:
+
+```sh
+sudo dnf install -y \
+  "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm"
+sudo dnf swap ffmpeg-free ffmpeg --allowerasing
+sudo dnf install -y ffmpeg-devel
+```
+
+**(b) Minimal — headers only, from the free repo:**
+
+```sh
+sudo dnf install -y libavcodec-free-devel libavutil-free-devel \
+                    libavfilter-free-devel libswscale-free-devel
+```
+
+with the caveat that this satisfies the build and hardware encode can still be **dead at runtime**.
+Either way, verify before donning:
+
+```sh
+vainfo | grep -i enc      # hw ENCODE entrypoints must be listed
+```
+
 **Arch / Omarchy.** No `-devel` split, so the runtime packages carry the headers:
 
 ```sh
@@ -117,9 +176,17 @@ sudo dnf install -y git cmake ninja-build ccache gcc-c++ openxr-devel vulkan-hea
                     vulkan-loader-devel libva-devel libva-utils inotify-tools jq
 ```
 
-> **UNVERIFIED from the Arch reference box** — check these on the Fedora machine:
-> - The exact name of the OpenXR loader devel package. Verify: `dnf provides '*/pkgconfig/openxr.pc'`,
->   then confirm with `pkg-config --modversion openxr`.
+`dnf builddep hyprland` does **not** cover the six non-compositor components, and on fc44 it missed
+`libeis-devel` even for the compositor. The pre-flight probe above is the authority, not the spec.
+
+> **VERIFIED on Fedora 44** (thinkpad-x1, 2026-08-03) — these names are correct, installed cleanly,
+> and satisfied the build they were needed for: `boost-devel` `pipewire-devel` `jansson-devel`
+> `libva-devel` `libsndfile-devel` `libeis-devel`.
+
+> **STILL UNVERIFIED** — check these on the Fedora machine:
+> - The exact name of the OpenXR loader devel package. That box already had a loader, so
+>   `openxr-devel` above has never actually been installed. Verify:
+>   `dnf provides '*/pkgconfig/openxr.pc'`, then confirm with `pkg-config --modversion openxr`.
 > - **WiVRn is not packaged for Fedora at all.** There is no `wivrn-server` RPM, so there is no base
 >   `wivrn.service` for the drop-in to sit on and no `/usr/share/openxr/1/openxr_wivrn.json`. The
 >   `wivrn` component builds the server from source anyway; on Fedora you additionally install the
@@ -128,6 +195,7 @@ sudo dnf install -y git cmake ninja-build ccache gcc-c++ openxr-devel vulkan-hea
 > - **Intel hardware encode.** Stock Fedora's `intel-media-driver` may ship without the H.264/H.265
 >   *encode* entrypoints. Verify: `vainfo | grep -iE 'EncSlice|EncSliceLP'`. If they are absent,
 >   install RPM Fusion's freeworld `intel-media-driver` build — WiVRn cannot stream without one.
+>   This is the same repo that option (a) above already turns on.
 > - Vulkan ICD manifests are at `/usr/share/vulkan/icd.d` on both distros (nothing in omedora
 >   changes this). The Intel manifest is `intel_icd.json`.
 
@@ -197,6 +265,17 @@ exec uwsm start -e -D Hyprland -- $HOME/code/hypxrland/build/Hyprland \
 
 The `PATH` export is what makes the session's `hyprctl` the one with the `openxr` command. The
 launcher indirection means the installed `.desktop` never has to change again.
+
+It also runs `git fetch --tags origin` first. `CMakeLists.txt` stamps the version banner from
+`git describe --tags`, and on a fork clone with no tags that prints
+
+```
+fatal: No names found, cannot describe anything
+```
+
+in the middle of the configure. It is harmless — but it reads exactly like a build failure, and cost
+a real "is this broken?" detour on the Fedora bring-up. The message comes from CMake, not from the
+script, so fetching the tags is the fix at the right layer.
 
 **The one root step for the session** (printed by the script):
 
@@ -276,7 +355,11 @@ reconfigure with `-DCMAKE_INSTALL_PREFIX=$HOME/.local` and the units land in
 `~/.local/lib/systemd/user`. The battery gauge only shows a headset percentage against the
 **patched** wivrn-server (it publishes the `Battery` property).
 
-**va.** `./install.sh` — user-local by construction, it refuses any prefix under `/usr`. The shim
+**va.** `./install.sh` — user-local by construction, it refuses any prefix under `/usr`. It runs
+`ctest --output-on-failure` as part of the install; when that fails, the setup script prints the
+captured output rather than swallowing it, so you see the failing test instead of a bare
+`Errors while running CTest`. To get an install anyway while a test is being fixed:
+`~/code/hypxrva/install.sh --skip-tests`. The shim
 directory `~/.local/lib/hypxrva/` must contain **nothing but the shim**, because
 `LIBVA_DRIVERS_PATH` points at it. The watcher is started by the compositor config, not systemd:
 
@@ -292,9 +375,16 @@ and `scripts/preview-xr.sh --env` launch it. `$HYPXRPAPER_BIN` overrides discove
 Only for the Air 2 Ultra glasses rig. Skip it on a Quest/WiVRn-only machine.
 
 ```sh
+git -C ~/code/hypxrland submodule sync --recursive     # see the note below — do NOT skip this
 git -C ~/code/hypxrland submodule update --init subprojects/monado
 scripts/hypxr-setup.sh monado
 ```
+
+> **`sync` before `update`, always.** A submodule's remote URL is frozen into `.git/config` at first
+> init, so a later `.gitmodules` URL change — monado moved to the `AndrewGaspar` fork — never reaches
+> an existing checkout on its own. The next fetch then dies with
+> `fatal: remote error: upload-pack: not our ref <sha>`, which looks like a corrupt submodule and is
+> not. This exact failure happened on the Fedora bring-up.
 
 > **Never `setcap` `monado-service`.** A file capability puts the process into secure-execution
 > mode, and the dynamic loader then *drops* the environment — silently discarding `VK_DRIVER_FILES`
@@ -320,8 +410,19 @@ forget:
 2. `git fetch origin --prune`
 3. `git reset --hard origin/<branch>`
 4. `git submodule sync --recursive && git submodule update --init` — **sync before update**: a
-   submodule's remote URL lives in the checkout, not in `.gitmodules`, so a URL change (e.g. monado
-   moving to the fork) otherwise fails with `fatal: not our ref <sha>`.
+   submodule's remote URL is frozen into `.git/config` at first init, not read from `.gitmodules`
+   each time, so a URL change (monado moving to the `AndrewGaspar` fork) otherwise fails with
+   `fatal: remote error: upload-pack: not our ref <sha>` on the next fetch. Seen for real on the
+   Fedora bring-up. If you are updating a compositor checkout **by hand** rather than through this
+   script, the two `submodule` lines are part of the update, not an optional extra:
+
+   ```sh
+   git -C ~/code/hypxrland fetch origin --prune
+   git -C ~/code/hypxrland reset --hard origin/hypxrland
+   git -C ~/code/hypxrland submodule sync --recursive     # BEFORE update, every time
+   git -C ~/code/hypxrland submodule update --init
+   rm -rf ~/code/hypxrland/build                          # see 5
+   ```
 5. **`rm -rf` the build directory whenever HEAD actually moved.** This is a rule from repeated
    pain: a stale CMake/ninja cache survives a history swap and then fails with missing-rule errors
    or soname mismatches after a system library bump — failures that look like source bugs and are
@@ -376,8 +477,9 @@ unplug and the laptop panel comes back (the display autopilot rides hypxrva's fl
 
 `hypxr-setup.sh` deliberately does not do these:
 
-1. **Package installation.** Printed per distro, never executed. Also the Fedora-side unknowns in
-   §2.1 (OpenXR loader package name, Intel encode entrypoints) need a human with that box.
+1. **Package installation.** Probed exhaustively and printed per distro as one command — but never
+   executed. Enabling RPM Fusion and the remaining Fedora-side unknown in §2.1 (the OpenXR loader
+   package name) still need a human with that box.
 2. **`sudo install` of the wayland-session `.desktop`** into `/usr/share/wayland-sessions/`.
 3. **`sudo cmake --install` for hypxrhud** into `/usr/local` — avoidable by choosing a
    `$HOME/.local` prefix instead.
