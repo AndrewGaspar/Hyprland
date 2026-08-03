@@ -952,6 +952,13 @@ void COpenXRManager::stop() {
     // Whether stop was ultimately triggered by instance loss decides the final state.
     const bool lost = m_session && m_session->m_instanceLost;
 
+    // report 12 §3a: the latched desk orientation belongs to the SESSION that captured it — a
+    // LOCAL_FLOOR origin is not stable across a runtime restart (report-20 issue C is the same fact
+    // from the anchor side). Drop it so the next session latches its own from a fresh head pose;
+    // until it does, syncLayout2D no-ops and the historic append-right stands.
+    m_l2dRef       = OpenXR::SXRLayout2DRef{};
+    m_l2dPrev.clear();
+
     setState(XR_STATE_STOPPING);
 
     // Remove the ray pointer first (main thread) so no further input routes while tearing down.
@@ -1267,6 +1274,18 @@ void COpenXRManager::onFrameChannelReadable() {
             dispatchInputEvent(*ie);
     }
 
+    // report 12 §3a: a runtime recenter (the user pressed the recenter button) moved LOCAL_FLOOR
+    // under us. Every anchor was re-expressed into the new space by the frame loop, but the latched
+    // desk orientation is still in the old one — drop it and re-derive. Consumed with an exchange so
+    // exactly one sync is requested no matter how often this fd fires; the re-latch then happens in
+    // syncLayout2D against a fresh head pose, which is also the semantic the user expects from
+    // recentering ("re-sync to how I'm sitting now").
+    if (m_l2dRefStale.exchange(false, std::memory_order_acq_rel)) {
+        m_l2dRef.valid = false;
+        m_l2dPrev.clear();
+        requestLayout2DSync();
+    }
+
     // EXITING / LOSS_PENDING: the frame loop has already exited. Defer stop() out of this
     // fd callback (doLater is main-thread-safe) so we don't remove the event source from
     // within its own dispatch. stop() decides DISABLED vs UNAVAILABLE from m_instanceLost.
@@ -1310,9 +1329,18 @@ void COpenXRManager::frameThread() {
             const bool            valid  = m_session->m_recenterPoseValid;
             m_session->m_recenterPending = false;
             if (valid) {
-                std::scoped_lock lock(m_layersMu);
-                for (auto& l : m_layers)
-                    l->m_anchor.onReferenceSpaceChanged(M);
+                {
+                    std::scoped_lock lock(m_layersMu);
+                    for (auto& l : m_layers)
+                        l->m_anchor.onReferenceSpaceChanged(M);
+                }
+                // report 12 §3a: the whole reference space moved under us, so the latched desk
+                // orientation the 2D projection measures world monitors against is now expressed in
+                // a space that no longer exists. A plain atomic store plus a wake is all the frame
+                // thread may do here (XRMonitorLayer.hpp: no refcounts, no strings, no config);
+                // onFrameChannelReadable consumes it on the main thread and re-latches.
+                m_l2dRefStale.store(true, std::memory_order_release);
+                wakeMain();
             }
         }
 
@@ -3120,6 +3148,13 @@ void COpenXRManager::updateMonitorsPlugged(bool allowGrace) {
             if (*PRECENTER) {
                 m_recenteredThisSession = true;
                 m_recenterArmed.store(true, std::memory_order_release);
+                // report 12 §3a: a recenter re-seats every anchor:local monitor around the current
+                // head, so the desk orientation the 2D projection measures against must be re-taken
+                // too — otherwise the plane would describe the arrangement that existed before the
+                // re-seat. Dropping it (rather than latching now) makes the next sync capture the
+                // head pose AFTER the frame thread has actually applied the re-seat.
+                m_l2dRef = OpenXR::SXRLayout2DRef{};
+                m_l2dPrev.clear();
                 Log::logger->log(Log::DEBUG, "[OPENXR] first plug of session — arming recenter-on-plug (anchor:local monitors re-seat to the current head)");
             }
         }
@@ -4303,6 +4338,30 @@ OpenXR::eXRLayout2DAttach COpenXRManager::readLayout2DAttach() {
     return OpenXR::xrParseLayout2DAttach(*PATTACH).value_or(OpenXR::XR_L2D_ATTACH_RIGHT);
 }
 
+void COpenXRManager::releaseLayout2DPlacements() {
+    // MAIN THREAD. Clear every offset the sync engine owns, back to the {-INT32_MAX,-INT32_MAX}
+    // "auto" sentinel arrange() treats as append-right. Idempotent: a no-op once nothing is placed.
+    bool changed = false;
+    {
+        std::scoped_lock lock(m_layersMu);
+        for (auto& l : m_layers) {
+            if (!l->m_l2dPlaced)
+                continue;
+            l->m_l2dPlaced = false;
+            if (auto mon = l->m_monitor.lock())
+                mon->m_activeMonitorRule.m_offset = Vector2D{-INT32_MAX, -INT32_MAX};
+            changed = true;
+        }
+    }
+    m_l2dPrev.clear();
+    m_l2dPlacedCount = 0;
+    m_l2dRows = m_l2dWidth = m_l2dHeight = 0;
+    if (!changed)
+        return;
+    Log::logger->log(Log::DEBUG, "[OPENXR] 2D-plane sync off — XR monitors handed back to auto placement");
+    State::monitorLayoutController()->scheduleRecheck();
+}
+
 void COpenXRManager::latchLayout2DReference() {
     // §3a: world-anchored monitors are measured against a LATCHED "desk orientation", never the live
     // head yaw — turning your chair must not re-map your mouse. Re-latched only at moments that mean
@@ -4327,7 +4386,10 @@ void COpenXRManager::requestLayout2DSync() {
     // The debounced funnel every trigger uses. Re-arming (rather than only arming) is what makes a
     // burst — five monitors declared in a config, or a flurry of grab releases — cost ONE relayout:
     // the timer only fires once the events stop. NEVER call syncLayout2D() straight from a trigger.
-    if (!g_pEventLoopManager || !layout2DEnabled() || m_l2dFrozen)
+    // NOTE: this deliberately does NOT check layout2DEnabled(). Turning the feature off at runtime
+    // has to reach syncLayout2D so it can hand every monitor back to the auto path — an offset we
+    // wrote would otherwise sit in the rule forever.
+    if (!g_pEventLoopManager || m_l2dFrozen)
         return;
 
     static auto PDEB = CConfigValue<Hyprlang::INT>("openxr:layout2d:debounce_ms");
@@ -4356,10 +4418,16 @@ void COpenXRManager::onLayout2DSyncDue() {
 void COpenXRManager::syncLayout2D(bool force) {
     // MAIN THREAD. One pass: snapshot poses -> project -> attach the block -> write the offsets ->
     // let the ordinary arrange() pipeline do placement, xdg-output and monitor.layoutChanged.
-    if (!layout2DEnabled())
-        return;
     if (m_l2dFrozen && !force)
         return;
+    if (!layout2DEnabled()) {
+        // Switched off (config or `hyprctl keyword openxr:layout2d:enabled 0`). Give every monitor we
+        // placed back to the ordinary append-right path instead of leaving it pinned at an offset
+        // nothing maintains any more — an off switch that leaves the layout frozen where it was is
+        // not an off switch.
+        releaseLayout2DPlacements();
+        return;
+    }
 
     if (!m_l2dRef.valid)
         latchLayout2DReference();
