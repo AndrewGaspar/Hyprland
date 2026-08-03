@@ -503,6 +503,7 @@ DEP_PROBES=(
   "avahi-glib            wivrn       avahi               avahi-glib-devel"
   "gio-unix-2.0          wivrn       glib2               glib2-devel"
   "bin:gdbus-codegen     wivrn       glib2-devel         glib2-devel"
+  "bin:spirv-opt         wivrn       spirv-tools         spirv-tools"
   "libnotify             wivrn       libnotify           libnotify-devel"
   "librsvg-2.0           wivrn       librsvg             librsvg2-devel"
   "libarchive            wivrn       libarchive          libarchive-devel"
