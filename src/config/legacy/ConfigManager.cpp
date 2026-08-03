@@ -299,6 +299,18 @@ static Hyprlang::CParseResult handleXRMonitor(const char* c, const char* v) {
     return result;
 }
 
+static Hyprlang::CParseResult handleXRRule(const char* c, const char* v) {
+    const std::string      VALUE   = v;
+    const std::string      COMMAND = c;
+
+    const auto             RESULT = Config::Legacy::mgr()->handleXRRule(COMMAND, VALUE);
+
+    Hyprlang::CParseResult result;
+    if (RESULT.has_value())
+        result.setError(RESULT.value().c_str());
+    return result;
+}
+
 static Hyprlang::CParseResult handleBezier(const char* c, const char* v) {
     const std::string      VALUE   = v;
     const std::string      COMMAND = c;
@@ -620,6 +632,7 @@ CConfigManager::CConfigManager() {
     m_config->registerHandler(&::handleExecShutdown, "exec-shutdown", {false});
     m_config->registerHandler(&::handleMonitor, "monitor", {false});
     m_config->registerHandler(&::handleXRMonitor, "xrmonitor", {false});
+    m_config->registerHandler(&::handleXRRule, "xrrule", {false});
     m_config->registerHandler(&::handleBind, "bind", {true});
     m_config->registerHandler(&::handleUnbind, "unbind", {false});
     m_config->registerHandler(&::handleWorkspaceRules, "workspace", {false});
@@ -788,6 +801,7 @@ std::optional<std::string> CConfigManager::resetHLConfig() {
     m_failedPluginConfigValues.clear();
     m_keywordRules.clear();
     m_declaredXRMonitors.clear();
+    m_declaredXRRules.clear();
 
     // paths
     m_configPaths.clear();
@@ -1498,6 +1512,31 @@ std::optional<std::string> CConfigManager::handleXRMonitor(const std::string& co
         g_pEventLoopManager->doLater([] {
             if (g_pOpenXRManager)
                 g_pOpenXRManager->reconcileDeclaredMonitors();
+        });
+#endif
+    return {};
+}
+
+std::optional<std::string> CConfigManager::handleXRRule(const std::string& command, const std::string& args) {
+    // Situational per-monitor transparency (doc 05 §xrrule). Like handleXRMonitor this does no XR
+    // work itself: parse via the pure parser and append to the declared list IN CONFIG ORDER (there
+    // is no name key — every rule is evaluated, later matches override earlier ones per effect).
+    // COpenXRManager snapshots the list and re-evaluates after the reload. Compiles either way.
+    auto parsed = OpenXR::parseXRRuleLine(args);
+    if (!parsed.has_value())
+        return parsed.error();
+
+    m_declaredXRRules.emplace_back(std::move(parsed.value()));
+
+#ifdef HAVE_OPENXR
+    // A dynamic `hyprctl keyword xrrule ...` fires neither config.reloaded nor props_refreshed, so
+    // it never reaches COpenXRManager::onConfigReload(). Re-snapshot explicitly in that case,
+    // deferred so a burst of keywords settles first. A full reload re-snapshots once from
+    // onConfigReload() after parsing completes, so we must NOT do it per-line there.
+    if (g_pHyprCtl && g_pHyprCtl->m_currentRequestParams.isDynamicKeyword && g_pEventLoopManager)
+        g_pEventLoopManager->doLater([] {
+            if (g_pOpenXRManager)
+                g_pOpenXRManager->reloadXRRules();
         });
 #endif
     return {};
