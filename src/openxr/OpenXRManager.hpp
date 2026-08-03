@@ -695,11 +695,20 @@ class COpenXRManager {
     // m_l2dTimer is the debounce: every trigger RE-ARMS it, so the pass runs once at the end of a
     // burst rather than once per event. m_l2dFrozen is the `sync-layout freeze` latch.
     OpenXR::SXRLayout2DRef               m_l2dRef;
+    // Set by the FRAME thread when the runtime hands us a reference-space change (the user pressed
+    // recenter): the LOCAL_FLOOR origin moved, every anchor was re-expressed into the new space, and
+    // our latched eye/yaw are still in the OLD one. A plain atomic bool is the whole handoff — no
+    // refcounts, no strings, no lock (XRMonitorLayer.hpp threading rule). syncLayout2D tests-and-
+    // clears it and re-latches from a fresh head pose.
+    std::atomic<bool>                    m_l2dRefStale{false};
     std::vector<OpenXR::SXRLayout2DPrev> m_l2dPrev;
     SP<CEventLoopTimer>                  m_l2dTimer;
     bool                                 m_l2dFrozen = false;
     int                                  m_l2dPlacedCount = 0, m_l2dRows = 0, m_l2dWidth = 0, m_l2dHeight = 0;
     void                                 onLayout2DSyncDue();
+    // Hand every monitor the engine placed back to the ordinary auto (append-right) path — the
+    // feature was switched off. Idempotent.
+    void                                 releaseLayout2DPlacements();
     OpenXR::SXRLayout2DConfig            readLayout2DConfig();     // reads STRING config: main thread only
     OpenXR::eXRLayout2DAttach            readLayout2DAttach();     // ditto
     bool                                 layout2DEnabled();
