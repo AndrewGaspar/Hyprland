@@ -173,4 +173,27 @@ namespace OpenXR {
 
     // Convenience: the feedback state to carry into the next call.
     std::vector<SXRLayout2DPrev> xrLayout2DPrevOf(const SXRLayout2DResult& r);
+
+    // ---- the attach seam (§2.5) ----
+
+    // One monitor that is already anchored in the layout plane and is NOT being placed by this pass.
+    struct SXRLayout2DAnchorBox {
+        int x = 0, y = 0, w = 0, h = 0;
+    };
+
+    // Where the projected block sits relative to the monitors that are already anchored.
+    //
+    // `anchors` MUST contain ONLY monitors with an EXPLICIT position, and this is load-bearing rather
+    // than a shortcut. CMonitorPositionController::arrange places every explicit-position monitor
+    // FIRST and then appends the AUTO ones flush to the right of that block — so the moment the XR
+    // monitors get an explicit offset, any auto monitor lands to the right of THEM. Measuring the
+    // seam from an auto monitor's current position would be measuring our own previous output: pass
+    // N puts the block right of the auto monitor, arrange() then pushes the auto monitor right of
+    // the block, pass N+1 measures the moved monitor and shifts the block again — the whole layout
+    // marches rightwards a block-width per event, forever. Restricting the input to the explicit set
+    // makes the seam a FIXED POINT, because nothing our own placement can move is an input to it.
+    //
+    // With no anchors at all (or attach == AROUND) the block sits at the origin and auto monitors
+    // append to its right, keeping their arrangement relative to each other exactly as before.
+    void xrLayout2DAttachOrigin(const std::vector<SXRLayout2DAnchorBox>& anchors, int blockW, int blockH, eXRLayout2DAttach attach, int& outX, int& outY);
 }

@@ -18,7 +18,8 @@
 #include "../helpers/time/Time.hpp" // Time::steady_tp (presence blip window)
 #include "../desktop/DesktopTypes.hpp" // PHLMONITOR (applyCrossGpuLinear)
 #include "XRMonitorConfig.hpp"
-#include "XRRule.hpp"  // situational transparency: SXRRule / SXRRuleContext / SXREffects (unguarded)
+#include "XRRule.hpp"     // situational transparency: SXRRule / SXRRuleContext / SXREffects (unguarded)
+#include "XRLayout2D.hpp" // 2D-plane sync: the pure projection (report 12, unguarded)
 #include "XRInput.hpp" // SXRInputEvent / SXRStateEvent / XRQueueItem / CXRQueue / CXRInput
 
 struct wl_event_source;
@@ -262,8 +263,43 @@ class COpenXRManager {
         std::string fxKneeSrc        = "default";
         bool        fxTransitioning  = false;
         std::string anchorState      = "docked";
+        // 2D-plane sync (report 12): the slot the projection assigned and the angles it used, so
+        // `hyprctl openxr status` explains where the mouse will cross. source is
+        // "auto" (the projection placed it) | "pinned" (an explicit user monitor= offset owns it) |
+        // "off" (2D-plane sync disabled, or nothing placed yet — the historic append-right).
+        std::string l2dSource = "off";
+        int         l2dCol = 0, l2dRow = 0;
+        double      l2dX = 0.0, l2dY = 0.0;
+        float       l2dAzDeg = 0.f, l2dElDeg = 0.f;
     };
     std::vector<SXRMonitorInfo> monitorInfos();
+
+    // ---- 2D-plane sync (report 12 WP-S2): derive the layout plane from the 3D arrangement ----
+    // MAIN THREAD ONLY. requestLayout2DSync() is the DEBOUNCED entry point every trigger uses
+    // (monitor add/remove/plug, grab RELEASE — never grab begin, adaptive dock/undock, the pose
+    // verbs, config reload): it re-arms a single timer, so a burst of releases costs one relayout.
+    // syncLayout2D() is the pass itself; force=true runs it even while frozen (the explicit verb).
+    void                             requestLayout2DSync();
+    void                             syncLayout2D(bool force = false);
+    // Re-latch the "desk orientation" reference frame (§3a) from the current head pose: the frame
+    // world-anchored monitors' azimuths are measured against. Turning your chair must NOT re-map
+    // your mouse, so this happens only at well-defined moments (session start, `center`/recenter,
+    // an explicit `sync-layout`), never per-frame. No-op without a valid tracked view.
+    void                             latchLayout2DReference();
+    // `hyprctl openxr sync-layout [freeze|thaw]` / `xrmonitor sync`.
+    std::expected<void, std::string> cmdSyncLayout(const std::string& args);
+
+    struct SXRLayout2DStatus {
+        bool        enabled  = false;
+        bool        frozen   = false;
+        bool        refValid = false;
+        float       refYawDeg = 0.f;
+        int         placed = 0, rows = 0, width = 0, height = 0;
+        std::string vertical = "elevation";
+        std::string attach   = "right";
+        float       pxPerDegree = 35.f;
+    };
+    SXRLayout2DStatus layout2DStatus();
 
     // WP-G5: per-hand active input device for `hyprctl openxr status`. Reads CXRInput's atomic
     // interaction-profile mirror (main-thread safe) + the openxr:hand_grab mode. `hands` is true
@@ -652,6 +688,21 @@ class COpenXRManager {
     CHyprSignalListener m_fxWorkspaceActiveListener;
     CHyprSignalListener m_fxMonitorAddedListener;
     CHyprSignalListener m_fxMonitorRemovedListener;
+
+    // ---- 2D-plane sync (report 12 WP-S2) — MAIN THREAD ONLY ----
+    // m_l2dRef is the LATCHED desk orientation (§3a). m_l2dPrev is the previous placement's angles,
+    // fed back into the projection so a slightly bumped quad changes nothing (§4 hysteresis).
+    // m_l2dTimer is the debounce: every trigger RE-ARMS it, so the pass runs once at the end of a
+    // burst rather than once per event. m_l2dFrozen is the `sync-layout freeze` latch.
+    OpenXR::SXRLayout2DRef               m_l2dRef;
+    std::vector<OpenXR::SXRLayout2DPrev> m_l2dPrev;
+    SP<CEventLoopTimer>                  m_l2dTimer;
+    bool                                 m_l2dFrozen = false;
+    int                                  m_l2dPlacedCount = 0, m_l2dRows = 0, m_l2dWidth = 0, m_l2dHeight = 0;
+    void                                 onLayout2DSyncDue();
+    OpenXR::SXRLayout2DConfig            readLayout2DConfig();     // reads STRING config: main thread only
+    OpenXR::eXRLayout2DAttach            readLayout2DAttach();     // ditto
+    bool                                 layout2DEnabled();
 
     // ---- conditional hand input (research/16 Part A) ----
     // m_handPolicy is the openxr:hand_input baseline (config + `handinput on|off|auto`); m_handForce

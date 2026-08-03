@@ -348,6 +348,40 @@ position, so the frame thread orders quads by their freshly solved distance from
 viewer — farthest first — so nearer quads occlude farther ones. `m_zOrder` is an
 explicit override tier compared first; creation `m_seq` breaks remaining ties.
 
+## The 2D layout plane (2D-plane sync)
+
+An XR monitor is still an ordinary `CMonitor` in Hyprland's flat 2D layout plane, and that plane —
+not the 3D arrangement — is what governs the mouse. `CPointerManager::closestValid` clamps the
+pointer to the **union of monitor boxes**, and `CMonitorQueryCore::directionLookup` only finds a
+neighbour when the facing edges are within `STICKS` (2 px) **and** the perpendicular ranges overlap.
+So the 2D box positions decide where the cursor crosses and where `movefocus` goes, and they
+originally had nothing to do with where the quad floats: a new XR monitor takes the default monitor
+rule (offset sentinel `{-INT32_MAX, -INT32_MAX}` = "auto") and
+`CMonitorPositionController::arrange` appends it flush-right in **creation order** at `y = 0`.
+
+`COpenXRManager::syncLayout2D()` closes that gap. It projects each quad's world (or follow-frame)
+centre to an (azimuth, elevation) pair about a latched reference eye, scales both by
+`openxr:layout2d:px_per_degree`, and compacts the result into gap-free, overlap-free rows and
+columns — then writes each monitor's `m_activeMonitorRule.m_offset` and calls
+`CMonitorLayoutController::scheduleRecheck()`, so the ordinary `arrange()` pipeline does the
+placement, the xdg-output update and the `monitor.layoutChanged` emission. `CMonitor::moveTo` then
+shifts floating windows by the delta, re-arranges the monitor's layer surfaces, relayouts tiled
+windows and re-clamps the cursor.
+
+Threading and cadence follow the rules the rest of this page sets out: the whole pass is **main
+thread**, taking its pose snapshot under `m_layersMu` exactly as `layoutDump()` does (the frame
+thread already publishes `CXRAnchor::lastWorld()`, so no new cross-thread plumbing and no refcount
+work off-main), and it is **event-driven and debounced** — monitor add/remove, plug/unplug, a grab
+RELEASE, an adaptive dock/undock, a pose verb, a config reload, or an explicit `sync-layout`. It
+never runs per frame, and it refuses to run at all while any quad is being carried (it re-arms
+instead, so the release still gets its relayout).
+
+The projection itself is pure and lives in `src/openxr/XRLayout2D.{hpp,cpp}` (compiled
+unconditionally, gtested in `tests/xr/layout2d.cpp`). The user-facing surface — `openxr:layout2d:*`,
+`hyprctl openxr sync-layout`, the per-monitor pin opt-out, the reference-frame semantics — is
+documented in [`05-configuration.md` §2](05-configuration.md#2d-plane-sync-layout2d); the design
+rationale is [`research/archive/12-spatial-2d-layout.md`](research/archive/12-spatial-2d-layout.md).
+
 ## Mirroring an XR monitor onto a physical one
 
 Seeing an XR monitor on a physical display needs **no XR code** — the ordinary
