@@ -691,9 +691,21 @@ comp_deps() {
         note "GPU stack: vulkan-radeon (AMD) / vulkan-intel + intel-media-driver (Intel) / nvidia-utils (NVIDIA)"
         ;;
       fedora)
-        note "omedora already enables COPR agaspar/omedora-4, which ships the hypr* stack — so"
-        note "\`dnf builddep hyprland\` resolves the whole compositor dependency set in one shot."
-        $pkg "sudo dnf copr enable -y agaspar/omedora-4   # (already on if this box runs omedora)"
+        # The hypr* stack comes from the agaspar/omedora-<N> COPR, but the COPR is
+        # omedora's to manage: omedora enables the one matching ITS major version, and
+        # enabling a different one by hand (e.g. -4 on an omedora-3 box) would pull a
+        # mismatched compositor stack over what omedora ships. So: detect, never suggest.
+        local omedora_copr
+        omedora_copr=$(ls /etc/yum.repos.d/_copr:copr.fedorainfracloud.org:agaspar:omedora*.repo 2>/dev/null | head -1)
+        if [[ -n $omedora_copr ]]; then
+          note "COPR $(basename "$omedora_copr" .repo | sed 's/_copr:copr.fedorainfracloud.org://; s/:/\//') is enabled (managed by omedora) — it ships the hypr* stack,"
+          note "so \`dnf builddep hyprland\` resolves the whole compositor dependency set in one shot."
+        else
+          note "no agaspar/omedora COPR detected. On an omedora box the COPR is managed by"
+          note "omedora itself — do NOT enable one by hand; fix the omedora install instead."
+          note "On plain Fedora, enable the COPR matching the omedora major version you track:"
+          note "  sudo dnf copr enable -y agaspar/omedora-<N>"
+        fi
         $pkg "sudo dnf builddep -y hyprland"
         $pkg "sudo dnf install -y git cmake ninja-build ccache gcc-c++ openxr-devel vulkan-headers vulkan-loader-devel libva-devel libva-utils inotify-tools jq"
         note "\`dnf builddep hyprland\` does NOT cover the six non-compositor components, and it"
