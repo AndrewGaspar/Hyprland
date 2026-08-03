@@ -1,13 +1,13 @@
 # 05 — Configuration & Control Reference
 
 The complete user-facing control surface of HypXRland: the `openxr:*` config section, the
-`xrmonitor` keyword, the `xrmonitor` dispatcher, the `hyprctl openxr` command, the socket2
-events, idle integration, and consumer recipes (waybar, hypridle, shell). A ready-to-copy
+`xrmonitor` and `xrrule` keywords, the `xrmonitor` dispatcher, the `hyprctl openxr` command, the
+socket2 events, idle integration, and consumer recipes (waybar, hypridle, shell). A ready-to-copy
 config with every variable and example binds lives at `example/openxr.conf`; run
 `hyprctl descriptions | grep openxr` for the live descriptions including min/max clamps.
 
-`openxr { }` and `xrmonitor =` are classic-hyprlang config keywords; there is no Lua config
-binding for them.
+`openxr { }`, `xrmonitor =` and `xrrule =` are classic-hyprlang config keywords; there is no Lua
+config binding for them.
 
 ---
 
@@ -152,8 +152,9 @@ in-headset with `hyprctl keyword` and the monitors re-blit immediately.
 
 | Variable | Type | Default | Meaning | Applies |
 |---|---|---|---|---|
-| `black_alpha` | float | `1.0` | Alpha given to **pure black** content pixels. `1.0` = feature **off** (every pixel opaque, exactly the historic behavior); `0.0` = black is fully transparent; in between = translucent black. Brighter pixels are untouched (see `black_alpha_knee`). | hot |
-| `black_alpha_knee` | float | `0.10` | The luma at which content becomes **fully opaque**. Pure black gets `black_alpha`, luma ≥ this is left alone, `smoothstep` ramp between. Lower = only near-black dissolves; higher = dark greys go see-through too. | hot |
+| `black_alpha` | float | `1.0` | Alpha given to **pure black** content pixels. `1.0` = feature **off** (every pixel opaque, exactly the historic behavior); `0.0` = black is fully transparent; in between = translucent black. Brighter pixels are untouched (see `black_alpha_knee`). **This is the DEFAULT layer** for per-monitor resolution — an `xrrule` or a manual override can change it per monitor (see [§xrrule](#the-xrrule-keyword--situational-per-monitor-transparency)). | hot |
+| `black_alpha_knee` | float | `0.10` | The luma at which content becomes **fully opaque**. Pure black gets `black_alpha`, luma ≥ this is left alone, `smoothstep` ramp between. Lower = only near-black dissolves; higher = dark greys go see-through too. Also the default layer for per-monitor resolution. | hot |
+| `transparency_blend_ms` | int | `600` | How long any per-monitor transparency change (uniform `alpha` or luma key, from a rule, a manual verb or a reload) takes to ease in. Nothing pops: the value rides a smoothstep envelope and an interrupted transition continues from wherever it is. `0` = snap. | hot |
 
 The curve is `alpha = mix(black_alpha, 1.0, smoothstep(0.0, black_alpha_knee, luma))`, and the
 result is written **premultiplied** (rgb is scaled by the same alpha) because XR quads composite
@@ -187,7 +188,9 @@ Caveats:
   at their configured `chrome_col_*` alpha, so a fully-dissolved monitor still has grabbable chrome.
 - Any content that is *actually* black loses its ability to occlude: video letterboxing, a black
   wallpaper or a not-yet-painted monitor become windows onto the room. That is the feature working.
-- **Global, not per-monitor**, in this version.
+- **These two variables are the DEFAULTS**, not the final word: they seed the per-monitor resolution
+  that `xrrule` and `hyprctl openxr blackalpha` layer on top of. A config with no `xrrule` and no
+  manual override behaves exactly as it did before that feature existed.
 
 ### Ray aim assist (cursor, magnetism, sticky hover, aim filter)
 
@@ -366,6 +369,170 @@ workspace = 9, monitor:XR-code, default:true
 
 ---
 
+## 3.5 The `xrrule` keyword — situational per-monitor transparency
+
+Makes each XR monitor's transparency **react to what is happening**: ghost the panels while you
+walk away from the desk, go fully opaque for a fullscreen game, disable the luma key for a video
+monitor. Same idiom as `windowrule`: a flat `effects, conditions` line.
+
+```ini
+xrrule = <effects>, <conditions>
+```
+
+### The model
+
+- The **monitor** is the unit of *effect*. Windows are only a source of *conditions* — there is no
+  such thing as "make this window transparent in XR"; you make the monitor it is on transparent.
+- Two effects compose per pixel: `final_alpha = uniform_alpha × lumakey_alpha(pixel)`. The uniform
+  alpha fades the whole panel; the luma key (`blackalpha`, [above](#luma-keyed-transparency-black-as-alpha))
+  dissolves its dark pixels. Both are written premultiplied, so they never glow additively over
+  passthrough.
+- **Three precedence layers, resolved per effect**:
+  1. **defaults** — `alpha` is `1.0` (opaque); `blackalpha`/`blackalpha_knee` come from
+     `openxr:black_alpha` / `openxr:black_alpha_knee`;
+  2. **rules** — every matching `xrrule`, in **config order**; a later match overrides an earlier
+     one *per effect* (a rule that only sets `blackalpha` leaves an earlier rule's `alpha` alone);
+  3. **manual override** — `hyprctl openxr alpha|blackalpha`, sticky until cleared with `auto`.
+     Manual always wins, exactly like the `handinput` manual-over-auto latch.
+- Every change **eases** over `openxr:transparency_blend_ms` (default 600ms). An interrupted
+  transition continues from wherever it currently is — it never snaps back and re-runs.
+- A ghosted monitor ghosts **entirely**: the uniform alpha is applied over the finished panel, so
+  the move-bar and resize handles fade with the content. (A solid bar under a near-invisible screen
+  looks broken; report 09 §3.3.) The luma key still leaves chrome alone, so a *dissolved* — as
+  opposed to *faded* — monitor keeps a grabbable bar.
+
+### Effects (space-separated `name value`)
+
+| Effect | Value | Meaning |
+|---|---|---|
+| `alpha` | `0..1` | Uniform monitor opacity. `1.0` = opaque. Applies under **every** blend mode (under `opaque` it reads as a dim rather than see-through — there is nothing behind us to reveal). |
+| `blackalpha` | `0..1` or `off` | Per-monitor `openxr:black_alpha`. `off` == `1.0` == keying disabled. Gated on the blend mode exactly like the global (see below). |
+| `blackalpha_knee` | float | Per-monitor `openxr:black_alpha_knee`. |
+
+At least one effect is required.
+
+### Conditions (space-separated `key:value`, **all** must match)
+
+| Condition | Value | Matches |
+|---|---|---|
+| `monitor` | regex | The XR monitor's name. |
+| `anchorstate` | `docked` \| `follow` \| `carried` | How the monitor is anchored *right now* (see below). |
+| `focusclass` | regex | The class of the monitor's focused window. |
+| `focustitle` | regex | The title of the monitor's focused window. |
+| `fullscreen` | `0` \| `1` | Whether the monitor's focused window is fullscreen. |
+
+An omitted condition is a **wildcard**; omitting the whole list (no comma at all) matches every
+monitor. Every monitor is evaluated against its **own** context tuple — that is what makes
+`monitor:` a filter rather than a selector.
+
+**Regexes are RE2 (the same engine as `windowrule`) matched as a SEARCH, not a full match.** So
+`focusclass:^steam_app_` is a prefix test and `focusclass:(mpv|vlc)` finds a substring; anchor with
+`^…$` (`monitor:^XR-main$`) when you want an exact match. This differs deliberately from
+`windowrule`, whose regexes are full matches. Values are whitespace-split, so a value that needs a
+space must be quoted: `focustitle:"Mozilla Firefox"`.
+
+**`anchorstate`**, in priority order:
+
+| State | When |
+|---|---|
+| `carried` | A hand grab, corner resize or gaze carry owns the monitor right now. |
+| `follow` | The monitor is leashed to you: `anchor:head`, `anchor:body`, `anchor:device`, or an adaptive monitor that has left its desk pose (adaptive phase ≠ docked). |
+| `docked` | Everything else — world-fixed where you left it. |
+
+**"The focused window of a monitor"** is the fullscreen window on the monitor's active workspace if
+there is one, else that workspace's last-focused window (`CWorkspace::m_lastFocusedWindow`).
+Deliberately *per workspace*, not the compositor's global focus: every XR monitor must resolve its
+own situation, so a rule can dim the monitor you are **not** looking at. A monitor with no window at
+all can never match `focusclass:`/`focustitle:` (there is nothing to match), but it *does* match
+`fullscreen:0` — that is a property of the monitor's situation, not a claim that a window exists.
+
+### Examples
+
+```ini
+# Fullscreen games get the panel back at full strength, no keying.
+xrrule = alpha 1.0 blackalpha off, monitor:.* anchorstate:docked focusclass:^steam_app_ fullscreen:1
+
+# A dedicated video monitor should never dissolve its letterboxing.
+xrrule = blackalpha off, monitor:XR-media focusclass:(mpv|vlc)
+
+# THE SAFETY RULE — see below. Put this in your config.
+xrrule = alpha 0.55, anchorstate:follow
+```
+
+### The walking rule (ship this)
+
+```ini
+xrrule = alpha 0.55, anchorstate:follow
+```
+
+**Add this rule if you use head/body leashing or adaptive anchoring at all.** When a monitor is
+leashed to your body it travels with you — which means a large, opaque panel is pinned in front of
+your face while you walk through a room you cannot fully see. That is the one genuinely unsafe
+configuration this feature exists to fix: at `alpha 0.55` the desktop stays readable *and* you can
+see the doorway, the coffee table and the cat. It is **not** hardcoded (a default that silently
+changes what your monitors look like would be worse), so it lives here and in
+`example/openxr.conf` — copy it.
+
+Tune to taste: lower (`0.4`) sees the room better, higher (`0.7`) keeps text crisper. Report 09
+§3.4 cites Meta's MR guidance that UI over passthrough needs contrast; do not drive it so low that
+you are squinting, and remember `alpha` under `blend_mode = opaque` dims toward black rather than
+revealing anything.
+
+### Blend-mode gating
+
+`blackalpha` from a rule (or a manual override) rides the **same** gate as the global: keying only
+does anything under `blend_mode = alpha` (passthrough) or `additive`, and is forced off under
+`opaque` with one warning. `alpha` is **not** gated — dimming a monitor toward the background is a
+legitimate de-emphasis cue under any blend mode.
+
+### Reload & runtime behavior
+
+- Rules are re-parsed on every config reload; a malformed rule is reported as a config error
+  (naming the offending effect/condition) and that line is dropped, the rest still load.
+- Rules are re-evaluated, on the main thread, on: focus change, fullscreen change, window close,
+  active-workspace change, window **title** change (only when some rule actually uses
+  `focustitle:` — titles change on every browser tab switch and we refuse to pay for that
+  otherwise), anchor-state transitions (grab begin/end, adaptive dock/undock, `xrmonitor anchor`),
+  monitor add/remove/create, session start, and config reload. A burst of events collapses into a
+  single evaluation.
+- `hyprctl keyword xrrule …` works and takes effect immediately, but **appends** to the current rule
+  set (there is no name to replace) — reload the config to start from a clean slate.
+
+### Manual override
+
+```
+hyprctl openxr alpha      <name|active> <0..1|auto>
+hyprctl openxr blackalpha <name|active> <0..1|off|auto>
+```
+
+`active` is the currently selected monitor (same resolution as every other verb). The value is
+**sticky** — it outranks every rule until you clear it with `auto`, which hands the monitor straight
+back to rule control (re-resolved for its *current* situation, so it may move again immediately).
+
+`hyprctl openxr status` reports the effective values and where each came from:
+
+```
+monitor XR-main (ID 3): 2560x1440@72.00 size 1.60m anchor body … adaptive: roaming (roam body, seat 2.30m)
+  XR-main: alpha 0.55 (rule), blackalpha 0.20 (default, knee 0.10), anchorstate follow
+```
+
+A live transition shows as `alpha 0.83 -> 0.55`. The JSON form carries the same data per monitor
+under `transparency` (`alpha`, `alphaTarget`, `alphaSource`, `blackAlpha`, `blackAlphaTarget`,
+`blackAlphaSource`, `knee`, `kneeSource`, `transitioning`) plus a top-level `anchorState`. The
+older top-level `black alpha:` line still reports the **global default**, not any monitor's
+resolved value — read the per-monitor lines.
+
+### Cost
+
+Zero when unused: no rules and no manual override means every monitor resolves to the defaults, the
+uniform-fade pass is skipped entirely (it is a no-op at `alpha 1.0`) and the envelope timer stays
+disarmed. While a **uniform alpha** transition runs, the affected monitor recomposes its own XR
+panel per frame — no desktop re-render. While a **luma key** transition runs, the monitor is damaged
+each tick so the desktop re-renders and the blit can re-key it (the key is per-pixel and must be
+baked while the source buffer is in hand); this is bounded by the blend duration.
+
+---
+
 ## 4. The `xrmonitor` dispatcher
 
 `bind = MODS, KEY, xrmonitor, <verb> [args…]` — also callable as
@@ -393,6 +560,8 @@ transports, one implementation.
 | `gazerelease` | *(none)* | Explicit release of the gaze carry (no-op if none). For a `bindr` hold-to-carry pattern. |
 | `gazepush` | `<±m>` | Push/pull the gaze-carried monitor along the gaze ray (or, when not carrying, the gaze-selected monitor along the view ray). No arg = `openxr:gaze_dist_step`. Designed for `binde` repeats. |
 | `handinput` | `on\|off\|auto\|toggle` | Set the conditional hand-input policy (§2). `toggle` is the key-chord to flip hands on/off at the keyboard. |
+| `alpha` | `<name\|active> <0..1\|auto>` | Manual uniform-transparency override (§3.5). Sticky — outranks every `xrrule` until cleared with `auto`. |
+| `blackalpha` | `<name\|active> <0..1\|off\|auto>` | Manual luma-key override (§3.5). `off` disables keying on that monitor; `auto` hands it back to the rules. |
 
 **Selected-target resolution** (for `active` / omitted targets): explicit `select` > last
 ray-hovered monitor > focused-monitor-if-XR — else the verb errors with "no XR monitor
@@ -422,8 +591,8 @@ hyprctl openxr [status]        # default subcommand
 hyprctl -j openxr              # JSON
 hyprctl openxr enable|disable  # start/stop the session (does not touch openxr:enabled)
 hyprctl openxr <verb> …        # the §4 verbs: create destroy select anchor move rotate
-                               #   scale distance center place adaptive dock undock roam
-                               #   gazegrab gazerelease gazepush handinput
+                               #   scale distance center place alpha blackalpha adaptive
+                               #   dock undock roam gazegrab gazerelease gazepush handinput
 hyprctl openxr gaze [at <ms>]  # read-only head ray + timestamped gaze history (see below)
 hyprctl openxr layout          # dump the CURRENT live layout as paste-ready xrmonitor= lines
 ```
