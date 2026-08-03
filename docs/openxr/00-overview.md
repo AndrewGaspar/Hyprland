@@ -53,6 +53,7 @@ Runtimes exercised: **Monado** (including its null compositor for headless testi
 | `05-configuration.md` | user reference: every `openxr:*` var, the `xrmonitor` + `xrrule` keywords, the dispatcher, `hyprctl openxr`, socket2 events, idle integration, consumer recipes, overlay/hypxrpaper |
 | `06-testing.md` | pure-math gtests, the Monado-backed integration suite, the containerized runner |
 | `07-xreal.md` | the XREAL Air 2 Ultra 3DoF display rig (WP-XR1): udev, the xreal Monado build flavor, the `xreal-ctl` HID helper, the flat↔XR toggle, the 3DoF profile, and the live checklist |
+| `08-machine-setup.md` | bringing the whole stack up on a new machine (`scripts/hypxr-setup.sh`): the eight components, the per-machine decision table (GPU profile, distro paths), Arch/Omarchy vs Fedora/omedora, the force-push-safe update path, and the verification checklist |
 
 A ready-to-copy config with every variable, several `xrmonitor` declarations, and example
 binds lives at `example/openxr.conf`. For the XREAL Air 2 Ultra as a 3DoF display, see
