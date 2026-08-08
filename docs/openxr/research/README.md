@@ -38,6 +38,22 @@ WPs are V1–V12.
 
 ---
 
+## Standalone numbered reports (20+)
+
+Post-reorg investigations. Each is self-contained: ground truth with `file:line`, options with
+honest sizing, a recommendation, and a WP ladder. They are *not* coalesced into the live docs
+above; when one ships, move it to `archive/` with a disposition line like the table below.
+
+| Report | Covers | Status |
+|--------|--------|--------|
+| [20-wivrn-idle-inhibit](20-wivrn-idle-inhibit.md) | idle/sleep-inhibition policy for WiVRn sessions | **shipped** — `openxr:inhibit_idle` is now `off\|focused\|present` (`e1a99138`) |
+| [21-wivrn-variable-bitrate](21-wivrn-variable-bitrate.md) | variable-rate encoding for WiVRn streaming (+ erratum `e66b91b4`) | unimplemented |
+| [22-spatial-persistence-locations](22-spatial-persistence-locations.md) | spatial persistence and named locations | unimplemented |
+| [23-xr-native-launcher](23-xr-native-launcher.md) | head-leashed presentation of transient layer-shell UI (walker, mako, OSDs) | unimplemented — WPs N0–N10 |
+| [24-stereo-content-and-depth-desktop](24-stereo-content-and-depth-desktop.md) | stereoscopic (SBS/half-SBS/over-under) client content, and "depth" as a first-class window/layer styling axis | unimplemented — WPs S0–S8, D0–D7 |
+
+---
+
 ## Archive — original reports and their disposition
 
 `archive/` holds the 18 numbered reports that have either **shipped** or been **coalesced**
