@@ -1187,10 +1187,17 @@ hyprctl keyword monitor DP-5, 3840x1080@60, 0x0, 1              # off
 ### Scale must be 1.0
 
 On a physically split panel one buffer pixel must map to one physical pixel, or the per-eye split
-softens and can skew. A stereo output with `scale != 1.0` **warns** in the log and keeps going;
-an `auto` scale is left alone (it is not a user mistake). Note that the fractional-scale validator
-divides the **pane**, not the mode — `stereo:sbs` at 3840 wide validates 1920/scale, so a scale
-that is legal on a 1920 monitor is legal here too.
+softens and can skew. A stereo output with `scale != 1.0` **warns** in the log and keeps going —
+your config is honoured, you are just told why it is discouraged.
+
+An `auto` scale (the default when the rule carries no `scale`) resolves to **1.0** on a stereo
+output instead of guessing from the panel's pixel density. The guess would be wrong twice over:
+it reads the density of the *packed* mode, which is inflated by the pack divisor, and even a
+correct guess of 1.5 or 2 would shrink the logical desktop below the presented per-eye resolution
+without anyone asking for it. Ask for a non-1.0 scale explicitly if you want one.
+
+Note that the fractional-scale validator divides the **pane**, not the mode — `stereo:sbs` at
+3840 wide validates 1920/scale, so a scale that is legal on a 1920 monitor is legal here too.
 
 ### What `wl_output` and screenshots report
 

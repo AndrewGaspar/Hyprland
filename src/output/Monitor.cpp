@@ -1474,6 +1474,15 @@ float CMonitor::getDefaultScale() {
     if (!m_output)
         return 1;
 
+    // stereo: the pack needs one buffer pixel per physical pixel per eye, so a stereo output is
+    // driven at scale 1.0 (research/24 §3.8 — an auto scale picking 1.25 is exactly what softened
+    // and skewed the split in the field). Deriving a scale from the PACKED mode would also inflate
+    // the horizontal pixel density by the pack divisor and silently halve the logical desktop —
+    // the scale validator below divides the pane and would happily accept 1920/2. An explicit
+    // scale is still honored (with the warning in applyMonitorRule); only the guess is pinned.
+    if (isStereo())
+        return 1;
+
     static constexpr double MMPERINCH = 25.4;
 
     const auto              DIAGONALPX = sqrt(pow(m_pixelSize.x, 2) + pow(m_pixelSize.y, 2));
