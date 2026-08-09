@@ -1071,3 +1071,71 @@ TEST_CASE(stereoDepthShippedLadderIsSubPixel) {
     EXPECT_MAX_DELTA(HIGH.y - FLAT.y, 0.0, 0.5);
 }
 
+// stereoDepthStaysFlatOnARotatedOutput — the one geometry the disparity has no answer for.
+//
+// The producer turns a depth into a LOGICAL +x offset, and logical +x is the panel's horizontal
+// axis under exactly one transform: the normal one. Under 90°/270° deriveGeometry transposes the
+// pane, so that offset would run DOWN the panel — vertical disparity, which the eyes cannot fuse
+// into depth and which §8.2 lists among the things that cause strain rather than discomfort. Under
+// 180° and the flipped transforms the axis survives but reverses, which swaps the eyes and inverts
+// the ladder: every window sinks BEHIND the page, against the one-sided design §8.2 point 2 chose
+// deliberately.
+//
+// There is no correct shift to apply in either case, so the producer declines: every spread is 0,
+// nothing is raised, and the output falls back to the single composite F1 shipped. This asserts
+// that fallback — and, in the second half, that the SAME desktop produces two composites the moment
+// the transform goes back to normal, which is what makes the first half about the transform rather
+// than about some unrelated reason the producer might have been idle.
+TEST_CASE(stereoDepthStaysFlatOnARotatedOutput) {
+    Tests::killAllWindows();
+    getFromSocket(std::format("/output remove {}", STEREO_MON));
+
+    // 90° — the transposing case, where the disparity axis would be the panel's vertical one
+    OK(getFromSocket(std::format("/eval hl.monitor({{ output = '{}', mode = '{}', position = 'auto-right', scale = '1', stereo = 'sbs', transform = 1 }})", STEREO_MON,
+                                 STEREO_MODE)));
+    OK(getFromSocket(std::format("/output create headless {}", STEREO_MON)));
+
+    CScopeGuard guard = {[&]() {
+        Tests::killAllWindows();
+        getFromSocket(std::format("/output remove {}", STEREO_MON));
+    }};
+
+    ASSERT(waitForMonitorPresent(STEREO_MON, true), true);
+
+    // The pack itself is untouched by the rotation — `width`/`height` are paneSize(), the scanout
+    // pane, which is what the mode was split into and is transform-independent. (What the transform
+    // transposes is the LOGICAL size the desktop is laid out in, which these fields do not report.)
+    // Asserting it here is the control: the output really is a packed stereo output, so a `1` below
+    // is the depth producer declining and not the stereo path having fallen over.
+    ASSERT(waitForMonitorField(STEREO_MON, "transform", "1"), true);
+    EXPECT(monitorField(STEREO_MON, "width"), std::string("1920"));
+    EXPECT(monitorField(STEREO_MON, "height"), std::string("1080"));
+    EXPECT(monitorField(STEREO_MON, "scanoutWidth"), std::string("3840"));
+    EXPECT(monitorField(STEREO_MON, "stereo"), std::string("sbs"));
+
+    OK(getFromSocket(std::format("/dispatch hl.dsp.focus({{ monitor = '{}' }})", STEREO_MON)));
+
+    // a focused window on the shipped ladder — depth 0.6, i.e. the case that WOULD composite twice
+    const int     BEFORE = Tests::windowCount();
+    SWindowClient client;
+    ASSERT(client.waitForWindow(BEFORE), true);
+    Tests::sync();
+
+    ASSERT(waitForWindowDepth("0.600"), true);
+
+    // === 1. rotated: the window carries a depth and the output is still ONE composite ===
+    //
+    // Note what is NOT asserted: that depth is zero. The ladder is untouched — `hyprctl clients`
+    // still reports 0.600 — because this is a property of the OUTPUT, not of the window. Move the
+    // same window to an unrotated stereo monitor and it rises there.
+    EXPECT(waitForMonitorField(STEREO_MON, "stereoComposites", "1"), true);
+
+    // === 2. ...and the same desktop composites twice the moment the transform is normal ===
+    OK(getFromSocket(std::format("/eval hl.monitor({{ output = '{}', mode = '{}', position = 'auto-right', scale = '1', stereo = 'sbs', transform = 0 }})", STEREO_MON,
+                                 STEREO_MODE)));
+
+    ASSERT(waitForMonitorField(STEREO_MON, "transform", "0"), true);
+    EXPECT(monitorField(STEREO_MON, "width"), std::string("1920"));
+
+    EXPECT(waitForMonitorField(STEREO_MON, "stereoComposites", "2"), true);
+}

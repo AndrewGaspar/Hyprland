@@ -1334,9 +1334,19 @@ Two guards enforce that from the compositor side:
   is ever pushed past one degree of angular disparity.
 - **The frame-violation clamp.** An element whose left or right edge sits on the panel edge is cut
   differently in the two eyes, and the sliver visible to one eye alone is the severe artifact — it
-  destroys the depth cue in that zone. So an element's shift may not exceed its own margin from
-  the frame, plus `decoration:depth_edge_slack` (2 px). A full-width bar therefore floats by the
-  slack and no more; set the slack to `0` for the strict reading and full-width bars stay flat.
+  destroys the depth cue in that zone. So an element's shift may not exceed **the greater of** its
+  own margin from the frame and `decoration:depth_edge_slack` (2 px) — the slack is a floor, not a
+  bonus added on top, so an element with room to move is never pushed past its own margin. A
+  full-width bar has no margin at all and therefore floats by the slack and no more; set the slack
+  to `0` for the strict reading and full-width bars stay flat.
+- **An unrotated output.** Disparity is a horizontal offset between the eyes, and the only transform
+  under which the compositor's logical +x is the panel's horizontal axis is the normal one. On a
+  stereo output carrying `transform = 1/3` (90°/270°) that axis runs down the panel, and on
+  `transform = 2` and the flipped ones it runs backwards — vertical disparity and swapped eyes
+  respectively, both comfort hazards rather than cosmetic bugs. So depth is simply **off** on a
+  rotated or flipped stereo output: every element stays on the wallpaper plane and the output falls
+  back to the ordinary single-composite flat pair. Rotate the images in your headset's own settings
+  instead, or leave the output at `transform = 0`.
 
 ### Tell it about your screen
 
