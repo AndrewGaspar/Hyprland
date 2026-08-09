@@ -98,7 +98,7 @@ void CHyprGroupBarDecoration::damageEntire() {
     auto box = assignedBoxGlobal();
     box.translate(m_window->presentation().floatingOffset());
     // stereo depth (research/24 §6.3): the bar is drawn into both panes at ±disparity
-    box.expand(std::ceil(g_pHyprRenderer->depthDamageSpread(m_window.lock(), m_window->m_monitor.lock())));
+    box.expand(std::ceil(g_pHyprRenderer->depthDamageSpreadAnyMonitor(m_window.lock())));
     g_pHyprRenderer->damageBox(box);
 }
 
