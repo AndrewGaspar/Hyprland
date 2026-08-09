@@ -171,7 +171,10 @@ static SSettings parseSettings(const std::span<const char*> args) {
     return settings;
 }
 
-static bool preTestCleanup(bool xrMode = false) {
+// Half of the resets go through test.lua's `hl.dsp.*` dispatchers; a classic hyprlang config
+// (--xr's xr-test.conf, the stereo front-end run's stereo-legacy.conf) has none of them, so those
+// runs skip that half.
+static bool preTestCleanup(bool nonLuaConfig = false) {
     bool failed = false;
 
     if (!Tests::killAllWindows()) {
@@ -188,8 +191,8 @@ static bool preTestCleanup(bool xrMode = false) {
     }
 
     // The remaining resets use Lua dispatchers (hl.dsp.*) that only exist under the
-    // standard test.lua config; xr-test.conf is classic hyprlang, so skip them.
-    if (xrMode)
+    // standard test.lua config; a classic hyprlang config has none of them, so skip them.
+    if (nonLuaConfig)
         return !failed;
 
     if (!getFromSocket("/activeworkspace").contains("workspace ID 1 (1)")) {
@@ -206,16 +209,16 @@ static bool preTestCleanup(bool xrMode = false) {
     return !failed;
 }
 
-static STestsRunResult runTests(std::vector<std::shared_ptr<CTestCase>>& testCases, bool xrMode = false) {
+static STestsRunResult runTests(std::vector<std::shared_ptr<CTestCase>>& testCases, bool nonLuaConfig = false) {
     struct STestsRunResult res{.total = testCases.size(), .failedNames = {}};
 
     for (auto& tc : testCases) {
         // Clean up before every test
         NLog::yellow("Cleaning up");
 
-        if (!preTestCleanup(xrMode)) { // damn it, something really went wrong
-            if (xrMode) {
-                NLog::red("XR pre-test cleanup failed; continuing (best-effort)");
+        if (!preTestCleanup(nonLuaConfig)) { // damn it, something really went wrong
+            if (nonLuaConfig) {
+                NLog::red("pre-test cleanup failed; continuing (best-effort)");
             } else
                 std::exit(1);
         }
@@ -233,9 +236,9 @@ static STestsRunResult runTests(std::vector<std::shared_ptr<CTestCase>>& testCas
     return res;
 }
 
-static void cleanupAndReport(const STestsRunResult& tInfo) {
+static void cleanupAndReport(const STestsRunResult& tInfo, bool nonLuaConfig = false) {
     NLog::green("dispatching exit");
-    getFromSocket("/dispatch hl.dsp.exit()");
+    getFromSocket(nonLuaConfig ? "/dispatch exit" : "/dispatch hl.dsp.exit()");
 
     NLog::log("\nSummary:\n\tPASSED: {}{}{}/{}", Colors::GREEN, tInfo.total - tInfo.failedNames.size(), Colors::RESET, tInfo.total);
     NLog::log("\tFAILED: {}{}{}/{}", Colors::RED, tInfo.failedNames.size(), Colors::RESET, tInfo.total);
@@ -404,7 +407,7 @@ static int runXrSuite(const SSettings& settings) {
     } else
         cases = xrTestCases;
 
-    STestsRunResult result = runTests(cases, /*xrMode*/ true);
+    STestsRunResult result = runTests(cases, /*nonLuaConfig*/ true);
 
     // Report + teardown.
     NLog::green("dispatching exit");
@@ -462,6 +465,11 @@ int main(int argc, char** argv, char** envp) {
         std::ranges::copy(mainTestCases, std::back_inserter(requestedTestCases));
     }
 
+    // Which front-end parsed the config decides what the harness may dispatch: the `hl.dsp.*`
+    // resets exist only under test.lua. `-c ./stereo-legacy.conf` runs the same tests against the
+    // classic monitor= / monitorv2 front-ends (research/24 §3.10).
+    const bool NONLUACONFIG = settings.configPath.extension() != ".lua";
+
     NLog::yellow("launching hl");
     if (!launchHyprland(settings.configPath, settings.binaryPath)) {
         NLog::red("well it failed");
@@ -504,9 +512,9 @@ int main(int argc, char** argv, char** envp) {
 
     NLog::yellow("Loaded plugin");
 
-    STestsRunResult result = runTests(requestedTestCases);
+    STestsRunResult result = runTests(requestedTestCases, NONLUACONFIG);
 
-    cleanupAndReport(result);
+    cleanupAndReport(result, NONLUACONFIG);
 
     return result.failedNames.size() > 0;
 }
