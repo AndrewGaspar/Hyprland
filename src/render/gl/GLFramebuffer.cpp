@@ -99,12 +99,17 @@ void CGLFramebuffer::bind() {
 
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_fb);
     if (g_pHyprOpenGL) {
-        // On a stereo monitor "which size" genuinely depends on which buffer is bound (research/24
-        // §3.4 item 3): work/mirror/export FBs are pane-sized, the scanout FB is mode-sized. Every
-        // FB knows its own size, so use it; non-stereo keeps the historical mode-sized override.
+        // The viewport must always be the pass's PROJECTION BASE, never the bound buffer's own size:
+        // every box goes through CMonitor::getScaleMatrix() == outputProjection(paneSize()), so a
+        // smaller target (a region screencopy buffer) must CLIP the projected pane, not squeeze the
+        // whole pane into itself. paneSize() == m_pixelSize when stereo is off, so this is exactly
+        // the historical override there (research/24 §3.4 item 3). The mode-sized scanout FB is the
+        // one buffer that wants a different viewport, and CHyprOpenGLImpl::end() sets it per pane
+        // itself; passes that project into a buffer instead of the monitor (RPT_EXPORT) likewise set
+        // their own viewport after binding.
         const auto& PMONITOR = g_pHyprRenderer->m_renderData.pMonitor;
-        const auto& size     = PMONITOR ? (PMONITOR->isStereo() ? m_size : PMONITOR->m_pixelSize) : m_size;
-        g_pHyprOpenGL->setViewport(0, 0, size.x, size.y);
+        const auto  SIZE     = PMONITOR ? PMONITOR->paneSize() : m_size;
+        g_pHyprOpenGL->setViewport(0, 0, SIZE.x, SIZE.y);
     } else
         glViewport(0, 0, m_size.x, m_size.y);
 }
