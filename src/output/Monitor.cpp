@@ -1,4 +1,5 @@
 #include "Monitor.hpp"
+#include "StereoPacking.hpp"
 #include "../helpers/MiscFunctions.hpp"
 #include "../macros.hpp"
 #include "SharedDefs.hpp"
@@ -739,20 +740,15 @@ bool CMonitor::applyMonitorRuleSoft(Config::CMonitorRule&& pMonitorRule) {
 
     // research/24 §3.2: the logical size derives from ONE PANE, not the mode. The pack sits strictly
     // below m_transformedSize (like zoom/mirror, a final-blit stage), so every logical↔buffer
-    // round-trip in the tree (m_size * m_scale == m_transformedSize) stays true. paneSize() ==
-    // m_pixelSize when stereo is off — this line is then bit-identical to stock.
-    const Vector2D PANE = paneSize();
-    Vector2D xfmd       = m_transform % 2 == 1 ? Vector2D{PANE.y, PANE.x} : PANE;
-    m_size              = (xfmd / m_scale).round();
-    m_transformedSize   = xfmd;
+    // round-trip in the tree (m_size * m_scale == m_transformedSize) stays true. The derivation ==
+    // stock when stereo is off (Monitor::Stereo::deriveGeometry, unit-tested in tests/output).
+    const auto GEOM   = Monitor::Stereo::deriveGeometry(m_pixelSize, m_stereoMode, m_transform, m_scale);
+    m_size            = GEOM.logicalSize;
+    m_transformedSize = GEOM.transformedSize;
 
-    if (m_createdByUser) {
-        CBox transformedBox = {0, 0, m_transformedSize.x, m_transformedSize.y};
-        transformedBox.transform(Math::wlTransformToHyprutils(Math::invertTransform(m_transform)), m_transformedSize.x, m_transformedSize.y);
-
-        // back-compute the MODE: un-transform the pane, then re-pack (×{1,1} when stereo is off)
-        m_pixelSize = Vector2D(transformedBox.width, transformedBox.height) * stereoPackDivisor();
-    }
+    // back-compute the MODE: un-transform the pane, then re-pack (×{1,1} when stereo is off)
+    if (m_createdByUser)
+        m_pixelSize = Monitor::Stereo::backComputeMode(m_transformedSize, m_transform, m_stereoMode);
 
     updateStereoCursorLock();
 
@@ -1066,7 +1062,7 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
     if (isStereo() && m_scale != 1.F && !autoScale)
         Log::logger->log(Log::WARN, "Monitor {}: stereo output with scale {:.2f} != 1.0 — the physical per-eye split maps 1:1 only at scale 1.0", m_name, m_scale);
 
-    Vector2D logicalSize = SCALEBASE / m_scale;
+    Vector2D logicalSize = Monitor::Stereo::scaleValidationSize(m_pixelSize, m_stereoMode, m_scale);
     if (!*PDISABLESCALECHECKS && (logicalSize.x != std::round(logicalSize.x) || logicalSize.y != std::round(logicalSize.y))) {
         // invalid scale, will produce fractional pixels.
         // find the nearest valid.
@@ -1130,9 +1126,9 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
 
     // research/24 §3.2: logical/transformed derive from ONE PANE (see applyMonitorRuleSoft)
     const Vector2D PANE = paneSize();
-    Vector2D xfmd       = m_transform % 2 == 1 ? Vector2D{PANE.y, PANE.x} : PANE;
-    m_size              = (xfmd / m_scale).round();
-    m_transformedSize   = xfmd;
+    const auto     GEOM = Monitor::Stereo::deriveGeometry(m_pixelSize, m_stereoMode, m_transform, m_scale);
+    m_size              = GEOM.logicalSize;
+    m_transformedSize   = GEOM.transformedSize;
 
     if ((WAS10B != m_enabled10bit || OLDPIXELSIZE != m_pixelSize || OLDPANESIZE != PANE)) {
         m_resources.reset(); // TODO skip for 10bit change and fp16?
@@ -1853,37 +1849,30 @@ bool CMonitor::isStereo() const {
     return m_stereoMode != Config::STEREO_OFF;
 }
 
+// The pane geometry itself lives in StereoPacking.hpp as pure functions, so the gtests
+// (tests/output/StereoPacking.cpp) exercise the very expressions these accessors run.
 Vector2D CMonitor::stereoPackDivisor() const {
-    switch (m_stereoMode) {
-        case Config::STEREO_SBS: return {2, 1};
-        default: return {1, 1};
-    }
+    return Monitor::Stereo::packDivisor(m_stereoMode);
 }
 
 Vector2D CMonitor::paneSize() const {
-    return m_pixelSize / stereoPackDivisor();
+    return Monitor::Stereo::paneSize(m_pixelSize, m_stereoMode);
 }
 
 int CMonitor::stereoPaneCount() const {
-    const auto DIV = stereoPackDivisor();
-    return sc<int>(DIV.x * DIV.y);
+    return Monitor::Stereo::paneCount(m_stereoMode);
 }
 
 CBox CMonitor::stereoPaneDestBox(int idx) const {
-    const auto PANE = paneSize();
-    const auto DIV  = stereoPackDivisor();
-    const int  COL  = idx % sc<int>(DIV.x);
-    const int  ROW  = idx / sc<int>(DIV.x);
-    return {COL * PANE.x, ROW * PANE.y, PANE.x, PANE.y};
+    return Monitor::Stereo::paneDestBox(m_pixelSize, m_stereoMode, idx);
 }
 
 void CMonitor::sanitizeStereoMode() {
     if (!isStereo())
         return;
 
-    const auto     DIV  = stereoPackDivisor();
-    const Vector2D PANE = m_pixelSize / DIV;
-    if (PANE != PANE.floor() || PANE.x < 1 || PANE.y < 1) {
+    const auto DIV = stereoPackDivisor();
+    if (!Monitor::Stereo::modeDivides(m_pixelSize, m_stereoMode)) {
         Log::logger->log(Log::ERR, "Monitor {}: mode {:X0} is not divisible into a {}x{} stereo pack, disabling stereo", m_name, m_pixelSize, sc<int>(DIV.x), sc<int>(DIV.y));
         ErrorOverlay::overlay()->queueError(std::format("Monitor {}: mode not divisible for stereo packing, stereo disabled", m_name));
         m_stereoMode = Config::STEREO_OFF;

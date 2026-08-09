@@ -37,6 +37,7 @@
 #include "../helpers/CursorShapes.hpp"
 #include "../helpers/MainLoopExecutor.hpp"
 #include "../output/Monitor.hpp"
+#include "../output/StereoPacking.hpp"
 #include "../state/MonitorState.hpp"
 #include "../state/WorkspaceState.hpp"
 #include "macros.hpp"
@@ -2228,10 +2229,16 @@ void IHyprRenderer::renderMonitor(PHLMONITOR pMonitor, bool commit) {
     // output — D_L ∪ (D_R + paneW) (research/24 §3.4 item 6). Must run AFTER damageMirrorsWith,
     // which expects pane-space damage.
     if UNLIKELY (pMonitor->isStereo()) {
-        CRegion paneDamage{frameDamage};
-        frameDamage.clear();
-        for (int i = 0; i < pMonitor->stereoPaneCount(); ++i)
-            frameDamage.add(paneDamage.copy().translate(pMonitor->stereoPaneDestBox(i).pos()));
+        frameDamage = Monitor::Stereo::foldPaneDamage(frameDamage, pMonitor->m_pixelSize, pMonitor->m_stereoMode);
+
+        // the fold is otherwise invisible from outside the process — surface it under the existing
+        // damage-logging switch so hyprtester can assert that both halves were submitted (WP F3).
+        static auto PLOGDAMAGE = CConfigValue<Config::INTEGER>("debug:log_damage");
+        if (*PLOGDAMAGE) {
+            const auto& EXT = frameDamage.pixman()->extents;
+            Log::logger->log(Log::DEBUG, "Damage: Stereo fold on {} ({} panes): extents xy: {}, {} wh: {}, {}", pMonitor->m_name, pMonitor->stereoPaneCount(), EXT.x1, EXT.y1,
+                             EXT.x2 - EXT.x1, EXT.y2 - EXT.y1);
+        }
     }
 
     pMonitor->m_output->state->addDamage(frameDamage);
