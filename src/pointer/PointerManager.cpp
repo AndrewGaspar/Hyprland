@@ -639,22 +639,24 @@ SP<Aquamarine::IBuffer> CPointerManager::renderHWCursorBuffer(SP<CPointerManager
 }
 
 void CPointerManager::renderSoftwareCursorsFor(PHLMONITOR pMonitor, const Time::steady_tp& now, CRegion& damage, std::optional<Vector2D> overridePos, bool screencopy,
-                                               bool forceRender) {
+                                               bool forceRender, bool eyePass) {
     if (!hasCursor())
         return;
 
     auto state = stateFor(pMonitor);
 
     if (!state->hardwareFailed && state->softwareLocks == 0 && !screencopy) {
-        if (m_currentCursorImage.surface)
+        if (m_currentCursorImage.surface && !eyePass)
             m_currentCursorImage.surface->resource()->frame(now);
         return;
     }
 
     // don't render cursor on screencopy if using sw cursors
     // otherwise we draw the cursor again for screencopy when using sw cursors
-    // unless this is toplevel capture and we *actually* have to force render cursors
-    if (screencopy && !forceRender && (state->hardwareFailed || state->softwareLocks != 0))
+    // unless this is toplevel capture and we *actually* have to force render cursors.
+    // eye passes are exempt too: they ARE the deliberate second draw, into another per-eye
+    // composite of the same frame (research/24 §3.7)
+    if (screencopy && !forceRender && !eyePass && (state->hardwareFailed || state->softwareLocks != 0))
         return;
 
     auto box = state->box.copy();
@@ -686,11 +688,21 @@ void CPointerManager::renderSoftwareCursorsFor(PHLMONITOR pMonitor, const Time::
 
     // to erase the leftover in updateCursorBackend()
     if (!screencopy) {
-        state->swRendered    = true;
-        state->swRenderedBox = logicalBox;
+        if (eyePass && state->swRendered) {
+            // research/24 §3.7: a per-eye repeat draw lands at its own disparity — the leftover-erase
+            // box must cover EVERY pane's draw of this frame, so union with the primary instead of
+            // replacing it (which would leave an un-damaged ghost at the other eye's offset)
+            const double x1      = std::min(state->swRenderedBox.x, logicalBox.x);
+            const double y1      = std::min(state->swRenderedBox.y, logicalBox.y);
+            const double x2      = std::max(state->swRenderedBox.x + state->swRenderedBox.w, logicalBox.x + logicalBox.w);
+            const double y2      = std::max(state->swRenderedBox.y + state->swRenderedBox.h, logicalBox.y + logicalBox.h);
+            state->swRenderedBox = {x1, y1, x2 - x1, y2 - y1};
+        } else
+            state->swRenderedBox = logicalBox;
+        state->swRendered = true;
     }
 
-    if (m_currentCursorImage.surface)
+    if (m_currentCursorImage.surface && !eyePass)
         m_currentCursorImage.surface->resource()->frame(now);
 }
 
@@ -814,6 +826,13 @@ void CPointerManager::damageIfSoftware() {
 
         CBox damageBox = b.copy().translate(-monitor->m_position).scale(monitor->m_scale).round();
         monitor->addDamage(damageBox);
+
+        // research/24 §3.7: per-eye passes may have drawn the cursor disparity-shifted from the
+        // recomputed cursor box — erase the recorded union of what was actually drawn as well
+        // (monitor-local logical, same treatment as damageSoftwareLeftover in updateCursorBackend).
+        // The eye-pass caller damages its own NEW disparity-shifted box; this covers the OLD one.
+        if (mw->swRendered)
+            monitor->addDamage(mw->swRenderedBox.copy().expand(4).scale(monitor->m_scale).round());
     }
 }
 
