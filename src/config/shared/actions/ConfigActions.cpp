@@ -1,5 +1,6 @@
 #include "ConfigActions.hpp"
 #include "../parserUtils/ParserUtils.hpp"
+#include "../../../helpers/MiscFunctions.hpp"
 #include "../../../desktop/state/FocusState.hpp"
 #include "../../../desktop/state/GlobalWindowController.hpp"
 #include "../../../desktop/state/WindowState.hpp"
@@ -154,7 +155,7 @@ ActionResult Actions::killWindow(std::optional<PHLWINDOW> w) {
     if (!window)
         return {};
 
-    kill(window->getPID(), SIGKILL);
+    killPid(window->getPID(), SIGKILL);
 
     return {};
 }
@@ -167,7 +168,7 @@ ActionResult Actions::signalWindow(int sig, std::optional<PHLWINDOW> w) {
     if (sig < 1 || sig > 31)
         return std::unexpected(std::format("Invalid signal number {}", sig));
 
-    kill(window->getPID(), sig);
+    killPid(window->getPID(), sig);
 
     return {};
 }
@@ -956,7 +957,8 @@ ActionResult Actions::changeWorkspace(PHLWORKSPACE ws) {
     // backup to evacuate to), leaving this workspace welded to an output that can never show it.
     // Adopt it onto the focused monitor instead of focusing a disabled monitor.
     if (!PMONITORWORKSPACEOWNER->m_enabled) {
-        Log::logger->log(Log::DEBUG, "changeWorkspace: workspace {} is stranded on disabled monitor {}, adopting onto {}", ws->m_id, PMONITORWORKSPACEOWNER->m_name, PMONITOR->m_name);
+        Log::logger->log(Log::DEBUG, "changeWorkspace: workspace {} is stranded on disabled monitor {}, adopting onto {}", ws->m_id, PMONITORWORKSPACEOWNER->m_name,
+                         PMONITOR->m_name);
         State::workspacePlacementController()->moveWorkspaceToMonitor(ws, PMONITOR);
         PMONITORWORKSPACEOWNER = PMONITOR;
     }

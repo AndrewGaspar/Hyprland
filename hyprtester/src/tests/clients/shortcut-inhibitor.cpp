@@ -119,7 +119,7 @@ CClient::~CClient() {
     std::string cmd = "off\n";
     write(this->writeFd.get(), cmd.c_str(), cmd.length());
 
-    kill(this->proc->pid(), SIGKILL);
+    Safe::signalPid(this->proc->pid(), SIGKILL);
     this->proc.reset();
 }
 

@@ -204,7 +204,7 @@ namespace {
             if (m_proc) {
                 std::string cmd = "exit\n";
                 write(m_writeFd.get(), cmd.c_str(), cmd.length());
-                kill(m_proc->pid(), SIGKILL);
+                Safe::signalPid(m_proc->pid(), SIGKILL);
                 m_proc.reset();
             }
         }

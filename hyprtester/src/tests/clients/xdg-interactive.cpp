@@ -269,7 +269,7 @@ CClient::~CClient() {
     }
 
     if (proc)
-        kill(proc->pid(), SIGKILL);
+        Safe::signalPid(proc->pid(), SIGKILL);
     proc.reset();
 }
 

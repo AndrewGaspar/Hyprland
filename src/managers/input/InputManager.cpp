@@ -957,7 +957,7 @@ void CInputManager::processMouseDownKill(const IPointer::SButtonEvent& e) {
             Event::bus()->m_events.window.kill.emit(PWINDOW);
 
             // kill the mf
-            kill(PWINDOW->getPID(), SIGKILL);
+            killPid(PWINDOW->getPID(), SIGKILL);
             break;
         }
         case WL_POINTER_BUTTON_STATE_RELEASED: break;
