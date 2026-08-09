@@ -877,20 +877,29 @@ void CHyprOpenGLImpl::end() {
             // scissored to damage, so the parts of the work buffer the replay does not repaint can
             // never reach the output. The state dance restores the composite's own conventions
             // (monitor transform off, blending on, no final shader) and puts back the pack's.
+            //
+            // Surface feedback is blocked for the duration: this is the SAME frame, so every frame
+            // callback and wp_presentation feedback this pass owed was already sent by the first
+            // composite. Without the block each replayed surface queues a second (now empty)
+            // presentation record per pane per frame, and each discard path re-sends a discarded
+            // feedback for a surface that was already reported.
             const auto RECOMPOSITE = [&](int eye) {
-                const auto SAVED_DAMAGE = g_pHyprRenderer->m_renderData.damage;
+                const auto SAVED_DAMAGE   = g_pHyprRenderer->m_renderData.damage;
+                const auto SAVED_FEEDBACK = g_pHyprRenderer->m_bBlockSurfaceFeedback;
 
                 g_pHyprRenderer->popMonitorTransformEnabled();
                 g_pHyprRenderer->pushMonitorTransformEnabled(false);
                 g_pHyprRenderer->bindFB(m_renderData.mainFB);
                 blend(true);
-                m_applyFinalShader = false;
+                m_applyFinalShader                       = false;
+                g_pHyprRenderer->m_bBlockSurfaceFeedback = true;
 
                 m_renderData.stereoEye = eye;
                 g_pHyprRenderer->m_renderPass.replay();
                 m_renderData.stereoEye = 0;
 
-                m_applyFinalShader = !g_pHyprRenderer->m_renderData.blockScreenShader;
+                g_pHyprRenderer->m_bBlockSurfaceFeedback = SAVED_FEEDBACK;
+                m_applyFinalShader                       = !g_pHyprRenderer->m_renderData.blockScreenShader;
                 blend(false);
                 g_pHyprRenderer->bindFB(m_renderData.outFB);
                 g_pHyprRenderer->popMonitorTransformEnabled();
@@ -905,6 +914,14 @@ void CHyprOpenGLImpl::end() {
             auto srcTex = TEX;
             for (int i = 0; i < PMONITOR->stereoPaneCount(); ++i) {
                 if (i == 0 || PER_EYE) {
+                    // everything in this block draws into a PANE-sized buffer at its own origin,
+                    // while m_scissorOffset still holds the previous iteration's destination origin
+                    // from the blit below. It is {0,0} for every layout shipped today (pane 0 sits
+                    // at the origin in both sbs and tab), so this is a guard rather than a fix —
+                    // but the guard is what keeps a future packing whose first pane is elsewhere
+                    // from scissoring the replay and the colour/shader resolves out of existence.
+                    m_scissorOffset = {};
+
                     if (i > 0)
                         RECOMPOSITE(i);
 
