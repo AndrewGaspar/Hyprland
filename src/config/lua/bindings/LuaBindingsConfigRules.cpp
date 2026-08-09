@@ -192,7 +192,9 @@ namespace {
         {"order", []() -> ILuaConfigValue* { return new CLuaConfigInt(0); }, LE::LAYER_RULE_EFFECT_ORDER},
         {"above_lock", []() -> ILuaConfigValue* { return new CLuaConfigInt(0, 0, 2); }, LE::LAYER_RULE_EFFECT_ABOVE_LOCK},
         {"no_screen_share", []() -> ILuaConfigValue* { return new CLuaConfigBool(false); }, LE::LAYER_RULE_EFFECT_NO_SCREEN_SHARE},
-        {"depth", []() -> ILuaConfigValue* { return new CLuaConfigFloat(0.F, 0.F, 1.F); }, LE::LAYER_RULE_EFFECT_DEPTH},
+        // no min/max — it would REJECT where the classic front end clamps; see the window-rule
+        // `depth` entry in LuaBindingsInternal.hpp
+        {"depth", []() -> ILuaConfigValue* { return new CLuaConfigFloat(0.F); }, LE::LAYER_RULE_EFFECT_DEPTH},
     };
 
     static_assert(sizeof(LAYER_RULE_EFFECT_DESCS) / sizeof(SLayerRuleEffectDesc) == LE::LAYER_RULE_EFFECT_LAST_STATIC - 1);
