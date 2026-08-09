@@ -1387,12 +1387,20 @@ which is also the A/B switch for deciding whether you like it at all.
 
 Depth moves on **discrete events** — focus, fullscreen, a rule change — and is deliberately *not*
 animated on hover: pointer-driven depth changes at 60 Hz are vergence micro-adjustments and the
-likeliest source of strain in this design. The animation node is `windowsDepth` (a child of
-`windows`), off by default:
+likeliest source of strain in this design. The animation node is `windowsDepth`, a child of
+`windows` — so it is **on by default**, inheriting whatever `windows` (or `global`) is set to, like
+every other animation node. To give the rise its own curve rather than the one your window
+animations happen to use:
 
 ```ini
 bezier    = depthEase, 0.23, 1, 0.32, 1
 animation = windowsDepth, 1, 4, depthEase
+```
+
+To turn the easing off and have depth changes snap instead, disable just that node:
+
+```ini
+animation = windowsDepth, 0
 ```
 
 Note the `bezier =` line: `easeOutQuint` is not a built-in name, and an unknown curve is a config

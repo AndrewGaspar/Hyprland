@@ -152,7 +152,12 @@ TEST_CASE(depthLadderIsObservable) {
     // this would report "ok" and change nothing — silently — which is precisely report F8's bug.
     OK(getFromSocket("/eval hl.window_rule({ name = 'depth-integration', match = { class = '.*' }, depth = 0.35 })"));
 
-    const auto RULED_DEPTH = pollFor([] { return depthAfter(getFromSocket("j/clients")); }, DEPTH_RULE);
+    // a named Lua rule outlives the test that made it, so retire it here rather than leaving the
+    // next test case to clean up after this one — the rule matches EVERY window, so a leak of it
+    // pins the whole ladder and the failure lands somewhere else entirely
+    CScopeGuard ruleGuard = {[&]() { getFromSocket("/eval hl.window_rule({ name = 'depth-integration', enabled = false })"); }};
+
+    const auto  RULED_DEPTH = pollFor([] { return depthAfter(getFromSocket("j/clients")); }, DEPTH_RULE);
     EXPECT(RULED_DEPTH, std::string{DEPTH_RULE});
 
     // --- a top layer surface sits on the layer rung ---------------------------------------------
@@ -177,6 +182,22 @@ TEST_CASE(depthLadderIsObservable) {
 
     const auto LAYER_DEPTH = pollFor([] { return layerDepth(getFromSocket("j/layers"), DEPTH_LAYER_NS); }, DEPTH_LAYERS);
     EXPECT(LAYER_DEPTH, std::string{DEPTH_LAYERS});
+
+    // --- ...and a LAYER rule beats the layer tier, exactly as the window rule beat its own --------
+    //
+    // The window half of `depth` had end-to-end coverage from the start; the layer half had none —
+    // the assertion above passes for a layer surface with no rule at all, because 0.800 IS the tier.
+    // So it could not tell a working `layerrule = depth` from an applicator that dropped the effect
+    // on the floor, a missing entry in the resetProps tuple, or an override branch in
+    // CLayerSurface::updateDepth() that never ran. This is the assertion that can.
+    constexpr const char* LAYER_RULE_DEPTH = "0.450";
+
+    OK(getFromSocket(std::format("/eval hl.layer_rule({{ name = 'depth-layer-integration', match = {{ namespace = '{}' }}, depth = 0.45 }})", DEPTH_LAYER_NS)));
+
+    CScopeGuard layerRuleGuard = {[&]() { getFromSocket("/eval hl.layer_rule({ name = 'depth-layer-integration', enabled = false })"); }};
+
+    const auto  LAYER_RULED = pollFor([] { return layerDepth(getFromSocket("j/layers"), DEPTH_LAYER_NS); }, LAYER_RULE_DEPTH);
+    EXPECT(LAYER_RULED, std::string{LAYER_RULE_DEPTH});
 }
 
 // depthFocusRaiseSwapsTheRungs — §7.3's central claim, wired end to end (WP D4).
