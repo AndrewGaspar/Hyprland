@@ -1403,8 +1403,12 @@ do. **MPRIS2 has no stereo field**; the only thing MPRIS gives you is `xesam:url
 filename, i.e. tier C by another route.)
 
 **Concrete recommendation, and it is cheap: ship `contrib/mpv-hypxr-stereo.lua`.** Twenty lines
-that observe `video-params/stereo-in` on `file-loaded` and run
-`hyprctl openxr stereo <monitor> hsbs|sbs|tab|off` give the user *exact* detection for every 3D
+that observe `video-params/stereo-in` and set the window's stereo state — **shipped (S5) via the
+generic route, not the XR one**: the script runs `hyprctl dispatch tagwindow ±stereo-sbs
+pid:<self>` and four static `windowrule = stereo … always, match:tag stereo-…` lines do the rest,
+which needs no OpenXR verb and no runtime. (The original sketch below said
+`hyprctl openxr stereo <monitor> hsbs|sbs|tab|off`; the inversion made a *per-window*, XR-free
+route both available and better.) Either way it gives the user *exact* detection for every 3D
 file they own, with zero compositor heuristics and zero risk to the rest of the desktop. It is
 strictly better than any pixel analysis and it is a weekend's work in another language.
 
@@ -2197,8 +2201,8 @@ optional; it is now Phase F.
 | **S0** | **0** | XREAL | **Zero-code spike.** Put a known SBS video fullscreen and confirm the current build shows it doubled (it will). Confirm the mod's SBS output and the 3840 mode line up. Answers "is full-SBS at 3840 lossless end to end" |
 | **S1** ✅ | **M** | flat | **The stereo declaration and the Q1 producer.** `windowrule = stereo <layout>` as a generic window-rule effect (7 lines × 5 files + the Lua mirror, §7.1) matching `xdg_tag`/`class`/`title`/`content`; per-window UV crop in `calculateUVForSurface` (F7) so the tagged window samples a different half per pane; the "fullscreen-on-this-monitor unless overridden" negative heuristic (§4.3). **Stored in a shared config manager** (F8). Visible immediately on F1's flat presenter |
 | **S2** ✅ | S | flat | **Tests.** gtests: aspect/`k` from the destination box (`presentedAspect`), pane↔content UV mapping both directions (§5.6), and the precedence table as a pure function (`resolveDeclaration`, extracted from `CWindow::stereoLayout()`) — 700 → 718. hyprtester: `stereoTaggedWindowSamplesOneHalfPerPane` proves the crop **in pixels** via a new `screencopy-probe` client and a four-quadrant `xdg-interactive --paint` (§3.12), with an untagged control and the mono-monitor degradation; `stereoRuleFoldAndProvenance` covers the fold above the pure part. Stereo suite 6 → 8, headless on the host |
-| **S3** | S | — | **Config surface + docs.** The `xdg_tag` convention (§4.2), the HSBS resolution caveat, the heuristic block for `example/` (§4.3), status/JSON fields |
-| **S5** | XS | — | **`contrib/mpv-hypxr-stereo.lua`** (§4.5) — observe mpv's `video-params/stereo-in`, set the rule. **Must call a non-XR verb** (`hyprctl keyword` / a generic dispatcher), not `hyprctl openxr stereo` |
+| **S3** ✅ | S | — | **Config surface + docs.** `05-configuration.md` §8.6 carries the whole content story: the layout table, the fullscreen gate and `always`, the exact `xdg-toplevel-tag-v1` grammar as a stated compatibility contract (with a mod-facing paragraph — one call, set it early, no suffixes, `stereo:auto` invalid), the HSBS sharpness caveat (~21 px/° against ~42 on an XREAL), the `hyprctl clients` `stereo` / `hyprctl monitors` `stereoContent` fields, the heuristic regex block, and what it deliberately does not do. `example/xreal.conf` ships the same three tiers commented out |
+| **S5** ✅ | XS | — | **`contrib/mpv-hypxr-stereo.lua`** (§4.5) — observes `video-params/stereo-in` and tags mpv's own window (`hyprctl dispatch tagwindow ±stereo-sbs pid:<self>`), which four static `match:tag` rules turn into a layout. **Non-XR by construction**: a window tag and a windowrule, no `hyprctl openxr`. A tag change re-evaluates rules in place (`Actions::tag` → `propertiesChanged(RULE_PROP_TAG)`), and since the containers never record half-vs-full the script infers it from the display aspect. Advisory: it only ever adds a tag, so a hand-written `stereo off` still wins |
 | **S8** | M | flat | **`stereo:auto`** (§4.4): downsampled NCC detector, fullscreen precondition, hysteresis, decision surfaced in status. Default **off** |
 
 ### Phase D — the depth desktop (Q2)
@@ -2230,7 +2234,10 @@ Note what that order buys: **everything up to "ship Q1, flat" needs no headset, 
 SBS mode. The XR tier then lands as a small delta on a producer that is already proven.
 
 Rough totals: **Phase F core (F1–F3) ≈ 450–650 lines**, dominated by F1's fifteen touch points
-and F2's cursor work. **Phase S core (S1–S3) ≈ 300–450 lines.** **Phase D core (D1–D2, D4)
+and F2's cursor work. **Phase S core (S1–S3) is IMPLEMENTED** — S1, S2, S3 and S5 all landed, so
+Q1 on the flat presenter is complete end to end: declaration, crop, tests, docs and the mpv
+helper. Only S0 (a headset eyeball check) and the XR tier (X1) remain before "ship Q1".
+**Phase D core (D1–D2, D4) **Phase D core (D1–D2, D4)
 ≈ 700–900 lines**, dominated by the producer and the 14 `m_floatingOffset` call sites. **Phase X
 (X1–X3) ≈ 250–350 lines** — the cheapest phase, and now the last one, which is the whole point of
 the inversion.
