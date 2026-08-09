@@ -4,6 +4,7 @@
 #include <aquamarine/output/Output.hpp>
 #include <cstdint>
 #include <hyprutils/math/Vector2D.hpp>
+#include <hyprutils/utils/ScopeGuard.hpp>
 #include <ranges>
 #include <algorithm>
 #include "../../config/ConfigValue.hpp"
@@ -299,6 +300,16 @@ void CInputManager::mouseMoveUnified(uint32_t time, bool refocus, bool mouse, st
         m_lastCursorPosFloored = MOUSECOORDSFLOORED;
     }
 
+    // Hover state, as opposed to the refocus targets reset above: WHATEVER this pass resolves is
+    // what the pointer is over, and hoveredWindow()/hoveredLayer() have to say so on an ordinary
+    // motion event too — WP D2 renders the cursor at that thing's depth (research/24 §5.4) and
+    // must not run its own hit test. The guard, rather than an assignment per exit, because this
+    // function has twenty-odd early returns and a stale hover reads as the cursor's depth popping.
+    Hyprutils::Utils::CScopeGuard hoverGuard([this, &pFoundWindow, &pFoundLayerSurface] {
+        m_hoveredWindow = pFoundWindow;
+        m_hoveredLS     = pFoundLayerSurface;
+    });
+
     // use mouseCoords specifically in case touch sent overridePos, otherwise touch doesn't work on non-focused monitor
     const auto PMONITOR = isLocked() && Desktop::focusState()->monitor() ? Desktop::focusState()->monitor() : State::monitorState()->query().vec(mouseCoords).run();
 
@@ -318,8 +329,14 @@ void CInputManager::mouseMoveUnified(uint32_t time, bool refocus, bool mouse, st
         !SKIP_CURSOR_FRAME_SCHEDULE)
         CURSOR_MONITOR->scheduleFrame(Aquamarine::IOutput::AQ_SCHEDULE_CURSOR_MOVE);
 
-    if (!pointerOnly && m_pointerConstraints.apply(time, mouseCoords))
+    if (!pointerOnly && m_pointerConstraints.apply(time, mouseCoords)) {
+        // a constrained (or confined) pointer is over the surface that constrains it, by definition —
+        // say so, or the hover guard above records "nothing" and WP D2 drops the cursor to the
+        // wallpaper plane while it sits inside a raised window (research/24 §5.4)
+        if (const auto SURF = Desktop::View::CWLSurface::fromResource(Desktop::focusState()->surface()); SURF)
+            pFoundWindow = Desktop::View::CWindow::fromView(SURF->view());
         return;
+    }
 
     if (!pointerOnly && PMONITOR != Desktop::focusState()->monitor() && (*PMOUSEFOCUSMON || refocus) && m_forcedFocus.expired())
         Desktop::focusState()->rawMonitorFocus(PMONITOR);
