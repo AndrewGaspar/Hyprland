@@ -301,6 +301,12 @@ continuous motion.
   wire ABI-mismatch reason); `logSkip()` emits both a human line and a TAP-style
   `ok - <name> # SKIP <reason>` line so external harnesses can grep it. A SKIP counts as a pass.
   The `XR_SKIP_IF_UNAVAILABLE()` macro at the top of each case wires this in.
+- **GPU-topology gate.** `drmGpuCount()` counts the distinct *physical* GPUs reachable through
+  `/dev/dri`, collapsing each node onto its `/sys/dev/char/<maj>:<min>/device` parent so a GPU's
+  card and render nodes count once — the same node-type-agnostic equality `DRM::sameGpu`
+  (`drmDevicesEqual`) gives the compositor's cross-GPU decision. It enumerates `/dev/dri` rather
+  than `/sys/class/drm` deliberately: the hermetic container is handed one node out of a multi-GPU
+  host but sees the host's `/sys`. Cases that pin cross-GPU behaviour SKIP when it returns < 2.
 - **Artifact capture on failure.** `dumpXrArtifacts(testName)` (called by each case via an RAII
   guard that checks `this->failed`) writes to `hyprtester/artifacts/<run-id>/<testName>/`:
   `monitors.json`, `openxr.json`, a tail of the Monado log, and a tail of the Hyprland log. A
@@ -336,8 +342,12 @@ required). The cases, by file:
   RUNS (asserted from `j/monitors`, not the requested mode echoed back by `j/openxr`), and it
   survives a config reload — a reparse clears the rule manager, and reconciliation only reinstalls
   rules for config-*declared* monitors, so a runtime-created one used to snap back to 1920x1080.
-- `xr_force_linear_realloc` — toggling the `force_linear` swapchain policy reallocates the
-  monitor's swapchains.
+- `xr_force_linear_realloc` — a multigpu flip actually RE-ALLOCATES the XR-bound output's buffers
+  LINEAR, asserted on aquamarine's own allocator log (`multigpu, forcing linear` + `modifier 0x0 :
+  LINEAR`) rather than the status flag, which read `true` in the buggy build too. Guarded: it skips
+  unless `drmGpuCount() >= 2`, since with one GPU `auto` correctly never forces and only the
+  synthetic `force_linear = on` drive remains — and that lands evidence only when the new monitor
+  also gets plugged and composited, which the single-GPU container manages ~1 run in 5.
 - `xr_config_declared` — the two declared fixtures exist with correct anchors; a config reload
   reconciles idempotently (declared monitors keep their ids, a runtime-created monitor survives
   untouched).

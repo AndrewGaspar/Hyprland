@@ -158,14 +158,29 @@ TEST_CASE(xr_monitor_create_mode) {
 // never appeared and the buffers kept their native tiling. status `linear: true` alone is NOT
 // sufficient — it was `true` in the buggy build too; the aquamarine reallocation is what changed.
 //
-// This host happens to be cross-GPU (openxr:gpu pins a different node than the nested compositor
+// The dev host happens to be cross-GPU (openxr:gpu pins a different node than the nested compositor
 // allocates on), so the `auto` default already force-linears the declared XR-conf monitors AT
-// STARTUP — the exact live scenario. We observe that first; if the host turns out same-GPU (no
-// forced-linear monitor), we drive it explicitly via `force_linear = on` + a fresh monitor. Either
-// way the assertion is the aquamarine reallocation evidence.
+// STARTUP — the exact live scenario. We observe that first; if the host is cross-GPU but the
+// startup evidence is absent, we drive it explicitly via `force_linear = on` + a fresh monitor.
+// Either way the assertion is the aquamarine reallocation evidence.
+//
+// Requires two GPUs, so it SKIPs below that (docs §5.3): the defect is a CROSS-GPU one, and with a
+// single GPU `auto` correctly never forces, leaving only the synthetic `force_linear = on` drive —
+// whose evidence lands only if the freshly-created monitor also reaches a plugged, composited state
+// (report-20 issue D, the same environmental gate xr_mirror / xr_monitor_create_mode skip on). In
+// the hermetic container, which is handed ONE render node, that combination came up roughly 1 run
+// in 5, so a hard assertion there tests the environment rather than the fix.
 TEST_CASE(xr_force_linear_realloc) {
     XR_SKIP_IF_UNAVAILABLE();
     SArtifactGuard guard{this->failed, name(), {}};
+
+    // Counted the way applyCrossGpuLinear decides cross-GPU (DRM::sameGpu → drmDevicesEqual over
+    // the XR render node and the allocator's card node), so the gate and the feature agree on what
+    // "two GPUs" means. Checked before the session gate — it costs nothing and needs no session.
+    if (const size_t GPUS = XR::drmGpuCount(); GPUS < 2) {
+        XR::logSkip(name(), "single-GPU environment (" + std::to_string(GPUS) + " DRM device(s) under /dev/dri); the cross-GPU force-linear reallocation is not reproducible here");
+        return;
+    }
 
     if (!gateUp()) {
         XR::logSkip(name(), "session never reached focused/visible (known env instability)");

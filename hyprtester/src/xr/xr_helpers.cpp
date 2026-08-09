@@ -6,10 +6,14 @@
 #include "../hyprctlCompat.hpp"
 #include "../shared.hpp" // HIS
 
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
+#include <algorithm>
 #include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <thread>
 
 namespace XR {
@@ -52,6 +56,42 @@ namespace XR {
 
     std::string monitorName(int n) {
         return std::string("XR-t") + std::to_string(getpid()) + "-" + std::to_string(n);
+    }
+
+    size_t drmGpuCount() {
+        std::set<std::string> devices;
+        size_t                renderNodes = 0;
+
+        // Enumerate /dev/dri, NOT /sys/class/drm: what matters is what this process can actually
+        // open. The hermetic container is handed ONE render node out of a multi-GPU host, but its
+        // /sys is the host's — a sysfs walk would report the host's GPUs and never skip in here.
+        std::error_code ec;
+        for (const auto& e : std::filesystem::directory_iterator("/dev/dri", ec)) {
+            const std::string node     = e.path().filename().string();
+            const bool        isRender = node.starts_with("renderD");
+            if (!isRender && !node.starts_with("card"))
+                continue;
+            if (isRender)
+                ++renderNodes;
+
+            // Collapse the node onto its physical device the way drmDevicesEqual does:
+            // /sys/dev/char/<major>:<minor>/device is the PCI (or platform) device that BOTH the
+            // card node and the render node of one GPU hang off. That is precisely the node-type
+            // agnosticism DRM::sameGpu buys — a raw major/minor compare reads a single GPU's
+            // render node (226:128) and card node (226:1) as two GPUs (the NVIDIA all-black bug).
+            struct stat st = {};
+            if (::stat(e.path().c_str(), &st) != 0 || !S_ISCHR(st.st_mode))
+                continue;
+            std::error_code lec;
+            const auto      dev = std::filesystem::canonical("/sys/dev/char/" + std::to_string(major(st.st_rdev)) + ":" + std::to_string(minor(st.st_rdev)) + "/device", lec);
+            if (!lec)
+                devices.insert(dev.string());
+        }
+
+        // Fall back to the render-node count where sysfs is unreadable (masked in a sandbox): one
+        // render node per render-capable GPU, so it never over-counts. Take the larger of the two —
+        // a display-only card node with no render node is still a second device to import across.
+        return std::max(devices.size(), renderNodes);
     }
 
     static void writeTail(const std::string& src, const std::string& dst, size_t maxLines) {

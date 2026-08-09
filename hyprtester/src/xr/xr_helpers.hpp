@@ -3,6 +3,7 @@
 #ifdef WITH_XR_TESTS
 
 #include <chrono>
+#include <cstddef>
 #include <functional>
 #include <string>
 #include <vector>
@@ -44,6 +45,12 @@ namespace XR {
 
     // Unique per-run monitor name: XR-t<pid>-<n>.
     std::string monitorName(int n);
+
+    // How many distinct PHYSICAL GPUs this process can reach through /dev/dri, counted the way the
+    // compositor's cross-GPU decision counts them (DRM::sameGpu → drmDevicesEqual): every node is
+    // collapsed onto its sysfs parent device, so one GPU's card node and render node count ONCE.
+    // < 2 ⇒ no cross-GPU path exists here and the tests that pin cross-GPU behaviour must SKIP.
+    size_t drmGpuCount();
 
     // Dump monitors.json / openxr.json / monado.log tail / hyprland.log tail into
     // hyprtester/artifacts/<run-id>/<testName>/. Called on failure paths only.
