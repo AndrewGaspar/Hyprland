@@ -90,8 +90,21 @@ TEST_CASE(xr_transparency_rules) {
         MARK_TEST_FAILED("xrrule never took effect: alphaSource never became 'rule'");
     else {
         EXPECT(field("alphaTarget"), std::string("0.500"));
-        EXPECT(field("alpha"), std::string("0.500")); // blend_ms 0 -> the eased value is there already
-        NLog::green("xr_transparency_rules: xrrule applied (alpha 0.5, source rule)");
+        // The LIVE (eased) value lands one envelope tick LATER than the target, even at blend_ms 0.
+        // `alphaTarget`/`alphaSource` are written by evaluateMonitorEffects() the instant the rule
+        // resolves, but the number the frame loop samples is published from the envelope's own 8ms
+        // timer (SXRFxEnv::advance -> durationSec <= 0 snaps to the target, envAdvance); the
+        // retarget itself deliberately leaves the value where it was so an interrupted transition
+        // never jumps. So `alpha` read in the same breath as the source flip legitimately still
+        // reads the pre-transition 1.000 — which is what made this test fail on clean bases. Await
+        // it instead: the point of the assertion is that the resolved number REACHES the frame
+        // loop, and a poll proves exactly that (a value that never arrives still fails).
+        const std::string IMMEDIATE = field("alpha");
+        if (!awaitField("alpha", "0.500", 2000))
+            MARK_TEST_FAILED("the resolved alpha never reached the frame loop: live alpha is still {} (target {}, transitioning {})", field("alpha"), field("alphaTarget"),
+                             field("transitioning"));
+        else
+            NLog::green("xr_transparency_rules: xrrule applied (alpha 0.5, source rule; live alpha read {} at the source flip, settled to 0.500)", IMMEDIATE);
     }
 
     // 3. The manual override outranks the rule.
