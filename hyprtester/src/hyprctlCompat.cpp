@@ -1,91 +1,25 @@
 #include "hyprctlCompat.hpp"
 #include "shared.hpp"
 #include "SafeKill.hpp"
+#include "RuntimeIsolation.hpp"
 
-#include <pwd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
 
-#include <filesystem>
-#include <fstream>
-#include <algorithm>
 #include <csignal>
 #include <cerrno>
 #include <print>
 #include <hyprutils/memory/Casts.hpp>
 using namespace Hyprutils::Memory;
 
-static int getUID() {
-    const auto UID   = getuid();
-    const auto PWUID = getpwuid(UID);
-    return PWUID ? PWUID->pw_uid : UID;
-}
-
-static std::string getRuntimeDir() {
-    const auto XDG = getenv("XDG_RUNTIME_DIR");
-
-    if (!XDG) {
-        const std::string USERID = std::to_string(getUID());
-        return "/run/user/" + USERID + "/hypr";
-    }
-
-    return std::string{XDG} + "/hypr";
-}
-
+// Both of these resolve $XDG_RUNTIME_DIR on every call, which is what makes CRuntimeIsolation work
+// at all: engaging it mid-process silently moves every subsequent lookup — enumeration and IPC
+// alike — into the run's private directory.
 std::vector<SInstanceData> instances() {
-    std::vector<SInstanceData> result;
-
-    try {
-        if (!std::filesystem::exists(getRuntimeDir()))
-            return {};
-    } catch (std::exception& e) { return {}; }
-
-    for (const auto& el : std::filesystem::directory_iterator(getRuntimeDir())) {
-        if (!std::filesystem::exists(el.path() / "hyprland.lock"))
-            continue;
-
-        // read lock
-        SInstanceData* data = &result.emplace_back();
-        data->id            = el.path().filename().string();
-        data->pid           = 0; // 0 never names a process here; see the erase below
-
-        try {
-            data->time = std::stoull(data->id.substr(data->id.find_first_of('_') + 1, data->id.find_last_of('_') - (data->id.find_first_of('_') + 1)));
-        } catch (std::exception& e) {
-            // a directory whose name we cannot parse is not an instance — drop it rather than
-            // leaving a zero-filled entry in the list for callers to trip over
-            result.pop_back();
-            continue;
-        }
-
-        // read file
-        std::ifstream ifs(el.path().string() + "/hyprland.lock");
-
-        int           i = 0;
-        for (std::string line; std::getline(ifs, line); ++i) {
-            if (i == 0) {
-                try {
-                    data->pid = std::stoull(line);
-                } catch (std::exception& e) { continue; }
-            } else if (i == 1) {
-                data->wlSocket = line;
-            } else
-                break;
-        }
-
-        ifs.close();
-    }
-
-    // Safe::pidAlive rejects a pid of 0 (an unreadable lock file) instead of probing the caller's
-    // own process group, which the raw kill(0, 0) form would report as "alive".
-    std::erase_if(result, [&](const auto& el) { return !Safe::pidAlive(static_cast<pid_t>(el.pid)); });
-
-    std::ranges::sort(result, [&](const auto& a, const auto& b) { return a.time < b.time; });
-
-    return result;
+    return Harness::scanInstances(Harness::currentRegistryDir());
 }
 
 std::string getFromSocket(const std::string& cmd) {
@@ -102,7 +36,7 @@ std::string getFromSocket(const std::string& cmd) {
     sockaddr_un serverAddress = {0};
     serverAddress.sun_family  = AF_UNIX;
 
-    std::string socketPath = getRuntimeDir() + "/" + HIS + "/.socket.sock";
+    std::string socketPath = Harness::currentRegistryDir() + "/" + HIS + "/.socket.sock";
 
     strncpy(serverAddress.sun_path, socketPath.c_str(), sizeof(serverAddress.sun_path) - 1);
 
