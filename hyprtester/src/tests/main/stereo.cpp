@@ -9,6 +9,7 @@
 #include <hyprutils/utils/ScopeGuard.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -17,6 +18,7 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 using namespace Hyprutils::OS;
@@ -182,18 +184,51 @@ namespace {
         return "";
     }
 
+    // clients/screencopy-probe: capture the monitor and report the colour at each point. The stereo
+    // CONTENT producer is invisible to every structural assertion — same box, same geometry, same
+    // input region, different texels — so this is the only thing that can see it (WP S2).
+    std::string screencopyProbe(const std::string& monitor, const std::vector<std::pair<int, int>>& points) {
+        std::vector<std::string> args{monitor};
+        for (const auto& [X, Y] : points) {
+            args.push_back(std::to_string(X));
+            args.push_back(std::to_string(Y));
+        }
+
+        CProcess proc(binaryDir + "/screencopy-probe", args);
+        proc.addEnv("WAYLAND_DISPLAY", WLDISPLAY);
+        if (!proc.runSync() && proc.stdOut().empty())
+            return "";
+        return proc.stdOut();
+    }
+
+    // "px <i> <x> <y> <rrggbb>" -> the colour, or "" when the line is missing
+    std::string probedColour(const std::string& dump, size_t index) {
+        const auto MARKER = std::format("px {} ", index);
+        const auto POS    = dump.find(MARKER);
+        if (POS == std::string::npos)
+            return "";
+
+        const auto EOL  = dump.find('\n', POS);
+        const auto LINE = dump.substr(POS, EOL == std::string::npos ? std::string::npos : EOL - POS);
+        const auto LAST = LINE.rfind(' ');
+        return LAST == std::string::npos ? "" : LINE.substr(LAST + 1);
+    }
+
     // An xdg-toplevel window, held open by a stdin pipe (child-window.cpp precedent: the client
     // polls stdin, so the write end must stay open or it spins on EOF).
     struct SWindowClient {
         CSharedPointer<CProcess> proc;
         int                      stdinWrite = -1;
 
-        SWindowClient() {
+        // `args` reaches clients/xdg-interactive: `--paint` fills the buffer with four distinct
+        // quadrants and `--tag <t>` sets an xdg-toplevel-tag. Default (no args) is what every other
+        // case in the suite uses.
+        SWindowClient(std::vector<std::string> args = {}) {
             int pipeFds[2];
             if (pipe(pipeFds) != 0)
                 return;
 
-            proc       = makeShared<CProcess>(binaryDir + "/xdg-interactive", std::vector<std::string>{});
+            proc       = makeShared<CProcess>(binaryDir + "/xdg-interactive", args);
             stdinWrite = pipeFds[1];
             proc->setStdinFD(pipeFds[0]);
             proc->addEnv("WAYLAND_DISPLAY", WLDISPLAY);
@@ -242,10 +277,112 @@ namespace {
         return out;
     }
 
-    int widthOf(const std::string& size) {
+    int intOf(const std::string& s) {
         try {
-            return std::stoi(size);
+            return std::stoi(s);
         } catch (...) { return -1; }
+    }
+
+    int widthOf(const std::string& size) {
+        return intOf(size);
+    }
+
+    // "key": [a, b] -> {a, b}
+    std::pair<int, int> intPairIn(const std::string& json, const std::string& key) {
+        const auto POS = json.find("\"" + key + "\":");
+        if (POS == std::string::npos)
+            return {0, 0};
+
+        const auto OPEN  = json.find('[', POS);
+        const auto CLOSE = json.find(']', OPEN);
+        if (OPEN == std::string::npos || CLOSE == std::string::npos)
+            return {0, 0};
+
+        const auto INNER = json.substr(OPEN + 1, CLOSE - OPEN - 1);
+        const auto COMMA = INNER.find(',');
+        if (COMMA == std::string::npos)
+            return {0, 0};
+
+        try {
+            return {std::stoi(INNER.substr(0, COMMA)), std::stoi(INNER.substr(COMMA + 1))};
+        } catch (...) { return {0, 0}; }
+    }
+
+    struct SBox {
+        int x = 0, y = 0, w = 0, h = 0;
+    };
+
+    SBox activeWindowBox() {
+        const auto JSON = getFromSocket("j/activewindow");
+        const auto AT   = intPairIn(JSON, "at");
+        const auto SIZE = intPairIn(JSON, "size");
+        return {.x = AT.first, .y = AT.second, .w = SIZE.first, .h = SIZE.second};
+    }
+
+    // THE STEREO CONTENT ASSERTION (research/24 §5.3, WP S2).
+    //
+    // Probe the four quadrant centres of the focused window — a client painted with four distinct
+    // quadrants (xdg-interactive --paint) — and reduce them to a shape: which of the four sampled the
+    // same colour as which, written as the index of the first quadrant that had each colour. The
+    // monitor capture is pane-sized and taken from the composite of eye 0 (§3.6), so the shape says
+    // exactly which half of the client's buffer that pane sampled:
+    //
+    //   "abcd"  all four differ           -> no crop: the whole buffer across the whole box
+    //   "aacc"  left pair, right pair      -> a side-by-side crop: the LEFT half stretched across it
+    //   "abab"  top pair, bottom pair      -> an over-under crop: the TOP half stretched across it
+    //
+    // Relative and never absolute: the frame has been through the client's shm buffer, the
+    // composite, the monitor's colour management and the capture's own format, and every one of
+    // those preserves "these two pixels match" while none preserves "this pixel is red".
+    //
+    // Points are in monitor-local coordinates, which is what screencopy captures.
+    std::string paneSignature(const std::string& monitor) {
+        const auto BOX = activeWindowBox();
+        if (BOX.w <= 0 || BOX.h <= 0)
+            return "";
+
+        // row-major, so the probe order is top-left, top-right, bottom-left, bottom-right
+        const int                        MX = intOf(monitorField(monitor, "x")), MY = intOf(monitorField(monitor, "y"));
+        std::vector<std::pair<int, int>> points;
+        for (const auto& fy : {0.25, 0.75}) {
+            for (const auto& fx : {0.25, 0.75})
+                points.emplace_back(BOX.x - MX + static_cast<int>(BOX.w * fx), BOX.y - MY + static_cast<int>(BOX.h * fy));
+        }
+
+        const auto                 DUMP = screencopyProbe(monitor, points);
+        std::array<std::string, 4> colours;
+        for (size_t i = 0; i < colours.size(); ++i) {
+            colours[i] = probedColour(DUMP, i);
+            if (colours[i].empty())
+                return "";
+        }
+
+        std::string signature;
+        for (size_t i = 0; i < colours.size(); ++i) {
+            for (size_t j = 0; j <= i; ++j) {
+                if (colours[j] == colours[i]) {
+                    signature += static_cast<char>('a' + j);
+                    break;
+                }
+            }
+        }
+
+        return signature;
+    }
+
+    // The capture is a real frame off the compositor's render cycle, so poll: the first one can
+    // land before the client has painted at its configured size.
+    bool waitForPaneSignature(const std::string& monitor, const std::string& want, int seconds = 8) {
+        std::string last;
+        for (int i = 0; i < seconds * 4; ++i) {
+            last = paneSignature(monitor);
+            if (last == want)
+                return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+
+        NLog::log("{}pane signature on {} was \"{}\", wanted \"{}\"", Colors::YELLOW, monitor, last, want);
+        return false;
     }
 
     // --- the log (the only in-process view of what damage was submitted) ---
@@ -562,7 +699,7 @@ TEST_CASE(stereoContentSecondComposite) {
     OK(getFromSocket("/eval hl.window_rule({ match = { xwayland = false }, stereo = 'sbs always' })"));
     OK(getFromSocket(std::format("/dispatch hl.dsp.focus({{ monitor = '{}' }})", STEREO_MON)));
 
-    const int    WINDOWS_BEFORE = Tests::windowCount();
+    const int     WINDOWS_BEFORE = Tests::windowCount();
     SWindowClient client;
     ASSERT(client.waitForWindow(WINDOWS_BEFORE), true);
     Tests::sync();
@@ -593,6 +730,198 @@ TEST_CASE(stereoContentSecondComposite) {
     Tests::killAllWindows();
     Tests::waitUntilWindowsN(0);
     ASSERT(waitForMonitorField(STEREO_MON, "stereoContent", "false"), true);
+}
+
+// stereoTaggedWindowSamplesOneHalfPerPane — WP S2, and the only assertion in the tree that can see
+// the stereo CONTENT producer at all (research/24 §4.2, §5.3, §3.12).
+//
+// Everything else about a stereo-declared window is identical to an ordinary one: same box, same
+// geometry, same input region, same layout, same damage. The producer changes exactly one thing —
+// which texels of the client's buffer a pane samples — so it is invisible to every structural
+// assertion in this file, and stereoContentSecondComposite can only say that the replay RAN, not
+// that it sampled anything different.
+//
+// What closes the gap is §3.6: a monitor capture is sized at the pane and taken pre-pack, from the
+// composite of eye 0. So a client painted with four distinct quadrants tells us which half that
+// composite sampled, by comparing its own quadrants to each other (paneSignature above).
+//
+// Four cases, sharing one `stereo auto` rule that matches every wayland toplevel, so the ONLY
+// difference between the stereo cases and the control is what the client itself declared:
+//
+//   1. a client tagged `stereo:sbs` on a stereo monitor  -> the left half, stretched  ("aacc")
+//   2. a client tagged `stereo:tab` on the same monitor  -> the top half, stretched   ("abab")
+//   3. an untagged client on the same monitor            -> untouched                 ("abcd")
+//   4. the tagged client on a MONO monitor               -> untouched                 ("abcd")
+//
+// (4) is S1's documented degradation, asserted rather than assumed: a stereo window on a monitor
+// that presents no pane pair shows its packed frame as-is. There is only one pane to sample into,
+// so cropping half of it would be a strictly worse picture (research/24 §11, §8.6).
+TEST_CASE(stereoTaggedWindowSamplesOneHalfPerPane) {
+    getFromSocket(std::format("/output remove {}", STEREO_MON));
+    getFromSocket(std::format("/output remove {}", CONTROL_MON));
+
+    OK(declareMonitor(STEREO_MON, STEREO_MODE, "sbs"));
+    OK(declareMonitor(CONTROL_MON, CONTROL_MODE, nullptr));
+
+    OK(getFromSocket(std::format("/output create headless {}", STEREO_MON)));
+    OK(getFromSocket(std::format("/output create headless {}", CONTROL_MON)));
+
+    CScopeGuard guard = {[&]() {
+        Tests::killAllWindows();
+        // neutralise the rule for every case that runs after this one: a named rule is updated in
+        // place, and `off` is the one layout that wins outright.
+        getFromSocket("/eval hl.window_rule({ name = 's2-stereo-auto', stereo = 'off' })");
+        getFromSocket(std::format("/output remove {}", STEREO_MON));
+        getFromSocket(std::format("/output remove {}", CONTROL_MON));
+    }};
+
+    ASSERT(waitForMonitorPresent(STEREO_MON, true), true);
+    ASSERT(waitForMonitorPresent(CONTROL_MON, true), true);
+    ASSERT(waitForMonitorField(STEREO_MON, "width", "1920"), true);
+    Tests::sync();
+
+    // ONE rule for the whole case: tier A, and nothing else. A window is cropped here only because
+    // it said so itself — which is the property the control depends on.
+    OK(getFromSocket("/eval hl.window_rule({ name = 's2-stereo-auto', match = { xwayland = false }, stereo = 'auto' })"));
+
+    const auto probeCase = [&](const char* monitor, const char* tag, const char* wantLayout, const char* wantSignature) {
+        OK(getFromSocket(std::format("/dispatch hl.dsp.focus({{ monitor = '{}' }})", monitor)));
+
+        std::vector<std::string> args{"--paint"};
+        if (tag) {
+            args.emplace_back("--tag");
+            args.emplace_back(tag);
+        }
+
+        const int     BEFORE = Tests::windowCount();
+        SWindowClient client(args);
+        ASSERT(client.waitForWindow(BEFORE), true);
+        Tests::sync();
+
+        // the declaration resolved the way the case says it should — asserted first, so a signature
+        // failure below is unambiguously the PRODUCER and not the rule
+        EXPECT_CONTAINS(getFromSocket("/activewindow"), std::format("stereo: {}", wantLayout));
+        EXPECT(waitForPaneSignature(monitor, wantSignature), true);
+    };
+
+    NLog::log("{}1. tagged stereo:sbs on the stereo output — the left half in the pane", Colors::YELLOW);
+    probeCase(STEREO_MON, "stereo:sbs", "sbs", "aacc");
+    Tests::killAllWindows();
+    Tests::waitUntilWindowsN(0);
+
+    NLog::log("{}2. tagged stereo:tab on the stereo output — the top half, i.e. the other axis", Colors::YELLOW);
+    probeCase(STEREO_MON, "stereo:tab", "tab", "abab");
+    Tests::killAllWindows();
+    Tests::waitUntilWindowsN(0);
+
+    // THE CONTROL, and the whole reason the cases above mean anything: same rule, same client, same
+    // monitor, same capture — no tag. A build that cropped every window (or that ignored the eye
+    // index and cropped nothing) fails exactly one of these three.
+    NLog::log("{}3. untagged on the stereo output — the control: nothing is cropped", Colors::YELLOW);
+    probeCase(STEREO_MON, nullptr, "off", "abcd");
+    Tests::killAllWindows();
+    Tests::waitUntilWindowsN(0);
+
+    // S1's documented degradation (§11): the window still RESOLVES to sbs — the rule and the tag are
+    // per-window and know nothing about outputs — but there is no pane pair to sample into, so the
+    // packed frame is shown as-is rather than half of it being blown up.
+    NLog::log("{}4. tagged stereo:sbs on a MONO output — the packed frame, shown as-is", Colors::YELLOW);
+    probeCase(CONTROL_MON, "stereo:sbs", "sbs", "abcd");
+    EXPECT(monitorField(CONTROL_MON, "stereoContent"), std::string("")); // no stereo, no content panes
+}
+
+// stereoRuleFoldAndProvenance — which instruction wins when several apply (research/24 §4.2, §4.5).
+//
+// The precedence itself is a pure function and is unit-tested as a full matrix
+// (tests/render/StereoContent.cpp, StereoContentResolution.*). What that cannot reach is the fold
+// ABOVE it: window rules are applied in config order and the last one to set a property wins, so
+// what actually reaches resolveDeclaration is the fold of every rule that matched. This case owns
+// that seam, and the seam is where "I added a rule and nothing changed" comes from.
+//
+// Needs no stereo monitor: the resolution is per-window and `hyprctl clients` reports it directly.
+TEST_CASE(stereoRuleFoldAndProvenance) {
+    CScopeGuard guard = {[&]() {
+        Tests::killAllWindows();
+        for (const char* name : {"s2-fold-a", "s2-fold-b"})
+            getFromSocket(std::format("/eval hl.window_rule({{ name = '{}', stereo = 'off' }})", name));
+    }};
+
+    const auto  ruleIs = [&](const char* name, const char* stereo) {
+        OK(getFromSocket(std::format("/eval hl.window_rule({{ name = '{}', match = {{ xwayland = false }}, stereo = '{}' }})", name, stereo)));
+    };
+
+    const auto layoutOfAWindowTagged = [&](const char* tag) {
+        Tests::killAllWindows();
+        Tests::waitUntilWindowsN(0);
+
+        std::vector<std::string> args;
+        if (tag) {
+            args.emplace_back("--tag");
+            args.emplace_back(tag);
+        }
+
+        const int     BEFORE = Tests::windowCount();
+        SWindowClient client(args);
+        if (!client.waitForWindow(BEFORE))
+            return std::string("<no window>");
+        Tests::sync();
+
+        const auto DUMP = getFromSocket("/activewindow");
+        const auto POS  = DUMP.find("stereo: ");
+        if (POS == std::string::npos)
+            return std::string("<no field>");
+
+        const auto EOL = DUMP.find('\n', POS);
+        return DUMP.substr(POS + 8, EOL == std::string::npos ? std::string::npos : EOL - POS - 8);
+    };
+
+    // a is declared first, b second, both match -> b wins. This is the fold, and it is the ONLY
+    // reason a later `windowrule = stereo off` can turn an earlier one back off.
+    ruleIs("s2-fold-a", "tab always");
+    ruleIs("s2-fold-b", "sbs always");
+    EXPECT(layoutOfAWindowTagged(nullptr), std::string("sbs"));
+
+    // updating the WINNER changes the answer...
+    ruleIs("s2-fold-b", "htab always");
+    EXPECT(layoutOfAWindowTagged(nullptr), std::string("htab"));
+
+    // ...and updating the LOSER does not, however tempting the new value looks
+    ruleIs("s2-fold-a", "sbs always");
+    EXPECT(layoutOfAWindowTagged(nullptr), std::string("htab"));
+
+    // the last rule may also be the off switch, which beats everything before it
+    ruleIs("s2-fold-b", "off");
+    EXPECT(layoutOfAWindowTagged(nullptr), std::string("off"));
+
+    // --- provenance: the rule and the client can disagree, and §4.5 says the human wins ---
+
+    ruleIs("s2-fold-a", "auto");
+    ruleIs("s2-fold-b", "off");
+
+    // `off` last: even a client that declares loudly is silenced
+    EXPECT(layoutOfAWindowTagged("stereo:sbs"), std::string("off"));
+
+    // `auto` last: the client's own declaration is honoured exactly...
+    ruleIs("s2-fold-b", "auto");
+    EXPECT(layoutOfAWindowTagged("stereo:htab"), std::string("htab"));
+    // ...including its right to say it is NOT stereo, which is what distinguishes `stereo:mono`
+    // from a client that never set a tag at all
+    EXPECT(layoutOfAWindowTagged("stereo:mono"), std::string("off"));
+    EXPECT(layoutOfAWindowTagged(nullptr), std::string("off"));
+    // a tag outside the frozen grammar is not a declaration, and must not be guessed at
+    EXPECT(layoutOfAWindowTagged("stereo:lr"), std::string("off"));
+    EXPECT(layoutOfAWindowTagged("com.example.player"), std::string("off"));
+
+    // an explicit layout after `auto` outranks the tag: the last HUMAN instruction wins, because
+    // correct-looking content metadata is a liability (§4.5) and this is the user's override
+    ruleIs("s2-fold-b", "tab always");
+    EXPECT(layoutOfAWindowTagged("stereo:sbs"), std::string("tab"));
+
+    // and §4.3's gate is the default: an unqualified layout on a WINDOWED window stays off, while
+    // the same rule on a client that declared its own packing engages immediately
+    ruleIs("s2-fold-b", "hsbs");
+    EXPECT(layoutOfAWindowTagged(nullptr), std::string("off"));
+    EXPECT(layoutOfAWindowTagged("stereo:sbs"), std::string("hsbs"));
 }
 
 // stereoLiveToggleRestoresState — the hot-reload ordering risk.
