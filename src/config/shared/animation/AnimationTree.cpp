@@ -35,6 +35,12 @@ void CAnimationTreeController::reset() {
     m_animationTree.createNode("windowsIn", "windows");
     m_animationTree.createNode("windowsOut", "windows");
     m_animationTree.createNode("windowsMove", "windows");
+    // research/24 §7.2. Depth changes on DISCRETE events (focus, fullscreen, rule) and eases —
+    // never on hover, which would be 60 Hz vergence micro-adjustments. Layer-surface depth rides
+    // this node too: there is one ladder, so there is one easing for it.
+    // Unknown animation names are rejected at config-parse time, so the node must exist before any
+    // config that names it can be read.
+    m_animationTree.createNode("windowsDepth", "windows");
 
     // fade
     m_animationTree.createNode("fadeIn", "fade");

@@ -21,12 +21,13 @@ static const std::vector<std::string> EFFECT_STRINGS = {
     "order",                  //
     "above_lock",             //
     "no_screen_share",        //
+    "depth",                  //
     "__internal_last_static", //
 };
 
 // This is here so that if we change the rules, we get reminded to update
 // the strings.
-static_assert(LAYER_RULE_EFFECT_LAST_STATIC == 11);
+static_assert(LAYER_RULE_EFFECT_LAST_STATIC == 12);
 
 CLayerRuleEffectContainer::CLayerRuleEffectContainer() : IEffectContainer<eLayerRuleEffect>(std::vector<std::string>{EFFECT_STRINGS}) {
     ;
