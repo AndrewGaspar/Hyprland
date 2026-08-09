@@ -108,6 +108,11 @@ namespace Monitor {
         // stock. Set from the active monitor rule in applyMonitorRule/Soft (before the size derivation).
         Config::eMonitorStereoMode  m_stereoMode = Config::STEREO_OFF;
 
+        // stereo (§3.4 item 15): the last mode search did not land on a mode the rule asked for —
+        // the emergency any-available-mode fallback, or a total failure that kept the old mode.
+        // The pack cannot be trusted on such a mode, so sanitizeStereoMode() drops it.
+        bool                        m_modeSearchFellBack = false;
+
         // Force this output's render swapchain to allocate LINEAR (multi-GPU-shareable) buffers.
         // Set by the OpenXR integration on a headless XR output when the XR runtime's GPU differs
         // from the buffer allocator's GPU (cross-GPU import needs linear). Honored in
@@ -417,9 +422,10 @@ namespace Monitor {
         Mat3x3                  m_projMatrix;
         Mat3x3                  m_projOutputMatrix;
 
-        // stereo output (research/24 §3.7/§3.4): mode-divisibility sanitizing + the per-monitor
-        // software-cursor lock (a hardware cursor plane would be visible to one eye only)
-        void                    sanitizeStereoMode();
+        // stereo output (research/24 §3.7/§3.4): sanitizing (the committed mode must divide into
+        // panes AND be the mode `requestedMode` asked for) + the per-monitor software-cursor lock
+        // (a hardware cursor plane would be visible to one eye only)
+        void                    sanitizeStereoMode(const Vector2D& requestedMode);
         void                    updateStereoCursorLock();
         bool                    m_stereoSWCursorLocked = false;
 

@@ -49,6 +49,21 @@ namespace Monitor::Stereo {
         return PANE == PANE.floor() && PANE.x >= 1 && PANE.y >= 1;
     }
 
+    // sanitize predicate 2 (§3.4 item 15): the pack is only valid on the mode it was CONFIGURED
+    // for. A display that is not in side-by-side mode shows one eye's half stretched across the
+    // whole panel, so a mode fallback landing anywhere else has to drop the packing.
+    //
+    // `requestedMode` is a mode REQUEST, not a resolution: `preferred` is Vector2D() and
+    // highrr/highres/maxwidth are the (-1,-1)/(-1,-2)/(-1,-3) sentinels (Parser.cpp parseMode) —
+    // none of which can be compared against a committed mode. A rule that names a resolution is a
+    // contract; the rest ask for "whatever the mode search picks", and only the emergency
+    // any-available-mode fallback (`searchFellBack`) breaks that contract.
+    inline bool modeIsAsRequested(const Vector2D& committedMode, const Vector2D& requestedMode, bool searchFellBack = false) {
+        if (requestedMode.x > 0 && requestedMode.y > 0)
+            return committedMode == requestedMode;
+        return !searchFellBack;
+    }
+
     // the size the fractional-scale check must validate — the PANE over the scale, never the mode
     // over the scale (§3.4 item 11). == pixelSize / scale when off.
     inline Vector2D scaleValidationSize(const Vector2D& pixelSize, Config::eMonitorStereoMode mode, float scale) {

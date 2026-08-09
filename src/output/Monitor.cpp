@@ -736,7 +736,7 @@ bool CMonitor::applyMonitorRuleSoft(Config::CMonitorRule&& pMonitorRule) {
     }
 
     m_stereoMode = m_activeMonitorRule.m_stereo;
-    sanitizeStereoMode();
+    sanitizeStereoMode(m_activeMonitorRule.m_resolution);
 
     // research/24 §3.2: the logical size derives from ONE PANE, not the mode. The pack sits strictly
     // below m_transformedSize (like zoom/mirror, a final-blit stage), so every logical↔buffer
@@ -910,6 +910,10 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
     const auto OLDTRANSFORMEDSIZE = m_transformedSize;
     bool       success            = false;
 
+    // stereo: the mode search below can land on a mode nobody asked for. Reset the flag here so it
+    // always describes the CURRENT search (research/24 §3.4 item 15, read by sanitizeStereoMode).
+    m_modeSearchFellBack = false;
+
     // Needed in case we are switching from a custom modeline to a standard mode
     m_customDrmMode = {};
     m_currentMode   = nullptr;
@@ -1011,7 +1015,8 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
             m_currentMode   = mode;
             m_customDrmMode = {};
 
-            success = true;
+            success              = true;
+            m_modeSearchFellBack = true; // whatever we landed on, the rule did not ask for it
 
             break;
         }
@@ -1023,7 +1028,10 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
         // matrix, the damage ring, the render resources, the cursor lock), so the rule's stereo
         // mode must NOT be adopted here — a half-converted monitor scans out mono geometry through
         // a packing renderer. m_stereoMode is therefore only taken below, after a committed mode;
-        // the retry re-runs this whole function.
+        // the retry re-runs this whole function. The rule IS adopted (stock behaviour), so mark the
+        // mode as not-what-was-asked-for, or a later soft apply would adopt its stereo mode against
+        // the mode that failed (research/24 §3.4 item 15).
+        m_modeSearchFellBack = true;
         Log::logger->log(Log::ERR, "Monitor {} has NO FALLBACK MODES, and an INVALID one was requested: {:X0}@{:.2f}Hz", m_name, RULE->m_resolution, RULE->m_refreshRate);
         scheduleModeRetry();
         return true;
@@ -1040,11 +1048,11 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
 
     // stereo: adopt the rule's packing only now that a mode is actually committed — everything the
     // pack changes (the size derivation, the matrix, the damage ring, the resources, the cursor
-    // lock) is derived below this line, and the !success return above skips all of it. The
-    // committed mode must then divide cleanly into panes, or the packing is dropped loudly rather
-    // than deriving fractional pane sizes (research/24 §3.4 item 1).
+    // lock) is derived below this line, and the !success return above skips all of it. The pack
+    // must then survive sanitizing: the committed mode has to divide cleanly into panes AND be the
+    // mode the rule asked for (research/24 §3.4 items 1 and 15).
     m_stereoMode = RULE->m_stereo;
-    sanitizeStereoMode();
+    sanitizeStereoMode(RULE->m_resolution);
 
     static constexpr auto formats10bit = std::to_array<uint32_t>({DRM_FORMAT_XRGB2101010, DRM_FORMAT_XBGR2101010});
     static constexpr auto formats8bit  = std::to_array<uint32_t>({DRM_FORMAT_XRGB8888, DRM_FORMAT_XBGR8888});
@@ -1884,9 +1892,25 @@ CBox CMonitor::stereoPaneDestBox(int idx) const {
     return Monitor::Stereo::paneDestBox(m_pixelSize, m_stereoMode, idx);
 }
 
-void CMonitor::sanitizeStereoMode() {
+void CMonitor::sanitizeStereoMode(const Vector2D& requestedMode) {
     if (!isStereo())
         return;
+
+    // The pack is only valid on the mode it was CONFIGURED for: side-by-side content on a display
+    // that is not in SBS mode is one eye's half stretched across the panel. The mode search has
+    // three ways to land somewhere else (the custom-mode retry, the emergency any-available-mode
+    // loop, and a total failure that keeps the old mode), and none of them knows about stereo —
+    // so check the outcome here, the same way the wlr-output-management write path does
+    // (MonitorRuleManager, research/24 §3.4 item 15).
+    if (!Monitor::Stereo::modeIsAsRequested(m_pixelSize, requestedMode, m_modeSearchFellBack)) {
+        const auto ERRSTR = requestedMode.x > 0 && requestedMode.y > 0 ?
+            std::format("Monitor {}: mode {:X0} is not the stereo mode requested ({:X0}), disabling stereo", m_name, m_pixelSize, requestedMode) :
+            std::format("Monitor {}: fell back to mode {:X0}, which is not the mode the stereo rule asked for, disabling stereo", m_name, m_pixelSize);
+        Log::logger->log(Log::ERR, ERRSTR);
+        ErrorOverlay::overlay()->queueError(ERRSTR);
+        m_stereoMode = Config::STEREO_OFF;
+        return;
+    }
 
     const auto DIV = stereoPackDivisor();
     if (!Monitor::Stereo::modeDivides(m_pixelSize, m_stereoMode)) {
