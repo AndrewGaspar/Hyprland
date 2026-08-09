@@ -1141,6 +1141,32 @@ no-op for everyone who does not set it.
 
 ## 4. Q1 — detecting stereo content
 
+> **STATUS: IMPLEMENTED (Phase S, WP S1, commit `96cf9cdb`).** `windowrule = stereo <layout> [always|fullscreen]` is a
+> generic window-rule effect (`WINDOW_RULE_EFFECT_STEREO`), matching every standard condition
+> including `xdg_tag`, parsed once into a packed integer by the pure
+> `src/render/StereoContent.hpp`, and mirrored into the Lua binding table — so it works under both
+> config front-ends, which is F8's whole point. Tier A landed with it: `stereo auto` reads the
+> client's `xdg-toplevel-tag-v1`, whose grammar is frozen as `stereo:{sbs,hsbs,tab,htab,mono}`
+> (§4.2). §4.3's negative heuristic is in code as the DEFAULT gate — a rule engages only while the
+> window is fullscreen-and-covering unless it says `always` or the client declared its own layout.
+> Tier C ships as config (`example/xreal.conf`, `05-configuration.md` §8.6). Tier D (`stereo:auto`
+> pixel detection, S8) is **not** built and is still not recommended as a default.
+>
+> The producer is the second half of the same WP: the crop lands at F7's seam
+> (`IElementRenderer::calculateUVForSurface`) on the window's main surface only, and the pack in
+> `CHyprOpenGLImpl::end()` re-runs the frame's pass (`CRenderPass::replay()`) with the eye index in
+> render data when — and only when — a stereo-declared surface was actually drawn. That is §3.3's
+> producer table made self-gating: an ordinary desktop on a stereo output still costs one composite
+> and one extra blit. Both `sbs`/`hsbs` and `tab`/`htab` work; the `k` of §5.2 is deliberately
+> unused on the flat presenter (see §5.2 below) and waits for X1.
+>
+> **Deviations from this memo, recorded:** §5.4's "suppress the desktop pointer on a
+> client-stereo monitor" does not apply to the flat presenter — the cursor is a pass element, so
+> the replay draws it into each pane at the same position, i.e. both eyes at screen depth, which is
+> the correct behaviour and costs no code. And a stereo-declared window on a monitor that is not
+> presenting a pane pair is left **exactly** as it is today (packed frame shown as-is), per §11's
+> "❌ by design, cost 0" — not cropped to one half.
+
 ### 4.1 The tiers, and what each is for
 
 | Tier | Mechanism | Reliability | Who it serves |
@@ -1421,6 +1447,13 @@ quadAspect(H/W) = paneH / (paneW · k)      k = 1 for full SBS, k = 2 for half S
 ```
 
 Spelled out, because getting it backwards produces a subtly-wrong, hard-to-name image:
+
+**On the flat presenter this constant folds out, and that is a finding, not an omission.** There the
+destination is the window's own box, which the user sized — not a quad whose height we derive — so
+cropping half the buffer across an unchanged box already un-squeezes a half-packed frame by exactly
+2 and leaves a full-packed frame at 1:1. `sbs` and `hsbs` are the *same* geometric operation on a
+window and differ only in how many source samples each eye gets. `k` still ships, in
+`Render::Stereo::aspectFactor`, because X1's quad pair genuinely needs it.
 
 - **Full SBS** means the *frame* is double-width and each half is already correctly proportioned.
   A 3840×1080 SBS frame contains two 1920×1080 eye images. Quad aspect = pane aspect =
@@ -2116,7 +2149,7 @@ optional; it is now Phase F.
 | WP | Size | Device | What |
 |---|---|---|---|
 | **S0** | **0** | XREAL | **Zero-code spike.** Put a known SBS video fullscreen and confirm the current build shows it doubled (it will). Confirm the mod's SBS output and the 3840 mode line up. Answers "is full-SBS at 3840 lossless end to end" |
-| **S1** | **M** | flat | **The stereo declaration and the Q1 producer.** `windowrule = stereo <layout>` as a generic window-rule effect (7 lines × 5 files + the Lua mirror, §7.1) matching `xdg_tag`/`class`/`title`/`content`; per-window UV crop in `calculateUVForSurface` (F7) so the tagged window samples a different half per pane; the "fullscreen-on-this-monitor unless overridden" negative heuristic (§4.3). **Stored in a shared config manager** (F8). Visible immediately on F1's flat presenter |
+| **S1** ✅ | **M** | flat | **The stereo declaration and the Q1 producer.** `windowrule = stereo <layout>` as a generic window-rule effect (7 lines × 5 files + the Lua mirror, §7.1) matching `xdg_tag`/`class`/`title`/`content`; per-window UV crop in `calculateUVForSurface` (F7) so the tagged window samples a different half per pane; the "fullscreen-on-this-monitor unless overridden" negative heuristic (§4.3). **Stored in a shared config manager** (F8). Visible immediately on F1's flat presenter |
 | **S2** | S | flat | **Tests.** gtests: aspect/`k` from the destination box, pane→monitor UV mapping both directions, rule fold + provenance. hyprtester: a tagged window on a stereo monitor produces two distinct panes; untagged produces one |
 | **S3** | S | — | **Config surface + docs.** The `xdg_tag` convention (§4.2), the HSBS resolution caveat, the heuristic block for `example/` (§4.3), status/JSON fields |
 | **S5** | XS | — | **`contrib/mpv-hypxr-stereo.lua`** (§4.5) — observe mpv's `video-params/stereo-in`, set the rule. **Must call a non-XR verb** (`hyprctl keyword` / a generic dispatcher), not `hyprctl openxr stereo` |

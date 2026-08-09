@@ -1256,6 +1256,133 @@ HID mode switch and the flat↔XR toggle.
 
 ---
 
+## 8.6 Stereo *content* — `windowrule = stereo <layout>`
+
+§8.5 makes an **output** present two panes. This makes one **window's content** differ between
+them. They are independent: a stereo output with no stereo window shows an ordinary mono desktop
+in 3D-comfortable depth-free stereo, and a stereo window on a mono output is a no-op (below).
+
+A window declared stereo is one whose buffer already carries **both eyes packed into one frame** —
+a side-by-side 3D video, or a game with a stereo injection mod. Hyprland does not re-render it; it
+samples a different half of that frame into each pane.
+
+```ini
+windowrule = stereo sbs, match:class ^(mpv)$              # this player is showing SBS 3D
+windowrule = stereo auto, match:xdg_tag ^stereo:.*        # the client says what it is
+windowrule = stereo hsbs always, match:title .*Half-SBS.* # engage even when windowed
+windowrule = stereo off, match:class ^(mpv)$, match:title .*[._ -]2d[._ -].*   # the off switch
+```
+
+and from a Lua config, with the same grammar in the value:
+
+```lua
+hl.window_rule({ match = { xdg_tag = "^stereo:" }, stereo = "auto" })
+```
+
+### The layouts
+
+| Layout | The frame is | Each half is |
+|---|---|---|
+| `sbs` | 2× wide (full side-by-side) | a correct-aspect eye view |
+| `hsbs` | normal width (half side-by-side) | horizontally squeezed by 2 |
+| `tab` | 2× tall (full over-under) | a correct-aspect eye view |
+| `htab` | normal height (half over-under) | vertically squeezed by 2 |
+| `auto` | *whatever the client declares* (see the tag below) | |
+| `off` | not stereo | |
+
+The **left eye is the left half** (`sbs`/`hsbs`) or the **top half** (`tab`/`htab`), which is the
+left-first convention of both Matroska's `StereoMode` and ISOBMFF's `st3d`.
+
+On this presenter `sbs` and `hsbs` produce the *same* geometry: the destination is the window's own
+box, so cropping half the buffer across an unchanged box already un-squeezes a half-packed frame by
+exactly 2. They differ in **sharpness**, not shape — a half-SBS frame gives each eye half the
+horizontal samples. On an XREAL at 46°/eye that is ~21 px/degree horizontally against ~42
+vertically, visibly soft, and the reason full SBS at the 3840 mode is worth the mode switch. The
+distinction still has to be *declared* because it decides the presented aspect on the XR quad tier.
+
+### The fullscreen gate — why a rule may look like it did nothing
+
+A rule that names a layout engages **only while the window is fullscreen and covering its
+monitor**. Half-cropping a windowed desktop is the failure mode people report as "the compositor
+broke", so a rule matched on a guess (a class, a title, a filename token) waits until the window
+owns the screen.
+
+Two things are not guesses and skip the gate:
+
+- **`always`** — `windowrule = stereo sbs always, …`. You said so; it engages windowed, floating,
+  anywhere, alongside other windows.
+- **the client's own declaration** — see below.
+
+`hyprctl clients` reports the *resolved* layout per window as `stereo`, which is how you tell
+"my rule did not match" from "my rule matched and the gate is holding it".
+
+### The tag — what a client (or a game mod) emits
+
+The cooperative channel is **`xdg-toplevel-tag-v1`**, which is an upstream-ratified protocol
+Hyprland already implements and already matches as `xdg_tag`. One call, no new protocol, and it
+works in any compositor that chooses to read it. **The exact grammar, which is a compatibility
+contract:**
+
+```
+stereo:sbs      stereo:hsbs      stereo:tab      stereo:htab      stereo:mono
+```
+
+Exactly that string — lowercase, no whitespace, no suffixes, one tag. `stereo:mono` is the
+explicit *not*-stereo declaration; `stereo:auto` is not valid (a client cannot delegate the layout
+back to the compositor).
+
+```c
+xdg_toplevel_tag_v1_set_toplevel_tag(tag_manager, toplevel, "stereo:sbs");
+```
+
+The tag alone does nothing — a rule still has to opt in, because the compositor never engages
+stereo on its own. The one line that honours every layout a client might announce is:
+
+```ini
+windowrule = stereo auto, match:xdg_tag ^stereo:.*
+```
+
+Under `auto` the tag *is* the declaration: it picks the layout, it skips the fullscreen gate, and
+`stereo:mono` turns it off. Under an explicit layout (`stereo sbs, xdg_tag:^stereo:`) **the rule
+wins** — you get the layout you wrote, and a client tagging `stereo:mono` cannot override you.
+That asymmetry is deliberate: in the shipping VR-video world, content metadata that looks correct
+is a known liability, so the last human instruction has to win.
+
+### Heuristics belong in your config, not in the compositor
+
+The whole VR-video ecosystem detects layout from *filename tokens*, and every player's regex is
+subtly different. That belongs where you can fix it in ten seconds:
+
+```ini
+# more specific first — rules resolve in config order
+windowrule = stereo hsbs, match:class ^(mpv|vlc)$, match:title .*[._ -](h-?sbs|half-?sbs|3dh?sbs)[._ -].*
+windowrule = stereo sbs,  match:class ^(mpv|vlc)$, match:title .*[._ -](f-?sbs|full-?sbs|lrf)[._ -].*
+windowrule = stereo htab, match:class ^(mpv|vlc)$, match:title .*[._ -](h-?tab|half-?ou|h-?ou)[._ -].*
+windowrule = stereo off,  match:class ^(mpv|vlc)$, match:title .*[._ -]2d[._ -].*
+```
+
+(`windowrule` conditions are full-match regexes — unlike `xrrule`'s, which search — so they need
+the `.*` wrapping that `xrrule` lines do not.)
+
+### What it does not do
+
+- **On a monitor that is not `stereo:`, a stereo rule costs nothing and changes nothing** — the
+  packed frame is shown as-is, doubled, exactly as it is today. There is only one pane to sample
+  into, so there is nothing to un-pack; move the window to the stereo output. This is deliberate:
+  a rule must never alter what an ordinary monitor shows.
+- **Only the window's main surface is cropped.** Subsurfaces and popups — a player's OSD, a
+  context menu — are drawn once and appear identically in both eyes at screen depth. So does the
+  cursor, which is composited into each pane at the same position.
+- **The panes cost a second composite, but only while stereo content is actually on screen.** A
+  stereo output with nothing declared renders one frame and blits it into both panes; the second
+  composite starts when a declared window is drawn and stops when it is not.
+- **No automatic detection.** Nothing inspects pixels to guess that a frame is stereo. The false
+  positives are your actual desktop — a diff view, two terminals, a symmetric wallpaper — and the
+  cost of a false positive is half your screen going to one eye while you are wearing it.
+
+
+---
+
 ## 9. Known limitations
 
 - **Classic-config only.** `openxr { }` and `xrmonitor =` have no Lua config binding.
@@ -1265,8 +1392,11 @@ HID mode switch and the flat↔XR toggle.
   (yaw + pitch only) — a monitor that picked up roll during a grab loses it when
   re-serialized.
 - **No stereo/3D content on XR monitors.** Every *XR* monitor is a flat quad; there is no per-eye
-  rendering in the XR session. (A *physical* output can present stereo — §8.5 — but that is a
-  packing of one mono desktop, not per-eye content; a window cannot yet declare itself stereo.)
-- **Stereo outputs: `sbs` only** (no `hsbs`/`tab`/`htab`), no direct scanout, software cursor
-  only, and a display GUI can silently un-stereo the monitor (§8.5).
+  rendering in the XR session. Per-window stereo content (§8.6) needs an output that is presenting
+  a pane pair, which today means a physical `stereo:` output (§8.5), not an XR monitor.
+- **Stereo outputs: `sbs` only** (no `hsbs`/`tab`/`htab` *packings* — the window-content layouts of
+  §8.6 are all four), no direct scanout, software cursor only, and a display GUI can silently
+  un-stereo the monitor (§8.5).
+- **A stereo window carries no depth of its own.** Both panes place it at the screen plane; the
+  disparity is entirely the content's.
 - **Overlay input is unarbitrated** (§8).
