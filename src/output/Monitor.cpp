@@ -1912,6 +1912,24 @@ bool CMonitor::depthIsAnimating() const {
     return false;
 }
 
+void CMonitor::bookDepthRepaint() {
+    // The other half of §6.3's bring-up crutch, and the half that is easy to miss: renderMonitor
+    // repaints while depthIsAnimating(), but the windowsDepth animation does not always ANIMATE.
+    // With `animations { enabled = false }`, a `noanim` rule, or a disabled `windows` parent node,
+    // the value WARPS in the same tick the goal was set — isBeingAnimated() is already false by the
+    // time the frame is built. And the depth var is AVARDAMAGE_NONE by design (a depth change costs
+    // an ordinary monitor exactly zero), so nothing else damages either: the border ring would
+    // repaint at the new disparity while the window body kept the old one.
+    //
+    // So the goal-setter books the repaint itself, on stereo outputs only. Off a stereo output this
+    // is a branch and nothing else, which is what keeps depth free for everyone not using it.
+    if (!isStereo())
+        return;
+
+    m_forceFullFrames = std::max(m_forceFullFrames, 3);
+    scheduleFrame(Aquamarine::IOutput::AQ_SCHEDULE_ANIMATION);
+}
+
 void CMonitor::sanitizeStereoMode(const Vector2D& requestedMode) {
     if (!isStereo())
         return;

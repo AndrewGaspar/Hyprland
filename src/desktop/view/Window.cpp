@@ -126,8 +126,11 @@ PHLWINDOW CWindow::create(SP<CXWaylandSurface> surface) {
     Animation::mgr()->createAnimation(1.f, pWindow->alpha(WINDOW_ALPHA_MOVE_FROM_WORKSPACE), Config::animationTree()->getAnimationPropertyConfig("fadeIn"), pWindow,
                                       AVARDAMAGE_ENTIRE);
     Animation::mgr()->createAnimation(0.f, pWindow->m_notRespondingTint, Config::animationTree()->getAnimationPropertyConfig("fade"), pWindow, AVARDAMAGE_ENTIRE);
-    // AVARDAMAGE_NONE is the D1 assertion that depth is inert: nothing renders from it, so a depth
-    // change must not repaint anything. D2 flips this to AVARDAMAGE_ENTIRE with the producer.
+    // AVARDAMAGE_NONE, and it STAYS that way with D2's producer: a depth change must cost an
+    // ordinary monitor nothing, and the generic damage policies would repaint this window on every
+    // output it touches. The stereo repaint is booked instead by the only code that knows the
+    // output is stereo — CMonitor::bookDepthRepaint() from updateDepth(), plus depthIsAnimating()
+    // for the frames in between (research/24 §6.3).
     Animation::mgr()->createAnimation(0.f, pWindow->m_depth, Config::animationTree()->getAnimationPropertyConfig("windowsDepth"), pWindow, AVARDAMAGE_NONE);
 
     pWindow->addWindowDeco(makeUnique<CHyprDropShadowDecoration>(pWindow));
@@ -167,8 +170,11 @@ PHLWINDOW CWindow::create(SP<CXDGSurfaceResource> resource) {
     Animation::mgr()->createAnimation(1.f, pWindow->alpha(WINDOW_ALPHA_MOVE_FROM_WORKSPACE), Config::animationTree()->getAnimationPropertyConfig("fadeIn"), pWindow,
                                       AVARDAMAGE_ENTIRE);
     Animation::mgr()->createAnimation(0.f, pWindow->m_notRespondingTint, Config::animationTree()->getAnimationPropertyConfig("fade"), pWindow, AVARDAMAGE_ENTIRE);
-    // AVARDAMAGE_NONE is the D1 assertion that depth is inert: nothing renders from it, so a depth
-    // change must not repaint anything. D2 flips this to AVARDAMAGE_ENTIRE with the producer.
+    // AVARDAMAGE_NONE, and it STAYS that way with D2's producer: a depth change must cost an
+    // ordinary monitor nothing, and the generic damage policies would repaint this window on every
+    // output it touches. The stereo repaint is booked instead by the only code that knows the
+    // output is stereo — CMonitor::bookDepthRepaint() from updateDepth(), plus depthIsAnimating()
+    // for the frames in between (research/24 §6.3).
     Animation::mgr()->createAnimation(0.f, pWindow->m_depth, Config::animationTree()->getAnimationPropertyConfig("windowsDepth"), pWindow, AVARDAMAGE_NONE);
 
     pWindow->addWindowDeco(makeUnique<CHyprDropShadowDecoration>(pWindow));
@@ -2027,6 +2033,15 @@ void CWindow::updateDepth(bool warp) {
     const auto  OVERRIDE = m_ruleApplicator->depth().hasValue() ? std::optional<float>{m_ruleApplicator->depth().value()} : std::nullopt;
 
     const float GOAL = Desktop::Depth::resolve(OVERRIDE, Desktop::Depth::windowTier(TIERS, FOCUSED, FULLSCREEN));
+
+    // research/24 §6.3: a moving depth changes where this window is COMPOSITED in each pane, and
+    // the var itself is AVARDAMAGE_NONE — so when the value is about to change, the monitor is told
+    // to repaint in full. bookDepthRepaint() is a no-op off a stereo output; the warp path needs it
+    // most, because there is no ease for renderMonitor's depthIsAnimating() to notice.
+    if (GOAL != m_depth->goal() || GOAL != m_depth->value()) {
+        if (const auto MON = m_monitor.lock())
+            MON->bookDepthRepaint();
+    }
 
     if (warp)
         m_depth->setValueAndWarp(GOAL);
