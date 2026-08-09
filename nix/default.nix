@@ -268,6 +268,8 @@ customStdenv.mkDerivation (finalAttrs: {
       install hyprtester/xdg-interactive -t $out/bin
       install hyprland_gtests -t $out/bin
       install hyprtester/child-window -t $out/bin
+      install hyprtester/layer-surface -t $out/bin
+      install hyprtester/output-info -t $out/bin
     ''}
   '';
 
