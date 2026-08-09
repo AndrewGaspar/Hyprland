@@ -5,6 +5,7 @@
 #include "../managers/TokenManager.hpp"
 #include "fs/FsUtils.hpp"
 #include <optional>
+#include <csignal>
 #include <cstring>
 #include <climits>
 #include <cmath>
@@ -477,4 +478,15 @@ bool truthy(const std::string& str) {
         return (... || std::ranges::starts_with(str_view, prefixes));
     }("true"sv, "yes"sv, "on"sv);
     // clang-format on
+}
+
+bool killPid(pid_t pid, int sig) {
+    // The whole point of this wrapper: a non-positive pid is a broadcast, not a process. See the
+    // declaration for where the -1s and 0s come from.
+    if (pid <= 0) {
+        Log::logger->log(Log::ERR, "killPid: refusing to send signal {} to pid {}: that is a broadcast, not a process", sig, (int64_t)pid);
+        return false;
+    }
+
+    return ::kill(pid, sig) == 0;
 }
