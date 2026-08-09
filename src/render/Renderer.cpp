@@ -297,16 +297,22 @@ Vector2D IHyprRenderer::depthRenderOffset(const PHLLS& layer) {
     return Vector2D{Desktop::Depth::eyeSign(m_renderData.stereoPane) * depthShiftLogical(layer->m_depth->value(), MON, viewBoxLocal(layer, MON)), 0.0};
 }
 
+// The depth the cursor is drawn at: whatever it is HOVERING, which the input manager resolved on
+// the last motion event — no hit test on the render path. Taking the MAX of window and layer is the
+// conservative reading of Daydream's rule (§8.2 item 3): never behind what it is over. Split out of
+// cursorDepthOffset() because damageIfSoftware() needs the same number, unsigned, off a render pass.
+float IHyprRenderer::cursorDepth() {
+    const auto HOVEREDWIN = g_pInputManager->hoveredWindow();
+    const auto HOVEREDLS  = g_pInputManager->hoveredLayer();
+
+    return std::max(HOVEREDWIN && HOVEREDWIN->m_depth ? HOVEREDWIN->m_depth->value() : 0.F, HOVEREDLS && HOVEREDLS->m_depth ? HOVEREDLS->m_depth->value() : 0.F);
+}
+
 Vector2D IHyprRenderer::cursorDepthOffset(const PHLMONITOR& monitor) {
     if (m_renderData.stereoPane < 0 || !monitor)
         return {};
 
-    // What the pointer is over, as the input manager last resolved it — no hit test on the render
-    // path. Taking the MAX of the two is the conservative reading of Daydream's rule: never behind.
-    const auto  HOVEREDWIN = g_pInputManager->hoveredWindow();
-    const auto  HOVEREDLS  = g_pInputManager->hoveredLayer();
-
-    const float DEPTH = std::max(HOVEREDWIN && HOVEREDWIN->m_depth ? HOVEREDWIN->m_depth->value() : 0.F, HOVEREDLS && HOVEREDLS->m_depth ? HOVEREDLS->m_depth->value() : 0.F);
+    const float DEPTH = cursorDepth();
     if (DEPTH <= Desktop::Depth::MIN)
         return {};
 
@@ -314,6 +320,16 @@ Vector2D IHyprRenderer::cursorDepthOffset(const PHLMONITOR& monitor) {
     // Golden Rule (§8.3) explicitly exempts from the stereo window — so it takes the unclamped
     // shift, subject only to the comfort ceiling.
     return Vector2D{Desktop::Depth::eyeSign(m_renderData.stereoPane) * depthShiftUnclamped(DEPTH, monitor), 0.0};
+}
+
+// The same magnitude, eye-agnostic and available outside a pane pass: what damageIfSoftware() has
+// to grow the cursor's box by so BOTH panes' draws land inside it (§6.3 pt 2, applied to §3.7's
+// per-eye cursor). Unclamped, exactly like the shift it bounds.
+double IHyprRenderer::cursorDepthDamageSpread(const PHLMONITOR& monitor) {
+    if (!monitor || !monitor->isStereo() || monitor->isMirror())
+        return 0.0;
+
+    return depthShiftUnclamped(cursorDepth(), monitor);
 }
 
 double IHyprRenderer::depthDamageSpread(const PHLWINDOW& window, const PHLMONITOR& monitor) {
