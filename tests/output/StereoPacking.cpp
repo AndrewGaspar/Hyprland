@@ -308,3 +308,28 @@ TEST(StereoPacking, foldPaneDamageStaysInsideTheMode) {
     EXPECT_LE(BOX.pos().x + BOX.size().x, MODE.x);
     EXPECT_LE(BOX.pos().y + BOX.size().y, MODE.y);
 }
+
+// The one invariant that spans the two independent implementations of the pack: CHyprOpenGLImpl's
+// blit loop writes pane i at paneDestBox(i) (as a viewport, with the same origin installed as the
+// glScissor offset), and CHyprRenderer submits foldPaneDamage() to the output. If those two ever
+// disagreed the compositor would tell the display that pixels changed somewhere it did not draw —
+// tearing on one eye, or a stale eye, depending on which way the disagreement went. Neither side
+// is observable from a client (every capture protocol is sized at the pane by design), so this is
+// the boundary where they are checked against each other.
+TEST(StereoPacking, foldedDamageLandsExactlyOnThePaneDestinations) {
+    const Vector2D MODE = {3840, 1080};
+    const CBox     RECT = {40, 60, 100, 50}; // one pane-space rect, small enough not to merge
+
+    CRegion        damage;
+    damage.add(RECT);
+
+    std::vector<std::array<int, 4>> expected;
+    for (int i = 0; i < paneCount(STEREO_SBS); ++i) {
+        // the blit loop's destination for pane i — also the scissor offset it installs
+        const auto ORIGIN = paneDestBox(MODE, STEREO_SBS, i).pos();
+        expected.push_back({sc<int>(RECT.x + ORIGIN.x), sc<int>(RECT.y + ORIGIN.y), sc<int>(RECT.x + ORIGIN.x + RECT.width), sc<int>(RECT.y + ORIGIN.y + RECT.height)});
+    }
+    std::ranges::sort(expected);
+
+    EXPECT_EQ(rectsOf(foldPaneDamage(damage, MODE, STEREO_SBS)), expected);
+}
