@@ -3,6 +3,7 @@
 #include <desktop/rule/windowRule/WindowRuleEffectContainer.hpp>
 #include <desktop/rule/layerRule/LayerRule.hpp>
 #include <desktop/rule/layerRule/LayerRuleEffectContainer.hpp>
+#include <output/StereoPacking.hpp>
 
 #include <gtest/gtest.h>
 
@@ -26,6 +27,13 @@
 // §6.1's frame-violation clamp, and the two facts the rest of the producer is built on: that zero
 // depth means an exactly-zero shift in every pane (the fast path), and that integer rounding would
 // collapse the ladder (the sub-pixel seam in ElementRenderer).
+//
+// WP D4 finished the arithmetic with the three properties the RENDERER relies on but cannot state
+// itself: the depth × eye-sign matrix over the whole ladder, that a damage box grown by the spread
+// provably contains every pane's clamped draw (§6.3 pt 2 — the one place a wrong sign silently
+// leaves half a window stale), and that with nothing raised the depth path hands StereoPacking
+// exactly what WP F1 handed it. The pixel-level counterpart — a window that actually MOVES on a
+// real headless stereo output — is hyprtester's stereoDepthDisparityMovesTheWindow.
 
 using namespace Desktop;
 using namespace Desktop::Rule;
@@ -212,6 +220,89 @@ TEST(DepthTiers, zeroDepthMovesNothingInAnyPane) {
     EXPECT_FLOAT_EQ(Depth::damageSpreadPx(1.F, 0.F, GEO, 1920.F), 0.F);
 }
 
+// The depth × eye-sign matrix, over the ladder the compositor actually walks. Three properties in
+// one table because they are one property in the renderer: the panes disagree (or there is no
+// stereo), they disagree symmetrically (or the pair has a net horizontal offset, i.e. the whole
+// desktop drifts sideways instead of gaining depth), and a higher rung disagrees MORE (or the
+// ladder is not a ladder).
+TEST(DepthTiers, disparityIsAntisymmetricAndMonotonicAcrossTheLadder) {
+    constexpr Depth::SGeometry GEO   = {};
+    constexpr float            SCALE = 0.12F, PANE = 1920.F;
+
+    // 0.0 is the wallpaper, then the three shipped rungs in order
+    const float LADDER[] = {0.F, SHIPPED.unfocused, SHIPPED.focused, SHIPPED.layers, Depth::MAX};
+
+    float       previous = -1.F;
+    for (const float DEPTH : LADDER) {
+        const float LEFT  = Depth::paneShiftPx(DEPTH, SCALE, GEO, PANE, 0);
+        const float RIGHT = Depth::paneShiftPx(DEPTH, SCALE, GEO, PANE, 1);
+
+        // antisymmetric: the pair is centred on the screen plane, so the two panes move by the same
+        // amount in opposite directions and their MEAN is exactly zero at every rung
+        EXPECT_FLOAT_EQ(LEFT + RIGHT, 0.F) << "at depth " << DEPTH;
+        EXPECT_FLOAT_EQ(LEFT, -RIGHT) << "at depth " << DEPTH;
+        // ...and the left eye is the positive one (§8.1's convention, pane 0 = left half of an sbs)
+        EXPECT_GE(LEFT, 0.F) << "at depth " << DEPTH;
+
+        // strictly monotonic: every rung is a visibly different place, which is what makes the
+        // ladder readable at all
+        EXPECT_GT(LEFT, previous) << "at depth " << DEPTH;
+        previous = LEFT;
+    }
+}
+
+// §8.2's binding budget (4), restated in the only unit that can be checked against a screen: the
+// foveal fusion limit is ~0.1° ≈ 3 px TOTAL disparity at our defaults, and it governs the STEP
+// between two things visible at once — a raised window against the wallpaper, or the bar against
+// the window under it. DepthTiers.shippedLadderStepsStayInsideTheFovealBudget checks the same
+// property in ladder units; this is the one that would notice a `depth_scale` re-tune.
+TEST(DepthTiers, shippedLadderStepsStayUnderThreePixelsOfTotalDisparity) {
+    constexpr Depth::SGeometry GEO   = {};
+    constexpr float            SCALE = 0.12F, PANE = 1920.F;
+    constexpr float            FOVEAL_TOTAL_PX = 3.F;
+
+    const auto                 TOTAL = [&](float depth) { return 2.F * Depth::damageSpreadPx(depth, SCALE, GEO, PANE); };
+
+    const float                RUNGS[] = {0.F, SHIPPED.unfocused, SHIPPED.focused, SHIPPED.layers};
+    for (size_t i = 1; i < std::size(RUNGS); ++i) {
+        const float STEP = TOTAL(RUNGS[i]) - TOTAL(RUNGS[i - 1]);
+        EXPECT_GT(STEP, 0.F) << "rung " << i;
+        EXPECT_LT(STEP, FOVEAL_TOTAL_PX) << "rung " << i << " steps " << STEP << " px, past the foveal fusion limit";
+    }
+
+    // and the whole span against §8.2 budget 1 (the 1° rule, ≈31 px total): §7.2 claims the ladder
+    // uses "~20 % of the 1° budget", so hold it to a quarter
+    EXPECT_LT(TOTAL(SHIPPED.layers), 2.F * Depth::comfortCeilingPx(GEO, PANE) / 4.F);
+}
+
+// The two knobs §8.1's formula exposes as config (`decoration:depth_distance`,
+// `depth_screen_width`), each moving the disparity the way the geometry says it must. A user
+// measuring their own desk gets a different number of pixels for the same rung, and that is the
+// whole point of the keys existing — depth is a physical claim, not a pixel count.
+TEST(DepthTiers, geometryKnobsScaleTheDisparity) {
+    constexpr float PANE = 1920.F;
+
+    // pixels per metre is P/W, so a screen perceived twice as wide renders the same parallax in
+    // half the pixels
+    constexpr Depth::SGeometry NARROW = {.distanceM = 1.5F, .screenWidthM = 1.6F};
+    constexpr Depth::SGeometry WIDE   = {.distanceM = 1.5F, .screenWidthM = 3.2F};
+    EXPECT_NEAR(Depth::shiftMagnitudePx(0.12F, WIDE, PANE), Depth::shiftMagnitudePx(0.12F, NARROW, PANE) / 2.F, 0.001F);
+
+    // a screen further away needs MORE rise for the same parallax: at 3 m, 12 cm of rise is a
+    // smaller fraction of the distance than it is at 1.5 m
+    constexpr Depth::SGeometry FAR = {.distanceM = 3.0F, .screenWidthM = 1.6F};
+    EXPECT_LT(Depth::shiftMagnitudePx(0.12F, FAR, PANE), Depth::shiftMagnitudePx(0.12F, NARROW, PANE));
+
+    // ...and the comfort ceiling moves the other way, because 1° subtends more metres further out
+    EXPECT_GT(Depth::comfortCeilingPx(FAR, PANE), Depth::comfortCeilingPx(NARROW, PANE));
+
+    // a degenerate geometry is answered with zero rather than an infinity that would reach the
+    // vertex shader
+    EXPECT_FLOAT_EQ(Depth::shiftMagnitudePx(0.12F, {.screenWidthM = 0.F}, PANE), 0.F);
+    EXPECT_FLOAT_EQ(Depth::shiftMagnitudePx(0.12F, NARROW, 0.F), 0.F);
+    EXPECT_FLOAT_EQ(Depth::comfortCeilingPx(NARROW, 0.F), 0.F);
+}
+
 // §6.3 pt 2. The damage path has no eye — both panes are drawn in the same frame — so it uses the
 // magnitude, and the property that makes that correct is that it bounds every pane's signed shift.
 TEST(DepthTiers, damageSpreadCoversEveryPanesShift) {
@@ -271,6 +362,88 @@ TEST(DepthTiers, clampSurvivesABoxAlreadyOffTheEdge) {
     // negative limit that would invert the disparity
     EXPECT_FLOAT_EQ(Depth::clampToFrame(3.3F, -200, 400, 1920, 2.F), 2.F);
     EXPECT_FLOAT_EQ(Depth::clampToFrame(3.3F, -200, 400, 1920, 0.F), 0.F);
+}
+
+// The damage contract, end to end (§6.3 pt 2), because this is the property that decides whether
+// half a stereo desktop goes stale. CHyprRenderer computes a window's damage growth
+// (depthDamageSpread) and its per-pane render offset (depthRenderOffset) from the SAME clamped
+// expression, so the invariant is not "the growth is generous" but "the growth is exact": a box
+// grown by the spread contains both panes' draws, with nothing left over to repaint.
+TEST(DepthTiers, damageGrownBySpreadContainsEveryPanesClampedDraw) {
+    constexpr Depth::SGeometry GEO   = {};
+    constexpr float            SCALE = 0.30F; // 9.45 px at depth 1.0 — big enough for the clamp to bite
+    constexpr double           FRAME = 1920.0;
+    constexpr float            SLACK = 2.F;
+
+    struct SCase {
+        double      x, w;
+        float       depth;
+        const char* what;
+    };
+
+    // an interior window, a window pinned to each edge, a full-width bar, and one dragged off screen
+    static const SCase CASES[] = {
+        {500, 300, 1.F, "interior"},       {0, 300, 1.F, "flush left"},         {1620, 300, 1.F, "flush right"},
+        {0, 1920, 0.8F, "full-width bar"}, {-200, 400, 1.F, "half off screen"}, {500, 300, 0.F, "interior, no depth"},
+    };
+
+    for (const auto& C : CASES) {
+        const float RAW    = Depth::damageSpreadPx(C.depth, SCALE, GEO, FRAME);
+        const float SPREAD = Depth::clampToFrame(RAW, C.x, C.w, FRAME, SLACK);
+
+        for (int pane = 0; pane < 2; ++pane) {
+            const float SHIFT = Depth::clampToFrame(Depth::paneShiftPx(C.depth, SCALE, GEO, FRAME, pane), C.x, C.w, FRAME, SLACK);
+
+            // the growth IS the magnitude of the shift — same expression, same clamp
+            EXPECT_FLOAT_EQ(std::abs(SHIFT), SPREAD) << C.what << ", pane " << pane;
+
+            // ...so the grown box contains the drawn box, on both sides
+            EXPECT_LE(C.x - SPREAD, C.x + SHIFT) << C.what << ", pane " << pane;
+            EXPECT_GE(C.x + C.w + SPREAD, C.x + C.w + SHIFT) << C.what << ", pane " << pane;
+
+            // and the UNclamped spread (what an element with no box to clamp against would use)
+            // is still a safe over-approximation, never an under-one
+            EXPECT_LE(std::abs(SHIFT), RAW) << C.what << ", pane " << pane;
+        }
+    }
+}
+
+// ------------------------------------------------------- §6.4.1 the fast path, in the pack's terms
+
+// The claim WP D2's commit message makes and D4 has to be able to defend: with nothing raised off
+// the wallpaper plane, a stereo output's frame is the one WP F1 shipped, bit for bit. Two headers
+// meet to make that true — Depth's spread is exactly zero, so the damage handed to Stereo's fold is
+// the pane damage untouched, and the fold is F1's two halves and nothing more.
+TEST(DepthTiers, fastPathHandsTheFoldExactlyWhatWPF1Did) {
+    constexpr Depth::SGeometry GEO      = {};
+    constexpr Vector2D         MODE     = {3840, 1080};
+    constexpr float            PANEPX   = 1920.F;
+    const CRegion              PANEDMG  = CBox{100, 200, 300, 400};
+    const CRegion              F1FOLDED = Monitor::Stereo::foldPaneDamage(PANEDMG, MODE, Config::STEREO_SBS);
+
+    // the two ways a desktop is flat: nothing has depth, or the comfort knob is zero (§6.4's A/B
+    // toggle). Both must produce an exactly-zero spread — not a small one.
+    for (const auto& [DEPTH, SCALE] : {std::pair{0.F, 0.12F}, std::pair{1.F, 0.F}, std::pair{0.F, 0.F}}) {
+        const float SPREAD = Depth::damageSpreadPx(DEPTH, SCALE, GEO, PANEPX);
+        ASSERT_FLOAT_EQ(SPREAD, 0.F);
+
+        // growing a damage box by a zero spread is the identity, so the fold sees F1's region...
+        CRegion grown = PANEDMG.copy();
+        grown.expand(SPREAD);
+        EXPECT_EQ(grown.copy().getExtents(), PANEDMG.copy().getExtents());
+
+        // ...and produces F1's two halves
+        auto folded = Monitor::Stereo::foldPaneDamage(grown, MODE, Config::STEREO_SBS);
+        EXPECT_EQ(folded.copy().getExtents(), F1FOLDED.copy().getExtents());
+        EXPECT_TRUE(folded.copy().subtract(F1FOLDED).empty());
+        EXPECT_TRUE(F1FOLDED.copy().subtract(folded).empty());
+    }
+
+    // the negative control: once something IS raised, the fold sees a WIDER region — depth is not
+    // free, and a test that could not tell the two apart would not be testing the fast path
+    CRegion raised = PANEDMG.copy();
+    raised.expand(Depth::damageSpreadPx(1.F, 0.12F, GEO, PANEPX));
+    EXPECT_GT(Monitor::Stereo::foldPaneDamage(raised, MODE, Config::STEREO_SBS).copy().getExtents().width, F1FOLDED.copy().getExtents().width);
 }
 
 // ------------------------------------------------------- §8.1's sub-pixel warning

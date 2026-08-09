@@ -1256,6 +1256,163 @@ HID mode switch and the flat↔XR toggle.
 
 ---
 
+## 8.6 The depth desktop — `windowrule = depth` / `layerrule = depth`
+
+§8.5 gets both eyes the same picture: a flat desktop, presented in stereo, at zero disparity.
+**Depth is what makes the two eyes differ.** Every window and layer surface carries a `depth` — a
+unitless **0…1 height above the wallpaper plane** — and on a stereo output the compositor
+composites the desktop **once per eye**, shifting each raised element a few pixels horizontally in
+opposite directions. Your eyes fuse that as a window floating in front of the page: a desk with
+cards on it, not a 3D scene.
+
+It is a **decoration**, not a mode. It lives beside border, shadow and dim, it is generic Hyprland
+with nothing XR about it, and on an ordinary monitor a depth is simply state nobody reads
+(`hyprctl clients` still shows it). Only a `stereo:` output has two eyes to disagree with.
+
+### It is already on
+
+There is no `enable`. Give an output `stereo:sbs` and the shipped ladder applies immediately:
+
+```ini
+decoration {
+    depth_focused   = 0.6   # the focused window — the rise IS the focus indicator
+    depth_unfocused = 0.2   # every other window, one small step off the page
+    depth_layers    = 0.8   # top/overlay layer surfaces: bars, notifications, launchers
+    depth_scale     = 0.12  # metres of rise at depth 1.0 — THE comfort knob
+}
+```
+
+Two rungs are pinned and not configurable, because the design falls apart without them:
+`background`/`bottom` layer surfaces (your wallpaper) stay at **0.0**, and a **fullscreen window
+drops to 0.0** — a fullscreen window *is* the plane, and raising it just moves the whole panel. An
+explicit rule overrides both.
+
+### Rules — per window, per layer, both front-ends
+
+```ini
+# classic
+windowrule = depth 0.9, match:class ^(mpv)$          # the video sits proud of everything
+windowrule = depth 0,   match:class ^(Alacritty)$    # this one stays on the page
+layerrule  = depth 1.0, match:namespace ^(walker)$   # the launcher floats above the bar
+```
+
+```lua
+-- lua
+hl.window_rule({ match = { class = "^(mpv)$" }, depth = 0.9 })
+hl.layer_rule({ match = { namespace = "^(walker)$" }, depth = 1.0 })
+```
+
+A rule beats the tier — including on a fullscreen window and on a wallpaper layer, which is the
+only way to raise those at all. Values outside 0…1 are **clamped, not rejected**: `depth 2` means
+"as high as it goes". Depth is deliberately one-sided; there is no way to push something *behind*
+the screen, because crossed (toward-viewer) disparity is the more comfortable direction and the
+uncrossed half of the range buys nothing but eye strain.
+
+### What a depth is worth, in pixels
+
+`depth_scale` turns a rung into metres of rise, and the geometry turns metres into per-eye pixels.
+At the shipped defaults on a 1920-wide pane:
+
+| depth | rise | shift per eye | total disparity | what it is |
+|---|---|---|---|---|
+| 0.2 | 2.4 cm | ±0.61 px | 1.2 px | an ordinary window |
+| 0.6 | 7.2 cm | ±1.91 px | 3.8 px | the focused window |
+| 0.8 | 9.6 cm | ±2.58 px | 5.2 px | a bar or an overlay |
+| 1.0 | 12 cm | ±3.29 px | 6.6 px | the ceiling of the range |
+
+**Tasteful depth is single-digit pixels.** That is not a limitation of the implementation, it is
+the physiology: what the eye fuses foveally is the *step* between two things visible at once
+(~0.1°, about **3 px total** at these numbers), not the absolute offset (~1° is fine). So this is
+a **ladder of four rungs with small gaps, never a continuum** — the shipped steps are 1.2, 2.6 and
+1.4 px total, and the whole span is about a fifth of the 1° budget. Turning `depth_scale` up until
+it "looks 3D" is how you get a headache; if you want more depth, the honest move is fewer things
+at more different rungs, not bigger numbers.
+
+Two guards enforce that from the compositor side:
+
+- **A hard 1° ceiling** (≈15.7 px per eye at these defaults). Whatever `depth_scale` says, nothing
+  is ever pushed past one degree of angular disparity.
+- **The frame-violation clamp.** An element whose left or right edge sits on the panel edge is cut
+  differently in the two eyes, and the sliver visible to one eye alone is the severe artifact — it
+  destroys the depth cue in that zone. So an element's shift may not exceed its own margin from
+  the frame, plus `decoration:depth_edge_slack` (2 px). A full-width bar therefore floats by the
+  slack and no more; set the slack to `0` for the strict reading and full-width bars stay flat.
+
+### Tell it about your screen
+
+The pixel numbers above come from a virtual screen 1.6 m wide at 1.5 m — headset-shaped. For a
+flat panel, measure yours:
+
+```ini
+decoration {
+    depth_distance     = 0.7   # metres from your eyes to the screen
+    depth_screen_width = 0.6   # metres wide ONE eye's image appears
+}
+```
+
+Interocular distance is fixed at 63 mm and is deliberately not a config key: a wrong value there
+is a comfort hazard rather than a preference.
+
+### Cost, and the off switch
+
+A stereo output with nothing raised composites **once** and the pack duplicates the result — the
+flat SBS frame of §8.5, unchanged. The moment anything on that output would actually move, the
+output composites **twice**, once per eye. `hyprctl monitors` reports which one ran:
+
+```
+stereoComposites: 2       # or, in text form:  stereo: sbs (scanout 3840x1080, 2 composites)
+```
+
+Since `depth_unfocused` is 0.2, that means **any window on a stereo output puts it at two
+composites** by default. That is the feature working. To get §8.5's exact cost back without
+touching a rule:
+
+```bash
+hyprctl keyword decoration:depth_scale 0     # same ladder, no rise, one composite
+```
+
+which is also the A/B switch for deciding whether you like it at all.
+
+### Animation
+
+Depth moves on **discrete events** — focus, fullscreen, a rule change — and is deliberately *not*
+animated on hover: pointer-driven depth changes at 60 Hz are vergence micro-adjustments and the
+likeliest source of strain in this design. The animation node is `windowsDepth` (a child of
+`windows`), off by default:
+
+```ini
+bezier    = depthEase, 0.23, 1, 0.32, 1
+animation = windowsDepth, 1, 4, depthEase
+```
+
+Note the `bezier =` line: `easeOutQuint` is not a built-in name, and an unknown curve is a config
+error.
+
+### What you can inspect
+
+- `hyprctl clients` / `hyprctl layers` carry a `depth` field per window / per layer surface — the
+  resolved rung, after rules and tiers.
+- `hyprctl monitors` carries `stereoComposites` (see above).
+
+### Caveats worth knowing before you file a bug
+
+- **Screenshots and screen recordings of a depth-producing output show one eye** (the right one),
+  not the fused pair and not a flat version — the capture is taken from the last pane composited.
+  A mirrored output shows the same. Set `depth_scale = 0` for a mono capture that is exactly what
+  §8.5 would have produced.
+- **The optimised background blur is computed once and shared by both eyes.** That is correct
+  because background/bottom layers are pinned flat; an explicit `layerrule = depth` on a *bottom*
+  layer will show one eye's blur in both.
+- **The defaults are provisional.** They come from the literature and the arithmetic, not from a
+  day of wear: the numbers in the table above are a starting point pending a live tuning session on
+  the glasses. If a rung feels wrong to you, it probably is — `depth_scale` first, then the ladder.
+- **Depth is disparity, not geometry.** Each window stays internally flat and there is no
+  head-motion parallax; on an XR monitor (a quad in the session) depth does nothing yet. The rules
+  are forward-compatible on purpose: the same `windowrule = depth 0.6` is what a future per-window
+  quad tier would read to place the window 0.6 · `depth_scale` metres nearer, with no re-authoring.
+
+---
+
 ## 9. Known limitations
 
 - **Classic-config only.** `openxr { }` and `xrmonitor =` have no Lua config binding.
@@ -1269,4 +1426,8 @@ HID mode switch and the flat↔XR toggle.
   packing of one mono desktop, not per-eye content; a window cannot yet declare itself stereo.)
 - **Stereo outputs: `sbs` only** (no `hsbs`/`tab`/`htab`), no direct scanout, software cursor
   only, and a display GUI can silently un-stereo the monitor (§8.5).
+- **Depth needs a stereo output** (§8.6). `windowrule = depth` is accepted and readable everywhere,
+  but only an output presenting a pane pair has two eyes to shift; on an XR monitor (a flat quad)
+  and on an ordinary monitor it draws nothing. Its shipped defaults are provisional, its capture
+  shows one eye, and the optimised background blur is shared by both eyes.
 - **Overlay input is unarbitrated** (§8).
