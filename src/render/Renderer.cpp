@@ -939,8 +939,19 @@ void IHyprRenderer::renderWindow(PHLWINDOW pWindow, PHLMONITOR pMonitor, const T
             }
         }
 
+        // research/24 §8.1, the other half of the sub-pixel seam: nearest-neighbour sampling snaps
+        // the source texel, so a box placed at a FRACTIONAL x renders exactly as if the disparity
+        // had been rounded — the ladder collapses for this window and the rungs 0.61 px and 0.93 px
+        // apart become the same picture. That defeats roundKeepingDisparity at the sampler, after
+        // the box has done everything right, and it is the DEFAULT path: xwayland:use_nearest_neighbor
+        // ships true, so it would have hit every X11 window on a depth desktop.
+        //
+        // Nearest-neighbour exists to keep pixel art and fractional-scaled X11 apps crisp; a
+        // sub-pixel disparity is by construction a request for interpolation. When the window is
+        // actually being composited off the plane, the depth cue wins — and only then, so nothing
+        // outside a per-eye composite changes filtering.
         static auto PXWLUSENN = CConfigValue<Config::INTEGER>("xwayland:use_nearest_neighbor");
-        if ((pWindow->m_isX11 && *PXWLUSENN) || pWindow->m_ruleApplicator->nearestNeighbor().valueOrDefault())
+        if (((pWindow->m_isX11 && *PXWLUSENN) || pWindow->m_ruleApplicator->nearestNeighbor().valueOrDefault()) && DEPTHOFFSET.x == 0.0)
             renderdata.useNearestNeighbor = true;
 
         if (!TRANSFORMEDWINDOW && pWindow->wlSurface()->small() && !pWindow->wlSurface()->m_fillIgnoreSmall && renderdata.blur) {
