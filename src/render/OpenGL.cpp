@@ -804,7 +804,11 @@ void CHyprOpenGLImpl::end(CRenderContext& ctx) {
 
     // end the render, copy the data to the main framebuffer
     if LIKELY (ctx.m_gl.offloadedFramebuffer) {
-        ctx.m_data.damage = ctx.m_data.finalDamage;
+        // WP D2: the pack below blits EVERY pane through this one region, and finalDamage only ever
+        // describes the pane whose pass ran last. stereoPaneDamage carries the earlier panes' —
+        // live blur expands each pane's final damage around a region that moved by 2·disparity
+        // between them, so the union is what covers all of them. Empty everywhere else.
+        ctx.m_data.damage = ctx.m_data.finalDamage.copy().add(ctx.m_data.stereoPaneDamage);
         if UNLIKELY (ctx.m_mode != RENDER_MODE_NORMAL) {
             const auto TARGET_SIZE = ctx.m_data.outFB->m_size;
             const auto TEXTURE     = ctx.m_data.currentFB->getTexture();
@@ -992,6 +996,7 @@ void CHyprOpenGLImpl::end(CRenderContext& ctx) {
     ctx.m_data.mainFB.reset();
     ctx.m_data.outFB.reset();
     ctx.m_data.stereoPaneFBs.clear(); // hand the pane buffers back to the pool
+    ctx.m_data.stereoPaneDamage.clear();
     // invalidate our render FBs to signal to the driver we don't need them anymore
     ctx.m_data.pMonitor->resources()->forEachUnusedFB(
         [](const auto& fb) {
