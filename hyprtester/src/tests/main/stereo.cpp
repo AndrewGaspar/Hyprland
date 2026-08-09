@@ -93,8 +93,11 @@ namespace {
     }
 
     // add/replace the monitor rule. Single quotes so the lua needs no escaping (layer.cpp precedent).
-    std::string declareMonitor(const char* name, const char* mode, const char* stereo) {
-        std::string spec = std::format("hl.monitor({{ output = '{}', mode = '{}', position = 'auto-right', scale = '1'", name, mode);
+    // A null `scale` omits the key entirely, which is how a rule asks for an AUTO scale.
+    std::string declareMonitor(const char* name, const char* mode, const char* stereo, const char* scale = "1") {
+        std::string spec = std::format("hl.monitor({{ output = '{}', mode = '{}', position = 'auto-right'", name, mode);
+        if (scale)
+            spec += std::format(", scale = '{}'", scale);
         if (stereo)
             spec += std::format(", stereo = '{}'", stereo);
         spec += " })";
@@ -414,6 +417,31 @@ TEST_CASE(stereoSbsOneLogicalMonitor) {
     EXPECT(stereoWindowSize, controlWindowSize);
     // and it is derived from the pane, not the packed mode (which would be ~3840 wide)
     EXPECT(widthOf(stereoWindowSize) > 1000 && widthOf(stereoWindowSize) <= 1920, true);
+}
+
+// stereoAutoScaleStaysAtOne — the rule with no `scale` key at all.
+//
+// An auto scale must not guess a scale for a stereo output. The guess reads the pixel density of
+// the PACKED mode (3840 wide, ~1.8x the pane's horizontal density) and the fractional-scale
+// validator downstream divides the pane, so 1920/2 = 960 sails through: the monitor would come up
+// as a 960x540 desktop, below the resolution it presents per eye, with no warning anywhere (the
+// scale warning is deliberately only for explicit scales). research/24 §3.8 wants 1.0 here.
+TEST_CASE(stereoAutoScaleStaysAtOne) {
+    getFromSocket(std::format("/output remove {}", STEREO_MON));
+
+    OK(declareMonitor(STEREO_MON, STEREO_MODE, "sbs", nullptr /* no scale key => auto */));
+    OK(getFromSocket(std::format("/output create headless {}", STEREO_MON)));
+
+    CScopeGuard guard = {[&]() { getFromSocket(std::format("/output remove {}", STEREO_MON)); }};
+
+    ASSERT(waitForMonitorPresent(STEREO_MON, true), true);
+    ASSERT(waitForMonitorField(STEREO_MON, "scale", "1.00"), true);
+
+    // the invariant, restated for the auto case: one logical monitor at the presented per-eye size
+    EXPECT(monitorField(STEREO_MON, "width"), std::string("1920"));
+    EXPECT(monitorField(STEREO_MON, "height"), std::string("1080"));
+    EXPECT(monitorField(STEREO_MON, "scanoutWidth"), std::string("3840"));
+    EXPECT(monitorField(STEREO_MON, "stereo"), std::string("sbs"));
 }
 
 // stereoRegionCaptureIsACrop — the one thing structural assertions cannot see: the IMAGE.
