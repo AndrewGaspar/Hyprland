@@ -55,8 +55,12 @@ namespace Pointer {
         bool softwareLockedFor(PHLMONITOR pMonitor);
         bool hasVisibleHWCursor(PHLMONITOR pMonitor);
 
+        // eyePass: a deliberate repeat draw of the cursor into another per-eye composite of the same
+        // frame on a stereo output (research/24 §3.7) — pass overridePos with the disparity-shifted,
+        // monitor-local position. Exempt from the forceRender screencopy dedup guard; its leftover-erase
+        // box UNIONS with the primary draw instead of replacing it; sends no wl_surface frame callbacks.
         void renderSoftwareCursorsFor(PHLMONITOR pMonitor, const Time::steady_tp& now, CRegion& damage /* logical */, std::optional<Vector2D> overridePos = {} /* monitor-local */,
-                                      bool forceRender = false);
+                                      bool forceRender = false, bool eyePass = false);
 
         // this is needed e.g. during screensharing where
         // the software cursors aren't locked during the cursor move, but they

@@ -2183,6 +2183,10 @@ void IHyprRenderer::renderMonitor(PHLMONITOR pMonitor, bool commit) {
 
     if (renderCursor) {
         TRACY_GPU_ZONE("RenderCursor");
+        // stereo (research/24 §3.7): on a stereo output the cursor is software-locked
+        // (CMonitor::updateStereoCursorLock) and this single draw lands in the pane composite, which
+        // end()'s pack duplicates into every pane — both eyes see it at zero (screen-plane) disparity.
+        // Per-eye composites draw their own via renderSoftwareCursorsFor(..., overridePos, false, eyePass=true).
         Pointer::mgr()->renderSoftwareCursorsFor(pMonitor->m_self.lock(), NOW, m_renderData.damage);
     }
 
