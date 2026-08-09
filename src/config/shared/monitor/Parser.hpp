@@ -20,6 +20,7 @@ namespace Config {
         bool                       parseSDRSaturation(const std::string& value);
         bool                       parseVRR(const std::string& value);
         bool                       parseICC(const std::string& value);
+        bool                       parseStereo(const std::string& value); // research/24 §3.10: off | sbs (hsbs/tab/htab are WP F5)
 
         void                       setDisabled();
         void                       setLease(); // HypXRland: mark this output leasable-on-demand (XR direct mode)

@@ -127,12 +127,14 @@ static std::string availableModesForOutput(PHLMONITOR pMonitor, eHyprCtlOutputFo
 const std::array<const char*, Monitor::CMonitor::SC_CHECKS_COUNT> SOLITARY_REASONS_JSON = {
     "\"UNKNOWN\"",   "\"NOTIFICATION\"", "\"LOCK\"",      "\"WORKSPACE\"", "\"WINDOWED\"", "\"DND\"",        "\"SPECIAL\"",  "\"ALPHA\"",       "\"OFFSET\"",
     "\"CANDIDATE\"", "\"OPAQUE\"",       "\"TRANSFORM\"", "\"OVERLAYS\"",  "\"FLOAT\"",    "\"WORKSPACES\"", "\"SURFACES\"", "\"CONFIGERROR\"", "\"FADEOUT\"",
+    "\"STEREO\"",
 };
 
 const std::array<const char*, Monitor::CMonitor::SC_CHECKS_COUNT> SOLITARY_REASONS_TEXT = {
     "unknown reason",    "notification",     "session lock",     "invalid workspace", "windowed mode", "dnd active",
     "special workspace", "alpha channel",    "workspace offset", "missing candidate", "not opaque",    "surface transformations",
     "other overlays",    "floating windows", "other workspaces", "subsurfaces",       "config error",  "fadeout in progress",
+    "stereo output",
 };
 
 std::string CCommandFormatter::getSolitaryBlockedReason(PHLMONITOR m, eHyprCtlOutputFormat format) {
@@ -156,12 +158,12 @@ std::string CCommandFormatter::getSolitaryBlockedReason(PHLMONITOR m, eHyprCtlOu
 
 const std::array<const char*, Monitor::CMonitor::DS_CHECKS_COUNT> DS_REASONS_JSON = {
     "\"UNKNOWN\"",   "\"USER\"",    "\"WINDOWED\"",  "\"CONTENT\"", "\"MIRROR\"", "\"RECORD\"", "\"SW\"",
-    "\"CANDIDATE\"", "\"SURFACE\"", "\"TRANSFORM\"", "\"DMA\"",     "\"FAILED\"", "\"CM\"",
+    "\"CANDIDATE\"", "\"SURFACE\"", "\"TRANSFORM\"", "\"DMA\"",     "\"FAILED\"", "\"CM\"",     "\"STEREO\"",
 };
 
 const std::array<const char*, Monitor::CMonitor::DS_CHECKS_COUNT> DS_REASONS_TEXT = {
     "unknown reason",    "user settings",   "windowed mode",           "content type",   "monitor mirrors",   "screen record/screenshot", "software renders/cursors",
-    "missing candidate", "invalid surface", "surface transformations", "invalid buffer", "activation failed", "color management",
+    "missing candidate", "invalid surface", "surface transformations", "invalid buffer", "activation failed", "color management",         "stereo output",
 };
 
 std::string CCommandFormatter::getDSBlockedReason(PHLMONITOR m, eHyprCtlOutputFormat format) {
@@ -217,6 +219,15 @@ std::string CCommandFormatter::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat
     static auto tf = [](bool t) -> const char* { return t ? "true" : "false"; };
     static auto yn = [](bool t) -> const char* { return t ? "yes" : "no"; };
 
+    // stereo (research/24 §3.4 item 12): width/height report the presented per-eye pane (the ONE
+    // logical monitor everything above the scanout sees); the true packed scanout mode is exposed
+    // in these extra fields so the packing is discoverable. Empty (byte-identical output) when off.
+    const std::string STEREO_JSON = m->isStereo() ? std::format("\n    \"stereo\": \"{}\",\n    \"scanoutWidth\": {},\n    \"scanoutHeight\": {},",
+                                                                Config::stereoModeToString(m->m_stereoMode), sc<int>(m->m_pixelSize.x), sc<int>(m->m_pixelSize.y)) :
+                                                    "";
+    const std::string STEREO_TEXT =
+        m->isStereo() ? std::format("\n\tstereo: {} (scanout {}x{})", Config::stereoModeToString(m->m_stereoMode), sc<int>(m->m_pixelSize.x), sc<int>(m->m_pixelSize.y)) : "";
+
     if (format == eHyprCtlOutputFormat::FORMAT_JSON) {
 
         result += std::format(
@@ -246,7 +257,7 @@ std::string CCommandFormatter::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat
     }},
     "reserved": [{}, {}, {}, {}],
     "scale": {},
-    "transform": {},
+    "transform": {},{}
     "focused": {},
     "dpmsStatus": {},
     "vrr": {},
@@ -281,8 +292,8 @@ std::string CCommandFormatter::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat
             escapeJSONStrings(m->m_output->make),
             escapeJSONStrings(m->m_output->model),
             escapeJSONStrings(m->m_output->serial),
-            sc<int>(m->m_pixelSize.x),
-            sc<int>(m->m_pixelSize.y),
+            sc<int>(m->paneSize().x),
+            sc<int>(m->paneSize().y),
             sc<int>(m->m_output->physicalSize.x),
             sc<int>(m->m_output->physicalSize.y),
             m->m_refreshRate,
@@ -302,6 +313,7 @@ std::string CCommandFormatter::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat
             sc<int>(m->m_reservedArea.bottom()),
             m->m_scale,
             sc<int>(m->m_transform),
+            STEREO_JSON,
             tf(m == Desktop::focusState()->monitor()),
             tf(m->m_dpmsStatus),
             tf(m->m_output->state->state().adaptiveSync),
@@ -325,7 +337,7 @@ std::string CCommandFormatter::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat
     } else {
         result += std::format(
             "Monitor {} (ID {}):\n\t{}x{}@{:.5f} at {}x{}\n\tdescription: {}\n\tmake: {}\n\tmodel: {}\n\tphysical size (mm): {}x{}\n\tserial: {}\n\tactive workspace: {} ({})\n\t"
-            "special workspace: {} ({})\n\treserved: {} {} {} {}\n\tscale: {}\n\ttransform: {}\n\tfocused: {}\n\t"
+            "special workspace: {} ({})\n\treserved: {} {} {} {}\n\tscale: {}\n\ttransform: {}{}\n\tfocused: {}\n\t"
             "dpmsStatus: {}\n\tvrr: {}\n\tsolitary: {:x}\n\tsolitaryBlockedBy: {}\n\tactivelyTearing: {}\n\ttearingBlockedBy: {}\n\tdirectScanoutTo: "
             "{:x}\n\tdirectScanoutBlockedBy: {}\n\tdisabled: "
             "{}\n\tcurrentFormat: {}\n\tmirrorOf: "
@@ -333,8 +345,8 @@ std::string CCommandFormatter::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat
             "{}\n\thardwareCursorsInUse: {}\n\thardwareDetails:\n\t\tbackend: {}\n\t\thdr: {}\n\t\tchroma: {}\n\t\tbt2020: {}\n\t\tvrrCapable: {}\n\n",
             m->m_name,
             m->m_id,
-            sc<int>(m->m_pixelSize.x),
-            sc<int>(m->m_pixelSize.y),
+            sc<int>(m->paneSize().x),
+            sc<int>(m->paneSize().y),
             m->m_refreshRate,
             sc<int>(m->m_position.x),
             sc<int>(m->m_position.y),
@@ -351,6 +363,7 @@ std::string CCommandFormatter::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat
             sc<int>(m->m_reservedArea.bottom()),
             m->m_scale,
             sc<int>(m->m_transform),
+            STEREO_TEXT,
             yn(m == Desktop::focusState()->monitor()),
             sc<int>(m->m_dpmsStatus),
             m->m_output->state->state().adaptiveSync,

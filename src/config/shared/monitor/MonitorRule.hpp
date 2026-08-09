@@ -31,6 +31,23 @@ namespace Config {
         COMPARISON_NO_MATCH        // needs a modeset
     };
 
+    // HypXRland stereo output (research/24 §3): the physical mode is packed from N identical
+    // per-eye panes and the compositor presents ONE logical monitor at pane size. The pack is a
+    // final-blit scanout detail (like scale/transform, but Hyprland-private). STEREO_SBS packs two
+    // horizontal panes; further layouts (hsbs/tab/htab, WP F5) are data — a different pack divisor
+    // and destination boxes — not new mechanisms.
+    enum eMonitorStereoMode : uint8_t {
+        STEREO_OFF = 0,
+        STEREO_SBS, // full side-by-side: mode = 2 panes wide, 1 tall
+    };
+
+    constexpr const char* stereoModeToString(eMonitorStereoMode mode) {
+        switch (mode) {
+            case STEREO_SBS: return "sbs";
+            default: return "off";
+        }
+    }
+
     class CMonitorRule {
       public:
         CMonitorRule()  = default;
@@ -50,6 +67,9 @@ namespace Config {
         // drm-lease-v1 clients (monado direct mode owns the flip). Default false ⇒ ordinary desktop
         // monitor, byte-identical to stock. Toggling it reconfigures the output (see MonitorRuleManager).
         bool                         m_lease         = false;
+        // Stereo pane packing for this output (research/24 §3.10). The rule's resolution is always
+        // the MODE that is scanned out; the logical desktop is derived from it (mode / pack).
+        eMonitorStereoMode           m_stereo        = STEREO_OFF;
         wl_output_transform          m_transform     = WL_OUTPUT_TRANSFORM_NORMAL;
         std::string                  m_mirrorOf      = "";
         bool                         m_enable10bit   = false;

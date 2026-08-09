@@ -140,6 +140,8 @@ namespace {
          }},
         {"icc", []() -> ILuaConfigValue* { return new CLuaConfigString(STRVAL_EMPTY); },
          [](ILuaConfigValue* v, CMonitorRuleParser& p) { return p.parseICC(*sc<const Config::STRING*>(v->data())); }},
+        {"stereo", []() -> ILuaConfigValue* { return new CLuaConfigString("off"); },
+         [](ILuaConfigValue* v, CMonitorRuleParser& p) { return p.parseStereo(*sc<const Config::STRING*>(v->data())); }},
         {"supports_wide_color", []() -> ILuaConfigValue* { return new CLuaConfigInt(0, -1, 1); },
          [](ILuaConfigValue* v, CMonitorRuleParser& p) {
              p.rule().m_supportsWideColor = sc<int>(*sc<const Config::INTEGER*>(v->data()));

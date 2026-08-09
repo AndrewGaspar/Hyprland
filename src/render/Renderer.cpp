@@ -2484,6 +2484,17 @@ void IHyprRenderer::renderMonitor(PHLMONITOR pMonitor, bool commit) {
 
     Event::bus()->m_events.render.stage.emit({RENDER_POST, pMonitor, std::nullopt});
 
+    // stereo pack: frameDamage is in pane-buffer coordinates; the scanout buffer holds the same
+    // pane in every destination box, so fold the damage into each half before submitting to the
+    // output — D_L ∪ (D_R + paneW) (research/24 §3.4 item 6). Must run AFTER damageMirrorsWith,
+    // which expects pane-space damage.
+    if UNLIKELY (pMonitor->isStereo()) {
+        CRegion paneDamage{frameDamage};
+        frameDamage.clear();
+        for (int i = 0; i < pMonitor->stereoPaneCount(); ++i)
+            frameDamage.add(paneDamage.copy().translate(pMonitor->stereoPaneDestBox(i).pos()));
+    }
+
     pMonitor->m_output->state->addDamage(frameDamage);
     bool submitted = true;
     if (commit)

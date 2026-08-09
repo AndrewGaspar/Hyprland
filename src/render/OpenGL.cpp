@@ -903,7 +903,26 @@ void CHyprOpenGLImpl::end(CRenderContext& ctx) {
             g_pHyprRenderer->setProjectionType(ctx, RPT_OUTPUT);
             ctx.m_data.transformDamage = true;
 
-            if (NEEDS_CM && !finalCMComplete)
+            if UNLIKELY (PMONITOR->isStereo() && !ctx.m_gl.fakeFrame) {
+                // stereo pack (research/24 §3.3(i)): everything above is ONE pane; assemble the
+                // mode-sized scanout frame with one blit per pane. The destination box is expressed as
+                // the GL viewport (the pane projection fills NDC, the viewport places it), and the
+                // damage scissors get the pane's origin added (glScissor is window-relative —
+                // m_scissorOffset). A pending screen shader has already been resolved into the
+                // pane-sized post-process buffer above; a still-pending CM resolve runs per pane.
+                for (int i = 0; i < PMONITOR->stereoPaneCount(); ++i) {
+                    const auto DEST = PMONITOR->stereoPaneDestBox(i);
+                    setViewport(DEST.x, DEST.y, DEST.width, DEST.height);
+                    m_scissorOffset = {DEST.x, DEST.y};
+                    if (NEEDS_CM && !finalCMComplete)
+                        renderTexture(ctx, finalTexture, finalBox, {.finalMonitorCM = true});
+                    else
+                        renderTexturePrimitive(ctx, finalTexture, finalBox);
+                }
+
+                m_scissorOffset = {};
+                setViewport(0, 0, PMONITOR->m_pixelSize.x, PMONITOR->m_pixelSize.y);
+            } else if (NEEDS_CM && !finalCMComplete)
                 renderTexture(ctx, finalTexture, finalBox, {.finalMonitorCM = true});
             else
                 renderTexturePrimitive(ctx, finalTexture, finalBox);
@@ -1114,6 +1133,7 @@ void CHyprOpenGLImpl::scissor(CRenderContext& ctx, const CBox& originalBox, bool
         CBox       box = originalBox;
         const auto TR  = Math::wlTransformToHyprutils(Math::invertTransform(m_renderData.pMonitor->m_transform));
         box.transform(TR, m_renderData.pMonitor->m_transformedSize.x, m_renderData.pMonitor->m_transformedSize.y);
+        box.translate(m_scissorOffset); // stereo pack: nonzero only during end()'s per-pane blits
 
         if (box != m_lastScissorBox) {
             GLCALL(glScissor(box.x, box.y, box.width, box.height));
@@ -1124,9 +1144,12 @@ void CHyprOpenGLImpl::scissor(CRenderContext& ctx, const CBox& originalBox, bool
         return;
     }
 
-    if (originalBox != m_lastScissorBox) {
-        GLCALL(glScissor(originalBox.x, originalBox.y, originalBox.width, originalBox.height));
-        m_lastScissorBox = originalBox;
+    CBox box = originalBox;
+    box.translate(m_scissorOffset); // stereo pack: nonzero only during end()'s per-pane blits
+
+    if (box != m_lastScissorBox) {
+        GLCALL(glScissor(box.x, box.y, box.width, box.height));
+        m_lastScissorBox = box;
     }
 
     setCapStatus(GL_SCISSOR_TEST, true);
