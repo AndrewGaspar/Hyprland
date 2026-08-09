@@ -140,7 +140,7 @@ void CHyprBorderDecoration::damageEntire() {
     CRegion    borderRegion(GLOBAL_BOX);
     borderRegion.subtract(GLOBAL_BOX.copy().expand(-(BORDERSIZE + ROUNDING)));
     // stereo depth (research/24 §6.3): the border is drawn into both panes at ±disparity
-    borderRegion.expand(2 + std::ceil(g_pHyprRenderer->depthDamageSpread(m_window.lock(), m_window->m_monitor.lock()))); // pad
+    borderRegion.expand(2 + std::ceil(g_pHyprRenderer->depthDamageSpreadAnyMonitor(m_window.lock()))); // pad
 
     const CBox borderExtents = borderRegion.getExtents();
 

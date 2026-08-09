@@ -105,6 +105,9 @@ namespace Render {
         // Takes an explicit monitor because damage is computed outside any render pass.
         double depthDamageSpread(const PHLWINDOW& window, const PHLMONITOR& monitor);
         double depthDamageSpread(const PHLLS& layer, const PHLMONITOR& monitor);
+        // ...and the largest of those over every monitor the window is drawn on, for the callers
+        // that damage one global region and let it fan out to all of them (decoration damageEntire).
+        double depthDamageSpreadAnyMonitor(const PHLWINDOW& window);
         double cursorDepthDamageSpread(const PHLMONITOR& monitor);
 
         // §6.4.1: is anything on this monitor actually off the wallpaper plane? False means the
