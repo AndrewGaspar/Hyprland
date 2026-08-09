@@ -1130,6 +1130,117 @@ exec-once = hypxrpaper --scene forest-clearing
 
 ---
 
+## 8.5 Stereo (side-by-side) physical outputs — `monitor = …, stereo:sbs`
+
+A `stereo` token on an ordinary **`monitor =` rule** (not `xrmonitor`) tells Hyprland that the
+physical output packs two per-eye panes into one scanned-out frame — an XREAL in HID 3D mode, a
+3D TV, a shutter-glasses projector. The resolution in the rule is **always the mode you scan
+out**, exactly as it is today, and the logical desktop is derived from it:
+
+```ini
+# classic, positional — the compact token form
+monitor = DP-5, 3840x1080@60, 0x0, 1, stereo:sbs
+
+# equivalent key/value form on the same line
+monitor = DP-5, 3840x1080@60, 0x0, 1, stereo, sbs
+
+# monitorv2
+monitorv2 {
+    output = DP-5
+    mode   = 3840x1080@60
+    position = 0x0
+    scale  = 1
+    stereo = sbs
+}
+```
+
+`stereo:sbs` on a 3840×1080 mode gives you **one 1920×1080 monitor**. That is the whole model:
+the packing is an internal scanout detail *below* the logical layer, exactly like `scale` and
+`transform`, and nothing above it knows. `hyprctl monitors`, `wl_output`/`xdg_output`,
+workspaces, layout, layer surfaces and all pointer/tablet/touch mapping see one 1920×1080
+monitor. There are no phantom monitors and no second workspace set. The two panes are drawn from
+the same composite and blitted side by side at the final step, so a mono desktop costs one extra
+full-pane blit per frame and partial damage still works.
+
+`stereo:off` (the default, and what every existing config gets) is bit-identical to a build
+without the feature.
+
+### Values
+
+| Value | Meaning |
+|---|---|
+| `off` (or the token absent) | Normal output. Default. |
+| `sbs` | Full side-by-side: mode is split into a left and a right half, each one full pane. `3840x1080 → 1920x1080` logical. |
+| `hsbs`, `tab`, `htab` | **Not implemented yet.** The parser rejects them with an error rather than packing something wrong. Planned (see research/24 §3.8). |
+
+A mode that does not divide cleanly into panes (an odd width with `sbs`) is refused: the packing
+is dropped, stereo goes back to `off`, and you get a log line plus an on-screen error toast
+rather than a half-pixel pane.
+
+Live toggling needs no new command — monitor rules already re-apply:
+
+```bash
+hyprctl keyword monitor DP-5, 3840x1080@60, 0x0, 1, stereo:sbs   # on
+hyprctl keyword monitor DP-5, 3840x1080@60, 0x0, 1              # off
+```
+
+### Scale must be 1.0
+
+On a physically split panel one buffer pixel must map to one physical pixel, or the per-eye split
+softens and can skew. A stereo output with `scale != 1.0` **warns** in the log and keeps going;
+an `auto` scale is left alone (it is not a user mistake). Note that the fractional-scale validator
+divides the **pane**, not the mode — `stereo:sbs` at 3840 wide validates 1920/scale, so a scale
+that is legal on a 1920 monitor is legal here too.
+
+### What `wl_output` and screenshots report
+
+- **`wl_output.mode` reports the pane** (1920×1080), with the true refresh rate; `xdg_output`'s
+  logical size is the same 1920×1080. Clients ask "how big is the screen I am drawing on", and the
+  honest answer is one pane. It also removes a real trap: a client told 3840 could submit a
+  genuine 3840-wide fullscreen buffer, match the mode exactly and get **scanned out unpacked**
+  (one unstretched image across both eyes). Direct scanout is additionally blocked outright on a
+  stereo output (`hyprctl monitors` shows `stereo output` as the block reason).
+- **`wlr-output-management` still reports the real mode list**, so `wdisplays`/`nwg-displays`
+  show and can select `3840x1080` — the truth is one query away.
+- **Screenshots and screen capture get one pane**, at logical size, for every capture protocol in
+  the tree (wlr-screencopy, ext-image-copy-capture, `grim`, the portal path). A packed 3840 image
+  with both eyes in it is useless to a bug report or a chat message; "screenshot my desktop" means
+  the desktop, not the scanout.
+- **Mirroring** works in both directions and mirrors the pane, so a stereo monitor mirrored onto
+  an ordinary screen sends a normal mono desktop, and an ordinary monitor mirrored onto a stereo
+  one shows at zero disparity.
+- **The cursor is forced to software** on a stereo output for as long as it is stereo (a hardware
+  cursor plane lives above the pack and would appear once, in the wrong place, at the wrong
+  disparity). Dropping back to `stereo:off` restores hardware cursors.
+
+`hyprctl monitors` reports both numbers so the packing is discoverable rather than a mystery —
+`width`/`height` are the presented per-eye pane, plus `stereo`, `scanoutWidth` and
+`scanoutHeight` fields (text form: `stereo: sbs (scanout 3840x1080)`).
+
+> **Hazard: a display GUI can un-stereo the monitor behind your back.** `wlr-output-management`'s
+> *write* path takes a resolution straight from the head's mode list with no knowledge of the
+> stereo token, so touching `wdisplays` / `nwg-displays` / any config GUI on a stereo output can
+> silently drop the packing (or re-derive the wrong logical size). There is no guard for this yet.
+> If the desktop suddenly looks doubled or half-width after using a display GUI, re-apply the
+> rule with `hyprctl keyword monitor …, stereo:sbs` (or reload the config). Prefer editing the
+> config over GUI display tools on a stereo output.
+
+### Example — the XREAL flat path
+
+`example/xreal.conf` carries the ready-to-copy version. The glasses re-present a native
+**3840×1080@60** EDID after the HID `mode 3d` switch and hardware-split every scanline, so:
+
+```ini
+monitor = DP-5, 3840x1080@60, auto, 1, stereo:sbs
+```
+
+is a head-locked stereo 1920×1080 desktop on the glasses with no OpenXR runtime in the process
+tree at all. Do **not** force an unadvertised wide modeline — non-native timings in 3D mode
+stripe (see 07 §modes) — and do not set a non-1.0 scale. See `docs/openxr/07-xreal.md` for the
+HID mode switch and the flat↔XR toggle.
+
+---
+
 ## 9. Known limitations
 
 - **Classic-config only.** `openxr { }` and `xrmonitor =` have no Lua config binding.
@@ -1138,5 +1249,9 @@ exec-once = hypxrpaper --scene forest-clearing
 - **Roll is not representable** in `xrmonitor=` / `hyprctl openxr layout` serialization
   (yaw + pitch only) — a monitor that picked up roll during a grab loses it when
   re-serialized.
-- **No stereo/3D content.** Every XR monitor is a flat quad; there is no per-eye rendering.
+- **No stereo/3D content on XR monitors.** Every *XR* monitor is a flat quad; there is no per-eye
+  rendering in the XR session. (A *physical* output can present stereo — §8.5 — but that is a
+  packing of one mono desktop, not per-eye content; a window cannot yet declare itself stereo.)
+- **Stereo outputs: `sbs` only** (no `hsbs`/`tab`/`htab`), no direct scanout, software cursor
+  only, and a display GUI can silently un-stereo the monitor (§8.5).
 - **Overlay input is unarbitrated** (§8).

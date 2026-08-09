@@ -506,6 +506,20 @@ This section is the spine of the revision. It answers: *how does a plain 3840×1
 output, with no OpenXR runtime in the process tree, present a pane pair — while Hyprland keeps
 reporting exactly one 1920×1080 monitor to everything above the scanout?*
 
+> **STATUS: IMPLEMENTED (Phase F core, commits `431e2eaa..bd99f734`).** `monitor = NAME,
+> 3840x1080@60, 0x0, 1, stereo:sbs` ships. F1 (`431e2eaa`) landed the derivation, the pack in
+> `CHyprOpenGLImpl::end()`, the damage fold, the pane-sized work/mirror/capture buffers, the
+> `wl_output.mode` = pane decision (§3.6 item 8), `DS_BLOCK_STEREO`, the scale validation and the
+> `stereo` monitor-rule token in all three config front-ends (positional, `monitorv2`, Lua); F2
+> (`45fa12ef`) the forced-software, per-eye cursor (§3.7); F3 (`bd99f734`) extracted the pane
+> geometry into `src/output/StereoPacking.hpp` as pure functions and covered it with 27 gtests
+> plus a headless hyprtester case (644 → 671). F4 documents it (`docs/openxr/05-configuration.md`
+> §8.5, `example/xreal.conf`). What is **not** yet built: `hsbs`/`tab`/`htab` layouts (§3.8 — the
+> parser rejects them loudly rather than packing wrong), the item-15
+> `wlr-output-management` write-path guard (the display-GUI hazard in §3.6 is documented, not
+> fixed), and everything in §4 onwards (stereo *content* detection, the depth desktop, the XR-tier
+> pane pair).
+
 ### 3.1 Why this tier is primary
 
 Four reasons, in descending order of force:
