@@ -43,6 +43,14 @@ std::string                             deviceNameToInternalString(const std::st
 std::string                             getSystemLibraryVersion(const std::string& name);
 std::string                             getBuiltSystemLibraryNames();
 bool                                    truthy(const std::string& str);
+// Send a signal to exactly one process. kill(2) reads a non-positive pid as a BROADCAST — -1 is
+// every process we may signal, 0 is our own process group (for a compositor started by a session
+// manager, that is the session) — and the pid accessors we feed it hand back exactly those values
+// for a client that has gone away: CWindow::getPID() and CLayerSurface::getPID() return -1 once the
+// surface has no owner ("happens at unmap"), CANRManager::SANRData::getPID() returns 0. Force-killing
+// a window that is mid-unmap must close that window or nothing, never the session. Returns false
+// when the pid was refused.
+bool killPid(pid_t pid, int sig);
 
 template <typename... Args>
 [[deprecated("use std::format instead")]] std::string getFormat(std::format_string<Args...> fmt, Args&&... args) {

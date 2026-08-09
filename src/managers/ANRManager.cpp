@@ -1,6 +1,7 @@
 #include "ANRManager.hpp"
 
 #include "../helpers/fs/FsUtils.hpp"
+#include "../helpers/MiscFunctions.hpp"
 #include "../debug/log/Logger.hpp"
 #include "../macros.hpp"
 #include "../Compositor.hpp"
@@ -214,7 +215,7 @@ void CANRManager::SANRData::runDialog(const std::string& appName, const std::str
         const auto& result = r->result();
 
         if (result.starts_with(OPTION_TERMINATE_STR))
-            ::kill(dialogWmPID, SIGKILL);
+            killPid(dialogWmPID, SIGKILL);
         else if (result.starts_with(OPTION_WAIT_STR))
             dialogSaidWait = true;
         else
