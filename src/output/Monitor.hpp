@@ -108,6 +108,12 @@ namespace Monitor {
         // stock. Set from the active monitor rule in applyMonitorRule/Soft (before the size derivation).
         Config::eMonitorStereoMode  m_stereoMode = Config::STEREO_OFF;
 
+        // stereo CONTENT (research/24 §5.3, WP S1): the last frame cropped a stereo-declared window
+        // into the panes, so the panes DIFFER and that frame cost a second composite. Written by the
+        // pack in CHyprOpenGLImpl::end(), read by `hyprctl monitors` — the only outside view of the
+        // producer's decision, and always false on a monitor that is not stereo.
+        bool                        m_stereoContentPanes = false;
+
         // stereo (§3.4 item 15): the last mode search did not land on a mode the rule asked for —
         // the emergency any-available-mode fallback, or a total failure that kept the old mode.
         // The pack cannot be trusted on such a mode, so sanitizeStereoMode() drops it.

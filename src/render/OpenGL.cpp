@@ -869,7 +869,8 @@ void CHyprOpenGLImpl::end() {
             // differ only if a stereo-declared window was cropped into this composite (WP S1). An
             // ordinary desktop on a stereo output — the overwhelmingly common frame — takes the
             // floor: ONE composite, blitted into every pane.
-            const bool PER_EYE = m_renderData.stereoContentDrawn && PMONITOR->stereoPaneCount() > 1;
+            const bool PER_EYE             = m_renderData.stereoContentDrawn && PMONITOR->stereoPaneCount() > 1;
+            PMONITOR->m_stereoContentPanes = PER_EYE;
 
             // re-run this frame's pass with the next eye, back into the main work buffer. Safe to
             // overwrite: the previous pane is already in the scanout frame, and every blit is

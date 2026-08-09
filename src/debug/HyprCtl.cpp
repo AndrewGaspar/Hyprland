@@ -230,11 +230,19 @@ std::string CHyprCtl::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat format) 
     // stereo (research/24 §3.4 item 12): width/height report the presented per-eye pane (the ONE
     // logical monitor everything above the scanout sees); the true packed scanout mode is exposed
     // in these extra fields so the packing is discoverable. Empty (byte-identical output) when off.
-    const std::string STEREO_JSON = m->isStereo() ? std::format("\n    \"stereo\": \"{}\",\n    \"scanoutWidth\": {},\n    \"scanoutHeight\": {},",
-                                                                Config::stereoModeToString(m->m_stereoMode), sc<int>(m->m_pixelSize.x), sc<int>(m->m_pixelSize.y)) :
-                                                    "";
-    const std::string STEREO_TEXT =
-        m->isStereo() ? std::format("\n\tstereo: {} (scanout {}x{})", Config::stereoModeToString(m->m_stereoMode), sc<int>(m->m_pixelSize.x), sc<int>(m->m_pixelSize.y)) : "";
+    //
+    // `stereoContent` (WP S1) is the producer's own state: true while a stereo-declared window is
+    // actually being cropped into the panes, i.e. while the panes DIFFER and the frame costs a
+    // second composite. It is the only outside view of that decision, and the one field that
+    // answers "is my stereo window engaged, or is the rule sitting behind the fullscreen gate?".
+    const std::string STEREO_JSON = m->isStereo() ?
+        std::format("\n    \"stereo\": \"{}\",\n    \"scanoutWidth\": {},\n    \"scanoutHeight\": {},\n    \"stereoContent\": {},", Config::stereoModeToString(m->m_stereoMode),
+                    sc<int>(m->m_pixelSize.x), sc<int>(m->m_pixelSize.y), m->m_stereoContentPanes ? "true" : "false") :
+        "";
+    const std::string STEREO_TEXT = m->isStereo() ?
+        std::format("\n\tstereo: {} (scanout {}x{}, content {})", Config::stereoModeToString(m->m_stereoMode), sc<int>(m->m_pixelSize.x), sc<int>(m->m_pixelSize.y),
+                    m->m_stereoContentPanes ? "per-eye" : "mono") :
+        "";
 
     if (format == eHyprCtlOutputFormat::FORMAT_JSON) {
 
