@@ -960,18 +960,27 @@ void CHyprOpenGLImpl::end(CRenderContext& ctx) {
                 // scissored to damage, so the parts of the work buffer the replay does not repaint can
                 // never reach the output. The state dance restores the composite's own conventions
                 // (monitor projection, blending on, no final shader) before the pack takes over again.
+                //
+                // Surface feedback is blocked for the duration: this is the SAME frame, so every frame
+                // callback and wp_presentation feedback this pass owed was already sent by the first
+                // composite. Without the block each replayed surface queues a second (now empty)
+                // presentation record per pane per frame, and each discard path re-sends a discarded
+                // feedback for a surface that was already reported.
                 const auto RECOMPOSITE = [&](int eye) {
-                    const auto SAVED_DAMAGE = ctx.m_data.damage;
+                    const auto SAVED_DAMAGE   = ctx.m_data.damage;
+                    const auto SAVED_FEEDBACK = ctx.m_blockSurfaceFeedback;
 
                     g_pHyprRenderer->bindFB(ctx, ctx.m_data.mainFB);
                     g_pHyprRenderer->setProjectionType(ctx, RPT_MONITOR);
                     ctx.m_data.transformDamage = false;
                     blend(true);
+                    ctx.m_blockSurfaceFeedback = true;
 
                     ctx.m_data.stereoEye = eye;
                     ctx.m_pass.replay(ctx);
                     ctx.m_data.stereoEye = 0;
 
+                    ctx.m_blockSurfaceFeedback = SAVED_FEEDBACK;
                     blend(false);
 
                     ctx.m_data.damage = SAVED_DAMAGE;
@@ -983,6 +992,14 @@ void CHyprOpenGLImpl::end(CRenderContext& ctx) {
                 SResolvedComposite resolved;
                 for (int i = 0; i < PMONITOR->stereoPaneCount(); ++i) {
                     if (i == 0 || PER_EYE) {
+                        // everything in this block draws into a PANE-sized buffer at its own origin,
+                        // while m_scissorOffset still holds the previous iteration's destination origin
+                        // from the blit below. It is {0,0} for every layout shipped today (pane 0 sits
+                        // at the origin in both sbs and tab), so this is a guard rather than a fix —
+                        // but the guard is what keeps a future packing whose first pane is elsewhere
+                        // from scissoring the replay and the colour/shader resolves out of existence.
+                        m_scissorOffset = {};
+
                         if (i > 0) {
                             RELEASE(resolved);
                             RECOMPOSITE(i);
