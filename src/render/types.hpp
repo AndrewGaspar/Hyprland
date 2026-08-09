@@ -115,6 +115,10 @@ namespace Render {
         // CHyprOpenGLImpl::end(). Empty in the fast path, where end() duplicates the single
         // composite into every pane exactly as WP F1 shipped it.
         std::vector<SP<IFramebuffer>> stereoPaneFBs;
+        // ...and the union of those panes' FINAL damage. finalDamage is one slot per pass and each
+        // pane's pass overwrites it, so the pack — which blits every pane through a single damage
+        // region — would otherwise scissor earlier panes to the LAST pane's blur-expanded region.
+        CRegion stereoPaneDamage;
     };
 
     struct STFRange {
