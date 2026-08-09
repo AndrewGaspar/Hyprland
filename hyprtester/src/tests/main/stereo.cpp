@@ -530,6 +530,60 @@ TEST_CASE(stereoRegionCaptureIsACrop) {
     cropCheck(CONTROL_MON); // the same assertion on an ordinary output, as the control
 }
 
+// stereoContentSecondComposite — WP S1's producer, live (research/24 §3.3, §5.3).
+//
+// The declaration half — the rule grammar, the tag, §4.3's fullscreen gate — is asserted from the
+// Lua front-end in tests/main/window.cpp (stereoWindowRules). What this adds is the frame: with a
+// stereo-declared window actually on a stereo output, the pack in CHyprOpenGLImpl::end() stops
+// blitting one composite into both panes and re-runs the pass for the second eye.
+//
+// The two panes' pixels are unassertable from a client (see the note at the top of this file), so
+// what is proved here is narrower and still worth having: the replay path runs on real frames
+// without crashing, hanging or losing the monitor, and the window renders at pane geometry while it
+// happens. A regression that took down the compositor on any stereo desktop with an mpv window open
+// would show up here as a dead socket.
+TEST_CASE(stereoContentSecondComposite) {
+    getFromSocket(std::format("/output remove {}", STEREO_MON));
+
+    OK(declareMonitor(STEREO_MON, STEREO_MODE, "sbs"));
+    OK(getFromSocket(std::format("/output create headless {}", STEREO_MON)));
+
+    CScopeGuard guard = {[&]() {
+        Tests::killAllWindows();
+        getFromSocket(std::format("/output remove {}", STEREO_MON));
+    }};
+
+    ASSERT(waitForMonitorPresent(STEREO_MON, true), true);
+    ASSERT(waitForMonitorField(STEREO_MON, "width", "1920"), true);
+    Tests::sync();
+
+    // every wayland toplevel, since the in-tree client sets no class — and `always`, because the
+    // gate belongs to window.cpp's case and this one is about the producer
+    OK(getFromSocket("/eval hl.window_rule({ match = { xwayland = false }, stereo = 'sbs always' })"));
+    OK(getFromSocket(std::format("/dispatch hl.dsp.focus({{ monitor = '{}' }})", STEREO_MON)));
+
+    const int    WINDOWS_BEFORE = Tests::windowCount();
+    SWindowClient client;
+    ASSERT(client.waitForWindow(WINDOWS_BEFORE), true);
+    Tests::sync();
+
+    // the window resolves to a packed layout, so every frame from here owes a second composite
+    EXPECT_CONTAINS(getFromSocket("/activewindow"), "stereo: sbs");
+    // and it is still laid out on the PANE, not on the mode — the producer changes UVs, never boxes
+    EXPECT(widthOf(activeWindowSize()) <= 1920, true);
+
+    // let a few frames go through the replay, then confirm the compositor is still there and the
+    // monitor is still exactly one 1920-wide logical output
+    for (int i = 0; i < 3; ++i) {
+        getFromSocket(std::format("/dispatch hl.dsp.cursor.move({{ x = {}, y = 540 }})", 100 + i * 100));
+        Tests::sync();
+    }
+
+    EXPECT(monitorField(STEREO_MON, "width"), std::string("1920"));
+    EXPECT(monitorField(STEREO_MON, "stereo"), std::string("sbs"));
+    EXPECT(Tests::countOccurrences(getFromSocket("j/monitors"), std::string("\"name\": \"") + STEREO_MON + "\""), 1);
+}
+
 // stereoLiveToggleRestoresState — the hot-reload ordering risk.
 //
 // A stereo flip changes the logical size derivation, the render-resource sizes and the matrices,
@@ -661,4 +715,12 @@ TEST_CASE(stereoLegacyConfigFrontEnds) {
     ASSERT(waitForMonitorField(CONTROL, "width", "3840"), true);
     EXPECT(monitorField(CONTROL, "stereo"), std::string(""));
     EXPECT(monitorField(CONTROL, "scanoutWidth"), std::string(""));
+
+    // WP S1's content rule shares this run for the same reason the monitor token does: the classic
+    // `windowrule =` handler looks the effect up by NAME, so an effect that only exists in the Lua
+    // mirror's table would parse here and nowhere else (or the reverse).
+    EXPECT(getFromSocket("/keyword windowrule stereo sbs always, match:class ^(mpv)$"), std::string("ok"));
+    EXPECT(getFromSocket("/keyword windowrule stereo auto, match:xdg_tag ^stereo:.*"), std::string("ok"));
+    // and a layout the grammar does not have is refused rather than silently ignored
+    EXPECT_CONTAINS(getFromSocket("/keyword windowrule stereo lr, match:class ^(mpv)$"), "unknown layout");
 }

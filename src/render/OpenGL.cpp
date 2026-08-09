@@ -748,6 +748,13 @@ void CHyprOpenGLImpl::begin(PHLMONITOR pMonitor, const CRegion& damage_, SP<IFra
     g_pHyprRenderer->m_renderData.damage.set(damage_);
     g_pHyprRenderer->m_renderData.finalDamage.set(finalDamage.value_or(damage_));
 
+    // stereo content (research/24 §5.3): every composite starts as the LEFT eye with nothing
+    // stereo drawn. Anything that renders a monitor without going through the pack — screencopy,
+    // a fake frame, a mirror source — therefore sees the left eye, which is the same half the
+    // capture path already hands out.
+    g_pHyprRenderer->m_renderData.stereoEye          = 0;
+    g_pHyprRenderer->m_renderData.stereoContentDrawn = false;
+
     m_fakeFrame = !!fb;
 
     if (g_pHyprRenderer->m_reloadScreenShader) {
@@ -838,16 +845,19 @@ void CHyprOpenGLImpl::end() {
             SP<IFramebuffer>                    cmFB, shaderFB;
             NColorManagement::PImageDescription cmDesc, shaderDesc;
 
-            // one resolve pass into a fresh pane-sized work buffer tagged with the monitor's image
+            // one resolve pass into a pane-sized work buffer tagged with the monitor's image
             // description, handing back the buffer's texture (or the input, if the work buffer pool
-            // is exhausted — an unresolved pane beats a dropped frame).
+            // is exhausted — an unresolved pane beats a dropped frame). Claimed once and re-used for
+            // every eye: a second eye needs the same conversion, not a second buffer.
             const auto RESOLVEPASS = [&](SP<ITexture> tex, SP<IFramebuffer>& fb, NColorManagement::PImageDescription& saved) -> SP<ITexture> {
-                fb = PMONITOR->resources()->getUnusedWorkBuffer();
-                if (!fb)
-                    return tex;
+                if (!fb) {
+                    fb = PMONITOR->resources()->getUnusedWorkBuffer();
+                    if (!fb)
+                        return tex;
 
-                saved = fb->imageDescription();
-                fb->setImageDescription(PMONITOR->m_imageDescription);
+                    saved = fb->imageDescription();
+                    fb->setImageDescription(PMONITOR->m_imageDescription);
+                }
 
                 auto guard = g_pHyprRenderer->bindTempFB(fb);
                 GLFB(fb)->clearAfterInvalidation();
@@ -855,13 +865,55 @@ void CHyprOpenGLImpl::end() {
                 return fb->getTexture();
             };
 
-            auto srcTex = TEX;
-            if (NEEDS_CM)
-                srcTex = RESOLVEPASS(srcTex, cmFB, cmDesc); // the colour conversion (source description != the monitor's)
-            if (HAS_FINAL_SHADER)
-                srcTex = RESOLVEPASS(srcTex, shaderFB, shaderDesc); // the screen shader (source description IS the monitor's)
+            // research/24 §3.3's producer table, decided by what the frame actually drew: the panes
+            // differ only if a stereo-declared window was cropped into this composite (WP S1). An
+            // ordinary desktop on a stereo output — the overwhelmingly common frame — takes the
+            // floor: ONE composite, blitted into every pane.
+            const bool PER_EYE = m_renderData.stereoContentDrawn && PMONITOR->stereoPaneCount() > 1;
 
+            // re-run this frame's pass with the next eye, back into the main work buffer. Safe to
+            // overwrite: the previous pane is already in the scanout frame, and every blit is
+            // scissored to damage, so the parts of the work buffer the replay does not repaint can
+            // never reach the output. The state dance restores the composite's own conventions
+            // (monitor transform off, blending on, no final shader) and puts back the pack's.
+            const auto RECOMPOSITE = [&](int eye) {
+                const auto SAVED_DAMAGE = g_pHyprRenderer->m_renderData.damage;
+
+                g_pHyprRenderer->popMonitorTransformEnabled();
+                g_pHyprRenderer->pushMonitorTransformEnabled(false);
+                g_pHyprRenderer->bindFB(m_renderData.mainFB);
+                blend(true);
+                m_applyFinalShader = false;
+
+                m_renderData.stereoEye = eye;
+                g_pHyprRenderer->m_renderPass.replay();
+                m_renderData.stereoEye = 0;
+
+                m_applyFinalShader = !g_pHyprRenderer->m_renderData.blockScreenShader;
+                blend(false);
+                g_pHyprRenderer->bindFB(m_renderData.outFB);
+                g_pHyprRenderer->popMonitorTransformEnabled();
+                g_pHyprRenderer->pushMonitorTransformEnabled(true);
+
+                g_pHyprRenderer->m_renderData.damage      = SAVED_DAMAGE;
+                g_pHyprRenderer->m_renderData.currentWindow.reset();
+                g_pHyprRenderer->m_renderData.surface.reset();
+                g_pHyprRenderer->m_renderData.clipBox = {};
+            };
+
+            auto srcTex = TEX;
             for (int i = 0; i < PMONITOR->stereoPaneCount(); ++i) {
+                if (i == 0 || PER_EYE) {
+                    if (i > 0)
+                        RECOMPOSITE(i);
+
+                    srcTex = TEX;
+                    if (NEEDS_CM)
+                        srcTex = RESOLVEPASS(srcTex, cmFB, cmDesc); // the colour conversion (source description != the monitor's)
+                    if (HAS_FINAL_SHADER)
+                        srcTex = RESOLVEPASS(srcTex, shaderFB, shaderDesc); // the screen shader (source description IS the monitor's)
+                }
+
                 const auto DEST = PMONITOR->stereoPaneDestBox(i);
                 setViewport(DEST.x, DEST.y, DEST.width, DEST.height);
                 m_scissorOffset = {DEST.x, DEST.y};
@@ -898,9 +950,11 @@ void CHyprOpenGLImpl::end() {
     }
 
     // reset our data
-    g_pHyprRenderer->m_renderData.mouseZoomFactor   = 1.f;
-    g_pHyprRenderer->m_renderData.mouseZoomUseMouse = true;
-    g_pHyprRenderer->m_renderData.blockScreenShader = false;
+    g_pHyprRenderer->m_renderData.mouseZoomFactor      = 1.f;
+    g_pHyprRenderer->m_renderData.mouseZoomUseMouse    = true;
+    g_pHyprRenderer->m_renderData.blockScreenShader    = false;
+    g_pHyprRenderer->m_renderData.stereoEye            = 0;
+    g_pHyprRenderer->m_renderData.stereoContentDrawn   = false;
     g_pHyprRenderer->m_renderData.currentFB.reset();
     g_pHyprRenderer->m_renderData.mainFB.reset();
     g_pHyprRenderer->m_renderData.outFB.reset();
