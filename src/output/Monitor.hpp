@@ -101,6 +101,13 @@ namespace Monitor {
         uint32_t                    m_drmFormat     = DRM_FORMAT_INVALID;
         uint32_t                    m_prevDrmFormat = DRM_FORMAT_INVALID;
 
+        // Stereo output packing (research/24 §3): the mode is packed from N identical per-eye panes
+        // and everything above the final blit — logical size, transformedSize, damage ring, render
+        // resources, matrices, capture — works at PANE size. m_pixelSize stays the true mode. When
+        // STEREO_OFF, paneSize() == m_pixelSize and every pane-aware call site is bit-identical to
+        // stock. Set from the active monitor rule in applyMonitorRule/Soft (before the size derivation).
+        Config::eMonitorStereoMode  m_stereoMode = Config::STEREO_OFF;
+
         // Force this output's render swapchain to allocate LINEAR (multi-GPU-shareable) buffers.
         // Set by the OpenXR integration on a headless XR output when the XR runtime's GPU differs
         // from the buffer allocator's GPU (cross-GPU import needs linear). Honored in
@@ -223,6 +230,7 @@ namespace Monitor {
             DS_BLOCK_DMA       = (1 << 10),
             DS_BLOCK_FAILED    = (1 << 11),
             DS_BLOCK_CM        = (1 << 12),
+            DS_BLOCK_STEREO    = (1 << 13), // stereo pack: a client buffer can never be the packed scanout frame
 
             DS_CHECKS_COUNT = 14,
         };
@@ -249,8 +257,9 @@ namespace Monitor {
             SC_SURFACES     = (1 << 15),
             SC_ERRORBAR     = (1 << 16),
             SC_FADEOUT      = (1 << 17),
+            SC_STEREO       = (1 << 18), // stereo pack: never take the single-surface shortcut on a packed output
 
-            SC_CHECKS_COUNT = 18,
+            SC_CHECKS_COUNT = 19,
         };
 
         // keep in sync with HyprCtl
@@ -303,6 +312,13 @@ namespace Monitor {
         void         onCursorMovedOnMonitor();
         void         setDPMS(bool on);
         bool         shouldUseSoftwareCursors();
+
+        // stereo output (research/24 §3) — all return the trivial identity when m_stereoMode is off
+        bool         isStereo() const;
+        Vector2D     stereoPackDivisor() const; // {2,1} for sbs, {1,1} for off; F5 layouts are new divisors
+        Vector2D     paneSize() const;          // m_pixelSize / divisor, scanout orientation; == m_pixelSize when off
+        int          stereoPaneCount() const;
+        CBox         stereoPaneDestBox(int idx) const; // pane idx's destination box inside the mode-sized scanout buffer
 
         // IMonitorQueryable / IMonitorArrangeable
         virtual MONITORID                   id() const override;
@@ -400,6 +416,12 @@ namespace Monitor {
         void                    updateMatrix();
         Mat3x3                  m_projMatrix;
         Mat3x3                  m_projOutputMatrix;
+
+        // stereo output (research/24 §3.7/§3.4): mode-divisibility sanitizing + the per-monitor
+        // software-cursor lock (a hardware cursor plane would be visible to one eye only)
+        void                    sanitizeStereoMode();
+        void                    updateStereoCursorLock();
+        bool                    m_stereoSWCursorLocked = false;
 
         void                    setupDefaultWS(const Config::CMonitorRule&);
         WORKSPACEID             findAvailableDefaultWS();

@@ -15,8 +15,11 @@ eMonitorRuleComparisonResult CMonitorRule::compare(const CMonitorRule& other) co
     // A change to the lease flag flips the output between desktop and leased/offered — it needs the full
     // reconfigure path (MonitorRuleManager drives the offer↔reclaim transition), so treat it as hard.
     const auto SAME_LEASE        = other.m_lease == m_lease;
+    // Stereo changes the logical/pane size derivation, the render-resource sizes and the matrices —
+    // it needs the full applyMonitorRule path, so it is a hard prop.
+    const auto SAME_STEREO       = other.m_stereo == m_stereo;
 
-    if (!SAME_ENABLED || !SAME_LEASE || !SAME_RES || !SAME_REFRESH || !SAME_SCALE || !SAME_BITNESS || !SAME_DRM_MODELINE)
+    if (!SAME_ENABLED || !SAME_LEASE || !SAME_STEREO || !SAME_RES || !SAME_REFRESH || !SAME_SCALE || !SAME_BITNESS || !SAME_DRM_MODELINE)
         return COMPARISON_NO_MATCH;
 
     // Soft props

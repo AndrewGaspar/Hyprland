@@ -79,7 +79,11 @@ void CWLOutputResource::updateState() {
     if (m_resource->version() >= 2)
         m_resource->sendScale(std::ceil(m_monitor->m_scale));
 
-    m_resource->sendMode(WL_OUTPUT_MODE_CURRENT, m_monitor->m_pixelSize.x, m_monitor->m_pixelSize.y, m_monitor->m_refreshRate * 1000.0);
+    // stereo: advertise the PANE, not the packed mode (research/24 §3.6 item 8) — every client that
+    // reads wl_output.mode is asking "how big is the screen I draw on", and the honest answer is one
+    // pane; the packed mode would also entitle a fullscreen client to commit a full-mode buffer that
+    // direct-scanout could scan out unpacked. paneSize() == m_pixelSize when stereo is off.
+    m_resource->sendMode(WL_OUTPUT_MODE_CURRENT, m_monitor->paneSize().x, m_monitor->paneSize().y, m_monitor->m_refreshRate * 1000.0);
 
     m_resource->sendGeometry(m_monitor->m_position.x, m_monitor->m_position.y, m_monitor->m_output->physicalSize.x, m_monitor->m_output->physicalSize.y,
                              m_monitor->m_output->subpixel, m_monitor->m_output->make.c_str(), m_monitor->m_output->model.c_str(), m_monitor->m_transform);

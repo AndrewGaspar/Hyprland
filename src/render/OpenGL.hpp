@@ -322,6 +322,11 @@ namespace Render::GL {
         bool                             m_offloadedFramebuffer = false;
         bool                             m_cmSupported          = true;
 
+        // stereo pack (research/24 §3.3): while end() blits a pane into its destination box of the
+        // mode-sized scanout buffer, glScissor is in window coordinates (NOT viewport-relative), so
+        // every damage scissor must be offset by the pane's destination origin. Zero outside the pack.
+        Vector2D                         m_scissorOffset = {};
+
         SP<CShader>                      m_finalScreenShader;
         GLuint                           m_currentProgram;
 

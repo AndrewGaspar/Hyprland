@@ -113,7 +113,7 @@ void CScreenshareSession::calculateConstraints() {
 
     switch (m_type) {
         case SHARE_MONITOR:
-            m_bufferSize = PMONITOR->m_pixelSize;
+            m_bufferSize = PMONITOR->paneSize(); // stereo: capture the LOGICAL view (one pane), not the packed frame (research/24 §3.6); == m_pixelSize when off
             m_name       = PMONITOR->m_name;
             break;
         case SHARE_WINDOW:

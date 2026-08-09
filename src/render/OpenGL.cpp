@@ -732,7 +732,9 @@ void CHyprOpenGLImpl::begin(PHLMONITOR pMonitor, const CRegion& damage_, SP<IFra
 
     TRACY_GPU_ZONE("RenderBegin");
 
-    setViewport(0, 0, pMonitor->m_pixelSize.x, pMonitor->m_pixelSize.y);
+    // stereo: the pass renders ONE pane; paneSize() == m_pixelSize when off. (The work-buffer bind
+    // below re-derives the viewport per FB anyway — see CGLFramebuffer::bind.)
+    setViewport(0, 0, pMonitor->paneSize().x, pMonitor->paneSize().y);
 
     if (!m_shadersInitialized)
         initShaders();
@@ -813,7 +815,40 @@ void CHyprOpenGLImpl::end() {
         const bool HAS_FINAL_SHADER  = m_finalScreenShader->program() >= 1 || g_pHyprRenderer->m_crashingInProgress;
         const bool PRIMITIVE_BLOCKED = NEEDS_CM || HAS_FINAL_SHADER;
 
-        if LIKELY (!PRIMITIVE_BLOCKED || g_pHyprRenderer->m_renderMode != RENDER_MODE_NORMAL)
+        if UNLIKELY (PMONITOR->isStereo() && g_pHyprRenderer->m_renderMode == RENDER_MODE_NORMAL && !m_fakeFrame) {
+            // stereo pack (research/24 §3.3(i)): the composite above is ONE pane; assemble the
+            // mode-sized scanout frame with one blit per pane. The destination box is expressed as
+            // the GL viewport (the pane projection fills NDC, the viewport places it), and the
+            // damage scissors get the pane's origin added (glScissor is window-relative —
+            // m_scissorOffset). If CM or a screen shader applies, resolve it ONCE into a pane-sized
+            // work buffer, then blit the resolved pane; the panes themselves are raw copies.
+            auto             srcTex = TEX;
+            SP<IFramebuffer> tempFB;
+            NColorManagement::PImageDescription saveDesc;
+            if (PRIMITIVE_BLOCKED) {
+                tempFB   = g_pHyprRenderer->m_renderData.pMonitor->resources()->getUnusedWorkBuffer();
+                saveDesc = tempFB->imageDescription();
+                tempFB->setImageDescription(g_pHyprRenderer->m_renderData.pMonitor->m_imageDescription);
+                auto guard = g_pHyprRenderer->bindTempFB(tempFB);
+                GLFB(tempFB)->clearAfterInvalidation();
+                renderTexture(TEX, monbox, {.finalMonitorCM = true});
+                guard.reset();
+                srcTex = tempFB->getTexture();
+            }
+
+            for (int i = 0; i < PMONITOR->stereoPaneCount(); ++i) {
+                const auto DEST = PMONITOR->stereoPaneDestBox(i);
+                setViewport(DEST.x, DEST.y, DEST.width, DEST.height);
+                m_scissorOffset = {DEST.x, DEST.y};
+                renderTexturePrimitive(srcTex, monbox);
+            }
+
+            m_scissorOffset = {};
+            setViewport(0, 0, PMONITOR->m_pixelSize.x, PMONITOR->m_pixelSize.y);
+
+            if (tempFB)
+                tempFB->setImageDescription(saveDesc);
+        } else if LIKELY (!PRIMITIVE_BLOCKED || g_pHyprRenderer->m_renderMode != RENDER_MODE_NORMAL)
             renderTexturePrimitive(TEX, monbox);
         else if (NEEDS_CM && HAS_FINAL_SHADER) {
             const auto tempFB   = g_pHyprRenderer->m_renderData.pMonitor->resources()->getUnusedWorkBuffer();
@@ -999,6 +1034,7 @@ void CHyprOpenGLImpl::scissor(const CBox& originalBox, bool transform) {
         CBox       box = originalBox;
         const auto TR  = Math::wlTransformToHyprutils(Math::invertTransform(m_renderData.pMonitor->m_transform));
         box.transform(TR, m_renderData.pMonitor->m_transformedSize.x, m_renderData.pMonitor->m_transformedSize.y);
+        box.translate(m_scissorOffset); // stereo pack: nonzero only during end()'s per-pane blits
 
         if (box != m_lastScissorBox) {
             GLCALL(glScissor(box.x, box.y, box.width, box.height));
@@ -1009,9 +1045,12 @@ void CHyprOpenGLImpl::scissor(const CBox& originalBox, bool transform) {
         return;
     }
 
-    if (originalBox != m_lastScissorBox) {
-        GLCALL(glScissor(originalBox.x, originalBox.y, originalBox.width, originalBox.height));
-        m_lastScissorBox = originalBox;
+    CBox box = originalBox;
+    box.translate(m_scissorOffset); // stereo pack: nonzero only during end()'s per-pane blits
+
+    if (box != m_lastScissorBox) {
+        GLCALL(glScissor(box.x, box.y, box.width, box.height));
+        m_lastScissorBox = box;
     }
 
     setCapStatus(GL_SCISSOR_TEST, true);
@@ -1226,7 +1265,8 @@ WP<CShader> CHyprOpenGLImpl::renderToOutputInternal() {
         shader->setUniformFloat(SHADER_TIME, 0.f);
 
     shader->setUniformInt(SHADER_WL_OUTPUT, m_renderData.pMonitor->m_id);
-    shader->setUniformFloat2(SHADER_FULL_SIZE, m_renderData.pMonitor->m_pixelSize.x, m_renderData.pMonitor->m_pixelSize.y);
+    // stereo: the screen shader runs over the pane-sized composite; paneSize() == m_pixelSize when off
+    shader->setUniformFloat2(SHADER_FULL_SIZE, m_renderData.pMonitor->paneSize().x, m_renderData.pMonitor->paneSize().y);
     shader->setUniformFloat(SHADER_POINTER_INACTIVE_TIMEOUT, *PCURSORTIMEOUT);
     shader->setUniformInt(SHADER_POINTER_HIDDEN, g_pHyprRenderer->m_cursorHiddenByCondition);
     shader->setUniformInt(SHADER_POINTER_KILLING, g_pInputManager->getClickMode() == CLICKMODE_KILL);
@@ -1236,14 +1276,15 @@ WP<CShader> CHyprOpenGLImpl::renderToOutputInternal() {
 
     if (*PDT == 0) {
         PHLMONITORREF pMonitor = m_renderData.pMonitor;
+        const auto    PANE     = pMonitor->paneSize(); // stereo: shader coords live in the pane; == m_pixelSize when off
         Vector2D      p        = ((g_pInputManager->getMouseCoordsInternal() - pMonitor->m_position) * pMonitor->m_scale);
-        p                      = p.transform(Math::wlTransformToHyprutils(pMonitor->m_transform), pMonitor->m_pixelSize);
-        shader->setUniformFloat2(SHADER_POINTER, p.x / pMonitor->m_pixelSize.x, p.y / pMonitor->m_pixelSize.y);
+        p                      = p.transform(Math::wlTransformToHyprutils(pMonitor->m_transform), PANE);
+        shader->setUniformFloat2(SHADER_POINTER, p.x / PANE.x, p.y / PANE.y);
 
         std::vector<float> pressedPos = m_pressedHistoryPositions | std::views::transform([&](const Vector2D& vec) {
                                             Vector2D pPressed = ((vec - pMonitor->m_position) * pMonitor->m_scale);
-                                            pPressed          = pPressed.transform(Math::wlTransformToHyprutils(pMonitor->m_transform), pMonitor->m_pixelSize);
-                                            return std::array<float, 2>{pPressed.x / pMonitor->m_pixelSize.x, pPressed.y / pMonitor->m_pixelSize.y};
+                                            pPressed          = pPressed.transform(Math::wlTransformToHyprutils(pMonitor->m_transform), PANE);
+                                            return std::array<float, 2>{pPressed.x / PANE.x, pPressed.y / PANE.y};
                                         }) |
             std::views::join | std::ranges::to<std::vector<float>>();
 
@@ -1276,7 +1317,7 @@ WP<CShader> CHyprOpenGLImpl::renderToOutputInternal() {
 
     if (g_pHyprRenderer->m_crashingInProgress) {
         shader->setUniformFloat(SHADER_DISTORT, g_pHyprRenderer->m_crashingDistort);
-        shader->setUniformFloat2(SHADER_FULL_SIZE, m_renderData.pMonitor->m_pixelSize.x, m_renderData.pMonitor->m_pixelSize.y);
+        shader->setUniformFloat2(SHADER_FULL_SIZE, m_renderData.pMonitor->paneSize().x, m_renderData.pMonitor->paneSize().y);
     }
 
     return shader;
@@ -1803,12 +1844,13 @@ SP<IFramebuffer> CHyprOpenGLImpl::blurFramebufferWithDamage(float a, CRegion* or
         shader->setUniformMatrix3fv(SHADER_PROJ, 1, GL_TRUE, glMatrix.getMatrix());
         shader->setUniformFloat(SHADER_RADIUS, *PBLURSIZE * a); // this makes the blursize change with a
         if (frag == SH_FRAG_BLUR1) {
-            shader->setUniformFloat2(SHADER_HALFPIXEL, 0.5f / (m_renderData.pMonitor->m_pixelSize.x / 2.f), 0.5f / (m_renderData.pMonitor->m_pixelSize.y / 2.f));
+            shader->setUniformFloat2(SHADER_HALFPIXEL, 0.5f / (m_renderData.pMonitor->paneSize().x / 2.f),
+                                     0.5f / (m_renderData.pMonitor->paneSize().y / 2.f)); // stereo: blur FBs are pane-sized; == m_pixelSize when off
             shader->setUniformInt(SHADER_PASSES, BLUR_PASSES);
             shader->setUniformFloat(SHADER_VIBRANCY, *PBLURVIBRANCY);
             shader->setUniformFloat(SHADER_VIBRANCY_DARKNESS, *PBLURVIBRANCYDARKNESS);
         } else
-            shader->setUniformFloat2(SHADER_HALFPIXEL, 0.5f / (m_renderData.pMonitor->m_pixelSize.x * 2.f), 0.5f / (m_renderData.pMonitor->m_pixelSize.y * 2.f));
+            shader->setUniformFloat2(SHADER_HALFPIXEL, 0.5f / (m_renderData.pMonitor->paneSize().x * 2.f), 0.5f / (m_renderData.pMonitor->paneSize().y * 2.f));
         shader->setUniformInt(SHADER_TEX, 0);
 
         glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
@@ -2056,10 +2098,12 @@ void CHyprOpenGLImpl::renderTextureWithBlurInternal(SP<ITexture> tex, const CBox
         transformedBox.transform(Math::wlTransformToHyprutils(Math::invertTransform(m_renderData.pMonitor->m_transform)), m_renderData.pMonitor->m_transformedSize.x,
                                  m_renderData.pMonitor->m_transformedSize.y);
 
-        CBox        monitorSpaceBox = {transformedBox.pos().x / m_renderData.pMonitor->m_pixelSize.x * m_renderData.pMonitor->m_transformedSize.x,
-                                       transformedBox.pos().y / m_renderData.pMonitor->m_pixelSize.y * m_renderData.pMonitor->m_transformedSize.y,
-                                       transformedBox.width / m_renderData.pMonitor->m_pixelSize.x * m_renderData.pMonitor->m_transformedSize.x,
-                                       transformedBox.height / m_renderData.pMonitor->m_pixelSize.y * m_renderData.pMonitor->m_transformedSize.y};
+        // stereo: buffer coordinates are pane coordinates; paneSize() == m_pixelSize when off
+        const auto  PANESZ          = m_renderData.pMonitor->paneSize();
+        CBox        monitorSpaceBox = {transformedBox.pos().x / PANESZ.x * m_renderData.pMonitor->m_transformedSize.x,
+                                       transformedBox.pos().y / PANESZ.y * m_renderData.pMonitor->m_transformedSize.y,
+                                       transformedBox.width / PANESZ.x * m_renderData.pMonitor->m_transformedSize.x,
+                                       transformedBox.height / PANESZ.y * m_renderData.pMonitor->m_transformedSize.y};
 
         static auto PBLURIGNOREOPACITY = CConfigValue<Config::INTEGER>("decoration:blur:ignore_opacity");
 

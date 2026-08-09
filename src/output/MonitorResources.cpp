@@ -12,7 +12,9 @@ static const int MAX_WORK_BUFFERS   = 8;
 static const int MAX_UNUSED_SECONDS = 5;
 
 CMonitorResources::CMonitorResources(WP<CMonitor> monitor, DRMFormat format, Vector2D size, NColorManagement::PImageDescription imageDescription) :
-    m_stencilTex(g_pHyprRenderer->createStencilTexture(monitor->m_pixelSize.x, monitor->m_pixelSize.y)),
+    // stencil follows the requested resource size (the pane on a stereo monitor); it was always the
+    // same as monitor->m_pixelSize before stereo, so this is identical for ordinary monitors
+    m_stencilTex(g_pHyprRenderer->createStencilTexture(size.x, size.y)),
     m_blurFB(g_pHyprRenderer->createFB(std::format("Monitor {} blur FB", monitor->m_name))), m_monitor(monitor), m_drmFormat(format), m_size(size),
     m_imageDescription(imageDescription) {
     initFB(m_blurFB);

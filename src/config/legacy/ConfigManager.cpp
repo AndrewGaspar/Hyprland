@@ -604,6 +604,7 @@ CConfigManager::CConfigManager() {
     m_config->addSpecialConfigValue("monitorv2", "sdrbrightness", Hyprlang::FLOAT{1.0});
     m_config->addSpecialConfigValue("monitorv2", "sdrsaturation", Hyprlang::FLOAT{1.0});
     m_config->addSpecialConfigValue("monitorv2", "vrr", Hyprlang::INT{0});
+    m_config->addSpecialConfigValue("monitorv2", "stereo", {STRVAL_EMPTY}); // off | sbs (research/24 §3.10)
     m_config->addSpecialConfigValue("monitorv2", "transform", {STRVAL_EMPTY}); // TODO use correct type
     m_config->addSpecialConfigValue("monitorv2", "supports_wide_color", Hyprlang::INT{0});
     m_config->addSpecialConfigValue("monitorv2", "supports_hdr", Hyprlang::INT{0});
@@ -874,6 +875,9 @@ std::optional<std::string> CConfigManager::handleMonitorv2(const std::string& ou
     VAL = m_config->getSpecialConfigValuePtr("monitorv2", "transform", output.c_str());
     if (VAL && VAL->m_bSetByUser)
         parser.parseTransform(std::any_cast<Hyprlang::STRING>(VAL->getValue()));
+    VAL = m_config->getSpecialConfigValuePtr("monitorv2", "stereo", output.c_str());
+    if (VAL && VAL->m_bSetByUser)
+        parser.parseStereo(std::any_cast<Hyprlang::STRING>(VAL->getValue()));
 
     VAL = m_config->getSpecialConfigValuePtr("monitorv2", "supports_wide_color", output.c_str());
     if (VAL && VAL->m_bSetByUser)
@@ -1478,6 +1482,13 @@ std::optional<std::string> CConfigManager::handleMonitor(const std::string& comm
             // HypXRland XREAL V2.2: offer this named desktop output for drm-lease-v1 instead of
             // configuring it as a desktop (monado direct/XR mode). Valueless flag — no argno++ for a value.
             parser.setLease();
+        } else if (ARGS[argno] == "stereo") {
+            // stereo output packing (research/24 §3.10): `..., stereo, sbs`
+            parser.parseStereo(std::string(ARGS[argno + 1]));
+            argno++;
+        } else if (ARGS[argno].starts_with("stereo:")) {
+            // compact single-token form: `..., stereo:sbs`
+            parser.parseStereo(std::string(ARGS[argno].substr(7)));
         } else {
             Log::logger->log(Log::ERR, "Config error: invalid monitor syntax at \"{}\"", ARGS[argno]);
             return "invalid syntax at \"" + std::string(ARGS[argno]) + "\"";

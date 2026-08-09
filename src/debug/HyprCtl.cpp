@@ -138,12 +138,14 @@ static std::string availableModesForOutput(PHLMONITOR pMonitor, eHyprCtlOutputFo
 const std::array<const char*, Monitor::CMonitor::SC_CHECKS_COUNT> SOLITARY_REASONS_JSON = {
     "\"UNKNOWN\"",   "\"NOTIFICATION\"", "\"LOCK\"",      "\"WORKSPACE\"", "\"WINDOWED\"", "\"DND\"",        "\"SPECIAL\"",  "\"ALPHA\"",       "\"OFFSET\"",
     "\"CANDIDATE\"", "\"OPAQUE\"",       "\"TRANSFORM\"", "\"OVERLAYS\"",  "\"FLOAT\"",    "\"WORKSPACES\"", "\"SURFACES\"", "\"CONFIGERROR\"", "\"FADEOUT\"",
+    "\"STEREO\"",
 };
 
 const std::array<const char*, Monitor::CMonitor::SC_CHECKS_COUNT> SOLITARY_REASONS_TEXT = {
     "unknown reason",    "notification",     "session lock",     "invalid workspace", "windowed mode", "dnd active",
     "special workspace", "alpha channel",    "workspace offset", "missing candidate", "not opaque",    "surface transformations",
     "other overlays",    "floating windows", "other workspaces", "subsurfaces",       "config error",  "fadeout in progress",
+    "stereo output",
 };
 
 std::string CHyprCtl::getSolitaryBlockedReason(PHLMONITOR m, eHyprCtlOutputFormat format) {
@@ -167,12 +169,12 @@ std::string CHyprCtl::getSolitaryBlockedReason(PHLMONITOR m, eHyprCtlOutputForma
 
 const std::array<const char*, Monitor::CMonitor::DS_CHECKS_COUNT> DS_REASONS_JSON = {
     "\"UNKNOWN\"",   "\"USER\"",    "\"WINDOWED\"",  "\"CONTENT\"", "\"MIRROR\"", "\"RECORD\"", "\"SW\"",
-    "\"CANDIDATE\"", "\"SURFACE\"", "\"TRANSFORM\"", "\"DMA\"",     "\"FAILED\"", "\"CM\"",
+    "\"CANDIDATE\"", "\"SURFACE\"", "\"TRANSFORM\"", "\"DMA\"",     "\"FAILED\"", "\"CM\"",     "\"STEREO\"",
 };
 
 const std::array<const char*, Monitor::CMonitor::DS_CHECKS_COUNT> DS_REASONS_TEXT = {
     "unknown reason",    "user settings",   "windowed mode",           "content type",   "monitor mirrors",   "screen record/screenshot", "software renders/cursors",
-    "missing candidate", "invalid surface", "surface transformations", "invalid buffer", "activation failed", "color management",
+    "missing candidate", "invalid surface", "surface transformations", "invalid buffer", "activation failed", "color management",         "stereo output",
 };
 
 std::string CHyprCtl::getDSBlockedReason(PHLMONITOR m, eHyprCtlOutputFormat format) {
@@ -225,6 +227,15 @@ std::string CHyprCtl::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat format) 
     if (!m->m_output || m->m_id == -1)
         return "";
 
+    // stereo (research/24 §3.4 item 12): width/height report the presented per-eye pane (the ONE
+    // logical monitor everything above the scanout sees); the true packed scanout mode is exposed
+    // in these extra fields so the packing is discoverable. Empty (byte-identical output) when off.
+    const std::string STEREO_JSON = m->isStereo() ? std::format("\n    \"stereo\": \"{}\",\n    \"scanoutWidth\": {},\n    \"scanoutHeight\": {},",
+                                                                Config::stereoModeToString(m->m_stereoMode), sc<int>(m->m_pixelSize.x), sc<int>(m->m_pixelSize.y)) :
+                                                    "";
+    const std::string STEREO_TEXT =
+        m->isStereo() ? std::format("\n\tstereo: {} (scanout {}x{})", Config::stereoModeToString(m->m_stereoMode), sc<int>(m->m_pixelSize.x), sc<int>(m->m_pixelSize.y)) : "";
+
     if (format == eHyprCtlOutputFormat::FORMAT_JSON) {
 
         result += std::format(
@@ -252,7 +263,7 @@ std::string CHyprCtl::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat format) 
     }},
     "reserved": [{}, {}, {}, {}],
     "scale": {},
-    "transform": {},
+    "transform": {},{}
     "focused": {},
     "dpmsStatus": {},
     "vrr": {},
@@ -275,11 +286,11 @@ std::string CHyprCtl::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat format) 
 }},)#",
 
             m->m_id, escapeJSONStrings(m->m_name), escapeJSONStrings(m->m_shortDescription), escapeJSONStrings(m->m_output->make), escapeJSONStrings(m->m_output->model),
-            escapeJSONStrings(m->m_output->serial), sc<int>(m->m_pixelSize.x), sc<int>(m->m_pixelSize.y), sc<int>(m->m_output->physicalSize.x),
+            escapeJSONStrings(m->m_output->serial), sc<int>(m->paneSize().x), sc<int>(m->paneSize().y), sc<int>(m->m_output->physicalSize.x),
             sc<int>(m->m_output->physicalSize.y), m->m_refreshRate, sc<int>(m->m_position.x), sc<int>(m->m_position.y), m->activeWorkspaceID(),
             (!m->m_activeWorkspace ? "" : escapeJSONStrings(m->m_activeWorkspace->m_name)), m->activeSpecialWorkspaceID(),
             escapeJSONStrings(m->m_activeSpecialWorkspace ? m->m_activeSpecialWorkspace->m_name : ""), sc<int>(m->m_reservedArea.left()), sc<int>(m->m_reservedArea.top()),
-            sc<int>(m->m_reservedArea.right()), sc<int>(m->m_reservedArea.bottom()), m->m_scale, sc<int>(m->m_transform),
+            sc<int>(m->m_reservedArea.right()), sc<int>(m->m_reservedArea.bottom()), m->m_scale, sc<int>(m->m_transform), STEREO_JSON,
             (m == Desktop::focusState()->monitor() ? "true" : "false"), (m->m_dpmsStatus ? "true" : "false"), (m->m_output->state->state().adaptiveSync ? "true" : "false"),
             rc<uint64_t>(m->m_solitaryClient.get()), getSolitaryBlockedReason(m, format), (m->m_tearingState.activelyTearing ? "true" : "false"),
             getTearingBlockedReason(m, format), rc<uint64_t>(m->m_lastScanout.get()), getDSBlockedReason(m, format), (m->m_enabled ? "false" : "true"),
@@ -290,17 +301,17 @@ std::string CHyprCtl::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat format) 
     } else {
         result += std::format(
             "Monitor {} (ID {}):\n\t{}x{}@{:.5f} at {}x{}\n\tdescription: {}\n\tmake: {}\n\tmodel: {}\n\tphysical size (mm): {}x{}\n\tserial: {}\n\tactive workspace: {} ({})\n\t"
-            "special workspace: {} ({})\n\treserved: {} {} {} {}\n\tscale: {}\n\ttransform: {}\n\tfocused: {}\n\t"
+            "special workspace: {} ({})\n\treserved: {} {} {} {}\n\tscale: {}\n\ttransform: {}{}\n\tfocused: {}\n\t"
             "dpmsStatus: {}\n\tvrr: {}\n\tsolitary: {:x}\n\tsolitaryBlockedBy: {}\n\tactivelyTearing: {}\n\ttearingBlockedBy: {}\n\tdirectScanoutTo: "
             "{:x}\n\tdirectScanoutBlockedBy: {}\n\tdisabled: "
             "{}\n\tcurrentFormat: {}\n\tmirrorOf: "
             "{}\n\tavailableModes: {}\n\tcolorManagementPreset: {}\n\tsdrBrightness: {}\n\tsdrSaturation: {}\n\tsdrMinLuminance: {}\n\tsdrMaxLuminance: "
             "{}\n\thardwareCursorsInUse: {}\n\n",
-            m->m_name, m->m_id, sc<int>(m->m_pixelSize.x), sc<int>(m->m_pixelSize.y), m->m_refreshRate, sc<int>(m->m_position.x), sc<int>(m->m_position.y), m->m_shortDescription,
+            m->m_name, m->m_id, sc<int>(m->paneSize().x), sc<int>(m->paneSize().y), m->m_refreshRate, sc<int>(m->m_position.x), sc<int>(m->m_position.y), m->m_shortDescription,
             m->m_output->make, m->m_output->model, sc<int>(m->m_output->physicalSize.x), sc<int>(m->m_output->physicalSize.y), m->m_output->serial, m->activeWorkspaceID(),
             (!m->m_activeWorkspace ? "" : m->m_activeWorkspace->m_name), m->activeSpecialWorkspaceID(), (m->m_activeSpecialWorkspace ? m->m_activeSpecialWorkspace->m_name : ""),
             sc<int>(m->m_reservedArea.left()), sc<int>(m->m_reservedArea.top()), sc<int>(m->m_reservedArea.right()), sc<int>(m->m_reservedArea.bottom()), m->m_scale,
-            sc<int>(m->m_transform), (m == Desktop::focusState()->monitor() ? "yes" : "no"), sc<int>(m->m_dpmsStatus), m->m_output->state->state().adaptiveSync,
+            sc<int>(m->m_transform), STEREO_TEXT, (m == Desktop::focusState()->monitor() ? "yes" : "no"), sc<int>(m->m_dpmsStatus), m->m_output->state->state().adaptiveSync,
             rc<uint64_t>(m->m_solitaryClient.get()), getSolitaryBlockedReason(m, format), m->m_tearingState.activelyTearing, getTearingBlockedReason(m, format),
             rc<uint64_t>(m->m_lastScanout.get()), getDSBlockedReason(m, format), !m->m_enabled, formatToString(m->m_output->state->state().drmFormat),
             m->m_mirrorOf ? std::format("{}", m->m_mirrorOf->m_id) : "none", availableModesForOutput(m, format), (NCMType::toString(m->m_cmType)), (m->m_sdrBrightness),
