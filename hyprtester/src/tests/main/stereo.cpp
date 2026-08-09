@@ -569,6 +569,10 @@ TEST_CASE(stereoContentSecondComposite) {
 
     // the window resolves to a packed layout, so every frame from here owes a second composite
     EXPECT_CONTAINS(getFromSocket("/activewindow"), "stereo: sbs");
+    // ...and the producer says it took it. This is the assertion that the crop actually reached a
+    // drawn surface: without it the case would pass just as happily on a build where the rule
+    // resolved and the renderer ignored it.
+    ASSERT(waitForMonitorField(STEREO_MON, "stereoContent", "true"), true);
     // and it is still laid out on the PANE, not on the mode — the producer changes UVs, never boxes
     EXPECT(widthOf(activeWindowSize()) <= 1920, true);
 
@@ -581,7 +585,14 @@ TEST_CASE(stereoContentSecondComposite) {
 
     EXPECT(monitorField(STEREO_MON, "width"), std::string("1920"));
     EXPECT(monitorField(STEREO_MON, "stereo"), std::string("sbs"));
+    EXPECT(monitorField(STEREO_MON, "stereoContent"), std::string("true"));
     EXPECT(Tests::countOccurrences(getFromSocket("j/monitors"), std::string("\"name\": \"") + STEREO_MON + "\""), 1);
+
+    // and the fast path is not a claim: with the window gone the panes are identical again, so the
+    // frame goes back to one composite blitted twice (research/24 §3.3's floor)
+    Tests::killAllWindows();
+    Tests::waitUntilWindowsN(0);
+    ASSERT(waitForMonitorField(STEREO_MON, "stereoContent", "false"), true);
 }
 
 // stereoLiveToggleRestoresState — the hot-reload ordering risk.

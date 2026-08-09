@@ -1228,8 +1228,10 @@ Note that the fractional-scale validator divides the **pane**, not the mode — 
   disparity). Dropping back to `stereo:off` restores hardware cursors.
 
 `hyprctl monitors` reports both numbers so the packing is discoverable rather than a mystery —
-`width`/`height` are the presented per-eye pane, plus `stereo`, `scanoutWidth` and
-`scanoutHeight` fields (text form: `stereo: sbs (scanout 3840x1080)`).
+`width`/`height` are the presented per-eye pane, plus `stereo`, `scanoutWidth`, `scanoutHeight`
+and `stereoContent` fields (text form: `stereo: sbs (scanout 3840x1080, content mono)`).
+`stereoContent` belongs to §8.6 and is `false` here: it says whether the two panes currently
+differ, which for a packed mono desktop they do not.
 
 > **A display GUI can take the monitor out of side-by-side mode.** `wlr-output-management`'s
 > *write* path takes a resolution straight from the head's mode list with no knowledge of the
@@ -1314,7 +1316,10 @@ Two things are not guesses and skip the gate:
 - **the client's own declaration** — see below.
 
 `hyprctl clients` reports the *resolved* layout per window as `stereo`, which is how you tell
-"my rule did not match" from "my rule matched and the gate is holding it".
+"my rule did not match" from "my rule matched and the gate is holding it". And `hyprctl monitors`
+reports `stereoContent` on a stereo output — `true` while the panes actually differ, i.e. while a
+declared window is on screen and the frame is paying for a second composite. Between the two you
+can see exactly where a rule stopped.
 
 ### The tag — what a client (or a game mod) emits
 
@@ -1375,7 +1380,8 @@ the `.*` wrapping that `xrrule` lines do not.)
   cursor, which is composited into each pane at the same position.
 - **The panes cost a second composite, but only while stereo content is actually on screen.** A
   stereo output with nothing declared renders one frame and blits it into both panes; the second
-  composite starts when a declared window is drawn and stops when it is not.
+  composite starts when a declared window is drawn and stops when it is not — watch
+  `stereoContent` in `hyprctl monitors` flip as you open and close the window.
 - **No automatic detection.** Nothing inspects pixels to guess that a frame is stereo. The false
   positives are your actual desktop — a diff view, two terminals, a symmetric wallpaper — and the
   cost of a false positive is half your screen going to one eye while you are wearing it.
