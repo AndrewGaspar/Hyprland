@@ -438,31 +438,39 @@ TEST_CASE(bringActiveToTopMouseMovement) {
     ASSERT(getTopWindow(), std::string("a"));
 }
 
+// What a floating window opens at is OUR number here, not kitty's: `remember_window_size` (kitty's
+// default, yes) makes the "initial" size the size kitty last had open, which it persists to
+// ~/.cache/kitty/main.json when a window closes. Alone, this test therefore saw the stock 640x400;
+// inside the full suite — a hundred-odd kitty windows later, several of them resized — it saw
+// whatever the previous test left behind and failed. Turning that off and stating the size we want
+// keeps the assertion exact (which is the point of the test) while making it independent of both
+// the tests that ran before us and kitty's own defaults changing under us.
+static const std::vector<std::string> KITTY_PINNED_SIZE = {"-o", "remember_window_size=no", "-o", "initial_window_width=640", "-o", "initial_window_height=400"};
+static const std::string              KITTY_PINNED_SIZE_ARGV = "-o remember_window_size=no -o initial_window_width=640 -o initial_window_height=400";
+
 TEST_CASE(initialFloatSize) {
     OK(getFromSocket("/eval hl.window_rule({ match = { class = 'kitty' }, float = true })"));
     OK(getFromSocket("/eval hl.config({ input = { float_switch_override_focus = 0 } })"));
 
-    SPAWN_KITTY("kitty");
+    SPAWN_KITTY("kitty", KITTY_PINNED_SIZE);
 
     {
-        // Kitty by default opens as 640x400, if this changes this test will break
         auto str = getFromSocket("/clients");
-        EXPECT(str.contains("size: 640,400"), true);
+        EXPECT_CONTAINS(str, "size: 640,400");
     }
 
     OK(getFromSocket("/reload"));
 
     Tests::killAllWindows();
 
-    OK(getFromSocket("/dispatch hl.dsp.exec_cmd('kitty', { float = true })"));
+    OK(getFromSocket("/dispatch hl.dsp.exec_cmd('kitty " + KITTY_PINNED_SIZE_ARGV + "', { float = true })"));
 
     Tests::waitUntilWindowsN(1);
 
     {
-        // Kitty by default opens as 640x400, if this changes this test will break
         auto str = getFromSocket("/clients");
-        EXPECT(str.contains("size: 640,400"), true);
-        EXPECT(str.contains("floating: 1"), true);
+        EXPECT_CONTAINS(str, "size: 640,400");
+        EXPECT_CONTAINS(str, "floating: 1");
     }
 }
 
