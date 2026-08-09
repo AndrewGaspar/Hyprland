@@ -4,6 +4,7 @@
 #include "../../../protocols/OutputManagement.hpp"
 #include "../../../protocols/DRMLease.hpp"
 #include "../../../output/Monitor.hpp"
+#include "../../../output/StereoPacking.hpp"
 #include "../../../Compositor.hpp"
 #include "../../../render/Renderer.hpp"
 #include "../../../event/EventBus.hpp"
@@ -61,10 +62,20 @@ CMonitorRule CMonitorRuleManager::get(const PHLMONITOR PMONITOR) {
             // stereo un-stereo hazard (research/24 §3.4 item 15): a display GUI writes back a mode
             // picked from the raw mode list with no knowledge of the stereo token — silently keeping
             // the pack on a different mode would halve the desktop again (or scan out garbage).
-            // Keep stereo only if the GUI kept the configured mode; otherwise drop it loudly.
-            if (rule.m_stereo != STEREO_OFF && rule.m_resolution != Vector2D() && CONFIG->resolution != rule.m_resolution) {
-                Log::logger->log(Log::WARN, " > wlr-output-management picked mode {:.0f}x{:.0f} over the configured stereo mode {:.0f}x{:.0f} on {} — disabling stereo packing",
-                                 CONFIG->resolution.x, CONFIG->resolution.y, rule.m_resolution.x, rule.m_resolution.y, PMONITOR->m_name);
+            // Keep stereo only if the GUI kept the mode the pack was configured for; otherwise drop
+            // it loudly.
+            //
+            // That mode is NOT rule.m_resolution: that field is a mode REQUEST, so `preferred` is
+            // Vector2D() and highrr/highres/maxwidth are the (-1,-N) sentinels — comparing a real
+            // resolution against those skips the guard entirely for the first and fires it
+            // unconditionally for the rest. The mode the monitor is scanning out is the quantity
+            // that decides whether the pack is still valid; before it has ever been configured
+            // there is none, and then an explicit resolution in the rule is the mode it is about
+            // to get. Both are "no opinion" when unset, which modeIsAsRequested() reads as keep.
+            const Vector2D PACKMODE = PMONITOR->m_pixelSize.x > 0 ? PMONITOR->m_pixelSize : rule.m_resolution;
+            if (rule.m_stereo != STEREO_OFF && !Monitor::Stereo::modeIsAsRequested(CONFIG->resolution, PACKMODE)) {
+                Log::logger->log(Log::WARN, " > wlr-output-management picked mode {:.0f}x{:.0f} over the stereo mode {:.0f}x{:.0f} on {} — disabling stereo packing",
+                                 CONFIG->resolution.x, CONFIG->resolution.y, PACKMODE.x, PACKMODE.y, PMONITOR->m_name);
                 rule.m_stereo = STEREO_OFF;
             }
 
