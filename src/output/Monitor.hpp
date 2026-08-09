@@ -331,6 +331,10 @@ namespace Monitor {
         // (nothing on this output is raised, so both panes are the same image), 2 is the producer
         // running. Surfaced in `hyprctl monitors`; otherwise invisible from outside the process.
         bool depthIsAnimating() const; // any view on this output easing between depth tiers
+        // ...and its counterpart for the depth change that never eases at all (animations off, a
+        // `noanim` rule): the setter books a full repaint, because an AVARDAMAGE_NONE var that
+        // warps produces neither an animation to watch nor any damage of its own.
+        void bookDepthRepaint();
         int  m_stereoComposites = 1;
 
         // IMonitorQueryable / IMonitorArrangeable

@@ -464,6 +464,13 @@ void CLayerSurface::updateDepth(bool warp) {
 
     const float GOAL = Desktop::Depth::resolve(OVERRIDE, Desktop::Depth::layerTier(TIERS, m_layer));
 
+    // research/24 §6.3, exactly as for a window: the var damages nothing, so the setter books the
+    // repaint. See CWindow::updateDepth.
+    if (GOAL != m_depth->goal() || GOAL != m_depth->value()) {
+        if (const auto MON = m_monitor.lock())
+            MON->bookDepthRepaint();
+    }
+
     if (warp)
         m_depth->setValueAndWarp(GOAL);
     else
