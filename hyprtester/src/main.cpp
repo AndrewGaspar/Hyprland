@@ -19,6 +19,7 @@
 #include "shared.hpp"
 #include "hyprctlCompat.hpp"
 #include "SafeKill.hpp"
+#include "RuntimeIsolation.hpp"
 #include "tests/main/tests.hpp"
 #include "tests/clients/tests.hpp"
 #include "tests/misc/tests.hpp"
@@ -80,7 +81,12 @@ namespace {
 
 static SP<CProcess> hyprlandProc;
 
-static bool         launchHyprland(Path configPath, Path binaryPath, const std::vector<std::pair<std::string, std::string>>& env = {}, bool headlessOnly = true) {
+// The run's private $XDG_RUNTIME_DIR (RuntimeIsolation.hpp). Engaged before anything is launched
+// or enumerated, released — with the directory — when the process ends, including the std::exit()
+// in runTests() below, since static destructors still run there.
+static Harness::CRuntimeIsolation g_isolation;
+
+static bool                       launchHyprland(Path configPath, Path binaryPath, const std::vector<std::pair<std::string, std::string>>& env = {}, bool headlessOnly = true) {
     NLog::yellow("Launching Hyprland");
     hyprlandProc = makeShared<CProcess>(binaryPath, std::vector<std::string>{"--config", configPath});
     if (headlessOnly)
@@ -100,11 +106,13 @@ static bool hyprlandAlive() {
 
 // The instance registered by the Hyprland WE spawned, or nullopt.
 //
-// instances() enumerates every compositor in $XDG_RUNTIME_DIR/hypr — on a developer box that
-// includes the live desktop session the run was launched from. Taking instances().back() means
-// "the newest lock file", which is only our instance as long as ours registered at all: if the
-// Hyprland under test dies before writing its lock (or is slower than the 10s grace below), the
-// newest lock is the developer's LIVE session, and every getFromSocket() that follows — the
+// instances() enumerates every compositor in $XDG_RUNTIME_DIR/hypr. With the isolation engaged
+// that directory holds nothing but our own spawn — but this function predates it and stays as
+// defence in depth, because it is cheap and because it is the layer that still holds if the
+// isolation is ever bypassed. Taking instances().back() would mean "the newest lock file", which
+// is only our instance as long as ours registered at all: if the Hyprland under test dies before
+// writing its lock (or is slower than the 10s grace below), the newest lock in a SHARED runtime
+// dir is the developer's LIVE session, and every getFromSocket() that follows — the
 // preTestCleanup window/layer kills, `/plugin load`, the closing `/dispatch exit` — is aimed at
 // their desktop. Match on the pid in the lock instead, so a missing instance fails the run
 // loudly rather than quietly retargeting it.
@@ -114,13 +122,16 @@ static std::optional<SInstanceData> ourInstance() {
 
     // Belt to the pid match's braces: whatever we pick, it must not be the compositor this run was
     // launched from. A test run addressing its own parent session is never anything but a bug.
-    const char* PARENTHIS = std::getenv("HYPRLAND_INSTANCE_SIGNATURE");
+    // The signature is read from the isolation, which captured it before clearing it out of the
+    // environment — clearing it is what stops children inheriting the session's identity, and this
+    // check is why the value is kept rather than dropped.
+    const std::string PARENTHIS = g_isolation.engaged() ? g_isolation.hostInstanceSignature() : Harness::envOr("HYPRLAND_INSTANCE_SIGNATURE");
 
-    const auto  OURPID = static_cast<uint64_t>(hyprlandProc->pid());
+    const auto        OURPID = static_cast<uint64_t>(hyprlandProc->pid());
     for (const auto& i : instances()) {
         if (i.pid != OURPID)
             continue;
-        if (PARENTHIS && i.id == PARENTHIS) {
+        if (!PARENTHIS.empty() && i.id == PARENTHIS) {
             NLog::red("refusing to drive instance {}: it is the compositor hyprtester was launched from", i.id);
             return std::nullopt;
         }
@@ -252,8 +263,12 @@ static STestsRunResult runTests(std::vector<std::shared_ptr<CTestCase>>& testCas
         if (!preTestCleanup(nonLuaConfig)) { // damn it, something really went wrong
             if (nonLuaConfig) {
                 NLog::red("pre-test cleanup failed; continuing (best-effort)");
-            } else
+            } else {
+                // std::exit still runs static destructors, so the isolation is released — keep its
+                // directory, since the compositor log in it is the only account of what happened.
+                g_isolation.preserve();
                 std::exit(1);
+            }
         }
 
         NLog::log("{}Running test {}", Colors::BLUE, tc->name());
@@ -322,18 +337,15 @@ static int runXrSuite(const SSettings& settings) {
     static CMonadoOrchestrator orchestrator;
     static CRemoteClient       remote;
 
-    // Isolated-but-shared XDG_RUNTIME_DIR for BOTH monado and Hyprland (docs §3.1).
-    // We create it and point our own env at it so getFromSocket()/instances() also
-    // resolve against it (they read $XDG_RUNTIME_DIR live).
-    const std::string origRuntimeDir = getenv("XDG_RUNTIME_DIR") ? getenv("XDG_RUNTIME_DIR") : "";
-    const std::string origWayland    = getenv("WAYLAND_DISPLAY") ? getenv("WAYLAND_DISPLAY") : "";
-    const std::string runDir         = "/tmp/hyprtester-xr-" + std::to_string(getpid());
+    // Isolated-but-shared XDG_RUNTIME_DIR for BOTH monado and Hyprland (docs §3.1) — the same
+    // CRuntimeIsolation the ordinary path uses, at a fixed, greppable name because the container
+    // runner collects every surviving /tmp/hyprtester-xr-* as a failure artifact.
+    if (!g_isolation.engage("/tmp/hyprtester-xr-" + std::to_string(getpid()))) {
+        NLog::red("XR: could not create an isolated run dir");
+        return 1;
+    }
 
-    std::error_code   ec;
-    std::filesystem::remove_all(runDir, ec);
-    std::filesystem::create_directories(runDir, ec);
-    chmod(runDir.c_str(), 0700);
-    setenv("XDG_RUNTIME_DIR", runDir.c_str(), 1);
+    const std::string runDir = g_isolation.dir();
 
     XR::g_ctx.runId      = std::format("xr-{}-{}", getpid(), sc<long long>(std::time(nullptr)));
     XR::g_ctx.runtimeDir = runDir;
@@ -383,27 +395,20 @@ static int runXrSuite(const SSettings& settings) {
 
     // --- Bring up Hyprland. First try the stock headless-only path in the isolated
     // runtime dir; if that fails to come up, fall back to nesting under the host
-    // Wayland session (symlink its socket in) — nested startup is occasionally racy,
-    // so retry it. (See WP2 notes / docs §6 caveat.)
+    // Wayland session — the ONE thing this run takes from the developer's session, and it is
+    // taken explicitly: the isolation cleared WAYLAND_DISPLAY out of the environment, so the
+    // host's socket has to be symlinked into the private dir and the variable handed back to the
+    // child by name. Nested startup is occasionally racy, so retry it.
+    // (See WP2 notes / docs §6 caveat.)
     bool up = launchHyprland(launchConfig, settings.binaryPath, hlEnv, /*headlessOnly*/ true) && waitForHyprlandInstance(15);
 
     if (!up) {
         NLog::yellow("XR: stock headless launch did not come up; trying nested-Wayland fallback");
         killHyprlandProc();
 
-        if (!origRuntimeDir.empty() && !origWayland.empty()) {
-            for (const std::string suffix : {std::string(""), std::string(".lock")}) {
-                const std::string src = origRuntimeDir + "/" + origWayland + suffix;
-                const std::string dst = runDir + "/" + origWayland + suffix;
-                std::filesystem::remove(dst, ec);
-                if (std::filesystem::exists(src))
-                    std::filesystem::create_symlink(src, dst, ec);
-            }
-        }
-
         auto nestedEnv = hlEnv;
-        if (!origWayland.empty())
-            nestedEnv.emplace_back("WAYLAND_DISPLAY", origWayland);
+        if (const auto WLNAME = g_isolation.linkHostWaylandSocket(); !WLNAME.empty())
+            nestedEnv.emplace_back("WAYLAND_DISPLAY", WLNAME);
 
         for (int attempt = 0; attempt < 2 && !up; ++attempt) {
             NLog::yellow("XR: nested launch attempt {}", attempt + 1);
@@ -416,7 +421,7 @@ static int runXrSuite(const SSettings& settings) {
     if (!up) {
         NLog::red("XR: Hyprland failed to launch in both headless and nested modes");
         orchestrator.teardown(true);
-        NLog::red("XR: run dir preserved: {}", runDir);
+        g_isolation.preserve();
         return 1;
     }
 
@@ -432,8 +437,7 @@ static int runXrSuite(const SSettings& settings) {
                 NLog::red("ERROR: Unknown test name '{}'", t);
                 killHyprlandProc();
                 orchestrator.teardown(false);
-                std::filesystem::remove_all(runDir, ec);
-                return EXIT_FAILURE;
+                return EXIT_FAILURE; // the isolation takes its directory with it
             }
         }
     } else
@@ -456,9 +460,8 @@ static int runXrSuite(const SSettings& settings) {
         NLog::red("Failed tests:");
         for (const auto& n : result.failedNames)
             NLog::red("\t- {}", n);
-        NLog::red("XR: run dir preserved for inspection: {}", runDir);
-    } else
-        std::filesystem::remove_all(runDir, ec);
+        g_isolation.preserve();
+    }
 
     return anyFailed ? 1 : 0;
 }
@@ -502,9 +505,32 @@ int main(int argc, char** argv, char** envp) {
     // classic monitor= / monitorv2 front-ends (research/24 §3.10).
     const bool NONLUACONFIG = settings.configPath.extension() != ".lua";
 
+    // Give the run its own $XDG_RUNTIME_DIR before anything is launched or enumerated
+    // (RuntimeIsolation.hpp). Everything downstream — the compositor we spawn, the instance
+    // discovery below, getFromSocket(), the kitties and the hyprctl the tests invoke — resolves
+    // the runtime dir from the environment, so from here on the developer's live session is not
+    // in the registry this process can see. It is not "avoided"; it is not there.
+    if (!g_isolation.engage()) {
+        NLog::red("failed to create an isolated XDG_RUNTIME_DIR — refusing to run in the session's");
+        return 1;
+    }
+
+    NLog::yellow("isolated run dir: {}", g_isolation.dir());
+
+    // The one thing a run legitimately borrows from the session it was launched in: something for
+    // Aquamarine to display on when neither DRM nor headless can come up (see
+    // CRuntimeIsolation::linkHostWaylandSocket). Empty on a tty or in CI, where nothing is
+    // borrowed at all.
+    std::vector<std::pair<std::string, std::string>> hlEnv;
+    if (const auto WLNAME = g_isolation.linkHostWaylandSocket(); !WLNAME.empty()) {
+        NLog::yellow("nesting under the session's Wayland socket ({}), plumbed in explicitly", WLNAME);
+        hlEnv.emplace_back("WAYLAND_DISPLAY", WLNAME);
+    }
+
     NLog::yellow("launching hl");
-    if (!launchHyprland(settings.configPath, settings.binaryPath)) {
+    if (!launchHyprland(settings.configPath, settings.binaryPath, hlEnv)) {
         NLog::red("well it failed");
+        g_isolation.preserve();
         return 1;
     }
 
@@ -513,6 +539,7 @@ int main(int argc, char** argv, char** envp) {
     NLog::yellow("slept for 10s");
     if (!hyprlandAlive()) {
         NLog::red("Hyprland failed to launch!");
+        g_isolation.preserve();
         return 1;
     }
 
@@ -522,6 +549,7 @@ int main(int argc, char** argv, char** envp) {
     if (!OURS) {
         NLog::red("Hyprland failed to launch (2): the spawned compositor (pid {}) registered no instance", hyprlandProc->pid());
         Safe::signalPid(hyprlandProc->pid(), SIGKILL);
+        g_isolation.preserve();
         return 1;
     }
 
@@ -533,6 +561,7 @@ int main(int argc, char** argv, char** envp) {
     if (CREATE_HEADLESS_2 != "ok" && CREATE_HEADLESS_2 != "Name already taken") {
         NLog::red("Failed to create HEADLESS-2: {}", CREATE_HEADLESS_2);
         getFromSocket("/dispatch hl.dsp.exit()");
+        g_isolation.preserve();
         return 1;
     }
 
@@ -540,6 +569,7 @@ int main(int argc, char** argv, char** envp) {
     if (const auto R = getFromSocket(std::format("/plugin load {}", settings.pluginPath.string())); R != "ok") {
         NLog::red("Failed to load the test plugin: {}", R);
         getFromSocket("/dispatch hl.dsp.exit()");
+        g_isolation.preserve();
         return 1;
     }
 
@@ -548,6 +578,12 @@ int main(int argc, char** argv, char** envp) {
     STestsRunResult result = runTests(requestedTestCases, NONLUACONFIG);
 
     cleanupAndReport(result, NONLUACONFIG);
+
+    // A clean run leaves nothing behind; a failed one keeps its dir, because the compositor log
+    // inside it is the only record of the failure now that it no longer lands in the session's
+    // runtime dir.
+    if (!result.failedNames.empty())
+        g_isolation.preserve();
 
     return result.failedNames.size() > 0;
 }

@@ -17,6 +17,11 @@ inside a rootless-podman container with its own GPU, network namespace, and vend
 is the preferred, reproducible way to run the suite, because it touches no host sockets and can
 run alongside a live desktop session.
 
+Every `hyprtester` invocation — `--xr` and the ordinary suite alike — runs in a **private
+`$XDG_RUNTIME_DIR`**, so a run launched from inside a live Hyprland session cannot see, address
+or tear down that session. That is §3.1, and it is the one part of this page that is not
+XR-specific.
+
 Behavior under test is specified in the sibling docs: the session/graphics lifecycle (00, 01),
 virtual monitors (02), anchoring math (03), input (04), and the IPC/config surface — the
 `hyprctl openxr` JSON schema and event names every integration assertion parses — in the
@@ -57,6 +62,13 @@ including the header under test by its `src/`-relative path). Coverage as it sta
 
 These are the compile-time and pure-logic guarantees. Anything that needs a live session — real
 device poses, swapchain import, focus routing, teardown — belongs to the integration tier.
+
+The same binary also carries the **harness self-tests**, which include `hyprtester/src/*.hpp`
+directly so that the test harness's own safety properties are checked by the unit tier instead of
+by running the harness: `tests/helpers/HarnessSafeKill.cpp` (no signal may be a broadcast; a
+`/layers` reply really can carry `pid: -1`) and `tests/helpers/HarnessRuntimeIsolation.cpp` (an
+engaged run cannot enumerate a live session's instance registry; teardown restores the
+environment exactly and refuses to remove anything it did not create — §3.1).
 
 ---
 
@@ -112,7 +124,8 @@ the `--xr` flag. Under `--xr`, `main.cpp`'s `runXrSuite()`:
 Aquamarine's headless backend in a seatless sandbox (rootless podman, some CI). `runXrSuite()`
 handles this: it tries the headless launch first, and on failure symlinks the host's Wayland
 socket into the isolated run directory and relaunches **nested** inside the host's Wayland
-session (a few retries). Under the nested fallback Aquamarine names the base output `WAYLAND-1`
+session (a few retries) — both halves explicit, since the isolation clears `WAYLAND_DISPLAY` out
+of the environment and the fallback hands it back to the child by name (§3.1). Under the nested fallback Aquamarine names the base output `WAYLAND-1`
 rather than the `HEADLESS-1` from `xr-test.conf`'s `monitor =` line, so tests never hard-code the
 base monitor's name; every XR monitor a test creates is backend-independent.
 
@@ -154,8 +167,8 @@ orchestrator reports unavailable and the suite skips.
 The run directory is isolated-but-shared: a fresh per-run dir set as `XDG_RUNTIME_DIR` for both
 `monado-service` and the launched Hyprland (shared so the OpenXR client finds Monado's socket at
 `$XDG_RUNTIME_DIR/monado_comp_ipc`; isolated so a developer's real session is never touched and
-concurrent runs can't collide). The service's stdout/stderr are captured to a log for artifact
-dumps.
+concurrent runs can't collide — §3.1). The service's stdout/stderr are captured to a log for
+artifact dumps.
 
 **Readiness** (`pollReadiness`, 100 ms poll, 10 s timeout, both conditions): a `connect()` to the
 `monado_comp_ipc` unix socket succeeds, and a TCP `connect()` to `127.0.0.1:4242` — the remote
@@ -172,6 +185,72 @@ This matters on dual-GPU boxes — see §8.
 **Teardown**: `SIGTERM` → wait up to 3 s → `SIGKILL` + reap. The run directory is removed unless a
 test failed (then it is kept, with its path printed, for inspection). Teardown runs even when
 tests fail.
+
+### 3.1 The isolated run directory — for both `hyprtester` paths
+
+Hyprland discovery is keyed entirely off `$XDG_RUNTIME_DIR`: a compositor registers itself as
+`$XDG_RUNTIME_DIR/hypr/<signature>/` (lock file, IPC sockets, log), and `hyprtester` enumerates
+exactly that directory to decide which compositor it is driving. Run the suite from inside a live
+session with the session's runtime dir and both compositors are in the same registry — so a
+compositor that dies before registering, a slow lock write, or any "newest instance wins"
+shortcut aims the harness at the developer's desktop. On 2026-08-09 that happened: a run selected
+`instances().back()`, which was the live session.
+
+The fix has two layers, and both are load-bearing:
+
+- **Guard** (`hyprtester/src/SafeKill.hpp`): no signal is ever sent to a non-positive pid (kill(2)
+  reads those as *broadcasts*), and `ourInstance()` matches the compositor by the pid hyprtester
+  spawned, refusing an instance whose signature is the session hyprtester was launched from.
+- **Structure** (`hyprtester/src/RuntimeIsolation.hpp`): the run gets its **own**
+  `$XDG_RUNTIME_DIR`, so the live session is not in the registry the process can read at all. The
+  guard catches the mistake; the isolation removes the possibility.
+
+`CRuntimeIsolation::engage()` creates the directory (mode 0700), points **this process** at it,
+and that is the whole plumb: hyprtester resolves the runtime dir from the environment on every
+IPC call, and Hyprutils' `CProcess` hands our environment to every child, so the compositor under
+test, its kitties and clients, and any `hyprctl` a test invokes all land in the private dir.
+
+| Path | Directory | Why that shape |
+|---|---|---|
+| ordinary suite | `mkdtemp` at `/tmp/ht-<pid>-XXXXXX` | unguessable, collision-free, and **short** — see the budget below |
+| `--xr` | `/tmp/hyprtester-xr-<pid>` (fixed) | the container runner collects surviving `/tmp/hyprtester-xr-*` dirs as failure artifacts |
+
+**Why not nest the private dir inside the real `$XDG_RUNTIME_DIR`.** `AF_UNIX`'s `sun_path` is 108
+bytes, and Hyprland has spent nearly all of it before the runtime dir gets a say:
+`<runtimeDir>/hypr/<40-char commit>_<10-digit time>_<10-digit random>/.socket2.sock` leaves exactly
+**25 characters** for the runtime dir. `/run/user/1000` is 14 of them, so
+`/run/user/1000/ht-<pid>-XXXXXX` overflows — the compositor then logs `Socket2 path is too long.
+(2) IPC will not work.` and `HyprCtl`'s `snprintf` silently *truncates* the command socket, i.e. a
+compositor the harness cannot talk to. (Observed, not theorised: it is what the first run of this
+isolation did.) `CRuntimeIsolation` keeps the arithmetic (`MAX_RUNTIME_DIR_LEN`,
+`worstCaseSocketPathLen`) and warns when a directory it is handed does not fit.
+
+**Lifetime**: released when the process ends — including the `std::exit()` inside `runTests()`,
+since static destructors still run there. A clean run leaves nothing behind. A failed run
+(launch failure, plugin load failure, any failing test) calls `preserve()` and prints the path,
+because the compositor log inside it is now the only record of what happened. Teardown itself is
+guarded (`safeToRemove`): only an absolute path carrying the name we gave it, and never the
+host's runtime dir, is ever removed.
+
+**What crosses the boundary.** Anything the run needs from the real session is handed over by
+name; nothing is relied on by inheritance:
+
+| Variable | Treatment | Reason |
+|---|---|---|
+| `XDG_RUNTIME_DIR` | **replaced** with the private dir | the isolation itself; captured so teardown can restore it |
+| `HYPRLAND_INSTANCE_SIGNATURE` | **captured, then unset** | no child may inherit the developer's session identity. The captured value is kept because `ourInstance()` uses it for its "never drive the compositor we were launched from" check |
+| `WAYLAND_DISPLAY` | **captured, then unset** | inside the private dir it names a socket that isn't there. Silently keeping it is how a client that forgets to set its own would connect to the *live* session; unsetting makes that fail loudly instead |
+| `WAYLAND_DISPLAY` (compositor under test) | host socket symlinked into the private dir + explicit `addEnv` from `linkHostWaylandSocket()` | **the one thing a run legitimately borrows.** Aquamarine's Wayland backend is the `FALLBACK` for when DRM is unavailable, which is every run launched from inside a graphical session: libseat cannot take the seat the live compositor holds, and headless alone does not come up (`CBackend::create() failed!`). The suite has always nested there — silently, on an inherited variable and a shared runtime dir. Now it nests explicitly, or not at all: on a tty or in CI there is no host socket, nothing is linked, and DRM/headless carries the run |
+| `WAYLAND_DISPLAY` (per test client) | explicit `addEnv("WAYLAND_DISPLAY", WLDISPLAY)` | every test client connects to the compositor under test, whose socket name came from **its** lock file (`wayland-2` when the host's `wayland-1` is symlinked in and therefore taken) |
+| `HYPRLAND_INSTANCE_SIGNATURE` (hyprctl tests) | explicit `addEnv(…, HIS)` | `hyprctl` resolves `$XDG_RUNTIME_DIR/hypr/$HIS` — isolated dir inherited, signature named |
+| `XR_RUNTIME_JSON`, `XRT_*`, `HYPRTESTER_*`, `VK_DRIVER_FILES` | explicit `addEnv` (§3) | XR knobs, already explicit |
+| everything else (`PATH`, `DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `XDG_*`, …) | inherited unchanged | none of them is a compositor-discovery channel — no IPC command can be routed by them. `DBUS_SESSION_BUS_ADDRESS` holds an absolute socket path, so children can still reach the host's session bus; that is deliberate (nothing in the suite needs a bus, and the compositor under test only uses it for portals/logind, which are inert in a headless run) |
+
+**No escape hatch.** There is deliberately no `--no-isolate` flag: nothing needs the shared
+directory. The container runners only ever invoke `--xr` (which was already isolated), and the
+NixOS CI VM (`nix/tests/default.nix`) runs the ordinary suite as `alice` with
+`XDG_RUNTIME_DIR=/tmp` and no live session, so it simply gets a private dir under `/tmp`. A flag
+that re-enables the failure mode would only ever be used by accident.
 
 ---
 

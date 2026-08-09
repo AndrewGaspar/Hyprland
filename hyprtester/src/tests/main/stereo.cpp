@@ -310,7 +310,7 @@ namespace {
 
         ~SWindowClient() {
             if (proc && Tests::processAlive(proc->pid()))
-                kill(proc->pid(), SIGTERM);
+                Safe::signalPid(proc->pid(), SIGTERM);
             if (stdinWrite >= 0)
                 close(stdinWrite);
         }
@@ -1546,8 +1546,8 @@ TEST_CASE(stereoDepthStaysFlatOnARotatedOutput) {
     getFromSocket(std::format("/output remove {}", STEREO_MON));
 
     // 90° — the transposing case, where the disparity axis would be the panel's vertical one
-    OK(getFromSocket(std::format("/eval hl.monitor({{ output = '{}', mode = '{}', position = 'auto-right', scale = '1', stereo = 'sbs', transform = 1 }})", STEREO_MON,
-                                 STEREO_MODE)));
+    OK(getFromSocket(
+        std::format("/eval hl.monitor({{ output = '{}', mode = '{}', position = 'auto-right', scale = '1', stereo = 'sbs', transform = 1 }})", STEREO_MON, STEREO_MODE)));
     OK(getFromSocket(std::format("/output create headless {}", STEREO_MON)));
 
     CScopeGuard guard = {[&]() {
@@ -1586,8 +1586,8 @@ TEST_CASE(stereoDepthStaysFlatOnARotatedOutput) {
     EXPECT(waitForMonitorField(STEREO_MON, "stereoComposites", "1"), true);
 
     // === 2. ...and the same desktop composites twice the moment the transform is normal ===
-    OK(getFromSocket(std::format("/eval hl.monitor({{ output = '{}', mode = '{}', position = 'auto-right', scale = '1', stereo = 'sbs', transform = 0 }})", STEREO_MON,
-                                 STEREO_MODE)));
+    OK(getFromSocket(
+        std::format("/eval hl.monitor({{ output = '{}', mode = '{}', position = 'auto-right', scale = '1', stereo = 'sbs', transform = 0 }})", STEREO_MON, STEREO_MODE)));
 
     ASSERT(waitForMonitorField(STEREO_MON, "transform", "0"), true);
     EXPECT(monitorField(STEREO_MON, "width"), std::string("1920"));

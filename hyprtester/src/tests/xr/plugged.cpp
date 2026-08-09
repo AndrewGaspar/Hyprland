@@ -94,7 +94,9 @@ namespace {
             if (m_proc) {
                 std::string cmd = "exit\n";
                 write(m_writeFd.get(), cmd.c_str(), cmd.length());
-                kill(m_proc->pid(), SIGKILL); // tracked PID only — never by name
+                // tracked PID only — never by name, and never a non-positive pid: an unstarted
+                // CProcess answers -1, which kill(2) reads as "every process we may signal".
+                Safe::signalPid(m_proc->pid(), SIGKILL);
                 m_proc.reset();
             }
         }
@@ -146,9 +148,7 @@ TEST_CASE(xr_plugged_follow_session) {
 
     // (a) session up => the declared fixture is PLUGGED: in the default j/monitors list, and
     //     status reports plugged: true.
-    ASSERT(XR::waitForJson(
-               "j/monitors", [](const std::string& r) { return r.contains("\"name\": \"XR-conf-a\""); }, std::chrono::milliseconds(10000)),
-           true);
+    ASSERT(XR::waitForJson("j/monitors", [](const std::string& r) { return r.contains("\"name\": \"XR-conf-a\""); }, std::chrono::milliseconds(10000)), true);
     {
         const std::string status = getFromSocket("j/openxr");
         const auto        posA   = XR::findAfter(status, "\"name\": \"XR-conf-a\"");
@@ -189,9 +189,7 @@ TEST_CASE(xr_plugged_follow_session) {
     std::unique_ptr<CPluggedClient> client;
     try {
         client = std::make_unique<CPluggedClient>("XR-conf-a");
-    } catch (const std::exception& e) {
-        NLog::yellow("xr_plugged_follow_session: no windowed client ({}) — running the round-trip without the workspace-return check", e.what());
-    }
+    } catch (const std::exception& e) { NLog::yellow("xr_plugged_follow_session: no windowed client ({}) — running the round-trip without the workspace-return check", e.what()); }
     const int windowsWithClient = Tests::windowCount();
 
     // (c) UNPLUG: stop the session. The declared monitors must leave the default monitor list
@@ -199,10 +197,10 @@ TEST_CASE(xr_plugged_follow_session) {
     ASSERT(getFromSocket("/openxr disable"), std::string("ok"));
     ASSERT(XR::waitForXrState("disabled", std::chrono::milliseconds(10000)), true);
 
-    ASSERT(XR::waitForJson(
-               "j/monitors", [](const std::string& r) { return !r.contains("\"name\": \"XR-conf-a\"") && !r.contains("\"name\": \"XR-conf-b\""); },
-               std::chrono::milliseconds(10000)),
-           true);
+    ASSERT(
+        XR::waitForJson(
+            "j/monitors", [](const std::string& r) { return !r.contains("\"name\": \"XR-conf-a\"") && !r.contains("\"name\": \"XR-conf-b\""); }, std::chrono::milliseconds(10000)),
+        true);
 
     // Lingering-but-disabled in `monitors all` (research/18 §5 — same as `monitor=...,disable`).
     {
@@ -237,8 +235,7 @@ TEST_CASE(xr_plugged_follow_session) {
     ASSERT(XR::waitForXrState("focused", std::chrono::milliseconds(15000)) || XR::waitForXrState("visible", std::chrono::milliseconds(2000)), true);
 
     ASSERT(XR::waitForJson(
-               "j/monitors", [](const std::string& r) { return r.contains("\"name\": \"XR-conf-a\"") && r.contains("\"name\": \"XR-conf-b\""); },
-               std::chrono::milliseconds(10000)),
+               "j/monitors", [](const std::string& r) { return r.contains("\"name\": \"XR-conf-a\"") && r.contains("\"name\": \"XR-conf-b\""); }, std::chrono::milliseconds(10000)),
            true);
     {
         const std::string status = getFromSocket("j/openxr");
@@ -359,9 +356,7 @@ TEST_CASE(xr_plugged_create_while_sessionless) {
     // Session start plugs it in.
     ASSERT(getFromSocket("/openxr enable"), std::string("ok"));
     ASSERT(XR::waitForXrState("focused", std::chrono::milliseconds(15000)) || XR::waitForXrState("visible", std::chrono::milliseconds(2000)), true);
-    ASSERT(XR::waitForJson(
-               "j/monitors", [&](const std::string& r) { return r.contains("\"name\": \"" + mon + "\""); }, std::chrono::milliseconds(10000)),
-           true);
+    ASSERT(XR::waitForJson("j/monitors", [&](const std::string& r) { return r.contains("\"name\": \"" + mon + "\""); }, std::chrono::milliseconds(10000)), true);
     {
         const std::string status = getFromSocket("j/openxr");
         const auto        pos    = XR::findAfter(status, "\"name\": \"" + mon + "\"");
@@ -371,9 +366,7 @@ TEST_CASE(xr_plugged_create_while_sessionless) {
 
     ASSERT(getFromSocket("/openxr destroy " + mon), std::string("ok"));
     guard.monitorName.clear();
-    ASSERT(XR::waitForJson(
-               "j/monitors", [&](const std::string& r) { return !r.contains("\"name\": \"" + mon + "\""); }, std::chrono::milliseconds(10000)),
-           true);
+    ASSERT(XR::waitForJson("j/monitors", [&](const std::string& r) { return !r.contains("\"name\": \"" + mon + "\""); }, std::chrono::milliseconds(10000)), true);
 
     NLog::green("xr_plugged_create_while_sessionless: sessionless create came up unplugged; session start plugged it in");
 }
@@ -412,9 +405,7 @@ TEST_CASE(xr_plugged_survives_monitor_refresh) {
     // Unplug: stop the session so XR-conf-a is held disabled.
     ASSERT(getFromSocket("/openxr disable"), std::string("ok"));
     ASSERT(XR::waitForXrState("disabled", std::chrono::milliseconds(10000)), true);
-    ASSERT(XR::waitForJson(
-               "j/monitors all", [](const std::string& r) { return r.contains("\"name\": \"XR-conf-a\""); }, std::chrono::milliseconds(10000)),
-           true);
+    ASSERT(XR::waitForJson("j/monitors all", [](const std::string& r) { return r.contains("\"name\": \"XR-conf-a\""); }, std::chrono::milliseconds(10000)), true);
     {
         const std::string all  = getFromSocket("j/monitors all");
         const auto        posA = XR::findAfter(all, "\"name\": \"XR-conf-a\"");
