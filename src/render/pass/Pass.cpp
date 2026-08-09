@@ -209,7 +209,7 @@ CRegion CRenderPass::render(const CRegion& damage_) {
 
 CRegion CRenderPass::replay() {
     for (auto& el : m_passElements) {
-        if (el.discard)
+        if (el.discard || !el.element->replayable())
             continue;
 
         g_pHyprRenderer->m_renderData.damage = el.elementDamage;

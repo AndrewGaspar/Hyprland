@@ -27,7 +27,13 @@ namespace Render {
         //
         // Deliberately reuses render()'s simplify/blur decisions and its per-element damage — the
         // eye changes UVs, never geometry — and deliberately does NOT re-discard: presentFeedback
-        // for an invisible surface is a per-frame protocol event, not a per-composite one.
+        // for an invisible surface is a per-frame protocol event, not a per-composite one. Elements
+        // whose output is a per-frame side effect rather than paint (IPassElement::replayable() ==
+        // false, i.e. the pre-blur) are skipped for the same reason.
+        //
+        // The caller owes it the composite's own GL conventions (see CHyprOpenGLImpl::end()) and
+        // must suppress surface feedback for the duration: this is the same frame, so every frame
+        // callback and presentation feedback the first composite sent has already been sent.
         CRegion replay();
 
       private:
