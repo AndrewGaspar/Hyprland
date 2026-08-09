@@ -110,6 +110,51 @@ TEST(StereoPacking, modeDividesSbsRejectsOddWidth) {
     EXPECT_FALSE(modeDivides({0, 0}, STEREO_SBS));       // degenerate mode, never a stereo output
 }
 
+// --- the second sanitize predicate: the pack must be on the mode it was configured for ---
+//
+// (§3.4 item 15.) Divisibility is not enough: a 3840x1080 SBS pack on a display that fell back to
+// 2560x1440 divides perfectly and is still one eye's half stretched across the panel. Both the
+// applyMonitorRule sanitizer and the wlr-output-management write-back guard ask this predicate,
+// which is what keeps them from disagreeing. The mode REQUEST forms it has to survive are the ones
+// Parser.cpp produces — Vector2D() for `preferred`, (-1,-1)/(-1,-2)/(-1,-3) for
+// highrr/highres/maxwidth — none of which is a resolution (see tests/config/MonitorParser.cpp,
+// which drives the same predicate with values from the real parser).
+
+TEST(StereoPacking, modeIsAsRequestedExplicitResolutionIsAContract) {
+    EXPECT_TRUE(modeIsAsRequested({3840, 1080}, {3840, 1080}));
+    EXPECT_FALSE(modeIsAsRequested({2560, 1440}, {3840, 1080})); // the fallback landed elsewhere
+    EXPECT_FALSE(modeIsAsRequested({1920, 1080}, {3840, 1080})); // ... including on the pane itself
+    // an explicit request is checked against the mode even when the search reported no fallback:
+    // the custom-mode retry and the requestedModes loop can both land off-request quietly
+    EXPECT_FALSE(modeIsAsRequested({2560, 1440}, {3840, 1080}, false));
+}
+
+TEST(StereoPacking, modeIsAsRequestedPreferredHasNoModeToCompare) {
+    // `preferred` asks for whatever the display prefers, so any committed mode is as requested...
+    EXPECT_TRUE(modeIsAsRequested({3840, 1080}, Vector2D()));
+    EXPECT_TRUE(modeIsAsRequested({2560, 1440}, Vector2D()));
+    // ... unless the search gave up on the request entirely and took any mode it could commit
+    EXPECT_FALSE(modeIsAsRequested({2560, 1440}, Vector2D(), true));
+}
+
+TEST(StereoPacking, modeIsAsRequestedSentinelsAreNotResolutions) {
+    // highrr / highres / maxwidth. Comparing a real mode against these would be false forever,
+    // which would drop the pack on every stereo output configured with one of them.
+    for (const auto& SENTINEL : {Vector2D(-1, -1), Vector2D(-1, -2), Vector2D(-1, -3)}) {
+        EXPECT_TRUE(modeIsAsRequested({3840, 1080}, SENTINEL)) << SENTINEL.x << "," << SENTINEL.y;
+        EXPECT_FALSE(modeIsAsRequested({3840, 1080}, SENTINEL, true)) << SENTINEL.x << "," << SENTINEL.y;
+    }
+}
+
+TEST(StereoPacking, modeIsAsRequestedGuardsAModeWriteBack) {
+    // the wlr-output-management shape: a GUI writes a mode over a monitor that is already packed.
+    const Vector2D COMMITTED = {3840, 1080};
+    EXPECT_TRUE(modeIsAsRequested(COMMITTED, COMMITTED));            // the GUI kept the mode
+    EXPECT_FALSE(modeIsAsRequested({1920, 1080}, COMMITTED));        // it picked the pane's size
+    EXPECT_FALSE(modeIsAsRequested({2560, 1440}, COMMITTED));        // or anything else
+    EXPECT_TRUE(modeIsAsRequested({2560, 1440}, Vector2D()));        // nothing committed yet, no opinion
+}
+
 // --- the derivation: stereo:off must be bit-identical to the stock expression ---
 
 TEST(StereoPacking, deriveGeometryOffIsBitIdenticalToStock) {
