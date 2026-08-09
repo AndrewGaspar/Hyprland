@@ -95,6 +95,9 @@ namespace Render {
         // takes the depth of whatever it is over (§5.4, and Daydream's "same depth as or nearer
         // than the object it is over", §8.2 item 3).
         Vector2D cursorDepthOffset(const PHLMONITOR& monitor);
+        // The depth it takes, i.e. the hovered view's — public so the tests and the damage path
+        // read the same answer the render path does.
+        float cursorDepth();
 
         // ...and this is its eye-AGNOSTIC twin, for damage and visibility. Both panes exist in the
         // same frame, so anything asking "where might this be drawn" must cover [−s, +s] — a
@@ -102,6 +105,7 @@ namespace Render {
         // Takes an explicit monitor because damage is computed outside any render pass.
         double depthDamageSpread(const PHLWINDOW& window, const PHLMONITOR& monitor);
         double depthDamageSpread(const PHLLS& layer, const PHLMONITOR& monitor);
+        double cursorDepthDamageSpread(const PHLMONITOR& monitor);
 
         // §6.4.1: is anything on this monitor actually off the wallpaper plane? False means the
         // two panes are the same image and one composite is enough — the default, and the whole
