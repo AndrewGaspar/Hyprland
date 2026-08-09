@@ -14,6 +14,8 @@
 #include "../managers/fullscreen/FullscreenController.hpp"
 #include "../desktop/view/Window.hpp"
 #include "../desktop/view/LayerSurface.hpp"
+#include "../desktop/view/Popup.hpp"
+#include "../desktop/view/Subsurface.hpp"
 #include "../desktop/view/GlobalViewMethods.hpp"
 #include "../desktop/state/FocusState.hpp"
 #include "../desktop/state/FadingOutState.hpp"
@@ -273,6 +275,46 @@ static CBox viewBoxLocal(const PHLWINDOW& window, const PHLMONITOR& monitor) {
 
 static CBox viewBoxLocal(const PHLLS& layer, const PHLMONITOR& monitor) {
     return CBox{layer->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT) - monitor->m_position, layer->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT)};
+}
+
+// Which TOP-LEVEL view carries the depth a given view is drawn at. Depth is a property of the
+// toplevel and of nothing below it: renderWindow folds the disparity into renderdata.pos before it
+// walks the surface tree and before it walks the popups, so every subsurface and every popup is
+// composited at its owner's shift. Anything reasoning about where a surface might land — damage,
+// above all — has to ask the same question, and asking `CWindow::fromView` alone answers "no
+// depth" for a menu or an OSD, which is how a stale sliver gets left along their edges.
+static void depthOwnerOf(const SP<Desktop::View::IView>& view, PHLWINDOW& windowOut, PHLLS& layerOut) {
+    if (!view)
+        return;
+
+    switch (view->type()) {
+        case Desktop::View::VIEW_TYPE_WINDOW: windowOut = Desktop::View::CWindow::fromView(view); return;
+        case Desktop::View::VIEW_TYPE_LAYER_SURFACE: layerOut = Desktop::View::CLayerSurface::fromView(view); return;
+        case Desktop::View::VIEW_TYPE_POPUP: {
+            // a popup carries its T1 owner directly, and a nested popup inherits its parent's pair
+            const auto POPUP = Desktop::View::CPopup::fromView(view);
+            if (!POPUP)
+                return;
+            windowOut = POPUP->windowOwner();
+            layerOut  = POPUP->layerOwner();
+            return;
+        }
+        case Desktop::View::VIEW_TYPE_SUBSURFACE: {
+            // ...and every node of a subsurface tree carries the same T1 owner (or the popup that
+            // does), so this recurses exactly once
+            const auto SUB = Desktop::View::CSubsurface::fromView(view);
+            if (!SUB)
+                return;
+            if (const auto WIN = SUB->windowParent()) {
+                windowOut = WIN;
+                return;
+            }
+            if (const auto POPUP = SUB->popupParent())
+                depthOwnerOf(POPUP.lock(), windowOut, layerOut);
+            return;
+        }
+        default: return;
+    }
 }
 
 Vector2D IHyprRenderer::depthRenderOffset(const PHLWINDOW& window) {
@@ -2986,11 +3028,17 @@ void IHyprRenderer::damageSurface(SP<CWLSurfaceResource> pSurface, double x, dou
     // ±disparity. Windows are also covered by damageWindow(), but a layer surface has no such
     // path — a raised bar repainting itself has to widen its own damage or the other pane keeps
     // the stale pixels. Resolved once here, not per monitor, because the view does not change.
-    const auto VIEW     = WLSURF->view();
-    const auto DEPTHWIN = VIEW ? Desktop::View::CWindow::fromView(VIEW) : nullptr;
-    const auto DEPTHLS  = VIEW && !DEPTHWIN ? Desktop::View::CLayerSurface::fromView(VIEW) : nullptr;
+    //
+    // The view asked is the TOP-LEVEL one, not this surface's: renderWindow folds the disparity
+    // into renderdata.pos before the subsurface walk and before the popup walk, so a menu, an OSD
+    // or a video plane is composited at ±shift exactly like the toplevel it belongs to — and a
+    // commit that only widened damage for VIEW_TYPE_WINDOW / VIEW_TYPE_LAYER_SURFACE would leave a
+    // stale sliver along every subsurface edge.
+    PHLWINDOW DEPTHWIN;
+    PHLLS     DEPTHLS;
+    depthOwnerOf(WLSURF->view(), DEPTHWIN, DEPTHLS);
 
-    CRegion    damageBoxForEach;
+    CRegion   damageBoxForEach;
 
     for (auto const& m : State::monitorState()->monitors()) {
         if (!m->m_output)
