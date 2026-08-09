@@ -224,7 +224,7 @@ TEST_CASE(layersFollowAMonitorMovedByAnotherMonitorGoingAway) {
     layerProc->runAsync();
     CScopeGuard layerGuard = {[&]() {
         if (layerProc && Tests::processAlive(layerProc->pid()))
-            kill(layerProc->pid(), SIGTERM);
+            Safe::signalPid(layerProc->pid(), SIGTERM);
     }};
 
     bool        layerUp = false;

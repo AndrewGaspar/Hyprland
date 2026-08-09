@@ -111,7 +111,7 @@ CClient::~CClient() {
     write(m_writeFd.get(), cmd.c_str(), cmd.length());
 
     if (m_proc)
-        kill(m_proc->pid(), SIGKILL);
+        Safe::signalPid(m_proc->pid(), SIGKILL);
 }
 
 std::string CClient::command(const std::string& command) {
