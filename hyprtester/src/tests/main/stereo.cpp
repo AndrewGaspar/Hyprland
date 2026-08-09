@@ -31,12 +31,19 @@ using namespace Hyprutils::Utils;
 // indistinguishable from a build without the feature.
 //
 // Runs fully headless on the host: no container, no XR runtime, no kitty (the window client is
-// the in-tree hyprtester/clients/xdg-interactive, the output dump is clients/output-info).
+// the in-tree hyprtester/clients/xdg-interactive, the output dump is clients/output-info, the
+// pixel readback is clients/screencopy-crop).
 //
-// Known gap (§3.12): hyprtester has no pixel readback, so "the two panes hold the same image" is
-// not asserted here. The damage assertion below is the closest structural proxy — it proves the
-// compositor submitted both halves — and the pane geometry itself is unit-tested in
-// tests/output/StereoPacking.cpp.
+// What is NOT asserted here, precisely (§3.12): the packed scanout frame itself. Every capture
+// protocol is deliberately sized at the PANE (ScreenshareSession sizes SHARE_MONITOR at
+// paneSize(), §3.6 — stereoRegionCaptureIsACrop asserts exactly that), so no client can ever see
+// the two-pane buffer; the only readers of it are the display and the DRM commit. That leaves the
+// blit loop in CHyprOpenGLImpl::end() — and the m_scissorOffset it installs — without pixel
+// coverage. The damage-fold assertion below is NOT a proxy for it: the fold lives in
+// CHyprRenderer (Renderer.cpp foldPaneDamage) and would still pass if the blit loop wrote
+// nothing. Closing that gap needs an in-process readback of the output framebuffer (a hook in the
+// test plugin) or a nested compositor whose scanout buffer is a client surface; the pane geometry
+// the loop and the fold share is unit-tested in tests/output/StereoPacking.cpp.
 //
 // The config front-ends split across two runs: this file's `hl.monitor{ stereo = ... }` covers the
 // Lua one, and stereoLegacyConfigFrontEnds (below) covers the classic monitor= / monitorv2 syntax
@@ -385,7 +392,9 @@ TEST_CASE(stereoSbsOneLogicalMonitor) {
     // === 5. the damage fold reached both halves of the scanout buffer (§3.4 item 6) ===
     //
     // Pane damage is bounded by the pane (1920). Anything wider can only come from the fold, so
-    // this is positive proof rather than a smoke test. Without it the right eye freezes.
+    // this is positive proof that CHyprRenderer folded the damage — without it the right eye
+    // freezes. It says nothing about the blit loop that fills the halves (see the file header):
+    // the fold is computed and submitted whether or not end() drew anything.
     //
     // Polled, and nudged with a full re-render each round: the log is written by the compositor
     // asynchronously, and a headless monitor only repaints when something damages it.
@@ -504,7 +513,12 @@ TEST_CASE(stereoRegionCaptureIsACrop) {
         if (!DUMP.contains("result ok"))
             NLog::log("{}screencopy-crop on {} said:\n{}", Colors::YELLOW, monitor, DUMP);
 
-        // the monitor capture is the LOGICAL view — one pane, never the packed frame (§3.6)
+        // The monitor capture is the LOGICAL view — one pane, never the packed frame (§3.6). This is
+        // also the only assertion on the advertised capture SIZE (§3.4 item 14, "one fix, four
+        // protocols"): wlr-screencopy is the one capture protocol with an in-tree client, and the
+        // size it is told comes from CScreenshareSession's SHARE_MONITOR buffer sizing, which
+        // ext-image-copy-capture, the screenshot portal and grim all reach through the same
+        // CScreenshareSession — untested here only for want of clients, not for want of a fix.
         EXPECT_CONTAINS(DUMP, "full 1920x1080");
         EXPECT_CONTAINS(DUMP, std::format("region {}x{}", CROP_W, CROP_H));
         // a flat capture would make the comparison below vacuous
