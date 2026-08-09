@@ -5,6 +5,8 @@
 #include <desktop/rule/layerRule/LayerRuleEffectContainer.hpp>
 #include <output/StereoPacking.hpp>
 
+#include <hyprutils/math/Region.hpp>
+
 #include <gtest/gtest.h>
 
 #include <cmath>
@@ -469,6 +471,118 @@ TEST(DepthTiers, integerRoundingWouldCollapseTheLadder) {
     // all, which is exactly the "everything between 0 and 0.3 looks identical" §8.1 warns about
     EXPECT_LT(SHIFT(0.2F), 1.F);
     EXPECT_GT(SHIFT(0.2F), 0.F);
+}
+
+// ---------------------------------------------------------------- the sub-pixel seam itself
+
+// The test above says the ARITHMETIC needs sub-pixel. This says the EXPRESSION the renderer runs to
+// keep it does — Desktop::Depth::roundKeepingDisparity, called from IElementRenderer::drawSurface
+// and from every decoration that frames a window (border, inner glow, shadow, group bar).
+//
+// It exists because hyprtester cannot see this: stereoDepthDisparityMovesTheWindow runs at
+// `depth_scale = 0.30`, where the shift is 9.45 px and a whole-pixel quantisation error is a
+// twentieth of what is being measured. The regime where the seam is LOAD-BEARING is the shipped
+// one — 0.61 px unfocused, 1.91 px focused — and replacing the call with a plain CBox::round()
+// fails right here instead.
+TEST(DepthTiers, theSubPixelSeamKeepsTwoNearbyRungsApart) {
+    constexpr Depth::SGeometry GEO   = {};
+    const auto                 SHIFT = [&](float d) { return sc<double>(Depth::paneShiftPx(d, 0.12F, GEO, 1920.F, 0)); };
+
+    // two shipped-regime rungs whose shifts share an integer part — 0.61 px and 0.93 px
+    const double LOW = SHIFT(0.2F), HIGH = SHIFT(0.3F);
+    ASSERT_FLOAT_EQ(std::round(LOW), std::round(HIGH)); // the precondition the seam exists for
+
+    const auto PLACED = [&](double shift) {
+        CBox box{100.0 + shift, 50.0, 500.0, 400.0}; // an integer-aligned element, disparity folded in
+        Depth::roundKeepingDisparity(box, shift);
+        return box;
+    };
+
+    // the two rungs land in two different places, by exactly the difference between their shifts
+    EXPECT_NEAR(PLACED(HIGH).x - PLACED(LOW).x, HIGH - LOW, 1e-9);
+    EXPECT_GT(std::abs(PLACED(HIGH).x - PLACED(LOW).x), 0.2);
+
+    // ...and the element is still pixel-crisp: what was rounded is the box MINUS the disparity, so
+    // the surface keeps the exact grid alignment it had with no depth at all
+    for (const double SHIFTPX : {LOW, HIGH}) {
+        const auto BOX = PLACED(SHIFTPX);
+        EXPECT_FLOAT_EQ(BOX.x - SHIFTPX, 100.0);
+        EXPECT_FLOAT_EQ(BOX.w, 500.0);
+    }
+
+    // a fractional element still rounds — the seam moves the rounding, it does not remove it
+    CBox ugly{100.4 + HIGH, 50.6, 500.3, 400.2};
+    Depth::roundKeepingDisparity(ugly, HIGH);
+    EXPECT_FLOAT_EQ(ugly.x - HIGH, 100.0);
+    EXPECT_FLOAT_EQ(ugly.y, 51.0);
+
+    // and with no disparity it IS CBox::round(), which is what keeps the mono path bit-identical
+    CBox mono{100.4, 50.6, 500.3, 400.2}, plain = mono;
+    Depth::roundKeepingDisparity(mono, 0.0);
+    EXPECT_EQ(mono, plain.round());
+}
+
+// The other half of the seam, and the one that would show as §6.1's severe artifact: the scissor.
+// A sub-pixel box on its way into pixman is TRUNCATED (pixman_region32_init_rect takes int32), so
+// scissoring to the box itself clips the column the rasteriser does cover — a one-pixel background
+// sliver down a vertical edge, in ONE eye. rasterCover() rounds outward instead.
+TEST(DepthTiers, theScissorCoversTheSubPixelColumnTheRasteriserDraws) {
+    // 101.906 is a focused window at the shipped defaults: GL covers pixel centres 102.5..601.5,
+    // i.e. columns 102..601, while the truncated rect is (101, w 500) — columns 101..600.
+    const CBox SHIFTED{101.906, 50.0, 500.0, 400.0};
+    const CBox COVER = Depth::rasterCover(SHIFTED);
+
+    EXPECT_FLOAT_EQ(COVER.x, 101.0);
+    EXPECT_FLOAT_EQ(COVER.x + COVER.w, 602.0); // the rightmost column the draw can touch
+    EXPECT_GE(COVER.w, SHIFTED.w);
+
+    // the truncating conversion loses that column; the cover keeps it
+    EXPECT_FALSE(CRegion(SHIFTED).containsPoint({601, 60}));
+    EXPECT_TRUE(CRegion(COVER).containsPoint({601, 60}));
+
+    // the right eye leans the other way and loses the LEFT column instead — same defect, other edge
+    const CBox LEANLEFT{98.094, 50.0, 500.0, 400.0};
+    EXPECT_FLOAT_EQ(Depth::rasterCover(LEANLEFT).x, 98.0);
+
+    // on a whole-pixel box — every box on an ordinary monitor — it is the identity
+    const CBox WHOLE{100.0, 50.0, 500.0, 400.0};
+    EXPECT_EQ(Depth::rasterCover(WHOLE), WHOLE);
+}
+
+// ...and the mirror image, which is the half that is easy to get backwards. A box SUBTRACTED from a
+// draw region — a border's inner cutout (OpenGL.cpp renderBorder), a shadow's window cutout — must
+// round INWARD. Truncation rounds such a hole outward, which eats a column the shader would have
+// drawn: on a 1080-tall window that is a full-height 1 px gap in the border, in ONE eye, which is
+// §6.1's rivalry case again. Rounding a subtracted box inward only ever costs overdraw the shader
+// discards, so the direction is free to be conservative and must be.
+TEST(DepthTiers, theCutoutRoundsInwardSoTheRingKeepsItsColumn) {
+    // the inner edge of a border around the same focused window, disparity and all
+    const CBox HOLE{101.906, 50.0, 500.0, 400.0};
+    const CBox INNER = Depth::rasterInner(HOLE);
+
+    EXPECT_FLOAT_EQ(INNER.x, 102.0);               // ceil, not trunc
+    EXPECT_FLOAT_EQ(INNER.x + INNER.w, 601.0);     // floor of the right edge
+    EXPECT_LE(INNER.w, HOLE.w);                    // a hole never grows
+
+    // the column at x=101 is NOT subtracted, so the ring keeps it; truncation would have taken it
+    EXPECT_TRUE(CRegion(HOLE).containsPoint({101, 60}));
+    EXPECT_FALSE(CRegion(INNER).containsPoint({101, 60}));
+
+    // it is strictly inside the cover, which is the invariant the two together have to satisfy:
+    // whatever is scissored IN must never be smaller than what is punched OUT
+    const CBox COVER = Depth::rasterCover(HOLE);
+    EXPECT_LE(COVER.x, INNER.x);
+    EXPECT_GE(COVER.x + COVER.w, INNER.x + INNER.w);
+
+    // identity on a whole-pixel box, so the mono path is untouched here too
+    const CBox WHOLE{100.0, 50.0, 500.0, 400.0};
+    EXPECT_EQ(Depth::rasterInner(WHOLE), WHOLE);
+
+    // and a box thinner than a pixel collapses rather than going negative — CBox with a negative
+    // width would invert the subtraction and punch a hole somewhere else entirely
+    const CBox SLIVER = Depth::rasterInner(CBox{10.4, 10.4, 0.2, 0.2});
+    EXPECT_GE(SLIVER.w, 0.0);
+    EXPECT_GE(SLIVER.h, 0.0);
 }
 
 // ---------------------------------------------------------------- rule parse

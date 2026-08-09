@@ -10,6 +10,7 @@
 #include "../Renderer.hpp"
 #include "../WindowRenderPresentation.hpp"
 #include "../OpenGL.hpp"
+#include "../../desktop/DepthTiers.hpp"
 
 CHyprInnerGlowDecoration::CHyprInnerGlowDecoration(PHLWINDOW pWindow) : IHyprWindowDecoration(pWindow), m_window(pWindow) {
     ;
@@ -124,8 +125,11 @@ void CHyprInnerGlowDecoration::render(Render::CRenderContext& ctx, PHLMONITOR pM
 
     CBox       windowBox = {m_lastWindowPos.x, m_lastWindowPos.y, m_lastWindowSize.x, m_lastWindowSize.y};
     // research/24 §6.2 injection point 1: the depth disparity rides in beside the floating offset
-    windowBox.translate(-pMonitor->m_position + presentation.workspaceOffset + presentation.floatingOffset + g_pHyprRenderer->depthRenderOffset(PWINDOW));
-    windowBox.scale(pMonitor->m_scale).round();
+    const auto DEPTHOFFSET = g_pHyprRenderer->depthRenderOffset(PWINDOW);
+    windowBox.translate(-pMonitor->m_position + presentation.workspaceOffset + presentation.floatingOffset + DEPTHOFFSET);
+    windowBox.scale(pMonitor->m_scale);
+    // §8.1's seam, shared with the surface this glow rims — see roundKeepingDisparity
+    Desktop::Depth::roundKeepingDisparity(windowBox, DEPTHOFFSET.x * pMonitor->m_scale);
 
     if (windowBox.width < 1 || windowBox.height < 1)
         return;

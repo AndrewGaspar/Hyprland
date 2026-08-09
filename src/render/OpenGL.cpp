@@ -20,6 +20,7 @@
 #include "../config/ConfigValue.hpp"
 #include "../config/ConfigManager.hpp"
 #include "../pointer/PointerManager.hpp"
+#include "../desktop/DepthTiers.hpp"
 #include "../desktop/view/LayerSurface.hpp"
 #include "../desktop/state/FocusState.hpp"
 #include "../protocols/LayerShell.hpp"
@@ -2160,9 +2161,15 @@ void CHyprOpenGLImpl::renderBorder(CRenderContext& ctx, const CBox& box, const C
     glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
 
     // calculate the border's region, which we need to render over. No need to run the shader on
-    // things outside there
-    CRegion borderRegion = ctx.m_data.damage.copy().intersect(newBox);
-    borderRegion.subtract(innerBox.copy().expand(-scaledBorderSize - round));
+    // things outside there.
+    //
+    // research/24 §8.1: with the stereo depth producer running, `box` carries a SUB-PIXEL disparity
+    // and both of these boxes become fractional on their way into pixman, which takes int32. The
+    // outer one must round outward or the ring loses the column the shader does cover; the inner
+    // one must round inward or the hole eats it instead. Untouched on a whole-pixel box, which is
+    // every box on an ordinary monitor.
+    CRegion borderRegion = ctx.m_data.damage.copy().intersect(Desktop::Depth::rasterCover(newBox));
+    borderRegion.subtract(Desktop::Depth::rasterInner(innerBox.copy().expand(-scaledBorderSize - round)));
 
     if (ctx.m_data.clipBox.width != 0 && ctx.m_data.clipBox.height != 0)
         borderRegion.intersect(ctx.m_data.clipBox);
@@ -2246,9 +2253,15 @@ void CHyprOpenGLImpl::renderBorder(CRenderContext& ctx, const CBox& box, const C
     glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
 
     // calculate the border's region, which we need to render over. No need to run the shader on
-    // things outside there
-    CRegion borderRegion = ctx.m_data.damage.copy().intersect(newBox);
-    borderRegion.subtract(innerBox.copy().expand(-scaledBorderSize - round));
+    // things outside there.
+    //
+    // research/24 §8.1: with the stereo depth producer running, `box` carries a SUB-PIXEL disparity
+    // and both of these boxes become fractional on their way into pixman, which takes int32. The
+    // outer one must round outward or the ring loses the column the shader does cover; the inner
+    // one must round inward or the hole eats it instead. Untouched on a whole-pixel box, which is
+    // every box on an ordinary monitor.
+    CRegion borderRegion = ctx.m_data.damage.copy().intersect(Desktop::Depth::rasterCover(newBox));
+    borderRegion.subtract(Desktop::Depth::rasterInner(innerBox.copy().expand(-scaledBorderSize - round)));
 
     if (ctx.m_data.clipBox.width != 0 && ctx.m_data.clipBox.height != 0)
         borderRegion.intersect(ctx.m_data.clipBox);
@@ -2348,9 +2361,12 @@ void CHyprOpenGLImpl::renderRoundedShadow(CRenderContext& ctx, const CBox& box, 
                 CBox scaledWindowBox = WINDOWBOX.value();
 
                 // research/24 §6.2 injection point 1: the blur cutout follows the raised window
-                scaledWindowBox.translate(presentation.workspaceOffset + presentation.floatingOffset + g_pHyprRenderer->depthRenderOffset(PWINDOW));
+                const auto DEPTHOFFSET = g_pHyprRenderer->depthRenderOffset(PWINDOW);
+                scaledWindowBox.translate(presentation.workspaceOffset + presentation.floatingOffset + DEPTHOFFSET);
                 scaledWindowBox.translate(-m_renderData.pMonitor->m_position);
-                scaledWindowBox.scale(m_renderData.pMonitor->m_scale).round();
+                scaledWindowBox.scale(m_renderData.pMonitor->m_scale);
+                // §8.1's seam: the cutout is the WINDOW's outline, so it quantises with the window
+                Desktop::Depth::roundKeepingDisparity(scaledWindowBox, DEPTHOFFSET.x * m_renderData.pMonitor->m_scale);
                 m_renderData.renderModif.applyToBox(scaledWindowBox);
 
                 const auto cutoutTopLeft     = scaledWindowBox.pos() - newBox.pos();
@@ -2363,7 +2379,9 @@ void CHyprOpenGLImpl::renderRoundedShadow(CRenderContext& ctx, const CBox& box, 
                 shader->setUniformFloat2(SHADER_WINDOW_BOTTOM_RIGHT, sc<float>(cutoutBottomRight.x), sc<float>(cutoutBottomRight.y));
                 shader->setUniformFloat(SHADER_THICK, cutoutRadius);
 
-                drawRegion.subtract(scaledWindowBox.copy().expand(-sc<int>(std::round(cutoutRadius))));
+                // rounded INWARD: a subtracted box that truncates outward punches a column out of
+                // the shadow the shader would have drawn (see renderBorder)
+                drawRegion.subtract(Desktop::Depth::rasterInner(scaledWindowBox.copy().expand(-sc<int>(std::round(cutoutRadius)))));
             }
         }
     }

@@ -16,6 +16,8 @@
 // WP D1 shipped the ladder; WP D2 added the §8.1 half below it — the producer that turns a rung
 // into pixels of horizontal disparity. Everything here is still a pure function of its arguments.
 
+#include <hyprutils/math/Box.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -25,6 +27,8 @@
 #include <optional>
 
 namespace Desktop::Depth {
+
+    using CBox = Hyprutils::Math::CBox;
 
     // The wallpaper plane and the ceiling. Depth is deliberately one-sided: §8.2 point 2 (Shibata
     // et al.) measured crossed (toward-viewer) disparities as the more comfortable direction, so
@@ -174,5 +178,55 @@ namespace Desktop::Depth {
     // needs the element's box and therefore lives at the call site).
     inline float paneShiftPx(float depth, float depthScale, const SGeometry& geo, float panePixels, int paneIdx) {
         return eyeSign(paneIdx) * damageSpreadPx(depth, depthScale, geo, panePixels);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // §8.1's sub-pixel seam — the number-one implementation risk the design named — as ONE
+    // expression that everything drawing a raised element runs: the surface AND every decoration
+    // that frames it.
+    // ---------------------------------------------------------------------------------------
+
+    // BOX is in buffer pixels with SHIFTPX (same units) already folded into its x. Rounding it as
+    // it stands would quantise the disparity to whole pixels, and the whole ladder is single-digit
+    // pixels wide: at the shipped defaults 0.61 px (depth 0.2) and 0.93 px (depth 0.3) are two
+    // different rungs and the same integer. So round on the UN-SHIFTED grid — which leaves the
+    // element exactly as pixel-crisp as it was with no depth at all — and put the fraction back
+    // afterwards. Linear filtering renders it.
+    //
+    // Every drawer runs THIS rather than a copy of it, because a window whose surface slides
+    // sub-pixel while its border snaps to whole pixels has a frame that no longer sits at its
+    // content's depth: 0.5 px of relative error against a ~3 px foveal step budget is a large
+    // fraction of a rung, and it shimmers along the edge for the whole ease.
+    inline CBox& roundKeepingDisparity(CBox& box, double shiftPx) {
+        if (shiftPx == 0.0)
+            return box.round();
+
+        box.x -= shiftPx;
+        box.round();
+        box.x += shiftPx;
+        return box;
+    }
+
+    // ...and the integer footprint such a box actually rasterises into. CBox → CRegion truncates
+    // (pixman_region32_init_rect takes int32), so a scissor built from a fractional box is one
+    // column short on the side the fraction leans toward and clips away the element's own last
+    // pixel column — a one-pixel background sliver along a vertical edge, visible to ONE eye,
+    // which is precisely §6.1's severe case (retinal rivalry). Round the scissor OUTWARD instead.
+    // On an already-integer box this is the identity, so the mono path is untouched.
+    inline CBox rasterCover(const CBox& box) {
+        const double X1 = std::floor(box.x), Y1 = std::floor(box.y);
+        const double X2 = std::ceil(box.x + box.w), Y2 = std::ceil(box.y + box.h);
+        return CBox{X1, Y1, X2 - X1, Y2 - Y1};
+    }
+
+    // ...and its mirror image, for a box that is SUBTRACTED from a draw region rather than
+    // intersected with it — a border's inner cutout, a shadow's window cutout. There, truncation
+    // rounds the hole OUTWARD, which punches a column out of the ring that the shader would have
+    // drawn: on a 1080-tall window that is a full-height 1 px stripe of missing border, visible in
+    // one eye. Rounding a subtracted box inward only ever costs overdraw the shader discards.
+    inline CBox rasterInner(const CBox& box) {
+        const double X1 = std::ceil(box.x), Y1 = std::ceil(box.y);
+        const double X2 = std::floor(box.x + box.w), Y2 = std::floor(box.y + box.h);
+        return CBox{X1, Y1, std::max(X2 - X1, 0.0), std::max(Y2 - Y1, 0.0)};
     }
 }
