@@ -47,8 +47,7 @@ namespace {
             getFromSocket("/openxr enable");
             // Kill the primary app by tracked PID only (never by name).
             if (paper) {
-                if (kill(paper->pid(), 0) == 0)
-                    kill(paper->pid(), SIGKILL);
+                Safe::signalPid(paper->pid(), SIGKILL);
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 paper.reset();
             }
@@ -111,7 +110,7 @@ TEST_CASE(xr_overlay_composition) {
 
     // Give it a beat to create its session; if it dies immediately that's an env problem, SKIP.
     std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-    if (kill(paper->pid(), 0) != 0) {
+    if (!Safe::pidAlive(paper->pid())) {
         XR::logSkip(name(), "hypxrpaper exited immediately (known env instability / missing runtime)");
         return;
     }
