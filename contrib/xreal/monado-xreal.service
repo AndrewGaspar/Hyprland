@@ -22,6 +22,12 @@ Type=simple
 # Default path assumes the repo at ~/code/Hyprland and the xreal build at subprojects/monado/build-xreal
 # (scripts/build-monado.sh --xreal). Override MONADO_XREAL_SERVICE in ~/.config/xreal/monado.env for a
 # different repo location (e.g. the Lunar Lake laptop) — the EnvironmentFile line below picks it up.
+# CAUTION: EnvironmentFile is applied AFTER Environment=, so a MONADO_XREAL_SERVICE line in that file
+# silently WINS over this %h default — including when it names a build that no longer exists (or never
+# did): ExecStart then dies 127 "No such file or directory" and EVERY XR start fails, with nothing wrong
+# in the unit itself. Set it there only if you really build the xreal flavor outside ~/code/Hyprland, and
+# re-check it whenever that build moves — note `systemctl show` does NOT expand the file, so look directly:
+#   grep -s MONADO_XREAL_SERVICE ~/.config/xreal/monado.env   # empty = the %h default below is in effect
 Environment=MONADO_XREAL_SERVICE=%h/code/Hyprland/subprojects/monado/build-xreal/src/xrt/targets/service/monado-service
 # Force comp_main's Wayland window backend so the compositor output is an ordinary Wayland toplevel
 # (app-id "openxr") that HypXRland fullscreens on the glasses' DisplayPort output. This is the DEFAULT
