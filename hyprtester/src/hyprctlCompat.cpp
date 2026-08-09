@@ -1,5 +1,6 @@
 #include "hyprctlCompat.hpp"
 #include "shared.hpp"
+#include "SafeKill.hpp"
 
 #include <pwd.h>
 #include <sys/socket.h>
@@ -49,10 +50,16 @@ std::vector<SInstanceData> instances() {
         // read lock
         SInstanceData* data = &result.emplace_back();
         data->id            = el.path().filename().string();
+        data->pid           = 0; // 0 never names a process here; see the erase below
 
         try {
             data->time = std::stoull(data->id.substr(data->id.find_first_of('_') + 1, data->id.find_last_of('_') - (data->id.find_first_of('_') + 1)));
-        } catch (std::exception& e) { continue; }
+        } catch (std::exception& e) {
+            // a directory whose name we cannot parse is not an instance — drop it rather than
+            // leaving a zero-filled entry in the list for callers to trip over
+            result.pop_back();
+            continue;
+        }
 
         // read file
         std::ifstream ifs(el.path().string() + "/hyprland.lock");
@@ -72,7 +79,9 @@ std::vector<SInstanceData> instances() {
         ifs.close();
     }
 
-    std::erase_if(result, [&](const auto& el) { return kill(el.pid, 0) != 0 && errno == ESRCH; });
+    // Safe::pidAlive rejects a pid of 0 (an unreadable lock file) instead of probing the caller's
+    // own process group, which the raw kill(0, 0) form would report as "alive".
+    std::erase_if(result, [&](const auto& el) { return !Safe::pidAlive(static_cast<pid_t>(el.pid)); });
 
     std::ranges::sort(result, [&](const auto& a, const auto& b) { return a.time < b.time; });
 
