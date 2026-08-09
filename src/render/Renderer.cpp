@@ -1317,7 +1317,7 @@ SP<ITexture> IHyprRenderer::getBackground(PHLMONITOR pMonitor) {
             m_renderData.fbSize          = oldFbSize;
             m_renderData.transformDamage = oldTransformDmg;
             setProjectionType(oldProjType);
-            setViewport(0, 0, (int)pMonitor->m_pixelSize.x, (int)pMonitor->m_pixelSize.y);
+            setViewport(0, 0, (int)pMonitor->paneSize().x, (int)pMonitor->paneSize().y); // stereo: pass renders one pane; == m_pixelSize when off
 
             backgroundTexture = fb->getTexture();
 
@@ -1677,7 +1677,7 @@ void IHyprRenderer::renderSessionLockPrimer(PHLMONITOR pMonitor) {
 
     CRectPassElement::SRectData data;
     data.color = CHyprColor(0, 0, 0, 1.f);
-    data.box   = CBox{{}, pMonitor->m_pixelSize};
+    data.box   = CBox{{}, pMonitor->paneSize()}; // stereo: the pass covers one pane; == m_pixelSize when off
 
     m_renderPass.add(makeUnique<CRectPassElement>(data));
 }
@@ -1690,7 +1690,7 @@ void IHyprRenderer::renderSessionLockMissing(PHLMONITOR pMonitor) {
 
     // ANY_PRESENT: render image2, without instructions. Lock still "alive", unless texture dead
     // else: render image, with instructions. Lock is gone.
-    CBox                         monbox = {{}, pMonitor->m_pixelSize};
+    CBox                         monbox = {{}, pMonitor->paneSize()}; // stereo: one pane; == m_pixelSize when off
     CTexPassElement::SRenderData data;
     if (g_pCompositor->m_startLocked && g_pCompositor->m_startLockedCommand.empty())
         data.tex = m_lockDead3Texture;
@@ -1773,8 +1773,9 @@ void IHyprRenderer::setDamage(const CRegion& damage_, std::optional<CRegion> fin
 }
 
 static Mat3x3 getMirrorProjection(PHLMONITORREF monitor) {
+    // stereo: the mirror monitor's render target is its (pane-sized) work buffer; == m_pixelSize when off
     return Mat3x3::identity()
-        .translate(monitor->m_pixelSize / 2.0)
+        .translate(monitor->paneSize() / 2.0)
         .transform(Math::wlTransformToHyprutils(monitor->m_transform))
         .transform(Math::wlTransformToHyprutils(Math::invertTransform(monitor->m_mirrorOf->m_transform)))
         .translate(-monitor->m_transformedSize / 2.0);
@@ -2142,7 +2143,7 @@ void IHyprRenderer::renderMonitor(PHLMONITOR pMonitor, bool commit) {
             Event::bus()->m_events.render.stage.emit(RENDER_POST_MIRROR);
             renderCursor = false;
         } else {
-            CBox renderBox = {0, 0, sc<int>(pMonitor->m_pixelSize.x), sc<int>(pMonitor->m_pixelSize.y)};
+            CBox renderBox = {0, 0, sc<int>(pMonitor->paneSize().x), sc<int>(pMonitor->paneSize().y)}; // stereo: one pane; == m_pixelSize when off
             renderWorkspace(pMonitor, pMonitor->m_activeWorkspace, NOW, renderBox);
 
             renderLockscreen(pMonitor, NOW, renderBox);
@@ -2217,6 +2218,17 @@ void IHyprRenderer::renderMonitor(PHLMONITOR pMonitor, bool commit) {
         damageMirrorsWith(pMonitor, frameDamage);
 
     Event::bus()->m_events.render.stage.emit(RENDER_POST);
+
+    // stereo pack: frameDamage is in pane-buffer coordinates; the scanout buffer holds the same
+    // pane in every destination box, so fold the damage into each half before submitting to the
+    // output — D_L ∪ (D_R + paneW) (research/24 §3.4 item 6). Must run AFTER damageMirrorsWith,
+    // which expects pane-space damage.
+    if UNLIKELY (pMonitor->isStereo()) {
+        CRegion paneDamage{frameDamage};
+        frameDamage.clear();
+        for (int i = 0; i < pMonitor->stereoPaneCount(); ++i)
+            frameDamage.add(paneDamage.copy().translate(pMonitor->stereoPaneDestBox(i).pos()));
+    }
 
     pMonitor->m_output->state->addDamage(frameDamage);
     auto presentationMode = shouldTear ? Aquamarine::eOutputPresentationMode::AQ_OUTPUT_PRESENTATION_IMMEDIATE : Aquamarine::eOutputPresentationMode::AQ_OUTPUT_PRESENTATION_VSYNC;
@@ -2463,12 +2475,14 @@ bool IHyprRenderer::commitPendingAndDoExplicitSync(PHLMONITOR pMonitor) {
 }
 
 void IHyprRenderer::renderWorkspace(PHLMONITOR pMonitor, PHLWORKSPACE pWorkspace, const Time::steady_tp& now, const CBox& geometry) {
-    Vector2D translate = {geometry.x, geometry.y};
-    float    scale     = sc<float>(geometry.width) / pMonitor->m_pixelSize.x;
+    // stereo: workspace geometry is pane-based (renderMonitor passes a pane-sized box); == m_pixelSize when off
+    const auto PANE      = pMonitor->paneSize();
+    Vector2D   translate = {geometry.x, geometry.y};
+    float      scale     = sc<float>(geometry.width) / PANE.x;
 
     TRACY_GPU_ZONE("RenderWorkspace");
 
-    if (!DELTALESSTHAN(sc<double>(geometry.width) / sc<double>(geometry.height), pMonitor->m_pixelSize.x / pMonitor->m_pixelSize.y, 0.01)) {
+    if (!DELTALESSTHAN(sc<double>(geometry.width) / sc<double>(geometry.height), PANE.x / PANE.y, 0.01)) {
         Log::logger->log(Log::ERR, "Ignoring geometry in renderWorkspace: aspect ratio mismatch");
         scale     = 1.f;
         translate = Vector2D{};
@@ -2801,7 +2815,8 @@ void IHyprRenderer::damageMirrorsWith(PHLMONITOR pMonitor, const CRegion& pRegio
         monbox.y      = (monitor->m_transformedSize.y - monbox.h) / 2;
 
         transformed.scale(scale);
-        transformed.transform(Math::wlTransformToHyprutils(pMonitor->m_transform), pMonitor->m_pixelSize.x * scale, pMonitor->m_pixelSize.y * scale);
+        // stereo: pRegion is pane-buffer damage, so the transform extents are the pane; == m_pixelSize when off
+        transformed.transform(Math::wlTransformToHyprutils(pMonitor->m_transform), pMonitor->paneSize().x * scale, pMonitor->paneSize().y * scale);
         transformed.translate(Vector2D(monbox.x, monbox.y));
 
         mirror->addDamage(transformed);
@@ -3072,7 +3087,7 @@ SP<IFramebuffer> IHyprRenderer::makeSnapshotFB(PHLWINDOW pWindow) {
 
     const auto PFRAMEBUFFER = createFB("window snapshot");
 
-    PFRAMEBUFFER->alloc(PMONITOR->m_pixelSize.x, PMONITOR->m_pixelSize.y, DRM_FORMAT_ABGR8888);
+    PFRAMEBUFFER->alloc(PMONITOR->paneSize().x, PMONITOR->paneSize().y, DRM_FORMAT_ABGR8888); // stereo: snapshots render one pane; == m_pixelSize when off
     PFRAMEBUFFER->setImageDescription(PMONITOR->workBufferImageDescription());
 
     beginFullFakeRender(PMONITOR, fakeDamage, PFRAMEBUFFER);
@@ -3112,7 +3127,7 @@ SP<IFramebuffer> IHyprRenderer::makeSnapshotFB(PHLLS pLayer) {
 
     const auto PFRAMEBUFFER = createFB("layer snapshot");
 
-    PFRAMEBUFFER->alloc(PMONITOR->m_pixelSize.x, PMONITOR->m_pixelSize.y, DRM_FORMAT_ABGR8888);
+    PFRAMEBUFFER->alloc(PMONITOR->paneSize().x, PMONITOR->paneSize().y, DRM_FORMAT_ABGR8888); // stereo: snapshots render one pane; == m_pixelSize when off
     PFRAMEBUFFER->setImageDescription(PMONITOR->workBufferImageDescription());
 
     beginFullFakeRender(PMONITOR, fakeDamage, PFRAMEBUFFER);
@@ -3153,7 +3168,7 @@ SP<IFramebuffer> IHyprRenderer::makeSnapshotFB(WP<Desktop::View::CPopup> popup) 
 
     const auto PFRAMEBUFFER = createFB("popup shapshot");
 
-    PFRAMEBUFFER->alloc(PMONITOR->m_pixelSize.x, PMONITOR->m_pixelSize.y, DRM_FORMAT_ABGR8888);
+    PFRAMEBUFFER->alloc(PMONITOR->paneSize().x, PMONITOR->paneSize().y, DRM_FORMAT_ABGR8888); // stereo: snapshots render one pane; == m_pixelSize when off
     PFRAMEBUFFER->setImageDescription(PMONITOR->workBufferImageDescription());
 
     beginFullFakeRender(PMONITOR, fakeDamage, PFRAMEBUFFER);

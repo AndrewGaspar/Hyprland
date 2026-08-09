@@ -57,6 +57,17 @@ CMonitorRule CMonitorRuleManager::get(const PHLMONITOR PMONITOR) {
         if ((CONFIG->committedProperties & OUTPUT_HEAD_COMMITTED_MODE) || (CONFIG->committedProperties & OUTPUT_HEAD_COMMITTED_CUSTOM_MODE)) {
             Log::logger->log(Log::DEBUG, " > overriding mode: {:.0f}x{:.0f}@{:.2f}Hz -> {:.0f}x{:.0f}@{:.2f}Hz", rule.m_resolution.x, rule.m_resolution.y, rule.m_refreshRate,
                              CONFIG->resolution.x, CONFIG->resolution.y, CONFIG->refresh / 1000.F);
+
+            // stereo un-stereo hazard (research/24 §3.4 item 15): a display GUI writes back a mode
+            // picked from the raw mode list with no knowledge of the stereo token — silently keeping
+            // the pack on a different mode would halve the desktop again (or scan out garbage).
+            // Keep stereo only if the GUI kept the configured mode; otherwise drop it loudly.
+            if (rule.m_stereo != STEREO_OFF && rule.m_resolution != Vector2D() && CONFIG->resolution != rule.m_resolution) {
+                Log::logger->log(Log::WARN, " > wlr-output-management picked mode {:.0f}x{:.0f} over the configured stereo mode {:.0f}x{:.0f} on {} — disabling stereo packing",
+                                 CONFIG->resolution.x, CONFIG->resolution.y, rule.m_resolution.x, rule.m_resolution.y, PMONITOR->m_name);
+                rule.m_stereo = STEREO_OFF;
+            }
+
             rule.m_resolution  = CONFIG->resolution;
             rule.m_refreshRate = CONFIG->refresh / 1000.F;
         }

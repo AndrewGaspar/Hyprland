@@ -99,7 +99,11 @@ void CGLFramebuffer::bind() {
 
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_fb);
     if (g_pHyprOpenGL) {
-        const auto& size = g_pHyprRenderer->m_renderData.pMonitor ? g_pHyprRenderer->m_renderData.pMonitor->m_pixelSize : m_size;
+        // On a stereo monitor "which size" genuinely depends on which buffer is bound (research/24
+        // §3.4 item 3): work/mirror/export FBs are pane-sized, the scanout FB is mode-sized. Every
+        // FB knows its own size, so use it; non-stereo keeps the historical mode-sized override.
+        const auto& PMONITOR = g_pHyprRenderer->m_renderData.pMonitor;
+        const auto& size     = PMONITOR ? (PMONITOR->isStereo() ? m_size : PMONITOR->m_pixelSize) : m_size;
         g_pHyprOpenGL->setViewport(0, 0, size.x, size.y);
     } else
         glViewport(0, 0, m_size.x, m_size.y);

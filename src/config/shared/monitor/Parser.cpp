@@ -272,6 +272,22 @@ bool CMonitorRuleParser::parseVRR(const std::string& value) {
     return true;
 }
 
+bool CMonitorRuleParser::parseStereo(const std::string& value) {
+    if (value.empty() || value == "off")
+        m_rule.m_stereo = STEREO_OFF;
+    else if (value == "sbs")
+        m_rule.m_stereo = STEREO_SBS;
+    else if (value == "hsbs" || value == "tab" || value == "htab") {
+        // planned layouts (research/24 §3.8, WP F5) — reject loudly instead of silently packing wrong
+        m_error += "stereo layout '" + value + "' is not implemented yet (supported: off, sbs) ";
+        return false;
+    } else {
+        m_error += "invalid stereo mode '" + value + "' (supported: off, sbs) ";
+        return false;
+    }
+    return true;
+}
+
 bool CMonitorRuleParser::parseICC(const std::string& val) {
     if (val.empty()) {
         m_error += "invalid icc ";

@@ -88,10 +88,10 @@ static int monitorIndex(lua_State* L) {
         lua_pushstring(L, mon->m_shortDescription.c_str());
     else if (key == "serial")
         lua_pushstring(L, mon->m_output->serial.c_str());
-    else if (key == "width")
-        lua_pushinteger(L, sc<int>(mon->m_pixelSize.x));
+    else if (key == "width") // stereo: report the presented per-eye pane; == m_pixelSize when off
+        lua_pushinteger(L, sc<int>(mon->paneSize().x));
     else if (key == "height")
-        lua_pushinteger(L, sc<int>(mon->m_pixelSize.y));
+        lua_pushinteger(L, sc<int>(mon->paneSize().y));
     else if (key == "physical_width")
         lua_pushinteger(L, sc<int>(mon->m_output->physicalSize.x));
     else if (key == "physical_height")
@@ -120,9 +120,9 @@ static int monitorIndex(lua_State* L) {
         lua_setfield(L, -2, "y");
     } else if (key == "size") {
         lua_newtable(L);
-        lua_pushinteger(L, sc<int>(mon->m_pixelSize.x));
+        lua_pushinteger(L, sc<int>(mon->paneSize().x));
         lua_setfield(L, -2, "width");
-        lua_pushinteger(L, sc<int>(mon->m_pixelSize.y));
+        lua_pushinteger(L, sc<int>(mon->paneSize().y));
         lua_setfield(L, -2, "height");
     } else if (key == "scale")
         lua_pushnumber(L, mon->m_scale);

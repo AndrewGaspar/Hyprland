@@ -200,8 +200,11 @@ void CScreenshareFrame::renderMonitor() {
     g_pHyprRenderer->m_renderData.noSimplify      = true;
 
     // render monitor texture
-    CBox       monbox = CBox{{}, PMONITOR->m_pixelSize}
-                            .transform(Math::wlTransformToHyprutils(Math::invertTransform(PMONITOR->m_transform)), PMONITOR->m_pixelSize.x, PMONITOR->m_pixelSize.y)
+    // stereo: the mirror texture (and the advertised capture size) is ONE pane — the copy is taken
+    // pre-pack in CHyprOpenGLImpl::end() (research/24 §3.6). paneSize() == m_pixelSize when off.
+    const auto PANE   = PMONITOR->paneSize();
+    CBox       monbox = CBox{{}, PANE}
+                            .transform(Math::wlTransformToHyprutils(Math::invertTransform(PMONITOR->m_transform)), PANE.x, PANE.y)
                             .translate(-m_session->m_captureBox.pos()); // vvvv kinda ass-backwards but that's how I designed the renderer... sigh.
 
     const auto OLD                                    = g_pHyprRenderer->m_renderData.renderModif.enabled;
@@ -214,7 +217,7 @@ void CScreenshareFrame::renderMonitor() {
             .flipEndFrame = true,
             .cmBackToSRGB = !IS_CM_AWARE,
         },
-        {0, 0, PMONITOR->m_pixelSize.x, PMONITOR->m_pixelSize.y});
+        {0, 0, PANE.x, PANE.y});
     g_pHyprRenderer->m_renderData.renderModif.enabled = OLD;
 
     // render black boxes for noscreenshare
@@ -359,7 +362,7 @@ void CScreenshareFrame::renderWindow() {
 void CScreenshareFrame::render() {
     const auto PERM = g_pDynamicPermissionManager->clientPermissionMode(m_session->m_client, PERMISSION_TYPE_SCREENCOPY);
 
-    CRegion    frameRegion = {0, 0, g_pHyprRenderer->m_renderData.pMonitor->m_pixelSize.x, g_pHyprRenderer->m_renderData.pMonitor->m_pixelSize.y};
+    CRegion    frameRegion = {0, 0, g_pHyprRenderer->m_renderData.pMonitor->paneSize().x, g_pHyprRenderer->m_renderData.pMonitor->paneSize().y}; // stereo: pane; == m_pixelSize when off
 
     g_pHyprRenderer->draw(CClearPassElement::SClearData{{0, 0, 0, 0}}, frameRegion);
 

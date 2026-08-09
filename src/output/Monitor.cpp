@@ -488,6 +488,9 @@ void CMonitor::onDisconnect(bool destroy) {
     m_enabled             = false;
     m_renderingInitPassed = false;
 
+    // stereo: drop the per-monitor software-cursor lock a stereo output holds (research/24 §3.7)
+    updateStereoCursorLock();
+
     std::vector<PHLWORKSPACE> wspToMove;
     for (auto const& w : State::workspaceState()->workspaces()) {
         if (w->m_monitor == m_self || !w->m_monitor)
@@ -731,16 +734,27 @@ bool CMonitor::applyMonitorRuleSoft(Config::CMonitorRule&& pMonitorRule) {
         }
     }
 
-    Vector2D xfmd     = m_transform % 2 == 1 ? Vector2D{m_pixelSize.y, m_pixelSize.x} : m_pixelSize;
-    m_size            = (xfmd / m_scale).round();
-    m_transformedSize = xfmd;
+    m_stereoMode = m_activeMonitorRule.m_stereo;
+    sanitizeStereoMode();
+
+    // research/24 §3.2: the logical size derives from ONE PANE, not the mode. The pack sits strictly
+    // below m_transformedSize (like zoom/mirror, a final-blit stage), so every logical↔buffer
+    // round-trip in the tree (m_size * m_scale == m_transformedSize) stays true. paneSize() ==
+    // m_pixelSize when stereo is off — this line is then bit-identical to stock.
+    const Vector2D PANE = paneSize();
+    Vector2D xfmd       = m_transform % 2 == 1 ? Vector2D{PANE.y, PANE.x} : PANE;
+    m_size              = (xfmd / m_scale).round();
+    m_transformedSize   = xfmd;
 
     if (m_createdByUser) {
         CBox transformedBox = {0, 0, m_transformedSize.x, m_transformedSize.y};
         transformedBox.transform(Math::wlTransformToHyprutils(Math::invertTransform(m_transform)), m_transformedSize.x, m_transformedSize.y);
 
-        m_pixelSize = Vector2D(transformedBox.width, transformedBox.height);
+        // back-compute the MODE: un-transform the pane, then re-pack (×{1,1} when stereo is off)
+        m_pixelSize = Vector2D(transformedBox.width, transformedBox.height) * stereoPackDivisor();
     }
+
+    updateStereoCursorLock();
 
     updateMatrix();
 
@@ -791,7 +805,12 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
 
     const bool autoScale = RULE->m_scale <= 0.1;
 
-    m_transform = RULE->m_transform;
+    // stereo: capture the old pane BEFORE adopting the new rule's stereo mode — a stereo flip at an
+    // unchanged mode still changes the pane and must reset the render resources below
+    const auto OLDPANESIZE = paneSize();
+
+    m_transform  = RULE->m_transform;
+    m_stereoMode = RULE->m_stereo; // needed before the size derivation + scale validation below
 
     // accumulate requested modes in reverse order (cause inesrting at front is inefficient)
     std::vector<SP<Aquamarine::SOutputMode>> requestedModes;
@@ -1019,6 +1038,10 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
 
     m_pixelSize = m_size;
 
+    // stereo: the committed mode must divide cleanly into panes; if not, drop the packing loudly
+    // rather than deriving fractional pane sizes (research/24 §3.4 item 1)
+    sanitizeStereoMode();
+
     static constexpr auto formats10bit = std::to_array<uint32_t>({DRM_FORMAT_XRGB2101010, DRM_FORMAT_XBGR2101010});
     static constexpr auto formats8bit  = std::to_array<uint32_t>({DRM_FORMAT_XRGB8888, DRM_FORMAT_XBGR8888});
 
@@ -1035,7 +1058,15 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
 
     m_setScale = m_scale;
 
-    Vector2D logicalSize = m_pixelSize / m_scale;
+    // stereo: the scale validation must divide the PANE, not the mode — a stereo monitor at scale
+    // 1.5 must validate 1920/1.5, not 3840/1.5 (research/24 §3.4 item 11). paneSize() == m_pixelSize
+    // when stereo is off. Also, per-eye pixel mapping wants scale 1.0 on a physically-split panel
+    // (§3.8) — warn, but honor the config.
+    const Vector2D SCALEBASE = paneSize();
+    if (isStereo() && m_scale != 1.F && !autoScale)
+        Log::logger->log(Log::WARN, "Monitor {}: stereo output with scale {:.2f} != 1.0 — the physical per-eye split maps 1:1 only at scale 1.0", m_name, m_scale);
+
+    Vector2D logicalSize = SCALEBASE / m_scale;
     if (!*PDISABLESCALECHECKS && (logicalSize.x != std::round(logicalSize.x) || logicalSize.y != std::round(logicalSize.y))) {
         // invalid scale, will produce fractional pixels.
         // find the nearest valid.
@@ -1045,7 +1076,7 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
 
         double   scaleZero = searchScale / 120.0;
 
-        Vector2D logicalZero = m_pixelSize / scaleZero;
+        Vector2D logicalZero = SCALEBASE / scaleZero;
         if (logicalZero == logicalZero.round())
             m_scale = scaleZero;
         else {
@@ -1053,8 +1084,8 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
                 double   scaleUp   = (searchScale + i) / 120.0;
                 double   scaleDown = (searchScale - i) / 120.0;
 
-                Vector2D logicalUp   = m_pixelSize / scaleUp;
-                Vector2D logicalDown = m_pixelSize / scaleDown;
+                Vector2D logicalUp   = SCALEBASE / scaleUp;
+                Vector2D logicalDown = SCALEBASE / scaleDown;
 
                 if (logicalUp == logicalUp.round()) {
                     found       = true;
@@ -1097,11 +1128,13 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
     if (!m_state.commit())
         Log::logger->log(Log::ERR, "Couldn't commit output named {}", m_name);
 
-    Vector2D xfmd     = m_transform % 2 == 1 ? Vector2D{m_pixelSize.y, m_pixelSize.x} : m_pixelSize;
-    m_size            = (xfmd / m_scale).round();
-    m_transformedSize = xfmd;
+    // research/24 §3.2: logical/transformed derive from ONE PANE (see applyMonitorRuleSoft)
+    const Vector2D PANE = paneSize();
+    Vector2D xfmd       = m_transform % 2 == 1 ? Vector2D{PANE.y, PANE.x} : PANE;
+    m_size              = (xfmd / m_scale).round();
+    m_transformedSize   = xfmd;
 
-    if ((WAS10B != m_enabled10bit || OLDPIXELSIZE != m_pixelSize)) {
+    if ((WAS10B != m_enabled10bit || OLDPIXELSIZE != m_pixelSize || OLDPANESIZE != PANE)) {
         m_resources.reset(); // TODO skip for 10bit change and fp16?
 
         if (g_pHyprRenderer && g_pHyprRenderer->glBackend())
@@ -1110,7 +1143,7 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
 
     applyMonitorRuleSoft(std::move(pMonitorRule));
 
-    if (OLD_PIXEL_SIZE != m_pixelSize)
+    if (OLD_PIXEL_SIZE != m_pixelSize || OLDPANESIZE != PANE)
         m_background.reset();
 
     updateVCGTRamps();
@@ -1805,11 +1838,72 @@ const Mat3x3& CMonitor::getScaleMatrix() {
 }
 
 void CMonitor::updateMatrix() {
-    m_projMatrix = Mat3x3::identity();
+    // stereo: the render target of the pass is ONE pane (the work buffers are pane-sized), so both
+    // matrices project into pane space; the pack below the final blit is unaware. paneSize() ==
+    // m_pixelSize when stereo is off (research/24 §3.4 item 2).
+    const auto PANE = paneSize();
+    m_projMatrix    = Mat3x3::identity();
     if (m_transform != WL_OUTPUT_TRANSFORM_NORMAL)
-        m_projMatrix.translate(m_pixelSize / 2.0).transform(Math::wlTransformToHyprutils(m_transform)).translate(-m_transformedSize / 2.0);
+        m_projMatrix.translate(PANE / 2.0).transform(Math::wlTransformToHyprutils(m_transform)).translate(-m_transformedSize / 2.0);
 
-    m_projOutputMatrix = Mat3x3::outputProjection(m_pixelSize, HYPRUTILS_TRANSFORM_NORMAL);
+    m_projOutputMatrix = Mat3x3::outputProjection(PANE, HYPRUTILS_TRANSFORM_NORMAL);
+}
+
+bool CMonitor::isStereo() const {
+    return m_stereoMode != Config::STEREO_OFF;
+}
+
+Vector2D CMonitor::stereoPackDivisor() const {
+    switch (m_stereoMode) {
+        case Config::STEREO_SBS: return {2, 1};
+        default: return {1, 1};
+    }
+}
+
+Vector2D CMonitor::paneSize() const {
+    return m_pixelSize / stereoPackDivisor();
+}
+
+int CMonitor::stereoPaneCount() const {
+    const auto DIV = stereoPackDivisor();
+    return sc<int>(DIV.x * DIV.y);
+}
+
+CBox CMonitor::stereoPaneDestBox(int idx) const {
+    const auto PANE = paneSize();
+    const auto DIV  = stereoPackDivisor();
+    const int  COL  = idx % sc<int>(DIV.x);
+    const int  ROW  = idx / sc<int>(DIV.x);
+    return {COL * PANE.x, ROW * PANE.y, PANE.x, PANE.y};
+}
+
+void CMonitor::sanitizeStereoMode() {
+    if (!isStereo())
+        return;
+
+    const auto     DIV  = stereoPackDivisor();
+    const Vector2D PANE = m_pixelSize / DIV;
+    if (PANE != PANE.floor() || PANE.x < 1 || PANE.y < 1) {
+        Log::logger->log(Log::ERR, "Monitor {}: mode {:X0} is not divisible into a {}x{} stereo pack, disabling stereo", m_name, m_pixelSize, sc<int>(DIV.x), sc<int>(DIV.y));
+        ErrorOverlay::overlay()->queueError(std::format("Monitor {}: mode not divisible for stereo packing, stereo disabled", m_name));
+        m_stereoMode = Config::STEREO_OFF;
+    }
+}
+
+void CMonitor::updateStereoCursorLock() {
+    // research/24 §3.7: a hardware cursor plane places ONE cursor in the packed scanout buffer —
+    // visible to a single eye. Force per-monitor software cursors while stereo is active, with the
+    // same refcounted lock mirroring uses (Monitor.cpp setMirror). The lock transitions exactly on
+    // the stereo edge, so ordinary monitors never touch the cursor backend.
+    const bool WANT = isStereo() && m_enabled;
+    if (WANT == m_stereoSWCursorLocked)
+        return;
+
+    m_stereoSWCursorLocked = WANT;
+    if (WANT)
+        Pointer::mgr()->lockSoftwareForMonitor(m_self.lock());
+    else
+        Pointer::mgr()->unlockSoftwareForMonitor(m_self.lock());
 }
 
 WORKSPACEID CMonitor::activeWorkspaceID() {
@@ -1859,6 +1953,14 @@ uint32_t CMonitor::isSolitaryBlocked(bool full) {
     if (!PWORKSPACE) {
         reasons |= SC_WORKSPACE;
         return reasons;
+    }
+
+    // stereo pack: never take the single-surface shortcut on a packed output (research/24 §3.4
+    // item 8) — it also keeps tearing and direct scanout off via the missing candidate.
+    if (isStereo()) {
+        reasons |= SC_STEREO;
+        if (!full)
+            return reasons;
     }
 
     // Monitor considers only FSMODE_FULLSCREEN as FS
@@ -2098,6 +2200,16 @@ uint16_t CMonitor::isDSBlocked(bool full) {
 
     if (!m_mirrors.empty() || isMirror()) {
         reasons |= DS_BLOCK_MIRROR;
+        if (!full)
+            return reasons;
+    }
+
+    // stereo pack: the scanout frame is assembled from two pane blits — no client buffer can ever
+    // be it. The bufferSize != m_pixelSize check below already fails safe (a client on the
+    // pane-sized logical monitor commits pane-sized buffers), but be explicit and cheap
+    // (research/24 §3.4 item 7).
+    if (isStereo()) {
+        reasons |= DS_BLOCK_STEREO;
         if (!full)
             return reasons;
     }
@@ -2345,6 +2457,11 @@ bool CMonitor::isMultiGPU() {
 bool CMonitor::shouldUseSoftwareCursors() {
     static auto PNOHW      = CConfigValue<Config::INTEGER>("cursor:no_hardware_cursors");
     static auto PINVISIBLE = CConfigValue<Config::INTEGER>("cursor:invisible");
+
+    // stereo: a hardware cursor plane is monocular on a packed output (research/24 §3.7). The
+    // refcounted per-monitor lock (updateStereoCursorLock) is the mechanism; this is the belt.
+    if (isStereo())
+        return true;
 
     if (m_tearingState.activelyTearing)
         return true;
@@ -2865,8 +2982,11 @@ WP<CMonitorResources> CMonitor::resources() {
     const auto DRM_FORMAT = useFP16() ? DRM_FORMAT_ABGR16161616F : m_output->state->state().drmFormat;
     const auto DESC       = workBufferImageDescription();
 
-    if (!m_resources || m_resources->m_drmFormat != DRM_FORMAT || m_resources->m_size != m_pixelSize)
-        m_resources = makeUnique<CMonitorResources>(m_self, DRM_FORMAT, m_pixelSize, DESC);
+    // stereo: work/blur/mirror buffers are PANE-sized — the whole pass renders one pane and the
+    // pack in CHyprOpenGLImpl::end() assembles the mode-sized scanout frame (research/24 §3.4 item 4).
+    // paneSize() == m_pixelSize when stereo is off.
+    if (!m_resources || m_resources->m_drmFormat != DRM_FORMAT || m_resources->m_size != paneSize())
+        m_resources = makeUnique<CMonitorResources>(m_self, DRM_FORMAT, paneSize(), DESC);
 
     if (m_resources->m_imageDescription != DESC)
         m_resources->setImageDescription(DESC);
