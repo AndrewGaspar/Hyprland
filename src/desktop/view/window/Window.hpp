@@ -16,6 +16,7 @@
 #include "../../../workspace/HLWorkspace.hpp"
 #include "../../rule/windowRule/WindowRuleApplicator.hpp"
 #include "../../../protocols/types/ContentType.hpp"
+#include "../../../render/StereoContent.hpp"
 #include "../types/GeometricMovableAnimated.hpp"
 #include "../types/AlphaModifiable.hpp"
 #include "../focusable/Focusable.hpp"
@@ -231,6 +232,10 @@ namespace Desktop::View {
         bool                       isScrollTouchpadOverridden();
         void                       updateWindowData();
         void                       updateWindowData(const Config::CWorkspaceRule&);
+        // research/24 §5.3 (WP S1): the resolved per-window stereo content layout — the rule, the
+        // client's tag and the fullscreen gate folded into one enum. CONTENT_OFF for every window
+        // that has no stereo rule, which is every window in an unconfigured session.
+        Render::Stereo::eContentLayout stereoLayout();
         void                       warpCursor(bool force = false);
         bool                       shouldntFocus() const;
         bool                       suggestsFloat(bool pending = false) const;

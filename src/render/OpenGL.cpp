@@ -759,6 +759,13 @@ bool CHyprOpenGLImpl::begin(CRenderContext& ctx, PHLMONITOR pMonitor, const CReg
 
     ctx.m_gl.fakeFrame = !!fb;
 
+    // stereo content (research/24 §5.3): every composite starts as the LEFT eye with nothing
+    // stereo drawn. Anything that renders a monitor without going through the pack — screencopy,
+    // a fake frame, a mirror source — therefore sees the left eye, which is the same half the
+    // capture path already hands out. (A fresh render context already starts there; this states it.)
+    ctx.m_data.stereoEye          = 0;
+    ctx.m_data.stereoContentDrawn = false;
+
     if (!ctx.readOnlyEffects() && g_pHyprRenderer->m_reloadScreenShader) {
         g_pHyprRenderer->m_reloadScreenShader = false;
         static auto PSHADER                   = CConfigValue<std::string>("decoration:screen_shader");
@@ -842,93 +849,163 @@ void CHyprOpenGLImpl::end(CRenderContext& ctx) {
             const bool                      NEEDS_CM           = ctx.m_data.pMonitor->m_imageDescription->value() != ctx.m_data.mainFB->imageDescription()->value();
             const bool                      WANTS_FINAL_SHADER = !ctx.m_data.blockScreenShader && (m_finalScreenShader->program() >= 1 || g_pHyprRenderer->m_crashingInProgress);
 
-            auto                            finalTexture = ctx.m_data.currentFB->getTexture();
-            CBox                            finalBox     = monbox;
-            std::array<SP<IFramebuffer>, 2> postProcessFBs;
-            std::array<NColorManagement::PImageDescription, 2> savedDescriptions;
-            size_t                                             postProcessCount = 0;
-            bool                                               finalCMComplete  = false;
+            // The post-process chain (final CM, then the screen shader) for ONE source composite,
+            // factored out of upstream's inline chain because the stereo content producer
+            // (research/24 §5.3, WP S1) resolves a second, re-composited eye. In every other frame
+            // it runs exactly once, as upstream's chain did.
+            struct SResolvedComposite {
+                SP<ITexture>                                       texture;
+                CBox                                               box;
+                bool                                               cmComplete = false;
+                std::array<SP<IFramebuffer>, 2>                    fbs;
+                std::array<NColorManagement::PImageDescription, 2> savedDescriptions;
+                size_t                                             count = 0;
+            };
 
-            if (WANTS_FINAL_SHADER) {
+            const auto RESOLVE = [&](SP<ITexture> source) {
+                SResolvedComposite r{.texture = std::move(source), .box = monbox};
+
+                if (!WANTS_FINAL_SHADER)
+                    return r;
+
                 if (NEEDS_CM) {
-                    postProcessFBs[postProcessCount] = g_pHyprRenderer->getWorkBuffer(ctx);
-                    if (postProcessFBs[postProcessCount]) {
-                        savedDescriptions[postProcessCount] = postProcessFBs[postProcessCount]->imageDescription();
-                        postProcessFBs[postProcessCount]->setImageDescription(ctx.m_data.pMonitor->m_imageDescription);
+                    r.fbs[r.count] = g_pHyprRenderer->getWorkBuffer(ctx);
+                    if (r.fbs[r.count]) {
+                        r.savedDescriptions[r.count] = r.fbs[r.count]->imageDescription();
+                        r.fbs[r.count]->setImageDescription(ctx.m_data.pMonitor->m_imageDescription);
 
                         {
-                            auto guard = g_pHyprRenderer->bindTempFB(ctx, postProcessFBs[postProcessCount]);
-                            GLFB(postProcessFBs[postProcessCount])->clearAfterInvalidation();
+                            auto guard = g_pHyprRenderer->bindTempFB(ctx, r.fbs[r.count]);
+                            GLFB(r.fbs[r.count])->clearAfterInvalidation();
                             g_pHyprRenderer->setProjectionType(ctx, RPT_MONITOR);
                             ctx.m_data.transformDamage = false;
-                            renderTexture(ctx, finalTexture, finalBox, {.finalMonitorCM = true});
+                            renderTexture(ctx, r.texture, r.box, {.finalMonitorCM = true});
                         }
 
-                        finalTexture    = postProcessFBs[postProcessCount++]->getTexture();
-                        finalBox        = CBox{{}, m_renderData.pMonitor->m_transformedSize};
-                        finalCMComplete = true;
+                        r.texture    = r.fbs[r.count++]->getTexture();
+                        r.box        = CBox{{}, m_renderData.pMonitor->m_transformedSize};
+                        r.cmComplete = true;
                     } else {
                         LOG(Log::ERR, "Failed to acquire a work buffer for final color management");
-                        postProcessFBs[postProcessCount].reset();
+                        r.fbs[r.count].reset();
                     }
                 }
 
-                if (!NEEDS_CM || finalCMComplete) {
-                    postProcessFBs[postProcessCount] = g_pHyprRenderer->getWorkBuffer(ctx);
-                    if (postProcessFBs[postProcessCount]) {
-                        savedDescriptions[postProcessCount] = postProcessFBs[postProcessCount]->imageDescription();
-                        postProcessFBs[postProcessCount]->setImageDescription(ctx.m_data.pMonitor->m_imageDescription);
+                if (!NEEDS_CM || r.cmComplete) {
+                    r.fbs[r.count] = g_pHyprRenderer->getWorkBuffer(ctx);
+                    if (r.fbs[r.count]) {
+                        r.savedDescriptions[r.count] = r.fbs[r.count]->imageDescription();
+                        r.fbs[r.count]->setImageDescription(ctx.m_data.pMonitor->m_imageDescription);
 
                         {
-                            auto guard = g_pHyprRenderer->bindTempFB(ctx, postProcessFBs[postProcessCount]);
-                            GLFB(postProcessFBs[postProcessCount])->clearAfterInvalidation();
+                            auto guard = g_pHyprRenderer->bindTempFB(ctx, r.fbs[r.count]);
+                            GLFB(r.fbs[r.count])->clearAfterInvalidation();
                             g_pHyprRenderer->setProjectionType(ctx, RPT_MONITOR);
                             ctx.m_data.transformDamage = false;
                             ctx.m_gl.applyFinalShader  = true;
-                            renderTexture(ctx, finalTexture, finalBox, {.finalMonitorCM = true});
+                            renderTexture(ctx, r.texture, r.box, {.finalMonitorCM = true});
                             ctx.m_gl.applyFinalShader = false;
                         }
 
-                        finalTexture = postProcessFBs[postProcessCount++]->getTexture();
-                        finalBox     = CBox{{}, m_renderData.pMonitor->m_transformedSize};
+                        r.texture = r.fbs[r.count++]->getTexture();
+                        r.box     = CBox{{}, m_renderData.pMonitor->m_transformedSize};
                     } else {
                         LOG(Log::ERR, "Failed to acquire a work buffer for the final screen shader");
-                        postProcessFBs[postProcessCount].reset();
+                        r.fbs[r.count].reset();
                     }
                 }
-            }
 
-            g_pHyprRenderer->bindFB(ctx, ctx.m_data.outFB);
-            setViewport(0, 0, PMONITOR->m_pixelSize.x, PMONITOR->m_pixelSize.y);
-            g_pHyprRenderer->setProjectionType(ctx, RPT_OUTPUT);
-            ctx.m_data.transformDamage = true;
+                return r;
+            };
+
+            // hand a resolve's work buffers back (restoring their descriptions) so the next can reuse them
+            const auto RELEASE = [](SResolvedComposite& r) {
+                for (size_t i = 0; i < r.count; ++i) {
+                    r.fbs[i]->setImageDescription(r.savedDescriptions[i]);
+                    r.fbs[i].reset();
+                }
+                r.count = 0;
+            };
+
+            const auto BINDOUTPUT = [&]() {
+                g_pHyprRenderer->bindFB(ctx, ctx.m_data.outFB);
+                setViewport(0, 0, PMONITOR->m_pixelSize.x, PMONITOR->m_pixelSize.y);
+                g_pHyprRenderer->setProjectionType(ctx, RPT_OUTPUT);
+                ctx.m_data.transformDamage = true;
+            };
+
+            const auto BLIT = [&](const SResolvedComposite& r) {
+                if (NEEDS_CM && !r.cmComplete)
+                    renderTexture(ctx, r.texture, r.box, {.finalMonitorCM = true});
+                else
+                    renderTexturePrimitive(ctx, r.texture, r.box);
+            };
 
             if UNLIKELY (PMONITOR->isStereo() && !ctx.m_gl.fakeFrame) {
                 // stereo pack (research/24 §3.3(i)): everything above is ONE pane; assemble the
                 // mode-sized scanout frame with one blit per pane. The destination box is expressed as
                 // the GL viewport (the pane projection fills NDC, the viewport places it), and the
                 // damage scissors get the pane's origin added (glScissor is window-relative —
-                // m_scissorOffset). A pending screen shader has already been resolved into the
-                // pane-sized post-process buffer above; a still-pending CM resolve runs per pane.
+                // m_scissorOffset).
+                //
+                // research/24 §3.3's producer table, decided by what the frame actually drew: the panes
+                // differ only if a stereo-declared window was cropped into this composite (WP S1). An
+                // ordinary desktop on a stereo output — the overwhelmingly common frame — takes the
+                // floor: ONE composite, blitted into every pane.
+                const bool PER_EYE = ctx.m_data.stereoContentDrawn && PMONITOR->stereoPaneCount() > 1;
+
+                // re-run this frame's pass with the next eye, back into the main work buffer. Safe to
+                // overwrite: the previous pane is already in the scanout frame, and every blit is
+                // scissored to damage, so the parts of the work buffer the replay does not repaint can
+                // never reach the output. The state dance restores the composite's own conventions
+                // (monitor projection, blending on, no final shader) before the pack takes over again.
+                const auto RECOMPOSITE = [&](int eye) {
+                    const auto SAVED_DAMAGE = ctx.m_data.damage;
+
+                    g_pHyprRenderer->bindFB(ctx, ctx.m_data.mainFB);
+                    g_pHyprRenderer->setProjectionType(ctx, RPT_MONITOR);
+                    ctx.m_data.transformDamage = false;
+                    blend(true);
+
+                    ctx.m_data.stereoEye = eye;
+                    ctx.m_pass.replay(ctx);
+                    ctx.m_data.stereoEye = 0;
+
+                    blend(false);
+
+                    ctx.m_data.damage = SAVED_DAMAGE;
+                    ctx.m_data.currentWindow.reset();
+                    ctx.m_data.surface.reset();
+                    ctx.m_data.clipBox = {};
+                };
+
+                SResolvedComposite resolved;
                 for (int i = 0; i < PMONITOR->stereoPaneCount(); ++i) {
+                    if (i == 0 || PER_EYE) {
+                        if (i > 0) {
+                            RELEASE(resolved);
+                            RECOMPOSITE(i);
+                        }
+
+                        resolved = RESOLVE(ctx.m_data.currentFB->getTexture());
+                    }
+
+                    BINDOUTPUT();
                     const auto DEST = PMONITOR->stereoPaneDestBox(i);
                     setViewport(DEST.x, DEST.y, DEST.width, DEST.height);
                     m_scissorOffset = {DEST.x, DEST.y};
-                    if (NEEDS_CM && !finalCMComplete)
-                        renderTexture(ctx, finalTexture, finalBox, {.finalMonitorCM = true});
-                    else
-                        renderTexturePrimitive(ctx, finalTexture, finalBox);
+                    BLIT(resolved);
                 }
 
                 m_scissorOffset = {};
                 setViewport(0, 0, PMONITOR->m_pixelSize.x, PMONITOR->m_pixelSize.y);
-            } else if (NEEDS_CM && !finalCMComplete)
-                renderTexture(ctx, finalTexture, finalBox, {.finalMonitorCM = true});
-            else
-                renderTexturePrimitive(ctx, finalTexture, finalBox);
-
-            for (size_t i = 0; i < postProcessCount; ++i)
-                postProcessFBs[i]->setImageDescription(savedDescriptions[i]);
+                RELEASE(resolved);
+            } else {
+                auto resolved = RESOLVE(ctx.m_data.currentFB->getTexture());
+                BINDOUTPUT();
+                BLIT(resolved);
+                RELEASE(resolved);
+            }
 
             blend(true);
 

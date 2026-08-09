@@ -502,6 +502,7 @@ std::string CCommandFormatter::getWindowData(PHLWINDOW w, eHyprCtlOutputFormat f
     "xdgTag": "{}",
     "xdgDescription": "{}",
     "contentType": "{}",
+    "stereo": "{}",
     "tearingHint": {},
     "stableId": "{:x}"
 }},)#",
@@ -529,7 +530,8 @@ std::string CCommandFormatter::getWindowData(PHLWINDOW w, eHyprCtlOutputFormat f
             getFocusHistoryID(w), (g_pInputManager->isWindowInhibiting(w, false) ? "true" : "false"),
             escapeJSONStrings(METADATA.tag.value_or("")),
             escapeJSONStrings(METADATA.description.value_or("")),
-            escapeJSONStrings(NContentType::toString(w->getContentType())), ((w->m_hints & Desktop::View::WINDOW_HINT_TEAR) ? "true" : "false"),
+            escapeJSONStrings(NContentType::toString(w->getContentType())), Render::Stereo::layoutToString(w->stereoLayout()),
+            ((w->m_hints & Desktop::View::WINDOW_HINT_TEAR) ? "true" : "false"),
             w->metadata().stableID());
     } else {
         return std::format(
@@ -540,7 +542,7 @@ std::string CCommandFormatter::getWindowData(PHLWINDOW w, eHyprCtlOutputFormat f
             "{}\n\tfullscreen: {}\n\tfullscreenClient: {}\n\tfullscreenHandler: {}\n\tallowedOverFullscreen: {}\n\tgrouped: {}\n\ttags: {}\n\tswallowing: {:x}\n\tfocusHistoryID: "
             "{}\n\tinhibitingIdle: "
             "{}\n\txdgTag: "
-            "{}\n\txdgDescription: {}\n\tcontentType: {}\n\ttearingHint: {}\n\tstableID: {:x}\n\n",
+            "{}\n\txdgDescription: {}\n\tcontentType: {}\n\tstereo: {}\n\ttearingHint: {}\n\tstableID: {:x}\n\n",
             rc<uintptr_t>(w.get()),
             w->metadata().title(),
             sc<int>(w->mapped()),
@@ -574,6 +576,7 @@ std::string CCommandFormatter::getWindowData(PHLWINDOW w, eHyprCtlOutputFormat f
             METADATA.tag.value_or(""),
             METADATA.description.value_or(""),
             NContentType::toString(w->getContentType()),
+            Render::Stereo::layoutToString(w->stereoLayout()),
             sc<int>(sc<bool>(w->m_hints & Desktop::View::WINDOW_HINT_TEAR)),
             w->metadata().stableID());
     }

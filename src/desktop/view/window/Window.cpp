@@ -728,6 +728,44 @@ bool CWindow::canBeTorn() {
     return m_ruleApplicator->tearing().valueOr(sc<bool>(m_hints & WINDOW_HINT_TEAR)) && *PTEARING;
 }
 
+// research/24 §4.1/§4.3/§5.3 (WP S1): fold the three declaration tiers into the one layout the
+// renderer crops with. Read once per surface per frame, so: no string parsing on the common path.
+//
+//   rule `stereo off`            → mono, always. The user's off switch, and it wins over everything.
+//   rule `stereo auto`           → whatever the client's xdg-toplevel-tag says (tier A, exact).
+//   rule `stereo <layout>`       → that layout (tier B/C — hand-written or a title/class heuristic).
+//
+// and then §4.3's one-heuristic-in-code, the NEGATIVE one: a layout the user guessed at engages only
+// while the window is fullscreen-and-covering, because half-cropping a windowed desktop is the
+// failure mode people report as "the compositor broke". Two things are not guesses and skip the
+// gate: `always` (written by hand — the manual verb) and a client that declared its own packing.
+//
+// Note that a client tag of `stereo:mono` suppresses `auto` but does NOT beat an explicit rule
+// layout: §4.5's ecosystem warning is that correct-looking content metadata is a liability, so the
+// last human instruction has to win.
+Render::Stereo::eContentLayout CWindow::stereoLayout() {
+    using namespace Render::Stereo;
+
+    // valueOrDefault, never value(): an overridable var with nothing ever set throws, and "no stereo
+    // rule anywhere" is the state of every window in every session that has not configured this.
+    const auto DECL = unpackDeclaration(m_ruleApplicator->stereo().valueOrDefault());
+    if (DECL.layout == CONTENT_OFF)
+        return CONTENT_OFF;
+
+    const auto TAG    = m_backend->metadata().tag;
+    const auto TAGGED = TAG ? layoutFromTag(*TAG) : std::nullopt;
+
+    const auto LAYOUT = DECL.layout == CONTENT_AUTO ? TAGGED.value_or(CONTENT_OFF) : DECL.layout;
+    if (LAYOUT == CONTENT_OFF)
+        return CONTENT_OFF;
+
+    const bool CLIENT_DECLARED = TAGGED.has_value() && *TAGGED != CONTENT_OFF;
+    if (DECL.gate == GATE_ALWAYS || CLIENT_DECLARED)
+        return LAYOUT;
+
+    return Fullscreen::controller()->isFullscreen(m_self.lock(), Fullscreen::FSMODE_FULLSCREEN, true) ? LAYOUT : CONTENT_OFF;
+}
+
 void CWindow::setSuspended(bool suspend) {
     if (suspend == m_suspended)
         return;
