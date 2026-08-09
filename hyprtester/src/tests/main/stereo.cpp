@@ -37,6 +37,10 @@ using namespace Hyprutils::Utils;
 // not asserted here. The damage assertion below is the closest structural proxy — it proves the
 // compositor submitted both halves — and the pane geometry itself is unit-tested in
 // tests/output/StereoPacking.cpp.
+//
+// The config front-ends split across two runs: this file's `hl.monitor{ stereo = ... }` covers the
+// Lua one, and stereoLegacyConfigFrontEnds (below) covers the classic monitor= / monitorv2 syntax
+// under `-c ./stereo-legacy.conf`.
 
 namespace {
     constexpr const char* STEREO_MON  = "HYPRTEST-STEREO";
@@ -576,4 +580,71 @@ TEST_CASE(stereoLiveToggleRestoresState) {
 
     // and the compositor is still alive and answering (a crash here is the whole point of the test)
     EXPECT_CONTAINS(getFromSocket("/version"), "Hyprland");
+}
+
+// stereoLegacyConfigFrontEnds — the syntax users actually ship (research/24 §3.10).
+//
+// The rest of this file drives the Lua front-end, because the main suite runs test.lua. The token
+// documented in docs/openxr/05-configuration.md §8.5 and used in example/xreal.conf is the classic
+// one, and it has three separate wirings (the compact `stereo:sbs` positional token, the
+// `stereo, sbs` pair, and the monitorv2 `stereo =` key) that no test reached: the gtests exercise
+// CMonitorRuleParser::parseStereo, i.e. the shared leaf below all three, and `hyprctl keyword` is
+// refused outright under a non-legacy parser. Unit-testing the wiring is out too — instantiating
+// CConfigManager verifies (and creates) the user's real config file.
+//
+// So the wiring gets a second, tiny run against a classic config:
+//
+//   hyprtester -c ./stereo-legacy.conf -b ../build-debug/Hyprland -p <plugin> stereoLegacyConfigFrontEnds
+//
+// Under test.lua the case has nothing to assert and says so.
+TEST_CASE(stereoLegacyConfigFrontEnds) {
+    // dispatchKeyword refuses under any non-legacy parser, which is the cheapest possible probe for
+    // "which front-end parsed this run's config" (and has no side effects with no arguments).
+    if (getFromSocket("/keyword").contains("non-legacy")) {
+        NLog::log("{}skipped: this run parses test.lua — the classic monitor= / monitorv2 stereo wiring "
+                  "is covered by `hyprtester -c ./stereo-legacy.conf stereoLegacyConfigFrontEnds`",
+                  Colors::YELLOW);
+        return;
+    }
+
+    // one name per wiring, all declared in stereo-legacy.conf at the same 3840x1080 mode
+    static const std::vector<std::pair<std::string, std::string>> WIRINGS = {
+        {"HYPRTEST-LEG-POS", "the compact positional token (`, stereo:sbs`)"},
+        {"HYPRTEST-LEG-KV", "the two-token positional form (`, stereo, sbs`)"},
+        {"HYPRTEST-LEG-V2", "the monitorv2 `stereo =` key"},
+    };
+    static const std::string CONTROL = "HYPRTEST-LEG-CTL";
+
+    CScopeGuard              guard = {[&]() {
+        for (const auto& [NAME, WIRING] : WIRINGS) {
+            getFromSocket(std::format("/output remove {}", NAME));
+        }
+        getFromSocket(std::format("/output remove {}", CONTROL));
+    }};
+
+    for (const auto& [NAME, WIRING] : WIRINGS) {
+        getFromSocket(std::format("/output remove {}", NAME));
+        OK(getFromSocket(std::format("/output create headless {}", NAME)));
+    }
+    getFromSocket(std::format("/output remove {}", CONTROL));
+    OK(getFromSocket(std::format("/output create headless {}", CONTROL)));
+
+    for (const auto& [NAME, WIRING] : WIRINGS) {
+        NLog::log("{}checking {} — {}", Colors::YELLOW, NAME, WIRING);
+        ASSERT(waitForMonitorPresent(NAME, true), true);
+
+        // the pack reached the monitor: a 3840x1080 output presenting a 1920x1080 desktop
+        ASSERT(waitForMonitorField(NAME, "width", "1920"), true);
+        EXPECT(monitorField(NAME, "height"), std::string("1080"));
+        EXPECT(monitorField(NAME, "stereo"), std::string("sbs"));
+        EXPECT(monitorField(NAME, "scanoutWidth"), std::string("3840"));
+        EXPECT(monitorField(NAME, "scale"), std::string("1.00"));
+    }
+
+    // the control shares the mode and omits the token: 3840 stays 3840, so a run in which every
+    // rule silently packed (or none did) cannot pass
+    ASSERT(waitForMonitorPresent(CONTROL, true), true);
+    ASSERT(waitForMonitorField(CONTROL, "width", "3840"), true);
+    EXPECT(monitorField(CONTROL, "stereo"), std::string(""));
+    EXPECT(monitorField(CONTROL, "scanoutWidth"), std::string(""));
 }
