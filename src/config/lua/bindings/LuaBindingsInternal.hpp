@@ -106,7 +106,11 @@ namespace Config::Lua::Bindings::Internal {
         {"tonemap", []() -> ILuaConfigValue* { return new CLuaConfigString(STRVAL_EMPTY); }, WE::WINDOW_RULE_EFFECT_TONEMAP},
         // research/24 F8: this table is name-keyed, not enum-ordered, so a missing entry means
         // "silently unavailable from Lua" with no compile error — exactly the xrrule mistake.
-        {"depth", []() -> ILuaConfigValue* { return new CLuaConfigFloat(0.F, 0.F, 1.F); }, WE::WINDOW_RULE_EFFECT_DEPTH},
+        // ...and NO min/max, deliberately: a range here REJECTS, while the classic front end clamps
+        // (WindowRule.cpp — "a user who wrote `depth 2` wants 'as high as it goes', not an error").
+        // Two front ends for one rule must not disagree about whether it parses. The clamp still
+        // happens, once, where the rule is resolved against the tier (Desktop::Depth::resolve).
+        {"depth", []() -> ILuaConfigValue* { return new CLuaConfigFloat(0.F); }, WE::WINDOW_RULE_EFFECT_DEPTH},
     };
 
     std::string                                        argStr(lua_State* L, int idx);
