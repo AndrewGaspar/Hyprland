@@ -66,8 +66,11 @@ namespace Desktop::View {
         std::string                             m_namespace = "";
         SP<Desktop::View::CPopup>               m_popupHead;
 
+        PHLANIMVAR<float>                       m_depth; // 0..1 above the wallpaper plane, research/24 §7. See CWindow::m_depth.
+
         pid_t                                   getPID();
         void                                    updateSurfaceScaleTransformDetails();
+        void                                    updateDepth(bool warp = false);
 
         void                                    onDestroy();
         void                                    onMap();

@@ -10,6 +10,8 @@
 #include "../../animation/AnimationManager.hpp"
 #include "../../render/Renderer.hpp"
 #include "../../config/shared/animation/AnimationTree.hpp"
+#include "../../config/ConfigValue.hpp"
+#include "../DepthTiers.hpp"
 #include "../../output/Monitor.hpp"
 #include "../../managers/input/InputManager.hpp"
 #include "../../managers/EventManager.hpp"
@@ -36,6 +38,8 @@ PHLLS CLayerSurface::create(SP<CLayerShellResource> resource) {
     Animation::mgr()->createAnimation(0.f, pLS->m_alpha.get(LS_ALPHA_FADE), Config::animationTree()->getAnimationPropertyConfig("fadeLayersIn"), pLS, AVARDAMAGE_ENTIRE);
     Animation::mgr()->createAnimation(Vector2D(0, 0), pLS->positionAnimation(), Config::animationTree()->getAnimationPropertyConfig("layersIn"), pLS, AVARDAMAGE_ENTIRE);
     Animation::mgr()->createAnimation(Vector2D(0, 0), pLS->sizeAnimation(), Config::animationTree()->getAnimationPropertyConfig("layersIn"), pLS, AVARDAMAGE_ENTIRE);
+    // AVARDAMAGE_NONE: WP D1 depth is inert by construction — see CWindow::m_depth.
+    Animation::mgr()->createAnimation(0.f, pLS->m_depth, Config::animationTree()->getAnimationPropertyConfig("windowsDepth"), pLS, AVARDAMAGE_NONE);
 
     pLS->registerCallbacks();
 
@@ -167,6 +171,10 @@ void CLayerSurface::onMap() {
     m_aboveFullscreen = true;
 
     m_ruleApplicator->propertiesChanged(Desktop::Rule::RULE_PROP_ALL);
+
+    // the applicator already resolved the depth; a surface appearing for the first time arrives at
+    // its tier instead of climbing to it.
+    updateDepth(true);
 
     m_layerSurface->m_surface->map();
 
@@ -327,6 +335,10 @@ void CLayerSurface::onCommit() {
             m_layer           = NEW_LAYER;
             m_aboveFullscreen = NEW_LAYER >= ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY;
 
+            // the tier is a function of the layer, so a restack moves the surface up or down the
+            // depth ladder too (a bar that demotes itself to `bottom` returns to the page)
+            updateDepth();
+
             // if in fullscreen, only overlay can be above.
             *m_alpha.get(LS_ALPHA_FADE) = Fullscreen::controller()->hasFullscreen(PMONITOR) ? (m_layer >= ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY ? 1.F : 0.F) : 1.F;
 
@@ -434,6 +446,28 @@ pid_t CLayerSurface::getPID() {
     wl_client_get_credentials(m_layerSurface->m_surface->getResource()->client(), &PID, nullptr, nullptr);
 
     return PID;
+}
+
+// The layer half of the ladder (research/24 §7.3). Unlike a window's, a layer's rung is a function
+// of its layer alone, so this only needs to run when the rules or the layer change — not per frame,
+// and not on focus.
+void CLayerSurface::updateDepth(bool warp) {
+    static auto PDEPTHLAYERS = CConfigValue<Config::FLOAT>("decoration:depth_layers");
+
+    if (!m_depth)
+        return;
+
+    const Desktop::Depth::STiers TIERS = {.layers = *PDEPTHLAYERS};
+
+    // an explicit `layerrule = depth <z>` beats the tier, including on a background/bottom layer
+    const auto  OVERRIDE = m_ruleApplicator->depth().hasValue() ? std::optional<float>{m_ruleApplicator->depth().value()} : std::nullopt;
+
+    const float GOAL = Desktop::Depth::resolve(OVERRIDE, Desktop::Depth::layerTier(TIERS, m_layer));
+
+    if (warp)
+        m_depth->setValueAndWarp(GOAL);
+    else
+        *m_depth = GOAL;
 }
 
 void CLayerSurface::updateSurfaceScaleTransformDetails() {

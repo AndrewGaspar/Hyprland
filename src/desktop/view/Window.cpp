@@ -26,6 +26,7 @@
 #include "../state/WindowFadeout.hpp"
 #include "../state/WindowState.hpp"
 #include "../history/WindowHistoryTracker.hpp"
+#include "../DepthTiers.hpp"
 #include "../../Compositor.hpp"
 #include "../../render/decorations/CHyprDropShadowDecoration.hpp"
 #include "../../render/decorations/CHyprInnerGlowDecoration.hpp"
@@ -125,6 +126,9 @@ PHLWINDOW CWindow::create(SP<CXWaylandSurface> surface) {
     Animation::mgr()->createAnimation(1.f, pWindow->alpha(WINDOW_ALPHA_MOVE_FROM_WORKSPACE), Config::animationTree()->getAnimationPropertyConfig("fadeIn"), pWindow,
                                       AVARDAMAGE_ENTIRE);
     Animation::mgr()->createAnimation(0.f, pWindow->m_notRespondingTint, Config::animationTree()->getAnimationPropertyConfig("fade"), pWindow, AVARDAMAGE_ENTIRE);
+    // AVARDAMAGE_NONE is the D1 assertion that depth is inert: nothing renders from it, so a depth
+    // change must not repaint anything. D2 flips this to AVARDAMAGE_ENTIRE with the producer.
+    Animation::mgr()->createAnimation(0.f, pWindow->m_depth, Config::animationTree()->getAnimationPropertyConfig("windowsDepth"), pWindow, AVARDAMAGE_NONE);
 
     pWindow->addWindowDeco(makeUnique<CHyprDropShadowDecoration>(pWindow));
     pWindow->addWindowDeco(makeUnique<CHyprBorderDecoration>(pWindow));
@@ -163,6 +167,9 @@ PHLWINDOW CWindow::create(SP<CXDGSurfaceResource> resource) {
     Animation::mgr()->createAnimation(1.f, pWindow->alpha(WINDOW_ALPHA_MOVE_FROM_WORKSPACE), Config::animationTree()->getAnimationPropertyConfig("fadeIn"), pWindow,
                                       AVARDAMAGE_ENTIRE);
     Animation::mgr()->createAnimation(0.f, pWindow->m_notRespondingTint, Config::animationTree()->getAnimationPropertyConfig("fade"), pWindow, AVARDAMAGE_ENTIRE);
+    // AVARDAMAGE_NONE is the D1 assertion that depth is inert: nothing renders from it, so a depth
+    // change must not repaint anything. D2 flips this to AVARDAMAGE_ENTIRE with the producer.
+    Animation::mgr()->createAnimation(0.f, pWindow->m_depth, Config::animationTree()->getAnimationPropertyConfig("windowsDepth"), pWindow, AVARDAMAGE_NONE);
 
     pWindow->addWindowDeco(makeUnique<CHyprDropShadowDecoration>(pWindow));
     pWindow->addWindowDeco(makeUnique<CHyprBorderDecoration>(pWindow));
@@ -771,6 +778,7 @@ void CWindow::onMap() {
     m_glowFadeAnimationProgress->resetAllCallbacks();
     m_glowAngleAnimationProgress->resetAllCallbacks();
     m_dimPercent->resetAllCallbacks();
+    m_depth->resetAllCallbacks();
     alpha(WINDOW_ALPHA_MOVE_TO_WORKSPACE)->resetAllCallbacks();
     alpha(WINDOW_ALPHA_MOVE_FROM_WORKSPACE)->resetAllCallbacks();
 
@@ -1994,7 +2002,36 @@ void CWindow::updateDecorationValues() {
         m_realGlowColor = transparent;
     }
 
+    updateDepth();
+
     updateWindowDecos();
+}
+
+// Resolve which rung of the depth ladder this window sits on (research/24 §7.3) and hand it to the
+// animation. Called from updateDecorationValues(), which already runs on every focus, fullscreen
+// and rule change — the three discrete events §7.2 says depth is allowed to move on. `warp` skips
+// the easing for the map path, where there is no previous depth to ease from.
+void CWindow::updateDepth(bool warp) {
+    static auto PDEPTHFOCUSED   = CConfigValue<Config::FLOAT>("decoration:depth_focused");
+    static auto PDEPTHUNFOCUSED = CConfigValue<Config::FLOAT>("decoration:depth_unfocused");
+
+    if (!m_depth)
+        return;
+
+    const Desktop::Depth::STiers TIERS = {.focused = *PDEPTHFOCUSED, .unfocused = *PDEPTHUNFOCUSED};
+
+    const bool                   FOCUSED    = m_self == Desktop::focusState()->window();
+    const bool                   FULLSCREEN = Fullscreen::controller()->getFullscreenModes(m_self.lock()).internal == Fullscreen::FSMODE_FULLSCREEN;
+
+    // an explicit `windowrule = depth <z>` beats the tier, including on a fullscreen window
+    const auto  OVERRIDE = m_ruleApplicator->depth().hasValue() ? std::optional<float>{m_ruleApplicator->depth().value()} : std::nullopt;
+
+    const float GOAL = Desktop::Depth::resolve(OVERRIDE, Desktop::Depth::windowTier(TIERS, FOCUSED, FULLSCREEN));
+
+    if (warp)
+        m_depth->setValueAndWarp(GOAL);
+    else
+        *m_depth = GOAL;
 }
 
 std::optional<double> CWindow::calculateSingleExpr(const std::string& s) {
@@ -2464,6 +2501,11 @@ void CWindow::mapWindow() {
         alpha(WINDOW_ALPHA_ACTIVE)->setValueAndWarp(*PINACTIVEALPHA);
         m_dimPercent->setValueAndWarp(0);
     }
+
+    // a window that has never been on screen has no depth to ease FROM, so it arrives at its tier
+    // rather than climbing to it (research/24 §7.3: depth eases on discrete events, and a map is
+    // not one of them).
+    updateDepth(true);
 
     if (requestedClientFSMode.has_value() && (m_suppressedEvents & Desktop::View::SUPPRESS_FULLSCREEN))
         requestedClientFSMode = sc<Fullscreen::eFullscreenMode>(sc<uint8_t>(requestedClientFSMode.value_or(Fullscreen::FSMODE_NONE)) & ~sc<uint8_t>(Fullscreen::FSMODE_FULLSCREEN));

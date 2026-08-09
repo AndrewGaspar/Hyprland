@@ -60,7 +60,7 @@ std::unordered_set<CWindowRuleEffectContainer::storageType> CWindowRuleApplicato
                    std::pair{std::ref(m_scrollMouse), [this] { return scrollMouseEffect(); }}, std::pair{std::ref(m_scrollTouchpad), [this] { return scrollTouchpadEffect(); }},
                    std::pair{std::ref(m_animationStyle), [this] { return animationStyleEffect(); }}, std::pair{std::ref(m_maxSize), [this] { return maxSizeEffect(); }},
                    std::pair{std::ref(m_minSize), [this] { return minSizeEffect(); }}, std::pair{std::ref(m_activeBorderColor), [this] { return activeBorderColorEffect(); }},
-                   std::pair{std::ref(m_inactiveBorderColor), [this] { return inactiveBorderColorEffect(); }}));
+                   std::pair{std::ref(m_inactiveBorderColor), [this] { return inactiveBorderColorEffect(); }}, std::pair{std::ref(m_depth), [this] { return depthEffect(); }}));
 
     if (prio == Types::PRIORITY_WINDOW_RULE) {
         std::erase_if(m_dynamicTags, [props, this](const auto& el) {
@@ -117,6 +117,11 @@ CWindowRuleApplicator::SRuleResult CWindowRuleApplicator::applyDynamicRule(const
             case WINDOW_RULE_EFFECT_ROUNDING: {
                 m_rounding.first.set(std::get<int64_t>(value), Types::PRIORITY_WINDOW_RULE);
                 m_rounding.second |= rule->getPropertiesMask();
+                break;
+            }
+            case WINDOW_RULE_EFFECT_DEPTH: {
+                m_depth.first.set(std::get<float>(value), Types::PRIORITY_WINDOW_RULE);
+                m_depth.second |= rule->getPropertiesMask();
                 break;
             }
             case WINDOW_RULE_EFFECT_ROUNDING_POWER: {
