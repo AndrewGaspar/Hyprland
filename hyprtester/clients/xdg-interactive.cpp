@@ -15,6 +15,7 @@
 #include <wayland-client.h>
 #include <wayland.hpp>
 #include <xdg-shell.hpp>
+#include <xdg-toplevel-tag-v1.hpp>
 
 #include <hyprutils/math/Vector2D.hpp>
 #include <hyprutils/memory/SharedPtr.hpp>
@@ -23,36 +24,45 @@ using Hyprutils::Math::Vector2D;
 using namespace Hyprutils::Memory;
 
 struct SWlState {
-    wl_display*                    display = nullptr;
-    CSharedPointer<CCWlRegistry>   registry;
+    wl_display*                               display = nullptr;
+    CSharedPointer<CCWlRegistry>              registry;
 
-    CSharedPointer<CCWlCompositor> wlCompositor;
-    CSharedPointer<CCWlSeat>       wlSeat;
-    CSharedPointer<CCWlShm>        wlShm;
-    CSharedPointer<CCXdgWmBase>    xdgShell;
+    CSharedPointer<CCWlCompositor>            wlCompositor;
+    CSharedPointer<CCWlSeat>                  wlSeat;
+    CSharedPointer<CCWlShm>                   wlShm;
+    CSharedPointer<CCXdgWmBase>               xdgShell;
+    CSharedPointer<CCXdgToplevelTagManagerV1> xdgTagMgr;
 
-    CSharedPointer<CCWlShmPool>    shmPool;
-    CSharedPointer<CCWlBuffer>     shmBuf;
-    int                            shmFd            = -1;
-    size_t                         shmBufSize       = 0;
-    bool                           xrgb8888_support = false;
+    CSharedPointer<CCWlShmPool>               shmPool;
+    CSharedPointer<CCWlBuffer>                shmBuf;
+    int                                       shmFd            = -1;
+    size_t                                    shmBufSize       = 0;
+    void*                                     shmData          = nullptr; // only mapped for --paint
+    size_t                                    shmMapSize       = 0;
+    bool                                      xrgb8888_support = false;
 
-    CSharedPointer<CCWlSurface>    surf;
-    CSharedPointer<CCXdgSurface>   xdgSurf;
-    CSharedPointer<CCXdgToplevel>  xdgToplevel;
-    Vector2D                       geom = {500, 400};
+    CSharedPointer<CCWlSurface>               surf;
+    CSharedPointer<CCXdgSurface>              xdgSurf;
+    CSharedPointer<CCXdgToplevel>             xdgToplevel;
+    Vector2D                                  geom = {500, 400};
 
-    CSharedPointer<CCWlPointer>    pointer;
-    uint32_t                       enterSerial        = 0;
-    uint32_t                       lastButtonSerial   = 0;
-    bool                           requestActive      = false;
-    bool                           resizing           = false;
-    uint32_t                       leaveAfterRequest  = 0;
-    uint32_t                       motionAfterRequest = 0;
-    uint32_t                       buttonPresses      = 0;
+    CSharedPointer<CCWlPointer>               pointer;
+    uint32_t                                  enterSerial        = 0;
+    uint32_t                                  lastButtonSerial   = 0;
+    bool                                      requestActive      = false;
+    bool                                      resizing           = false;
+    uint32_t                                  leaveAfterRequest  = 0;
+    uint32_t                                  motionAfterRequest = 0;
+    uint32_t                                  buttonPresses      = 0;
 };
 
 static bool debug, started, shouldExit;
+
+// --tag <tag> / --paint (research/24 §4.2, §5.3 — WP S2). Both are opt-in and default to the
+// behaviour every other test in the suite already relies on: no tag, and an unpainted (black)
+// buffer.
+static std::string toplevelTag;
+static bool        paintQuadrants;
 
 template <typename... Args>
 //NOLINTNEXTLINE
@@ -124,6 +134,10 @@ static bool bindRegistry(SWlState& state) {
         } else if (NAME == "xdg_wm_base") {
             debugLog("  > binding to global: {} (version {}) with id {}", name, version, id);
             state.xdgShell = makeShared<CCXdgWmBase>((wl_proxy*)wl_registry_bind((wl_registry*)state.registry->resource(), id, &xdg_wm_base_interface, 1));
+        } else if (NAME == "xdg_toplevel_tag_manager_v1") {
+            debugLog("  > binding to global: {} (version {}) with id {}", name, version, id);
+            state.xdgTagMgr =
+                makeShared<CCXdgToplevelTagManagerV1>((wl_proxy*)wl_registry_bind((wl_registry*)state.registry->resource(), id, &xdg_toplevel_tag_manager_v1_interface, 1));
         }
     });
     state.registry->setGlobalRemove([](CCWlRegistry* r, uint32_t id) { debugLog("Global {} removed", id); });
@@ -136,6 +150,24 @@ static bool bindRegistry(SWlState& state) {
     }
 
     return true;
+}
+
+// research/24 §5.3 (WP S2): four flat quadrants, so a monitor capture can say WHICH half of this
+// buffer a pane sampled — an uncropped window shows all four, a side-by-side crop shows the left two
+// stretched across the box, an over-under crop the top two. The colours only ever have to be
+// distinguishable from each OTHER; see hyprtester/clients/screencopy-probe.cpp for why.
+static void paintBuffer(SWlState& state, int width, int height, size_t stride) {
+    if (!paintQuadrants || !state.shmData)
+        return;
+
+    static constexpr uint32_t QUADRANTS[4] = {0x00FF0000, 0x0000FF00, 0x000000FF, 0x00FFFF00}; // TL red, TR green, BL blue, BR yellow
+
+    auto*                     bytes = static_cast<uint8_t*>(state.shmData);
+    for (int y = 0; y < height; ++y) {
+        auto* row = reinterpret_cast<uint32_t*>(bytes + static_cast<size_t>(y) * stride);
+        for (int x = 0; x < width; ++x)
+            row[x] = QUADRANTS[(y >= height / 2 ? 2 : 0) + (x >= width / 2 ? 1 : 0)];
+    }
 }
 
 static bool createShm(SWlState& state, Vector2D geom) {
@@ -180,6 +212,22 @@ static bool createShm(SWlState& state, Vector2D geom) {
         state.shmBufSize = size;
     }
 
+    // the pool is only mapped when someone asked for pixels — every other test in the suite is happy
+    // with the zero-filled (black) buffer and should not pay for a mapping.
+    if (paintQuadrants && (!state.shmData || state.shmMapSize < state.shmBufSize)) {
+        if (state.shmData)
+            munmap(state.shmData, state.shmMapSize);
+
+        state.shmData = mmap(nullptr, state.shmBufSize, PROT_READ | PROT_WRITE, MAP_SHARED, state.shmFd, 0);
+        if (state.shmData == MAP_FAILED) {
+            state.shmData    = nullptr;
+            state.shmMapSize = 0;
+            return false;
+        }
+
+        state.shmMapSize = state.shmBufSize;
+    }
+
     auto buf = makeShared<CCWlBuffer>(state.shmPool->sendCreateBuffer(0, width, height, stride, WL_SHM_FORMAT_XRGB8888));
     if (!buf->resource())
         return false;
@@ -190,6 +238,7 @@ static bool createShm(SWlState& state, Vector2D geom) {
     }
 
     state.shmBuf = buf;
+    paintBuffer(state, width, height, stride);
 
     return true;
 }
@@ -249,6 +298,18 @@ static bool setupToplevel(SWlState& state) {
 
     state.xdgToplevel->sendSetTitle("xdg interactive test client");
     state.xdgToplevel->sendSetAppId("xdg-interactive");
+
+    // §4.2's cooperative channel, set before the first commit — the tag is what a `stereo auto` rule
+    // reads, and it is also a plain window-rule match property (`xdg_tag`).
+    if (!toplevelTag.empty()) {
+        if (!state.xdgTagMgr) {
+            clientLog("xdg_toplevel_tag_manager_v1 is not available");
+            return false;
+        }
+
+        state.xdgTagMgr->sendSetToplevelTag(state.xdgToplevel->resource(), toplevelTag.c_str());
+        clientLog("tag {}", toplevelTag);
+    }
 
     state.surf->sendAttach(nullptr, 0, 0);
     state.surf->sendCommit();
@@ -382,11 +443,19 @@ static bool dispatchDisplay(SWlState& state) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 1 && argc != 2)
-        clientLog("Only the \"--debug\" switch is allowed, it turns on debug logs.");
-
-    if (argc == 2 && std::string{argv[1]} == "--debug")
-        debug = true;
+    for (int i = 1; i < argc; ++i) {
+        const std::string ARG = argv[i];
+        if (ARG == "--debug")
+            debug = true;
+        else if (ARG == "--paint")
+            paintQuadrants = true;
+        else if (ARG == "--tag" && i + 1 < argc)
+            toplevelTag = argv[++i];
+        else {
+            clientLog("usage: xdg-interactive [--debug] [--paint] [--tag <xdg-toplevel-tag>]");
+            return -1;
+        }
+    }
 
     SWlState state;
 
@@ -433,6 +502,8 @@ int main(int argc, char** argv) {
     }
 
     wl_display* display = state.display;
+    if (state.shmData)
+        munmap(state.shmData, state.shmMapSize);
     if (state.shmFd >= 0)
         close(state.shmFd);
     state = {};

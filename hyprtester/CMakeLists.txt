@@ -174,18 +174,22 @@ protocolnew("staging/ext-idle-notify" "ext-idle-notify-v1" false)
 protocolnew("../protocols" "wlr-layer-shell-unstable-v1" true)
 # output-info test client (research/24 §3, WP F3): asserts what CLIENTS are told about an output.
 protocolnew("unstable/xdg-output" "xdg-output-unstable-v1" false)
-# screencopy-crop test client (research/24 §3.6, WP F3): the suite's only pixel readback — the XML
-# lives in the repo root, like the layer-shell one.
+# screencopy-crop / screencopy-probe test clients (research/24 §3.6 + §5.3, WP F3/S2): the suite's
+# only pixel readback — the XML lives in the repo root, like the layer-shell one.
 protocolnew("../protocols" "wlr-screencopy-unstable-v1" true)
+# xdg-interactive --tag (research/24 §4.2, WP S2): the cooperative stereo-content channel, which is
+# also a plain window-rule match property.
+protocolnew("staging/xdg-toplevel-tag" "xdg-toplevel-tag-v1" false)
 
 clientNew("pointer-warp" PROTOS "pointer-warp-v1" "xdg-shell")
 clientNew("surface-scale-transform" PROTOS "fractional-scale-v1" "xdg-shell")
 clientNew("pointer-scroll" PROTOS "xdg-shell")
 clientNew("child-window" PROTOS "xdg-shell")
-clientNew("xdg-interactive" PROTOS "xdg-shell")
+clientNew("xdg-interactive" PROTOS "xdg-shell" "xdg-toplevel-tag-v1")
 clientNew("shortcut-inhibitor" PROTOS "xdg-shell" "keyboard-shortcuts-inhibit-unstable-v1")
 clientNew("keyboard-modifiers" PROTOS "xdg-shell")
 clientNew("idle-notify" PROTOS "ext-idle-notify-v1")
 clientNew("layer-surface" PROTOS "wlr-layer-shell-unstable-v1" "xdg-shell") # layer-shell references xdg_popup
 clientNew("output-info" PROTOS "xdg-output-unstable-v1")
 clientNew("screencopy-crop" PROTOS "wlr-screencopy-unstable-v1")
+clientNew("screencopy-probe" PROTOS "wlr-screencopy-unstable-v1")
