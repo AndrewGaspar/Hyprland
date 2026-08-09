@@ -825,21 +825,41 @@ void CHyprOpenGLImpl::end() {
             // mode-sized scanout frame with one blit per pane. The destination box is expressed as
             // the GL viewport (the pane projection fills NDC, the viewport places it), and the
             // damage scissors get the pane's origin added (glScissor is window-relative —
-            // m_scissorOffset). If CM or a screen shader applies, resolve it ONCE into a pane-sized
-            // work buffer, then blit the resolved pane; the panes themselves are raw copies.
-            auto             srcTex = TEX;
-            SP<IFramebuffer> tempFB;
-            NColorManagement::PImageDescription saveDesc;
-            if (PRIMITIVE_BLOCKED) {
-                tempFB   = g_pHyprRenderer->m_renderData.pMonitor->resources()->getUnusedWorkBuffer();
-                saveDesc = tempFB->imageDescription();
-                tempFB->setImageDescription(g_pHyprRenderer->m_renderData.pMonitor->m_imageDescription);
-                auto guard = g_pHyprRenderer->bindTempFB(tempFB);
-                GLFB(tempFB)->clearAfterInvalidation();
-                renderTexture(TEX, monbox, {.finalMonitorCM = true});
-                guard.reset();
-                srcTex = tempFB->getTexture();
-            }
+            // m_scissorOffset).
+            //
+            // The panes are raw SH_FRAG_PASSTHRURGBA copies, so everything the stock final blit
+            // does has to be resolved into a pane-sized work buffer first — in the same number of
+            // passes as stock (see the branches below). renderTextureInternal only runs the screen
+            // shader when the SOURCE already carries the monitor's image description
+            // (renderToOutput), which is exactly what a CM pass produces and what the composite
+            // does not when a conversion is due: collapsing the two into a single pass would apply
+            // the conversion and silently drop decoration:screen_shader (and the crash glitch
+            // shader) on every stereo output.
+            SP<IFramebuffer>                    cmFB, shaderFB;
+            NColorManagement::PImageDescription cmDesc, shaderDesc;
+
+            // one resolve pass into a fresh pane-sized work buffer tagged with the monitor's image
+            // description, handing back the buffer's texture (or the input, if the work buffer pool
+            // is exhausted — an unresolved pane beats a dropped frame).
+            const auto RESOLVEPASS = [&](SP<ITexture> tex, SP<IFramebuffer>& fb, NColorManagement::PImageDescription& saved) -> SP<ITexture> {
+                fb = PMONITOR->resources()->getUnusedWorkBuffer();
+                if (!fb)
+                    return tex;
+
+                saved = fb->imageDescription();
+                fb->setImageDescription(PMONITOR->m_imageDescription);
+
+                auto guard = g_pHyprRenderer->bindTempFB(fb);
+                GLFB(fb)->clearAfterInvalidation();
+                renderTexture(tex, monbox, {.finalMonitorCM = true});
+                return fb->getTexture();
+            };
+
+            auto srcTex = TEX;
+            if (NEEDS_CM)
+                srcTex = RESOLVEPASS(srcTex, cmFB, cmDesc); // the colour conversion (source description != the monitor's)
+            if (HAS_FINAL_SHADER)
+                srcTex = RESOLVEPASS(srcTex, shaderFB, shaderDesc); // the screen shader (source description IS the monitor's)
 
             for (int i = 0; i < PMONITOR->stereoPaneCount(); ++i) {
                 const auto DEST = PMONITOR->stereoPaneDestBox(i);
@@ -851,8 +871,10 @@ void CHyprOpenGLImpl::end() {
             m_scissorOffset = {};
             setViewport(0, 0, PMONITOR->m_pixelSize.x, PMONITOR->m_pixelSize.y);
 
-            if (tempFB)
-                tempFB->setImageDescription(saveDesc);
+            if (cmFB)
+                cmFB->setImageDescription(cmDesc);
+            if (shaderFB)
+                shaderFB->setImageDescription(shaderDesc);
         } else if LIKELY (!PRIMITIVE_BLOCKED || g_pHyprRenderer->m_renderMode != RENDER_MODE_NORMAL)
             renderTexturePrimitive(TEX, monbox);
         else if (NEEDS_CM && HAS_FINAL_SHADER) {
