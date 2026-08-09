@@ -94,8 +94,12 @@ in
       _, out = machine.execute("cat /tmp/testerlog")
       print(f"Hyprtester log:\n{out}")
 
-      # Copy logs to host
-      machine.execute('cp "$(find /tmp/hypr -name *.log | head -1)" /tmp/hyprlog')
+      # Copy logs to host.
+      # hyprtester runs its compositor in a PRIVATE $XDG_RUNTIME_DIR (hyprtester/src/RuntimeIsolation.hpp),
+      # so the log is at /tmp/hyprtester-<pid>-XXXXXX/hypr/<sig>/hyprland.log rather than /tmp/hypr/...
+      # That directory is kept only when the run failed — which is when the log is worth having — so
+      # always leave /tmp/hyprlog existing for copy_from_machine below.
+      machine.execute('L="$(find /tmp -path "*/hypr/*" -name "*.log" 2>/dev/null | head -1)"; if [ -n "$L" ]; then cp "$L" /tmp/hyprlog; else echo "no hyprland log (clean run: the isolated run dir was removed)" > /tmp/hyprlog; fi')
       machine.execute(f'echo {exit_status} > /tmp/exit_status')
       machine.copy_from_machine("/tmp/gtestslog")
       machine.copy_from_machine("/tmp/testerlog")

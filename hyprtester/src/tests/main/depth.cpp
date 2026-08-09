@@ -130,7 +130,7 @@ TEST_CASE(depthLadderIsObservable) {
 
     CScopeGuard windowGuard = {[&]() {
         if (windowProc && Tests::processAlive(windowProc->pid()))
-            kill(windowProc->pid(), SIGTERM);
+            Safe::signalPid(windowProc->pid(), SIGTERM);
         close(pipeFds[1]);
     }};
 
@@ -168,7 +168,7 @@ TEST_CASE(depthLadderIsObservable) {
 
     CScopeGuard layerGuard = {[&]() {
         if (layerProc && Tests::processAlive(layerProc->pid()))
-            kill(layerProc->pid(), SIGTERM);
+            Safe::signalPid(layerProc->pid(), SIGTERM);
     }};
 
     bool        layerUp = false;
@@ -242,7 +242,7 @@ TEST_CASE(depthFocusRaiseSwapsTheRungs) {
 
         ~SWindow() {
             if (proc && Tests::processAlive(proc->pid()))
-                kill(proc->pid(), SIGTERM);
+                Safe::signalPid(proc->pid(), SIGTERM);
             if (stdinWrite >= 0)
                 close(stdinWrite);
         }
