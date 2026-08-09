@@ -805,8 +805,7 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
     // unchanged mode still changes the pane and must reset the render resources below
     const auto OLDPANESIZE = paneSize();
 
-    m_transform  = RULE->m_transform;
-    m_stereoMode = RULE->m_stereo; // needed before the size derivation + scale validation below
+    m_transform = RULE->m_transform;
 
     // accumulate requested modes in reverse order (cause inesrting at front is inefficient)
     std::vector<SP<Aquamarine::SOutputMode>> requestedModes;
@@ -1020,6 +1019,11 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
 
     if (!success) {
         m_activeMonitorRule = std::move(pMonitorRule);
+        // stereo: this return skips every derivation the pack feeds (the pane-derived size, the
+        // matrix, the damage ring, the render resources, the cursor lock), so the rule's stereo
+        // mode must NOT be adopted here — a half-converted monitor scans out mono geometry through
+        // a packing renderer. m_stereoMode is therefore only taken below, after a committed mode;
+        // the retry re-runs this whole function.
         Log::logger->log(Log::ERR, "Monitor {} has NO FALLBACK MODES, and an INVALID one was requested: {:X0}@{:.2f}Hz", m_name, RULE->m_resolution, RULE->m_refreshRate);
         scheduleModeRetry();
         return true;
@@ -1034,8 +1038,12 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
 
     m_pixelSize = m_size;
 
-    // stereo: the committed mode must divide cleanly into panes; if not, drop the packing loudly
-    // rather than deriving fractional pane sizes (research/24 §3.4 item 1)
+    // stereo: adopt the rule's packing only now that a mode is actually committed — everything the
+    // pack changes (the size derivation, the matrix, the damage ring, the resources, the cursor
+    // lock) is derived below this line, and the !success return above skips all of it. The
+    // committed mode must then divide cleanly into panes, or the packing is dropped loudly rather
+    // than deriving fractional pane sizes (research/24 §3.4 item 1).
+    m_stereoMode = RULE->m_stereo;
     sanitizeStereoMode();
 
     static constexpr auto formats10bit = std::to_array<uint32_t>({DRM_FORMAT_XRGB2101010, DRM_FORMAT_XBGR2101010});
