@@ -256,3 +256,80 @@ TEST(Config, monitorParserSetMirror) {
     parser.setMirror("HDMI-A-1");
     EXPECT_EQ(parser.rule().m_mirrorOf, "HDMI-A-1");
 }
+
+// --- stereo output packing (research/24 §3.10, WP F1/F3) ---
+
+TEST(Config, monitorParserStereoDefaultsOff) {
+    // the whole "stereo:off is bit-identical to today" promise starts here: a rule that never
+    // mentions stereo must carry STEREO_OFF.
+    CMonitorRuleParser parser("DP-1");
+    EXPECT_EQ(parser.rule().m_stereo, STEREO_OFF);
+    EXPECT_FALSE(parser.getError().has_value());
+}
+
+TEST(Config, monitorParserStereoAccepts) {
+    CMonitorRuleParser p1("DP-1");
+    EXPECT_TRUE(p1.parseStereo("sbs"));
+    EXPECT_EQ(p1.rule().m_stereo, STEREO_SBS);
+    EXPECT_FALSE(p1.getError().has_value());
+
+    CMonitorRuleParser p2("DP-1");
+    EXPECT_TRUE(p2.parseStereo("off"));
+    EXPECT_EQ(p2.rule().m_stereo, STEREO_OFF);
+
+    // an empty value (monitorv2's unset `stereo =` key) is "off", not an error
+    CMonitorRuleParser p3("DP-1");
+    EXPECT_TRUE(p3.parseStereo(""));
+    EXPECT_EQ(p3.rule().m_stereo, STEREO_OFF);
+    EXPECT_FALSE(p3.getError().has_value());
+}
+
+TEST(Config, monitorParserStereoTogglesBackOff) {
+    // the live-reload path: the same parser being driven off→on→off must land back on off.
+    CMonitorRuleParser parser("DP-1");
+    EXPECT_TRUE(parser.parseStereo("sbs"));
+    EXPECT_EQ(parser.rule().m_stereo, STEREO_SBS);
+    EXPECT_TRUE(parser.parseStereo("off"));
+    EXPECT_EQ(parser.rule().m_stereo, STEREO_OFF);
+}
+
+TEST(Config, monitorParserStereoRejectsUnimplementedLayouts) {
+    // hsbs/tab/htab are WP F5. They must FAIL loudly rather than silently packing as sbs.
+    for (const auto* LAYOUT : {"hsbs", "tab", "htab"}) {
+        CMonitorRuleParser parser("DP-1");
+        EXPECT_FALSE(parser.parseStereo(LAYOUT)) << LAYOUT;
+        EXPECT_TRUE(parser.getError().has_value()) << LAYOUT;
+        EXPECT_EQ(parser.rule().m_stereo, STEREO_OFF) << LAYOUT;
+    }
+}
+
+TEST(Config, monitorParserStereoRejectsGarbage) {
+    for (const auto* VALUE : {"SBS", "on", "1", "true", "sbs2", " sbs"}) {
+        CMonitorRuleParser parser("DP-1");
+        EXPECT_FALSE(parser.parseStereo(VALUE)) << VALUE;
+        EXPECT_TRUE(parser.getError().has_value()) << VALUE;
+        EXPECT_EQ(parser.rule().m_stereo, STEREO_OFF) << VALUE;
+    }
+}
+
+// The hot-reload ordering guard: a stereo flip changes the logical size derivation, the render
+// resource sizes and the matrices, so it must be a HARD mismatch (full applyMonitorRule), never a
+// soft one — a soft-applied flip would leave pane-sized buffers behind a mode-sized scanout.
+TEST(Config, monitorRuleStereoChangeIsAHardMismatch) {
+    CMonitorRule a;
+    a.m_name       = "DP-1";
+    a.m_resolution = {3840, 1080};
+    a.m_scale      = 1.F;
+
+    CMonitorRule b = a;
+    EXPECT_EQ(a.compare(b), COMPARISON_FULL_MATCH);
+
+    b.m_stereo = STEREO_SBS;
+    EXPECT_EQ(a.compare(b), COMPARISON_NO_MATCH);
+    EXPECT_EQ(b.compare(a), COMPARISON_NO_MATCH);
+
+    // and a soft-only difference on top of an equal stereo mode stays soft
+    CMonitorRule c = a;
+    c.m_offset     = {100, 100};
+    EXPECT_EQ(a.compare(c), COMPARISON_SOFT_MISMATCH);
+}
