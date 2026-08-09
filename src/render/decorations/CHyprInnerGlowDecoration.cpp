@@ -48,7 +48,7 @@ void CHyprInnerGlowDecoration::damageEntire() {
         windowBox.translate(PWORKSPACE->m_renderOffset->value());
     windowBox.translate(PWINDOW->m_floatingOffset);
     // stereo depth (research/24 §6.3): the glow is drawn into both panes at ±disparity
-    windowBox.expand(std::ceil(g_pHyprRenderer->depthDamageSpread(PWINDOW, PWINDOW->m_monitor.lock())));
+    windowBox.expand(std::ceil(g_pHyprRenderer->depthDamageSpreadAnyMonitor(PWINDOW)));
 
     g_pHyprRenderer->damageRegion(CRegion(windowBox));
 }

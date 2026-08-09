@@ -396,6 +396,30 @@ double IHyprRenderer::depthDamageSpread(const PHLWINDOW& window, const PHLMONITO
     return depthShiftLogical(window->m_depth->value(), monitor, viewBoxLocal(window, monitor));
 }
 
+// ...and the largest spread this window has on ANY monitor it is drawn on.
+//
+// For the callers that damage a GLOBAL region and let damageRegion()/damageBox() fan it out to
+// every monitor it overlaps — the four decoration damageEntire() paths. Those cannot ask about "the
+// monitor" the way damageWindow()'s loop can, and asking about m_monitor (where the window's centre
+// happens to be) is wrong in the case that matters: a window straddling a mono output and a stereo
+// one has m_monitor mono half the time, and the stereo output then gets a decoration damage region
+// with no room for the disparity — a stale sliver along the border, in one eye.
+//
+// The max is the conservative answer: on the stereo output it is exactly right, and on a mono one
+// it only over-damages by a few pixels of a region that was already being repainted.
+double IHyprRenderer::depthDamageSpreadAnyMonitor(const PHLWINDOW& window) {
+    if (!window)
+        return 0.0;
+
+    double spread = 0.0;
+    for (auto const& m : State::monitorState()->monitors()) {
+        if (m->m_output && shouldRenderWindow(window, m))
+            spread = std::max(spread, depthDamageSpread(window, m));
+    }
+
+    return spread;
+}
+
 double IHyprRenderer::depthDamageSpread(const PHLLS& layer, const PHLMONITOR& monitor) {
     if (!monitor || !monitor->isStereo() || !layer || !layer->m_depth)
         return 0.0;
