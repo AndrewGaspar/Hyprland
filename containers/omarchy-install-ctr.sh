@@ -92,6 +92,7 @@ CURATED_PKGS=(
   chromium                           # Omarchy's default browser: omarchy-launch-browser / SUPER+SHIFT+RETURN, the webapp helpers (omarchy-webapp-*), and the theme.sh chromium policy/appearance step all target it. Arch's /usr/bin/chromium wrapper sources ~/.config/chromium-flags.conf (seeded below).
   # --- terminal, fonts, theme ---
   alacritty                          # Omarchy default terminal
+  kitty xorg-xeyes                   # hyprtester's runtime deps (hyprtester/src/main.cpp header): 108 of the 178 non-XR cases spawn kitty, the xwayland cases spawn xeyes. Not Omarchy's, but the container is the only place the full suite can run.
   ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji woff2-font-awesome ttf-ia-writer
   fontconfig gnome-themes-extra yaru-icon-theme
   # --- screenshot / clipboard (omarchy keybinds) ---

@@ -149,6 +149,7 @@ scripts/xr-container.sh test --gpu amd        # full hyprtester --xr suite in-co
 scripts/xr-container.sh test --gpu amd xr_session_up   # a subset (test-name filter)
 scripts/xr-container.sh test --gpu amd --keep # leave the container up for debugging
 scripts/xr-container.sh test --gpu amd --build # force an in-container rebuild first
+scripts/xr-container.sh test --full --gpu amd # the FULL non-XR suite instead
 ```
 
 Boots `:session` with **no host wayland/X11/wivrn mounts** — only the `/src`
@@ -173,6 +174,24 @@ the default. `--gpu nvidia` needs the host CDI spec (see below); it is refused
 with setup instructions if the spec is absent. The suite pins the node it
 resolves **inside** the container, so a CDI-injected NVIDIA node is verified
 present rather than assumed by name.
+
+### The full (non-XR) suite (`test --full`)
+
+`--full` runs `tests/{main,clients,misc}` — the ordinary hyprtester suite — through
+[`test/run-full-tests.sh`](test/run-full-tests.sh) instead. **This is the only place
+that suite can run.** The host has no `kitty` (108 of the 178 cases spawn one), and
+a non-`--xr` hyprtester on the host can select the developer's *live* compositor and
+SIGTERM the session out from under them. The container has kitty and no live session
+to hit.
+
+It nests into the same headless labwc as the XR runner, for the same reason
+(rootless podman is seatless → `CBackend::create()` fails). `runXrSuite` retries
+nested by itself; the normal suite launches once and gives up — so the runner simply
+exports `WAYLAND_DISPLAY` at labwc's socket and lets the compositor inherit it.
+Hyprland no longer reads `HYPRLAND_HEADLESS_ONLY` (`Compositor.cpp` asks for HEADLESS
+mandatory / DRM if-available / WAYLAND fallback), so hyprtester still setting it does
+not pin the launch to headless and the wayland fallback backend takes. No hyprtester
+patch is involved.
 
 ## Layout
 
