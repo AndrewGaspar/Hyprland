@@ -7,6 +7,7 @@
 #include "../pass/InnerGlowPassElement.hpp"
 #include "../Renderer.hpp"
 #include "../OpenGL.hpp"
+#include "../../desktop/DepthTiers.hpp"
 
 CHyprInnerGlowDecoration::CHyprInnerGlowDecoration(PHLWINDOW pWindow) : IHyprWindowDecoration(pWindow), m_window(pWindow) {
     ;
@@ -46,6 +47,8 @@ void CHyprInnerGlowDecoration::damageEntire() {
     if (PWORKSPACE && PWORKSPACE->m_renderOffset->isBeingAnimated() && !PWINDOW->m_pinned)
         windowBox.translate(PWORKSPACE->m_renderOffset->value());
     windowBox.translate(PWINDOW->m_floatingOffset);
+    // stereo depth (research/24 §6.3): the glow is drawn into both panes at ±disparity
+    windowBox.expand(std::ceil(g_pHyprRenderer->depthDamageSpreadAnyMonitor(PWINDOW)));
 
     g_pHyprRenderer->damageRegion(CRegion(windowBox));
 }
@@ -79,8 +82,12 @@ void CHyprInnerGlowDecoration::render(PHLMONITOR pMonitor, float const& a) {
     const auto WORKSPACEOFF  = PWORKSPACE && !PWINDOW->m_pinned ? PWORKSPACE->m_renderOffset->value() : Vector2D();
 
     CBox       windowBox = {m_lastWindowPos.x, m_lastWindowPos.y, m_lastWindowSize.x, m_lastWindowSize.y};
-    windowBox.translate(-pMonitor->m_position + WORKSPACEOFF + PWINDOW->m_floatingOffset);
-    windowBox.scale(pMonitor->m_scale).round();
+    // research/24 §6.2 injection point 1: the depth disparity rides in beside the floating offset
+    const auto DEPTHOFFSET = g_pHyprRenderer->depthRenderOffset(PWINDOW);
+    windowBox.translate(-pMonitor->m_position + WORKSPACEOFF + PWINDOW->m_floatingOffset + DEPTHOFFSET);
+    windowBox.scale(pMonitor->m_scale);
+    // §8.1's seam, shared with the surface this glow rims — see roundKeepingDisparity
+    Desktop::Depth::roundKeepingDisparity(windowBox, DEPTHOFFSET.x * pMonitor->m_scale);
 
     if (windowBox.width < 1 || windowBox.height < 1)
         return;

@@ -43,6 +43,8 @@
 #include "../state/WorkspaceState.hpp"
 #include "../helpers/time/Time.hpp"
 #include "../desktop/view/LayerSurface.hpp"
+#include "../desktop/view/Window.hpp"
+#include "../desktop/state/WindowState.hpp"
 #include "../desktop/state/GlobalWindowController.hpp"
 #include "../desktop/state/FocusState.hpp"
 #include "../desktop/state/FadingOutState.hpp"
@@ -1890,6 +1892,42 @@ int CMonitor::stereoPaneCount() const {
 
 CBox CMonitor::stereoPaneDestBox(int idx) const {
     return Monitor::Stereo::paneDestBox(m_pixelSize, m_stereoMode, idx);
+}
+
+bool CMonitor::depthIsAnimating() const {
+    // research/24 §6.3: the depth animations damage nothing by design, so the renderer has to ask.
+    for (const auto& W : Desktop::windowState()->windows()) {
+        if (W->m_depth && W->m_depth->isBeingAnimated() && W->m_monitor == m_self)
+            return true;
+    }
+
+    for (const auto& LAYERS : m_layerSurfaceLayers) {
+        for (const auto& LSREF : LAYERS) {
+            const auto LS = LSREF.lock();
+            if (LS && LS->m_depth && LS->m_depth->isBeingAnimated())
+                return true;
+        }
+    }
+
+    return false;
+}
+
+void CMonitor::bookDepthRepaint() {
+    // The other half of §6.3's bring-up crutch, and the half that is easy to miss: renderMonitor
+    // repaints while depthIsAnimating(), but the windowsDepth animation does not always ANIMATE.
+    // With `animations { enabled = false }`, a `noanim` rule, or a disabled `windows` parent node,
+    // the value WARPS in the same tick the goal was set — isBeingAnimated() is already false by the
+    // time the frame is built. And the depth var is AVARDAMAGE_NONE by design (a depth change costs
+    // an ordinary monitor exactly zero), so nothing else damages either: the border ring would
+    // repaint at the new disparity while the window body kept the old one.
+    //
+    // So the goal-setter books the repaint itself, on stereo outputs only. Off a stereo output this
+    // is a branch and nothing else, which is what keeps depth free for everyone not using it.
+    if (!isStereo())
+        return;
+
+    m_forceFullFrames = std::max(m_forceFullFrames, 3);
+    scheduleFrame(Aquamarine::IOutput::AQ_SCHEDULE_ANIMATION);
 }
 
 void CMonitor::sanitizeStereoMode(const Vector2D& requestedMode) {

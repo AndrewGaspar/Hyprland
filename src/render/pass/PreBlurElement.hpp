@@ -10,7 +10,6 @@ class CPreBlurElement : public IPassElement {
     virtual bool        needsPrecomputeBlur();
     virtual bool        disableSimplification();
     virtual bool        undiscardable();
-    virtual bool        replayable();
 
     virtual const char* passName() {
         return "CPreBlurElement";

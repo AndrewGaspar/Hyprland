@@ -207,19 +207,6 @@ CRegion CRenderPass::render(const CRegion& damage_) {
     return m_damage;
 }
 
-CRegion CRenderPass::replay() {
-    for (auto& el : m_passElements) {
-        if (el.discard || !el.element->replayable())
-            continue;
-
-        g_pHyprRenderer->m_renderData.damage = el.elementDamage;
-        g_pHyprRenderer->draw(el.element, el.elementDamage);
-    }
-
-    g_pHyprRenderer->m_renderData.damage = m_damage;
-    return m_damage;
-}
-
 void CRenderPass::renderDebugData() {
     const auto pMonitor = g_pHyprRenderer->m_renderData.pMonitor;
     CBox       box      = {{}, pMonitor->m_transformedSize};

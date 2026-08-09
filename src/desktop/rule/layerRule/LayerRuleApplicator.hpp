@@ -59,6 +59,10 @@ namespace Desktop::Rule {
 
         DEFINE_PROP(Config::FLOAT, ignoreAlpha, 0.F)
 
+        // carries ONLY an explicit `layerrule = depth <z>`; the per-layer tier default lives in
+        // CLayerSurface::updateDepth(). Probe with hasValue() (research/24 §7.2).
+        DEFINE_PROP(Config::FLOAT, depth, 0.F)
+
         DEFINE_PROP(std::string, animationStyle, std::string(""))
 
 #undef COMMA

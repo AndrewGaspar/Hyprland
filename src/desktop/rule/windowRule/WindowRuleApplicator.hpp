@@ -129,6 +129,12 @@ namespace Desktop::Rule {
         // rule engine's value variant is a fixed set of types.
         DEFINE_PROP(Config::INTEGER, stereo, 0, WINDOW_RULE_EFFECT_STEREO)
 
+        // research/24 §7.2: unlike roundingPower there is no single config key to fall back to —
+        // the default depends on focus/fullscreen, so the tier is resolved in
+        // CWindow::updateDepth() and this var carries ONLY an explicit rule override. Read it with
+        // hasValue(), never valueOrDefault().
+        DEFINE_PROP(Config::FLOAT, depth, 0.F, WINDOW_RULE_EFFECT_DEPTH)
+
         DEFINE_PROP(Config::FLOAT, roundingPower, {std::string("decoration:rounding_power")}, WINDOW_RULE_EFFECT_ROUNDING_POWER)
         DEFINE_PROP(Config::FLOAT, scrollMouse, {std::string("input:scroll_factor")}, WINDOW_RULE_EFFECT_SCROLL_MOUSE)
         DEFINE_PROP(Config::FLOAT, scrollTouchpad, {std::string("input:touchpad:scroll_factor")}, WINDOW_RULE_EFFECT_SCROLL_TOUCHPAD)
