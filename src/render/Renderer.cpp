@@ -2544,16 +2544,17 @@ void IHyprRenderer::renderMonitor(PHLMONITOR pMonitor, bool commit) {
                     endRenderOverlay = std::chrono::high_resolution_clock::now();
                 }
 
-                if (*PDAMAGEBLINK && damageBlinkCleanup == 0) {
+                // debug:damage_blink, decided ONCE per frame rather than once per pane: the
+                // counter is a frame-rate state machine, so advancing it inside the pane loop both
+                // ran it at twice the rate and — because the tint is only drawn on the tick that
+                // sets it to 1 — painted the flash into pane 0 alone. A full-screen magenta wash
+                // shown to one eye is the §6.1 rivalry case, in a debug mode meant to be watched.
+                damageBlinkReached = true;
+                if (DRAWDAMAGEBLINK) {
                     CRectPassElement::SRectData data;
                     data.box   = {0, 0, pMonitor->m_transformedSize.x, pMonitor->m_transformedSize.y};
                     data.color = CHyprColor(1.0, 0.0, 1.0, 100.0 / 255.0);
                     m_renderPass.add(makeUnique<CRectPassElement>(data));
-                    damageBlinkCleanup = 1;
-                } else if (*PDAMAGEBLINK) {
-                    damageBlinkCleanup++;
-                    if (damageBlinkCleanup > 3)
-                        damageBlinkCleanup = 0;
                 }
             }
         } else if (!pMonitor->isMirror() && pane == 0) {
@@ -2598,6 +2599,14 @@ void IHyprRenderer::renderMonitor(PHLMONITOR pMonitor, bool commit) {
 
         if (pane + 1 < PANES)
             finishStereoPane(pMonitor);
+    }
+
+    // ...and the blink's state machine, once for the frame however many panes it took
+    if (*PDAMAGEBLINK && damageBlinkReached) {
+        if (damageBlinkCleanup == 0)
+            damageBlinkCleanup = 1;
+        else if (++damageBlinkCleanup > 3)
+            damageBlinkCleanup = 0;
     }
 
     // endRender() runs the LAST pane's pass and then the pack in end(), so the eye state and the
