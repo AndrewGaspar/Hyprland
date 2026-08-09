@@ -1137,6 +1137,28 @@ no-op for everyone who does not set it.
   so *content* assertions need either a small screencopy helper or an eyeball. The structural
   assertions are free.
 
+  > **STATUS: the caveat is spent — the helper exists (WP F3, then WP S2).**
+  > `hyprtester/clients/screencopy-crop` asks "is a region capture a 1:1 crop of the full one?" and
+  > `hyprtester/clients/screencopy-probe` asks "what colour is the pixel at x,y?", over the same
+  > shm path grim and the screenshot portal take (`clients/screencopy-capture.hpp` is the shared
+  > half). That was necessary, because the whole per-window CONTENT producer is invisible to every
+  > structural assertion — same box, same geometry, same input region, same damage; only the texels
+  > differ — so §5.3 could not be tested at all without pixels.
+  >
+  > The trick that makes it robust is to assert **shapes, not colours**. A client painted with four
+  > distinct quadrants (`xdg-interactive --paint`) is probed at its four quadrant centres and the
+  > result is reduced to which sampled the same colour as which: `abcd` for no crop, `aacc` for a
+  > side-by-side crop (the left half stretched across the box), `abab` for over-under. The
+  > composite, the monitor's colour management and the capture format all preserve "these two
+  > match" and none preserves "this one is red". `stereoTaggedWindowSamplesOneHalfPerPane` gets
+  > three different shapes out of the same client on the same monitor, which is what makes its
+  > untagged control mean something.
+  >
+  > **Still not covered, precisely:** the packed scanout frame itself. Every capture protocol is
+  > sized at the pane by design (§3.6), so the probe sees the eye-0 composite — never the two-pane
+  > buffer the blit loop assembles. That gap is unchanged and is stated at the top of
+  > `hyprtester/src/tests/main/stereo.cpp`.
+
 ---
 
 ## 4. Q1 — detecting stereo content
@@ -1166,6 +1188,14 @@ no-op for everyone who does not set it.
 > the correct behaviour and costs no code. And a stereo-declared window on a monitor that is not
 > presenting a pane pair is left **exactly** as it is today (packed frame shown as-is), per §11's
 > "❌ by design, cost 0" — not cropped to one half.
+>
+> **WP S2** then made the tier fold above testable without a compositor: the precedence is
+> `Render::Stereo::resolveDeclaration(rule, tagged) -> {layout, gated}` and `CWindow::stereoLayout()`
+> keeps only the two lookups and the fullscreen query — still asked *only* when the gate is in play,
+> which is what keeps a per-surface-per-frame read cheap. Nine gtests spell the matrix out, including
+> the two rows that are easy to get backwards: a client's `stereo:mono` suppresses `auto` but does
+> not beat an explicit rule, and a client that declares its own packing lifts §4.3's gate even when
+> the rule's layout disagrees with it. The producer itself is proved **in pixels** — see §3.12.
 
 ### 4.1 The tiers, and what each is for
 
@@ -1455,6 +1485,14 @@ cropping half the buffer across an unchanged box already un-squeezes a half-pack
 window and differ only in how many source samples each eye gets. `k` still ships, in
 `Render::Stereo::aspectFactor`, because X1's quad pair genuinely needs it.
 
+> **STATUS (WP S2):** the rule above is now applied, not merely stored —
+> `Render::Stereo::presentedAspect(bufferSize, layout)` turns a packed buffer into the height/width
+> one eye should present, `contentPaneSize()` being the "destination box" it derives from. The test
+> that earns its keep asserts that a 3840×1080 `sbs` buffer, a 1920×1080 `hsbs` one, a 1920×2160
+> `tab` one and a 1920×1080 `htab` one all land on the *same* number — and that `hsbs`, `htab` and
+> mono are indistinguishable **by size**, which is this section's argument stated as an executable
+> fact. X1 is still the only caller.
+
 - **Full SBS** means the *frame* is double-width and each half is already correctly proportioned.
   A 3840×1080 SBS frame contains two 1920×1080 eye images. Quad aspect = pane aspect =
   `1080/1920`.
@@ -1552,6 +1590,14 @@ presenter, and unit-test it (`tests/xr/` gtest, no headset needed).
 
 Which pane does the ray hit? Both — they are coincident in space. Hit-test against the pair as
 one target (the pose and size are shared), and use the *left* pane's mapping by convention.
+
+> **STATUS (WP S2):** the CONTENT producer's half is built and unit-tested —
+> `Render::Stereo::paneUVToContentUV` / `contentUVToPaneUV`, both directions, expressed through
+> `cropForEye` so the crop the renderer runs and the un-map the pointer runs cannot drift apart.
+> They are named for the producer rather than "stereoUnmap" precisely because of the warning above:
+> the DEPTH producer's mapping is the identity, and inviting one function to serve both is how the
+> cursor ends up half a screen out. X1/X3 are the callers; the flat presenter needs neither, since
+> the destination box there is the window's own and input never leaves monitor coordinates.
 
 ### 5.7 XREAL specifics
 
@@ -2150,7 +2196,7 @@ optional; it is now Phase F.
 |---|---|---|---|
 | **S0** | **0** | XREAL | **Zero-code spike.** Put a known SBS video fullscreen and confirm the current build shows it doubled (it will). Confirm the mod's SBS output and the 3840 mode line up. Answers "is full-SBS at 3840 lossless end to end" |
 | **S1** ✅ | **M** | flat | **The stereo declaration and the Q1 producer.** `windowrule = stereo <layout>` as a generic window-rule effect (7 lines × 5 files + the Lua mirror, §7.1) matching `xdg_tag`/`class`/`title`/`content`; per-window UV crop in `calculateUVForSurface` (F7) so the tagged window samples a different half per pane; the "fullscreen-on-this-monitor unless overridden" negative heuristic (§4.3). **Stored in a shared config manager** (F8). Visible immediately on F1's flat presenter |
-| **S2** | S | flat | **Tests.** gtests: aspect/`k` from the destination box, pane→monitor UV mapping both directions, rule fold + provenance. hyprtester: a tagged window on a stereo monitor produces two distinct panes; untagged produces one |
+| **S2** ✅ | S | flat | **Tests.** gtests: aspect/`k` from the destination box (`presentedAspect`), pane↔content UV mapping both directions (§5.6), and the precedence table as a pure function (`resolveDeclaration`, extracted from `CWindow::stereoLayout()`) — 700 → 718. hyprtester: `stereoTaggedWindowSamplesOneHalfPerPane` proves the crop **in pixels** via a new `screencopy-probe` client and a four-quadrant `xdg-interactive --paint` (§3.12), with an untagged control and the mono-monitor degradation; `stereoRuleFoldAndProvenance` covers the fold above the pure part. Stereo suite 6 → 8, headless on the host |
 | **S3** | S | — | **Config surface + docs.** The `xdg_tag` convention (§4.2), the HSBS resolution caveat, the heuristic block for `example/` (§4.3), status/JSON fields |
 | **S5** | XS | — | **`contrib/mpv-hypxr-stereo.lua`** (§4.5) — observe mpv's `video-params/stereo-in`, set the rule. **Must call a non-XR verb** (`hyprctl keyword` / a generic dispatcher), not `hyprctl openxr stereo` |
 | **S8** | M | flat | **`stereo:auto`** (§4.4): downsampled NCC detector, fullscreen precondition, hysteresis, decision surfaced in status. Default **off** |
