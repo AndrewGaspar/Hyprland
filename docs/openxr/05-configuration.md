@@ -1177,6 +1177,13 @@ A mode that does not divide cleanly into panes (an odd width with `sbs`) is refu
 is dropped, stereo goes back to `off`, and you get a log line plus an on-screen error toast
 rather than a half-pixel pane.
 
+The same happens when the mode you asked for is not the mode that came up. If the rule names a
+resolution and the modeset falls back to something else — or the rule says `preferred`/`highrr`
+and every requested mode was rejected, leaving Hyprland to take any mode the display would
+accept — then the display is not in side-by-side mode, and packing it would put one eye's half
+across the whole panel. The pack is dropped with the same log line and toast; fix the mode and it
+comes back on the next reload.
+
 Live toggling needs no new command — monitor rules already re-apply:
 
 ```bash
@@ -1224,13 +1231,14 @@ Note that the fractional-scale validator divides the **pane**, not the mode — 
 `width`/`height` are the presented per-eye pane, plus `stereo`, `scanoutWidth` and
 `scanoutHeight` fields (text form: `stereo: sbs (scanout 3840x1080)`).
 
-> **Hazard: a display GUI can un-stereo the monitor behind your back.** `wlr-output-management`'s
+> **A display GUI can take the monitor out of side-by-side mode.** `wlr-output-management`'s
 > *write* path takes a resolution straight from the head's mode list with no knowledge of the
-> stereo token, so touching `wdisplays` / `nwg-displays` / any config GUI on a stereo output can
-> silently drop the packing (or re-derive the wrong logical size). There is no guard for this yet.
-> If the desktop suddenly looks doubled or half-width after using a display GUI, re-apply the
-> rule with `hyprctl keyword monitor …, stereo:sbs` (or reload the config). Prefer editing the
-> config over GUI display tools on a stereo output.
+> stereo token. Hyprland guards the pack there: a write-back that keeps the mode the pack is
+> running on keeps the packing, and one that changes it **drops the packing** (with a log line)
+> instead of leaving a pack on a display that is no longer split. Either way the desktop stays
+> coherent, but the glasses stop being stereo — re-apply the rule with
+> `hyprctl keyword monitor …, stereo:sbs` (or reload the config) after using a display GUI, and
+> prefer editing the config over GUI display tools on a stereo output.
 
 ### Example — the XREAL flat path
 
