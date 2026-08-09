@@ -105,14 +105,34 @@ namespace Render {
         bool                   transformDamage = true;
         bool                   noSimplify      = false;
 
-        // stereo content (research/24 §5.3, WP S1). `stereoEye` names which pane of a stereo output
-        // is currently being composited — 0 is the left eye and is what every non-stereo render is.
-        // `stereoContentDrawn` is set by the UV crop when a stereo-declared surface actually made it
-        // onto this pane, and is what tells the pack in CHyprOpenGLImpl::end() that the panes differ
-        // and a second composite is owed. Nothing stereo drawn ⇒ one composite blitted N times, the
-        // §3.3 floor, which is the ordinary desktop on a stereo output.
-        int  stereoEye          = 0;
+        // --- the stereo per-eye producer (research/24 §5.3 WP S1 + §6.1 WP D2) ---
+        //
+        // ONE eye index for BOTH per-eye effects. Which pane of a stereo output is being
+        // composited RIGHT NOW; -1 means "not a per-eye pass", which is every frame on every
+        // ordinary monitor, every frame on a stereo monitor with nothing raised and no stereo
+        // content on it (§6.4.1's fast path), and every off-cycle render (screencopy, a fake
+        // frame, a mirror source).
+        //
+        // Depth reads it gated on >= 0 — a mono frame must not shift anything, so the mono path
+        // costs an integer compare and is otherwise untouched. The stereo-CONTENT crop instead
+        // reads it as eye `max(stereoPane, 0)`: a capture of a stereo output has exactly one pane
+        // to hand out and §3.6 says that pane is the left eye, which is also what the pane loop
+        // draws first.
+        int stereoPane = -1;
+        // ...and the crop's own witness: set when a stereo-declared surface actually made it onto
+        // a pane this frame. Not the producer's trigger any more (the pane count is decided before
+        // the frame is built, exactly as depth's is) — it is what `hyprctl monitors` reports as
+        // `stereoContent`, i.e. "is my stereo window engaged, or is the rule sitting behind the
+        // fullscreen gate?".
         bool stereoContentDrawn = false;
+        // The finished composite of each pane BEFORE the one still being built, for the pack in
+        // CHyprOpenGLImpl::end(). Empty in the fast path, where end() duplicates the single
+        // composite into every pane exactly as WP F1 shipped it.
+        std::vector<SP<IFramebuffer>> stereoPaneFBs;
+        // ...and the union of those panes' FINAL damage. finalDamage is one slot per pass and each
+        // pane's pass overwrites it, so the pack — which blits every pane through a single damage
+        // region — would otherwise scissor earlier panes to the LAST pane's blur-expanded region.
+        CRegion stereoPaneDamage;
     };
 
     struct STFRange {

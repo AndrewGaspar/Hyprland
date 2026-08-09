@@ -31,7 +31,7 @@ CLayerRuleApplicator::CLayerRuleApplicator(PHLLS ls) : m_ls(ls) {
 
 void CLayerRuleApplicator::resetProps(std::underlying_type_t<eRuleProperty> props, Types::eOverridePriority prio) {
     std::apply([&](auto&... prop) { (resetRuleProp(prop, props, prio), ...); },
-               std::forward_as_tuple(m_noanim, m_blur, m_blurPopups, m_dimAround, m_xray, m_noScreenShare, m_order, m_aboveLock, m_ignoreAlpha, m_animationStyle));
+               std::forward_as_tuple(m_noanim, m_blur, m_blurPopups, m_dimAround, m_xray, m_noScreenShare, m_order, m_aboveLock, m_ignoreAlpha, m_depth, m_animationStyle));
 
     if (prio == Types::PRIORITY_WINDOW_RULE)
         std::erase_if(m_otherProps.props, [props](const auto& el) { return !el.second || el.second->propMask & props; });
@@ -115,6 +115,11 @@ void CLayerRuleApplicator::applyDynamicRule(const SP<CLayerRule>& rule) {
                 m_ignoreAlpha.second |= rule->getPropertiesMask();
                 break;
             }
+            case LAYER_RULE_EFFECT_DEPTH: {
+                m_depth.first.set(std::get<float>(value), Types::PRIORITY_WINDOW_RULE);
+                m_depth.second |= rule->getPropertiesMask();
+                break;
+            }
             case LAYER_RULE_EFFECT_ANIMATION: {
                 m_animationStyle.first.set(std::get<std::string>(value), Types::PRIORITY_WINDOW_RULE);
                 m_animationStyle.second |= rule->getPropertiesMask();
@@ -148,6 +153,10 @@ void CLayerRuleApplicator::propertiesChanged(std::underlying_type_t<eRulePropert
 
         applyDynamicRule(wr);
     }
+
+    // the depth tier is resolved from the layer + the (possibly just-reset) rule override, so it
+    // has to run after the fold, not inside it (research/24 §7.3).
+    m_ls->updateDepth();
 
     // for plugins
     Event::bus()->m_events.layer.updateRules.emit(m_ls.lock());

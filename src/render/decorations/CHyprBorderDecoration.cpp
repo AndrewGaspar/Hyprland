@@ -5,6 +5,7 @@
 #include "../../managers/fullscreen/FullscreenController.hpp"
 #include "../pass/BorderPassElement.hpp"
 #include "../Renderer.hpp"
+#include "../../desktop/DepthTiers.hpp"
 #include "../../state/MonitorState.hpp"
 
 CHyprBorderDecoration::CHyprBorderDecoration(PHLWINDOW pWindow) : IHyprWindowDecoration(pWindow), m_window(pWindow) {
@@ -53,7 +54,16 @@ void CHyprBorderDecoration::draw(PHLMONITOR pMonitor, float const& a) {
     if (m_assignedGeometry.width < m_extents.topLeft.x + 1 || m_assignedGeometry.height < m_extents.topLeft.y + 1)
         return;
 
-    CBox windowBox = assignedBoxGlobal().translate(-pMonitor->m_position + m_window->m_floatingOffset).expand(-m_window->getRealBorderSize()).scale(pMonitor->m_scale).round();
+    // research/24 §6.2 injection point 1: the depth disparity rides in beside the floating offset
+    const auto DEPTHOFFSET = g_pHyprRenderer->depthRenderOffset(m_window.lock());
+
+    CBox       windowBox =
+        assignedBoxGlobal().translate(-pMonitor->m_position + m_window->m_floatingOffset + DEPTHOFFSET).expand(-m_window->getRealBorderSize()).scale(pMonitor->m_scale);
+
+    // ...and §8.1's seam, the same call the surface inside this border makes: round the box on the
+    // UN-SHIFTED grid so the frame and its content quantise together. A whole-pixel border around a
+    // sub-pixel surface is a frame at a different depth from the thing it frames.
+    Desktop::Depth::roundKeepingDisparity(windowBox, DEPTHOFFSET.x * pMonitor->m_scale);
 
     if (windowBox.width < 1 || windowBox.height < 1)
         return;
@@ -129,7 +139,8 @@ void CHyprBorderDecoration::damageEntire() {
 
     CRegion    borderRegion(GLOBAL_BOX);
     borderRegion.subtract(GLOBAL_BOX.copy().expand(-(BORDERSIZE + ROUNDING)));
-    borderRegion.expand(2); // pad
+    // stereo depth (research/24 §6.3): the border is drawn into both panes at ±disparity
+    borderRegion.expand(2 + std::ceil(g_pHyprRenderer->depthDamageSpreadAnyMonitor(m_window.lock()))); // pad
 
     const CBox borderExtents = borderRegion.getExtents();
 

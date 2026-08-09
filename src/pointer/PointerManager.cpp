@@ -824,7 +824,13 @@ void CPointerManager::damageIfSoftware() {
         if (!shouldAddDamage)
             continue;
 
-        CBox damageBox = b.copy().translate(-monitor->m_position).scale(monitor->m_scale).round();
+        // research/24 §6.3 pt 2 applied to §3.7's per-eye cursor: on a stereo output the cursor is
+        // drawn in each pane at ±its own (UNCLAMPED) disparity, so the box that damages its NEW
+        // position has to be grown by that magnitude — otherwise a warp of more than the fixed 4 px
+        // pad leaves each pane's shifted draw scissored away on one side. Zero off a stereo output.
+        const double CURSORSPREAD = g_pHyprRenderer->cursorDepthDamageSpread(monitor);
+
+        CBox         damageBox = b.copy().translate(-monitor->m_position).expand(std::ceil(CURSORSPREAD)).scale(monitor->m_scale).round();
         monitor->addDamage(damageBox);
 
         // research/24 §3.7: per-eye passes may have drawn the cursor disparity-shifted from the
@@ -832,7 +838,7 @@ void CPointerManager::damageIfSoftware() {
         // (monitor-local logical, same treatment as damageSoftwareLeftover in updateCursorBackend).
         // The eye-pass caller damages its own NEW disparity-shifted box; this covers the OLD one.
         if (mw->swRendered)
-            monitor->addDamage(mw->swRenderedBox.copy().expand(4).scale(monitor->m_scale).round());
+            monitor->addDamage(mw->swRenderedBox.copy().expand(4 + std::ceil(CURSORSPREAD)).scale(monitor->m_scale).round());
     }
 }
 

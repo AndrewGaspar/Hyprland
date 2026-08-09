@@ -285,6 +285,14 @@ Vector2D CSubsurface::coordsRelativeToParent() const {
     return m_subsurface->posRelativeToParent();
 }
 
+PHLWINDOW CSubsurface::windowParent() const {
+    return m_windowParent.lock();
+}
+
+WP<Desktop::View::CPopup> CSubsurface::popupParent() const {
+    return m_popupParent;
+}
+
 Vector2D CSubsurface::coordsGlobal() const {
     Vector2D coords = coordsRelativeToParent();
 

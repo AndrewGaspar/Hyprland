@@ -231,17 +231,25 @@ std::string CHyprCtl::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat format) 
     // logical monitor everything above the scanout sees); the true packed scanout mode is exposed
     // in these extra fields so the packing is discoverable. Empty (byte-identical output) when off.
     //
-    // `stereoContent` (WP S1) is the producer's own state: true while a stereo-declared window is
-    // actually being cropped into the panes, i.e. while the panes DIFFER and the frame costs a
-    // second composite. It is the only outside view of that decision, and the one field that
-    // answers "is my stereo window engaged, or is the rule sitting behind the fullscreen gate?".
+    // The two per-eye producers report separately, because they answer different questions and
+    // either can run without the other:
+    //
+    //   `stereoComposites` (WP D2, §6.4.1) — how many DISTINCT composites the last frame cost.
+    //     1 means both panes came from one, which is the fast path; 2 means the pane loop ran,
+    //     for depth or for stereo content or for both.
+    //   `stereoContent` (WP S1, §5.3) — did the per-window UV crop actually reach a drawn
+    //     surface. The one field that answers "is my stereo window engaged, or is the rule
+    //     sitting behind the fullscreen gate?", and the only outside view of that decision.
+    //
+    // Both are otherwise invisible from outside the process.
     const std::string STEREO_JSON = m->isStereo() ?
-        std::format("\n    \"stereo\": \"{}\",\n    \"scanoutWidth\": {},\n    \"scanoutHeight\": {},\n    \"stereoContent\": {},", Config::stereoModeToString(m->m_stereoMode),
-                    sc<int>(m->m_pixelSize.x), sc<int>(m->m_pixelSize.y), m->m_stereoContentPanes ? "true" : "false") :
+        std::format("\n    \"stereo\": \"{}\",\n    \"scanoutWidth\": {},\n    \"scanoutHeight\": {},\n    \"stereoComposites\": {},\n    \"stereoContent\": {},",
+                    Config::stereoModeToString(m->m_stereoMode), sc<int>(m->m_pixelSize.x), sc<int>(m->m_pixelSize.y), m->m_stereoComposites,
+                    m->m_stereoContentPanes ? "true" : "false") :
         "";
     const std::string STEREO_TEXT = m->isStereo() ?
-        std::format("\n\tstereo: {} (scanout {}x{}, content {})", Config::stereoModeToString(m->m_stereoMode), sc<int>(m->m_pixelSize.x), sc<int>(m->m_pixelSize.y),
-                    m->m_stereoContentPanes ? "per-eye" : "mono") :
+        std::format("\n\tstereo: {} (scanout {}x{}, {} composite{}, content {})", Config::stereoModeToString(m->m_stereoMode), sc<int>(m->m_pixelSize.x),
+                    sc<int>(m->m_pixelSize.y), m->m_stereoComposites, m->m_stereoComposites == 1 ? "" : "s", m->m_stereoContentPanes ? "per-eye" : "mono") :
         "";
 
     if (format == eHyprCtlOutputFormat::FORMAT_JSON) {
@@ -440,6 +448,7 @@ std::string CHyprCtl::getWindowData(PHLWINDOW w, eHyprCtlOutputFormat format) {
     "contentType": "{}",
     "stereo": "{}",
     "tearingHint": {},
+    "depth": {:.3f},
     "stableId": "{:x}"
 }},)#",
             rc<uintptr_t>(w.get()), (w->m_isMapped ? "true" : "false"), (w->isHidden() ? "true" : "false"), (w->visible() ? "true" : "false"),
@@ -452,7 +461,8 @@ std::string CHyprCtl::getWindowData(PHLWINDOW w, eHyprCtlOutputFormat format) {
             sc<uint8_t>(Fullscreen::controller()->getFullscreenModes(w).client), escapeJSONStrings(Fullscreen::controller()->getFullscreenHandlerNameAsString(w)),
             (w->m_allowedOverFullscreen ? "true" : "false"), getGroupedData(w, format), getTagsData(w, format), rc<uintptr_t>(w->m_swallowee.get()), getFocusHistoryID(w),
             (g_pInputManager->isWindowInhibiting(w, false) ? "true" : "false"), escapeJSONStrings(w->xdgTag().value_or("")), escapeJSONStrings(w->xdgDescription().value_or("")),
-            escapeJSONStrings(NContentType::toString(w->getContentType())), Render::Stereo::layoutToString(w->stereoLayout()), (w->m_tearingHint ? "true" : "false"), w->m_stableID);
+            escapeJSONStrings(NContentType::toString(w->getContentType())), Render::Stereo::layoutToString(w->stereoLayout()), (w->m_tearingHint ? "true" : "false"),
+            (w->m_depth ? w->m_depth->goal() : 0.F), w->m_stableID);
     } else {
         return std::format(
             "Window {:x} -> {}:\n\tmapped: {}\n\thidden: {}\n\tvisible: {}\n\tacceptsInput: {}\n\tat: {},{}\n\tsize: {},{}\n\tworkspace: {} ({})\n\tfloating: {}\n\tmonitor: "
@@ -462,7 +472,7 @@ std::string CHyprCtl::getWindowData(PHLWINDOW w, eHyprCtlOutputFormat format) {
             "{}\n\tfullscreen: {}\n\tfullscreenClient: {}\n\tfullscreenHandler: {}\n\tallowedOverFullscreen: {}\n\tgrouped: {}\n\ttags: {}\n\tswallowing: {:x}\n\tfocusHistoryID: "
             "{}\n\tinhibitingIdle: "
             "{}\n\txdgTag: "
-            "{}\n\txdgDescription: {}\n\tcontentType: {}\n\tstereo: {}\n\ttearingHint: {}\n\tstableID: {:x}\n\n",
+            "{}\n\txdgDescription: {}\n\tcontentType: {}\n\tstereo: {}\n\ttearingHint: {}\n\tdepth: {:.3f}\n\tstableID: {:x}\n\n",
             rc<uintptr_t>(w.get()), w->m_title, sc<int>(w->m_isMapped), sc<int>(w->isHidden()), sc<int>(w->visible()), sc<int>(w->acceptsInput()),
             sc<int>(w->position(Desktop::View::IGeometric::GEOMETRIC_GOAL).x), sc<int>(w->position(Desktop::View::IGeometric::GEOMETRIC_GOAL).y),
             sc<int>(w->size(Desktop::View::IGeometric::GEOMETRIC_GOAL).x), sc<int>(w->size(Desktop::View::IGeometric::GEOMETRIC_GOAL).y),
@@ -471,7 +481,8 @@ std::string CHyprCtl::getWindowData(PHLWINDOW w, eHyprCtlOutputFormat format) {
             sc<uint8_t>(Fullscreen::controller()->getFullscreenModes(w).internal), sc<uint8_t>(Fullscreen::controller()->getFullscreenModes(w).client),
             Fullscreen::controller()->getFullscreenHandlerNameAsString(w), sc<int>(w->m_allowedOverFullscreen), getGroupedData(w, format), getTagsData(w, format),
             rc<uintptr_t>(w->m_swallowee.get()), getFocusHistoryID(w), sc<int>(g_pInputManager->isWindowInhibiting(w, false)), w->xdgTag().value_or(""),
-            w->xdgDescription().value_or(""), NContentType::toString(w->getContentType()), Render::Stereo::layoutToString(w->stereoLayout()), sc<int>(w->m_tearingHint), w->m_stableID);
+            w->xdgDescription().value_or(""), NContentType::toString(w->getContentType()), Render::Stereo::layoutToString(w->stereoLayout()), sc<int>(w->m_tearingHint),
+            (w->m_depth ? w->m_depth->goal() : 0.F), w->m_stableID);
     }
 }
 
@@ -693,11 +704,13 @@ static std::string layersRequest(eHyprCtlOutputFormat format, std::string reques
                     "w": {},
                     "h": {},
                     "alpha": {},
+                    "depth": {:.3f},
                     "namespace": "{}",
                     "pid": {}
                 }},)#",
                         rc<uintptr_t>(layer.get()), layer->m_geometry.x, layer->m_geometry.y, layer->m_geometry.width, layer->m_geometry.height,
-                        std::clamp(sc<double>(layer->alpha().goal()), 0.0, 1.0), escapeJSONStrings(layer->m_namespace), layer->getPID());
+                        std::clamp(sc<double>(layer->alpha().goal()), 0.0, 1.0), (layer->m_depth ? layer->m_depth->goal() : 0.F), escapeJSONStrings(layer->m_namespace),
+                        layer->getPID());
                 }
 
                 trimTrailingComma(result);

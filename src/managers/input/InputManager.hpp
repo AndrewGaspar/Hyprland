@@ -228,6 +228,22 @@ class CInputManager {
     //
     bool m_emptyFocusCursorSet = false;
 
+    // What the pointer is over RIGHT NOW. WP D2 (research/24 §5.4) draws the cursor at that
+    // thing's depth — Daydream's rule is that a cursor may never sit BEHIND what it is over — and
+    // a render pass must not run a hit test to find out, so mouseMoveUnified() records the result
+    // of the hit test it already ran.
+    //
+    // NOT m_foundWindowToFocus/m_foundLSToFocus: those are the click-refocus targets, cleared at
+    // the top of every mouseMoveUnified and re-assigned only under `if (refocus)`, i.e. null for
+    // the whole of ordinary pointer motion. Reading them here made the cursor flat while moving
+    // and pop to the window's disparity on every click.
+    PHLWINDOW hoveredWindow() const {
+        return m_hoveredWindow.lock();
+    }
+    PHLLS hoveredLayer() const {
+        return m_hoveredLS.lock();
+    }
+
   private:
     // Listeners
     struct {
@@ -269,6 +285,12 @@ class CInputManager {
     WP<CWLSurfaceResource> m_foundSurfaceToFocus;
     PHLLSREF               m_foundLSToFocus;
     PHLWINDOWREF           m_foundWindowToFocus;
+
+    // ...and this is the same hit test's answer on EVERY pass, refocus or not — hover state, read
+    // by hoveredWindow()/hoveredLayer(). Written from one scope guard in mouseMoveUnified so the
+    // function's twenty-odd early returns cannot leave it stale.
+    PHLLSREF     m_hoveredLS;
+    PHLWINDOWREF m_hoveredWindow;
 
     // used for warping back after non-mouse input
     Vector2D m_lastMousePos   = {};

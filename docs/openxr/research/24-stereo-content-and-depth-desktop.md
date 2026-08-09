@@ -1175,19 +1175,36 @@ no-op for everyone who does not set it.
 > pixel detection, S8) is **not** built and is still not recommended as a default.
 >
 > The producer is the second half of the same WP: the crop lands at F7's seam
-> (`IElementRenderer::calculateUVForSurface`) on the window's main surface only, and the pack in
-> `CHyprOpenGLImpl::end()` re-runs the frame's pass (`CRenderPass::replay()`) with the eye index in
-> render data when — and only when — a stereo-declared surface was actually drawn. That is §3.3's
-> producer table made self-gating: an ordinary desktop on a stereo output still costs one composite
-> and one extra blit. Both `sbs`/`hsbs` and `tab`/`htab` work; the `k` of §5.2 is deliberately
-> unused on the flat presenter (see §5.2 below) and waits for X1.
+> (`IElementRenderer::calculateUVForSurface`) on the window's main surface only, reading the eye out
+> of `m_renderData.stereoPane`. It shipped with a second-eye mechanism of its own — a replay of the
+> frame's pass, self-gated on whether a declared surface had actually been drawn. **That mechanism
+> is gone.** WP D2 needs the second eye to differ in GEOMETRY, which a replay of already-built pass
+> elements cannot express, so the two producers were unified onto D2's: `renderMonitor` builds the
+> scene once per pane, and the pane count is a predicate over the scene
+> (`depthProducerActive(m) || stereoContentActive(m)`) rather than an outcome of drawing it. §3.3's
+> producer table survives — an ordinary desktop on a stereo output with nothing declared still costs
+> one composite and one extra blit — but it is now decided before the frame is built, which costs a
+> conservative second composite for a declared window that is on the output and entirely occluded.
+> The exact answer is still reported: `hyprctl monitors` carries both `stereoComposites` (what the
+> frame cost) and `stereoContent` (whether the crop reached a surface). Both `sbs`/`hsbs` and
+> `tab`/`htab` work; the `k` of §5.2 is deliberately unused on the flat presenter (see §5.2 below)
+> and waits for X1.
+>
+> The unification also settles the pre-blur, which both WPs found independently. S1 marked
+> `CPreBlurElement` non-replayable (it blurs what the framebuffer held BEFORE the pass reached it,
+> and on a replay that is the finished first eye); D2 re-dirties `m_blurFBDirty` between panes when
+> a background/bottom layer is raised. With the scene rebuilt per pane the first problem cannot
+> arise, and D2's rule is the whole rule: **the pre-blur is recomputed per pane iff its SOURCE
+> differs per pane, which is iff a `layerrule = depth` raised a background or bottom layer.** The
+> content crop only ever touches a declared window's own surface, never the background the pre-blur
+> samples, so a pane loop running for content alone leaves one pre-blur serving every pane.
 >
 > **Deviations from this memo, recorded:** §5.4's "suppress the desktop pointer on a
-> client-stereo monitor" does not apply to the flat presenter — the cursor is a pass element, so
-> the replay draws it into each pane at the same position, i.e. both eyes at screen depth, which is
-> the correct behaviour and costs no code. And a stereo-declared window on a monitor that is not
-> presenting a pane pair is left **exactly** as it is today (packed frame shown as-is), per §11's
-> "❌ by design, cost 0" — not cropped to one half.
+> client-stereo monitor" does not apply to the flat presenter — the cursor is drawn into each pane
+> at the same position (it takes depth from what it is over, and a stereo window carries none), i.e.
+> both eyes at screen depth, which is the correct behaviour and costs no code. And a stereo-declared
+> window on a monitor that is not presenting a pane pair is left **exactly** as it is today (packed
+> frame shown as-is), per §11's "❌ by design, cost 0" — not cropped to one half.
 >
 > **WP S2** then made the tier fold above testable without a compositor: the precedence is
 > `Render::Stereo::resolveDeclaration(rule, tagged) -> {layout, gated}` and `CWindow::stereoLayout()`

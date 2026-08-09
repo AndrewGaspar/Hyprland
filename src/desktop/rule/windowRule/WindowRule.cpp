@@ -9,6 +9,7 @@
 #include "../../../protocols/types/ContentType.hpp"
 #include "../../../render/StereoContent.hpp"
 #include "../../../config/shared/parserUtils/ParserUtils.hpp"
+#include "../../DepthTiers.hpp"
 #include "desktop/rule/windowRule/WindowRuleEffectContainer.hpp"
 
 #include <hyprutils/string/Numeric.hpp>
@@ -329,6 +330,17 @@ static std::expected<WindowRuleEffectValue, std::string> parseWindowRuleEffect(C
             if (!parsed)
                 return std::unexpected(parsed.error());
             return *parsed;
+        }
+
+        // research/24 §7.1 level 3: depth is per-view *styling*, so it lives beside border and
+        // shadow in windowrule/layerrule. 0 is the wallpaper plane, 1 the top of the ladder; the
+        // clamp is the comfort ceiling of §8.2 and never a parse failure, because a user who wrote
+        // `depth 2` wants "as high as it goes", not an error.
+        case WINDOW_RULE_EFFECT_DEPTH: {
+            auto parsed = parseFloat(EFFECT_NAME, raw);
+            if (!parsed)
+                return std::unexpected(parsed.error());
+            return Depth::clamp(*parsed);
         }
 
         case WINDOW_RULE_EFFECT_ROUNDING_POWER: {

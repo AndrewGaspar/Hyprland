@@ -108,10 +108,15 @@ namespace Monitor {
         // stock. Set from the active monitor rule in applyMonitorRule/Soft (before the size derivation).
         Config::eMonitorStereoMode  m_stereoMode = Config::STEREO_OFF;
 
-        // stereo CONTENT (research/24 §5.3, WP S1): the last frame cropped a stereo-declared window
-        // into the panes, so the panes DIFFER and that frame cost a second composite. Written by the
-        // pack in CHyprOpenGLImpl::end(), read by `hyprctl monitors` — the only outside view of the
-        // producer's decision, and always false on a monitor that is not stereo.
+        // stereo CONTENT (research/24 §5.3, WP S1): the last frame actually cropped a stereo-declared
+        // window into a pane — the declaration survived the fullscreen gate, the window was on this
+        // output, and it was not occluded away. Written by the pack in CHyprOpenGLImpl::end() from
+        // what the crop raised, read by `hyprctl monitors` as `stereoContent`, and always false on a
+        // monitor that is not stereo.
+        //
+        // Distinct from m_stereoComposites below, which counts what the frame COST: the pane loop is
+        // entered from a predicate over the scene, so a declared-but-invisible window is 2 composites
+        // with this false.
         bool                        m_stereoContentPanes = false;
 
         // stereo (§3.4 item 15): the last mode search did not land on a mode the rule asked for —
@@ -330,6 +335,19 @@ namespace Monitor {
         Vector2D     paneSize() const;          // m_pixelSize / divisor, scanout orientation; == m_pixelSize when off
         int          stereoPaneCount() const;
         CBox         stereoPaneDestBox(int idx) const; // pane idx's destination box inside the mode-sized scanout buffer
+
+        // the stereo per-eye producer (research/24 §5.3 WP S1 + §6 WP D2)
+        //
+        // m_stereoComposites is how many composites the last frame cost — 1 is §6.4.1's fast path
+        // (nothing on this output is raised AND nothing on it is declared stereo, so both panes are
+        // the same image), 2 is the pane loop running, for either reason or for both. Surfaced in
+        // `hyprctl monitors`; otherwise invisible from outside the process.
+        bool depthIsAnimating() const; // any view on this output easing between depth tiers
+        // ...and its counterpart for the depth change that never eases at all (animations off, a
+        // `noanim` rule): the setter books a full repaint, because an AVARDAMAGE_NONE var that
+        // warps produces neither an animation to watch nor any damage of its own.
+        void bookDepthRepaint();
+        int  m_stereoComposites = 1;
 
         // IMonitorQueryable / IMonitorArrangeable
         virtual MONITORID                   id() const override;

@@ -254,6 +254,13 @@ namespace Desktop::View {
         // animated tint
         PHLANIMVAR<float> m_dimPercent;
 
+        // How high this window floats above the wallpaper plane, 0..1 (research/24 §7).
+        // WP D1 shipped the state; WP D2 added the producer that turns it into per-pane disparity
+        // on a STEREO output. On every other output it is still inert — nothing reads it while
+        // rendering — which is why it is AVARDAMAGE_NONE at creation and why the repaint it does
+        // need is booked explicitly by CMonitor::bookDepthRepaint() rather than by a damage policy.
+        PHLANIMVAR<float> m_depth;
+
         // animate moving to an invisible workspace
         int m_monitorMovedFrom = -1; // -1 means not moving
 
@@ -361,6 +368,7 @@ namespace Desktop::View {
         bool                              visibleByAlphaGoal() const;
         bool                              targetVisible() const;
         void                              updateDecorationValues();
+        void                              updateDepth(bool warp = false);
         SBoxExtents                       getFullWindowReservedArea();
         Vector2D                          middle();
         bool                              opaque();

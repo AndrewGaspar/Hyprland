@@ -36,6 +36,12 @@ namespace Desktop::View {
         Vector2D                       coordsRelativeToParent() const;
         Vector2D                       coordsGlobal() const;
 
+        // the T1 view this subsurface tree hangs off, one of the two. Every node of the tree
+        // carries the same pair (onNewSubsurface passes the parent's straight down), so this is a
+        // lookup and not a walk.
+        PHLWINDOW                      windowParent() const;
+        WP<Desktop::View::CPopup>      popupParent() const;
+
         Vector2D                       size();
 
         void                           onCommit();

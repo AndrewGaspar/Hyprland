@@ -66,20 +66,59 @@ namespace Render {
             RT_VK = 2,
         };
 
-        virtual eType                       type() = 0;
-        WP<Render::GL::CHyprOpenGLImpl>     glBackend();
+        virtual eType                   type() = 0;
+        WP<Render::GL::CHyprOpenGLImpl> glBackend();
 
-        void                                renderMonitor(PHLMONITOR pMonitor, bool commit = true);
-        void                                arrangeLayersForMonitor(const MONITORID&);
-        void                                damageSurface(SP<CWLSurfaceResource>, double, double, double scale = 1.0);
-        void                                damageWindow(PHLWINDOW, bool forceFull = false);
-        void                                damageBox(const CBox&, bool skipFrameSchedule = false);
-        void                                damageBox(const int& x, const int& y, const int& w, const int& h);
-        void                                damageRegion(const CRegion&);
-        void                                damageMonitor(PHLMONITOR);
-        void                                damageMirrorsWith(PHLMONITOR, const CRegion&);
-        bool                                shouldRenderWindow(PHLWINDOW, PHLMONITOR);
-        bool                                shouldRenderWindow(PHLWINDOW);
+        void                            renderMonitor(PHLMONITOR pMonitor, bool commit = true);
+        void                            arrangeLayersForMonitor(const MONITORID&);
+        void                            damageSurface(SP<CWLSurfaceResource>, double, double, double scale = 1.0);
+        void                            damageWindow(PHLWINDOW, bool forceFull = false);
+        void                            damageBox(const CBox&, bool skipFrameSchedule = false);
+        void                            damageBox(const int& x, const int& y, const int& w, const int& h);
+        void                            damageRegion(const CRegion&);
+        void                            damageMonitor(PHLMONITOR);
+        void                            damageMirrorsWith(PHLMONITOR, const CRegion&);
+        bool                            shouldRenderWindow(PHLWINDOW, PHLMONITOR);
+        bool                            shouldRenderWindow(PHLWINDOW);
+
+        // --- the stereo depth producer (research/24 §6.1, §6.2 injection point 1, WP D2) -------
+        //
+        // depthRenderOffset() is THE seam. Every render-path reader of m_floatingOffset adds it,
+        // which is what makes depth follow decorations, blur cutouts, clip boxes and occlusion
+        // for free — they all already follow m_floatingOffset. It is the eye-SIGNED, edge-clamped
+        // offset for the pane currently being composited, in logical pixels, and it is exactly
+        // {0,0} unless m_renderData.stereoPane >= 0. That early-out is the fast path's guarantee:
+        // an ordinary monitor's frame is byte-for-byte what it was before this WP.
+        Vector2D depthRenderOffset(const PHLWINDOW& window);
+        Vector2D depthRenderOffset(const PHLLS& layer);
+        // The cursor's own offset for the pane being composited. It has no depth of its own: it
+        // takes the depth of whatever it is over (§5.4, and Daydream's "same depth as or nearer
+        // than the object it is over", §8.2 item 3).
+        Vector2D cursorDepthOffset(const PHLMONITOR& monitor);
+        // The depth it takes, i.e. the hovered view's — public so the tests and the damage path
+        // read the same answer the render path does.
+        float cursorDepth();
+
+        // ...and this is its eye-AGNOSTIC twin, for damage and visibility. Both panes exist in the
+        // same frame, so anything asking "where might this be drawn" must cover [−s, +s] — a
+        // raised window's damage has to reach both panes at their shifted positions (§6.3 pt 2).
+        // Takes an explicit monitor because damage is computed outside any render pass.
+        double depthDamageSpread(const PHLWINDOW& window, const PHLMONITOR& monitor);
+        double depthDamageSpread(const PHLLS& layer, const PHLMONITOR& monitor);
+        // ...and the largest of those over every monitor the window is drawn on, for the callers
+        // that damage one global region and let it fan out to all of them (decoration damageEntire).
+        double depthDamageSpreadAnyMonitor(const PHLWINDOW& window);
+        double cursorDepthDamageSpread(const PHLMONITOR& monitor);
+
+        // The two halves of the pane-loop predicate (renderMonitor). Either one true means the
+        // panes differ and the desktop is composited once per eye; both false is §6.4.1's
+        // single-composite fast path — the default, and the whole reason a flat SBS desktop with
+        // no packed content on it stays cheap.
+        //
+        // §6.4.1: is anything on this monitor actually off the wallpaper plane?
+        bool depthProducerActive(const PHLMONITOR& monitor);
+        // §5.3: is a window whose content is declared packed on this monitor?
+        bool                                stereoContentActive(const PHLMONITOR& monitor);
         bool                                shouldRenderMonitor(PHLMONITOR);
         void                                ensureCursorRenderingMode();
         bool                                shouldRenderCursor();
@@ -218,7 +257,10 @@ namespace Render {
         virtual void              renderOffToMain(SP<IFramebuffer> off)                                         = 0;
         virtual SP<IRenderbuffer> getOrCreateRenderbufferInternal(SP<Aquamarine::IBuffer> buffer, uint32_t fmt) = 0;
         void                      renderMirrored();
-        void                      setDamage(const CRegion& damage_, std::optional<CRegion> finalDamage);
+        // stereo depth producer: run the pass just built into the buffer it was aimed at, hand
+        // that buffer to end()'s pack as a finished pane, and bind a clean one for the next pane.
+        void finishStereoPane(PHLMONITOR pMonitor);
+        void setDamage(const CRegion& damage_, std::optional<CRegion> finalDamage);
         // if RENDER_MODE_NORMAL, provided damage will be written to.
         // otherwise, it will be the one used.
         bool         beginRender(PHLMONITOR pMonitor, CRegion& damage, eRenderMode mode = RENDER_MODE_NORMAL, SP<IHLBuffer> buffer = {}, SP<IFramebuffer> fb = nullptr,
