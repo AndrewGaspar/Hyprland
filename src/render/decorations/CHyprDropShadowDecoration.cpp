@@ -46,8 +46,11 @@ void CHyprDropShadowDecoration::damageEntire() {
         return; // disabled
 
     const auto PWINDOW = m_window.lock();
-    const auto pos     = PWINDOW->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
-    const auto size    = PWINDOW->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+    if (!PWINDOW)
+        return; // same teardown window as updateWindow(); nothing left to damage
+
+    const auto pos  = PWINDOW->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+    const auto size = PWINDOW->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
 
     CBox       shadowBox = {pos.x - m_extents.topLeft.x, pos.y - m_extents.topLeft.y, pos.x + size.x + m_extents.bottomRight.x, pos.y + size.y + m_extents.bottomRight.y};
 
@@ -74,6 +77,16 @@ void CHyprDropShadowDecoration::damageEntire() {
 
 void CHyprDropShadowDecoration::updateWindow(PHLWINDOW pWindow) {
     const auto PWINDOW = m_window.lock();
+
+    // The decoration outlives its window by a hair: CWindow's destructor tears down the group it
+    // belonged to, and ~CGroup re-assigns the surviving windows to their space, which walks every
+    // member's decorations (~CWindow -> ~CGroup -> assignToSpace -> onUpdateSpace ->
+    // updateWindowDecos -> here). By then the window's shared count is already zero, so lock()
+    // hands back null and the deref below is a read of address 0 — observed as a SIGSEGV on the
+    // compositor's exit path (2026-08-09 coredump: cleanup() -> ~CWindow -> ~CGroup -> here).
+    // There is nothing to recompute for a window that is going away; keep the last known box.
+    if (!PWINDOW)
+        return;
 
     m_lastWindowPos  = PWINDOW->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
     m_lastWindowSize = PWINDOW->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);

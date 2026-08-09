@@ -57,7 +57,7 @@ namespace {
 
         ~CIdleClient() {
             if (m_proc) {
-                kill(m_proc->pid(), SIGKILL);
+                Safe::signalPid(m_proc->pid(), SIGKILL);
                 m_proc.reset();
             }
         }

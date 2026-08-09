@@ -18,6 +18,7 @@
 
 #include "shared.hpp"
 #include "hyprctlCompat.hpp"
+#include "SafeKill.hpp"
 #include "tests/main/tests.hpp"
 #include "tests/clients/tests.hpp"
 #include "tests/misc/tests.hpp"
@@ -46,6 +47,7 @@
 #include <unistd.h>
 #include <utility>
 #include <memory>
+#include <optional>
 #include <print>
 #include <string>
 #include <string_view>
@@ -93,7 +95,38 @@ static bool         launchHyprland(Path configPath, Path binaryPath, const std::
 
 static bool hyprlandAlive() {
     NLog::yellow("hyprlandAlive");
-    return kill(hyprlandProc->pid(), 0) == 0 || errno != ESRCH;
+    return hyprlandProc && Safe::pidAlive(hyprlandProc->pid());
+}
+
+// The instance registered by the Hyprland WE spawned, or nullopt.
+//
+// instances() enumerates every compositor in $XDG_RUNTIME_DIR/hypr — on a developer box that
+// includes the live desktop session the run was launched from. Taking instances().back() means
+// "the newest lock file", which is only our instance as long as ours registered at all: if the
+// Hyprland under test dies before writing its lock (or is slower than the 10s grace below), the
+// newest lock is the developer's LIVE session, and every getFromSocket() that follows — the
+// preTestCleanup window/layer kills, `/plugin load`, the closing `/dispatch exit` — is aimed at
+// their desktop. Match on the pid in the lock instead, so a missing instance fails the run
+// loudly rather than quietly retargeting it.
+static std::optional<SInstanceData> ourInstance() {
+    if (!hyprlandProc)
+        return std::nullopt;
+
+    // Belt to the pid match's braces: whatever we pick, it must not be the compositor this run was
+    // launched from. A test run addressing its own parent session is never anything but a bug.
+    const char* PARENTHIS = std::getenv("HYPRLAND_INSTANCE_SIGNATURE");
+
+    const auto  OURPID = static_cast<uint64_t>(hyprlandProc->pid());
+    for (const auto& i : instances()) {
+        if (i.pid != OURPID)
+            continue;
+        if (PARENTHIS && i.id == PARENTHIS) {
+            NLog::red("refusing to drive instance {}: it is the compositor hyprtester was launched from", i.id);
+            return std::nullopt;
+        }
+        return i;
+    }
+    return std::nullopt;
 }
 
 [[noreturn]] static void helpAndDie(int exit_code) {
@@ -249,7 +282,7 @@ static void cleanupAndReport(const STestsRunResult& tInfo, bool nonLuaConfig = f
         }
     }
 
-    kill(hyprlandProc->pid(), SIGKILL);
+    Safe::signalPid(hyprlandProc->pid(), SIGKILL);
     hyprlandProc.reset();
 }
 
@@ -259,14 +292,14 @@ static void cleanupAndReport(const STestsRunResult& tInfo, bool nonLuaConfig = f
 // XDG_RUNTIME_DIR/hypr). Fills HIS/WLDISPLAY. Returns false if it dies or times out.
 static bool waitForHyprlandInstance(int timeoutSec) {
     for (int i = 0; i < timeoutSec * 10; ++i) {
-        if (!hyprlandProc || (kill(hyprlandProc->pid(), 0) != 0 && errno == ESRCH)) {
+        if (!hyprlandProc || !Safe::pidAlive(hyprlandProc->pid())) {
             NLog::red("Hyprland process died during startup");
             return false;
         }
-        const auto INSTANCES = instances();
-        if (!INSTANCES.empty()) {
-            HIS       = INSTANCES.back().id;
-            WLDISPLAY = INSTANCES.back().wlSocket;
+        // by pid, never "the newest lock" — see ourInstance()
+        if (const auto OURS = ourInstance()) {
+            HIS       = OURS->id;
+            WLDISPLAY = OURS->wlSocket;
             return true;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -276,8 +309,7 @@ static bool waitForHyprlandInstance(int timeoutSec) {
 
 static void killHyprlandProc() {
     if (hyprlandProc) {
-        if (kill(hyprlandProc->pid(), 0) == 0)
-            kill(hyprlandProc->pid(), SIGKILL);
+        Safe::signalPid(hyprlandProc->pid(), SIGKILL);
         // reap: CProcess detaches on runAsync, so just give it a moment
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
         hyprlandProc.reset();
@@ -297,7 +329,7 @@ static int runXrSuite(const SSettings& settings) {
     const std::string origWayland    = getenv("WAYLAND_DISPLAY") ? getenv("WAYLAND_DISPLAY") : "";
     const std::string runDir         = "/tmp/hyprtester-xr-" + std::to_string(getpid());
 
-    std::error_code ec;
+    std::error_code   ec;
     std::filesystem::remove_all(runDir, ec);
     std::filesystem::create_directories(runDir, ec);
     chmod(runDir.c_str(), 0700);
@@ -322,7 +354,7 @@ static int runXrSuite(const SSettings& settings) {
             wrap << "openxr:gpu = " << gpu << "\n";
     }
 
-    const bool monadoUp = orchestrator.start();
+    const bool                                       monadoUp = orchestrator.start();
 
     std::vector<std::pair<std::string, std::string>> hlEnv;
 
@@ -435,8 +467,8 @@ static int runXrSuite(const SSettings& settings) {
 
 int main(int argc, char** argv, char** envp) {
 
-    std::span<const char*>                  args{const_cast<const char**>(argv + 1), sc<std::size_t>(argc - 1)};
-    const SSettings                         settings = parseSettings(args);
+    std::span<const char*> args{const_cast<const char**>(argv + 1), sc<std::size_t>(argc - 1)};
+    const SSettings        settings = parseSettings(args);
 
 #ifdef WITH_XR_TESTS
     if (settings.xrMode)
@@ -484,16 +516,17 @@ int main(int argc, char** argv, char** envp) {
         return 1;
     }
 
-    // wonderful, we are in. Let's get the instance signature.
+    // wonderful, we are in. Let's get the instance signature — of OUR compositor, by pid.
     NLog::yellow("trying to get INSTANCES");
-    const auto INSTANCES = instances();
-    if (INSTANCES.empty()) {
-        NLog::red("Hyprland failed to launch (2)");
+    const auto OURS = ourInstance();
+    if (!OURS) {
+        NLog::red("Hyprland failed to launch (2): the spawned compositor (pid {}) registered no instance", hyprlandProc->pid());
+        Safe::signalPid(hyprlandProc->pid(), SIGKILL);
         return 1;
     }
 
-    HIS       = INSTANCES.back().id;
-    WLDISPLAY = INSTANCES.back().wlSocket;
+    HIS       = OURS->id;
+    WLDISPLAY = OURS->wlSocket;
 
     NLog::yellow("trying to get create headless output");
     const auto CREATE_HEADLESS_2 = getFromSocket("/output create headless HEADLESS-2");
