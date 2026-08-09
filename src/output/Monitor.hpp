@@ -325,6 +325,14 @@ namespace Monitor {
         int          stereoPaneCount() const;
         CBox         stereoPaneDestBox(int idx) const; // pane idx's destination box inside the mode-sized scanout buffer
 
+        // the stereo DEPTH producer (research/24 §6, WP D2)
+        //
+        // m_stereoComposites is how many composites the last frame cost — 1 is §6.4.1's fast path
+        // (nothing on this output is raised, so both panes are the same image), 2 is the producer
+        // running. Surfaced in `hyprctl monitors`; otherwise invisible from outside the process.
+        bool depthIsAnimating() const; // any view on this output easing between depth tiers
+        int  m_stereoComposites = 1;
+
         // IMonitorQueryable / IMonitorArrangeable
         virtual MONITORID                   id() const override;
         virtual std::string_view            name() const override;

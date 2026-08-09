@@ -835,6 +835,13 @@ void CHyprOpenGLImpl::end() {
             // does not when a conversion is due: collapsing the two into a single pass would apply
             // the conversion and silently drop decoration:screen_shader (and the crash glitch
             // shader) on every stereo output.
+            //
+            // WP D2 (research/24 §6.1): with the depth producer running, the panes are DIFFERENT
+            // images — m_renderData.stereoPaneFBs holds every composite but the last, which is
+            // still the offloaded buffer. Each then needs its own resolve. In the fast path that
+            // vector is empty, one resolve serves every pane, and this loop is what F1 shipped.
+            const bool                          PERPANE = !m_renderData.stereoPaneFBs.empty();
+
             SP<IFramebuffer>                    cmFB, shaderFB;
             NColorManagement::PImageDescription cmDesc, shaderDesc;
 
@@ -855,26 +862,45 @@ void CHyprOpenGLImpl::end() {
                 return fb->getTexture();
             };
 
-            auto srcTex = TEX;
-            if (NEEDS_CM)
-                srcTex = RESOLVEPASS(srcTex, cmFB, cmDesc); // the colour conversion (source description != the monitor's)
-            if (HAS_FINAL_SHADER)
-                srcTex = RESOLVEPASS(srcTex, shaderFB, shaderDesc); // the screen shader (source description IS the monitor's)
+            const auto RESOLVED = [&](SP<ITexture> tex) {
+                if (NEEDS_CM)
+                    tex = RESOLVEPASS(tex, cmFB, cmDesc); // the colour conversion (source description != the monitor's)
+                if (HAS_FINAL_SHADER)
+                    tex = RESOLVEPASS(tex, shaderFB, shaderDesc); // the screen shader (source description IS the monitor's)
+                return tex;
+            };
+
+            const auto RESTORE = [&]() {
+                if (cmFB) {
+                    cmFB->setImageDescription(cmDesc);
+                    cmFB.reset();
+                }
+                if (shaderFB) {
+                    shaderFB->setImageDescription(shaderDesc);
+                    shaderFB.reset();
+                }
+            };
+
+            const auto SHAREDTEX = PERPANE ? nullptr : RESOLVED(TEX);
 
             for (int i = 0; i < PMONITOR->stereoPaneCount(); ++i) {
+                // the last pane is the composite still in the offloaded buffer
+                const auto SRCTEX = PERPANE ? RESOLVED(i < sc<int>(m_renderData.stereoPaneFBs.size()) ? m_renderData.stereoPaneFBs[i]->getTexture() : TEX) : SHAREDTEX;
+
                 const auto DEST = PMONITOR->stereoPaneDestBox(i);
                 setViewport(DEST.x, DEST.y, DEST.width, DEST.height);
                 m_scissorOffset = {DEST.x, DEST.y};
-                renderTexturePrimitive(srcTex, monbox);
+                renderTexturePrimitive(SRCTEX, monbox);
+
+                if (PERPANE)
+                    RESTORE(); // hand the work buffers back before the next pane asks for them
             }
 
             m_scissorOffset = {};
             setViewport(0, 0, PMONITOR->m_pixelSize.x, PMONITOR->m_pixelSize.y);
 
-            if (cmFB)
-                cmFB->setImageDescription(cmDesc);
-            if (shaderFB)
-                shaderFB->setImageDescription(shaderDesc);
+            if (!PERPANE)
+                RESTORE();
         } else if LIKELY (!PRIMITIVE_BLOCKED || g_pHyprRenderer->m_renderMode != RENDER_MODE_NORMAL)
             renderTexturePrimitive(TEX, monbox);
         else if (NEEDS_CM && HAS_FINAL_SHADER) {
@@ -904,6 +930,7 @@ void CHyprOpenGLImpl::end() {
     g_pHyprRenderer->m_renderData.currentFB.reset();
     g_pHyprRenderer->m_renderData.mainFB.reset();
     g_pHyprRenderer->m_renderData.outFB.reset();
+    g_pHyprRenderer->m_renderData.stereoPaneFBs.clear(); // hand the pane buffers back to the pool
     g_pHyprRenderer->popMonitorTransformEnabled();
 
     // invalidate our render FBs to signal to the driver we don't need them anymore
@@ -2490,7 +2517,8 @@ void CHyprOpenGLImpl::renderRoundedShadow(const CBox& box, int round, float roun
                 if (PWORKSPACE && !PWINDOW->m_pinned)
                     scaledWindowBox.translate(PWORKSPACE->m_renderOffset->value());
 
-                scaledWindowBox.translate(PWINDOW->m_floatingOffset);
+                // research/24 §6.2 injection point 1: the blur cutout follows the raised window
+                scaledWindowBox.translate(PWINDOW->m_floatingOffset + g_pHyprRenderer->depthRenderOffset(PWINDOW));
                 scaledWindowBox.translate(-m_renderData.pMonitor->m_position);
                 scaledWindowBox.scale(m_renderData.pMonitor->m_scale).round();
                 m_renderData.renderModif.applyToBox(scaledWindowBox);

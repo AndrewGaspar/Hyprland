@@ -43,6 +43,8 @@
 #include "../state/WorkspaceState.hpp"
 #include "../helpers/time/Time.hpp"
 #include "../desktop/view/LayerSurface.hpp"
+#include "../desktop/view/Window.hpp"
+#include "../desktop/state/WindowState.hpp"
 #include "../desktop/state/GlobalWindowController.hpp"
 #include "../desktop/state/FocusState.hpp"
 #include "../desktop/state/FadingOutState.hpp"
@@ -1890,6 +1892,24 @@ int CMonitor::stereoPaneCount() const {
 
 CBox CMonitor::stereoPaneDestBox(int idx) const {
     return Monitor::Stereo::paneDestBox(m_pixelSize, m_stereoMode, idx);
+}
+
+bool CMonitor::depthIsAnimating() const {
+    // research/24 §6.3: the depth animations damage nothing by design, so the renderer has to ask.
+    for (const auto& W : Desktop::windowState()->windows()) {
+        if (W->m_depth && W->m_depth->isBeingAnimated() && W->m_monitor == m_self)
+            return true;
+    }
+
+    for (const auto& LAYERS : m_layerSurfaceLayers) {
+        for (const auto& LSREF : LAYERS) {
+            const auto LS = LSREF.lock();
+            if (LS && LS->m_depth && LS->m_depth->isBeingAnimated())
+                return true;
+        }
+    }
+
+    return false;
 }
 
 void CMonitor::sanitizeStereoMode(const Vector2D& requestedMode) {

@@ -253,7 +253,26 @@ void IElementRenderer::drawSurface(WP<CSurfacePassElement> element, const CRegio
     const auto  PROJSIZEUNSCALED = windowBox.size();
 
     windowBox.scale(m_data.pMonitor->m_scale);
-    windowBox.round();
+
+    // research/24 §8.1 — the number-one implementation risk this WP was told to check, and this is
+    // the seam the report named. Tasteful depth is SINGLE-DIGIT pixels of disparity (±3.3 px at
+    // depth 1.0 with the shipped defaults, ±0.5 px for a 2 cm rise), and CBox::round() quantises
+    // the box position to whole pixels — which would collapse the ladder into two or three visible
+    // steps and make everything between depth 0 and 0.3 look identical.
+    //
+    // So: round on the UN-SHIFTED grid, which keeps the surface pixel-crisp exactly as it was, and
+    // re-apply the disparity in floating point afterwards. Linear filtering renders the fraction.
+    // The guard keeps the mono path bit-identical — outside a per-eye composite the disparity is
+    // not merely zero, it is never computed.
+    const double DISPARITY = g_pHyprRenderer->depthRenderOffset(m_data.pWindow).x + g_pHyprRenderer->depthRenderOffset(m_data.pLS).x;
+
+    if UNLIKELY (DISPARITY != 0.0) {
+        const double SHIFT = DISPARITY * m_data.pMonitor->m_scale; // windowBox is in buffer pixels by now
+        windowBox.x -= SHIFT;
+        windowBox.round();
+        windowBox.x += SHIFT;
+    } else
+        windowBox.round();
 
     if (windowBox.width <= 1 || windowBox.height <= 1) {
         element->discard();

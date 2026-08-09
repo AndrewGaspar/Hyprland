@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <optional>
 #include <variant>
 
@@ -21,7 +22,10 @@
 //      rule engine — the same store both config front-ends write into (F8) — so parsing here is
 //      parsing under Lua too.
 //
-// What is NOT tested here, because D1 does not ship it: any rendering. Depth is inert until D2.
+// WP D2 added a third: the §8.1 DISPARITY math the producer runs — the worked table, the eye sign,
+// §6.1's frame-violation clamp, and the two facts the rest of the producer is built on: that zero
+// depth means an exactly-zero shift in every pane (the fast path), and that integer rounding would
+// collapse the ladder (the sub-pixel seam in ElementRenderer).
 
 using namespace Desktop;
 using namespace Desktop::Rule;
@@ -152,6 +156,146 @@ TEST(DepthTiers, riseMetresIsTheComfortKnob) {
     EXPECT_FLOAT_EQ(Depth::riseMetres(0.F, 0.12F), 0.F);
     // depth is clamped before it is scaled, so a rogue value cannot escape the comfort ceiling
     EXPECT_FLOAT_EQ(Depth::riseMetres(10.F, 0.12F), 0.12F);
+}
+
+// ------------------------------------------------------- §8.1 disparity (WP D2, the producer)
+
+// The report's worked table, reproduced from the shipped expressions. If these four rows ever move
+// it is because someone changed the formula or the defaults, and either is a comfort decision that
+// should be made deliberately rather than discovered on a headset.
+TEST(DepthTiers, disparityReproducesTheWorkedTable) {
+    constexpr Depth::SGeometry GEO   = {}; // 1.5 m away, 1.6 m wide, b = 0.063 → 1200 px/m at 1920
+    constexpr float            PANE  = 1920.F;
+    constexpr float            TOLPX = 0.06F; // the table is quoted to one decimal place (9.45 → "9.5")
+
+    // rise → per-pane pixels, from §8.1's table
+    EXPECT_NEAR(Depth::shiftMagnitudePx(0.02F, GEO, PANE), 0.5F, TOLPX);
+    EXPECT_NEAR(Depth::shiftMagnitudePx(0.05F, GEO, PANE), 1.3F, TOLPX);
+    EXPECT_NEAR(Depth::shiftMagnitudePx(0.12F, GEO, PANE), 3.3F, TOLPX);
+    EXPECT_NEAR(Depth::shiftMagnitudePx(0.30F, GEO, PANE), 9.5F, TOLPX);
+}
+
+TEST(DepthTiers, parallaxIsNegativeInFrontOfTheScreen) {
+    // §8.1's sign convention, and §8.2 point 2's design rule in one assertion: a raised element is
+    // always CROSSED (in front of the plane), and depth 0 is exactly the plane, not nearly it.
+    constexpr Depth::SGeometry GEO = {};
+    EXPECT_LT(Depth::parallaxMetres(0.12F, GEO), 0.F);
+    EXPECT_FLOAT_EQ(Depth::parallaxMetres(0.F, GEO), 0.F);
+}
+
+TEST(DepthTiers, eyeSignPutsPaneZeroOnTheLeft) {
+    // §8.1: "left pane +, right pane −". StereoPacking::paneDestBox is row-major, so pane 0 is the
+    // left half of an sbs mode and therefore the left eye.
+    EXPECT_FLOAT_EQ(Depth::eyeSign(0), 1.F);
+    EXPECT_FLOAT_EQ(Depth::eyeSign(1), -1.F);
+
+    constexpr Depth::SGeometry GEO = {};
+    EXPECT_GT(Depth::paneShiftPx(0.6F, 0.12F, GEO, 1920.F, 0), 0.F);
+    EXPECT_FLOAT_EQ(Depth::paneShiftPx(0.6F, 0.12F, GEO, 1920.F, 1), -Depth::paneShiftPx(0.6F, 0.12F, GEO, 1920.F, 0));
+}
+
+// THE FAST PATH, as arithmetic (§6.4.1). The renderer's predicate asks "would anything actually
+// move"; if the answer is no it builds ONE composite and the pack duplicates it, which is the
+// frame WP F1 shipped. This is the assertion the whole perf story rests on: with nothing raised,
+// every pane's shift is not "small", it is exactly zero, so the two composites cannot differ.
+TEST(DepthTiers, zeroDepthMovesNothingInAnyPane) {
+    constexpr Depth::SGeometry GEO = {};
+
+    for (int pane = 0; pane < 2; ++pane) {
+        EXPECT_FLOAT_EQ(Depth::paneShiftPx(0.F, 0.12F, GEO, 1920.F, pane), 0.F);
+        // ...and it stays exactly zero however absurd the comfort knob gets, because it is the
+        // DEPTH that is zero
+        EXPECT_FLOAT_EQ(Depth::paneShiftPx(0.F, 1.F, GEO, 1920.F, pane), 0.F);
+    }
+
+    // the other half of the toggle: a zeroed comfort knob flattens a fully raised desktop
+    EXPECT_FLOAT_EQ(Depth::damageSpreadPx(1.F, 0.F, GEO, 1920.F), 0.F);
+}
+
+// §6.3 pt 2. The damage path has no eye — both panes are drawn in the same frame — so it uses the
+// magnitude, and the property that makes that correct is that it bounds every pane's signed shift.
+TEST(DepthTiers, damageSpreadCoversEveryPanesShift) {
+    constexpr Depth::SGeometry GEO = {};
+
+    for (const float DEPTH : {0.2F, 0.6F, 0.8F, 1.F}) {
+        const float SPREAD = Depth::damageSpreadPx(DEPTH, 0.12F, GEO, 1920.F);
+        EXPECT_GT(SPREAD, 0.F);
+
+        for (int pane = 0; pane < 2; ++pane)
+            EXPECT_LE(std::abs(Depth::paneShiftPx(DEPTH, 0.12F, GEO, 1920.F, pane)), SPREAD);
+    }
+}
+
+TEST(DepthTiers, comfortCeilingBindsBeforeTheUserHurtsThemselves) {
+    constexpr Depth::SGeometry GEO = {};
+
+    // §8.2 budget 1, the 1° rule: ≈31 px total, ≈15.7 px per pane at the shipped geometry
+    EXPECT_NEAR(Depth::comfortCeilingPx(GEO, 1920.F), 15.7F, 0.1F);
+
+    // the shipped ladder is nowhere near it — ~3.3 px at depth 1.0, i.e. ~20 % of the budget, which
+    // is what §7.2 claims
+    EXPECT_LT(Depth::damageSpreadPx(1.F, 0.12F, GEO, 1920.F), Depth::comfortCeilingPx(GEO, 1920.F) / 4.F);
+
+    // ...but a user who sets depth_scale to a metre is stopped at the ceiling rather than obeyed
+    EXPECT_FLOAT_EQ(Depth::damageSpreadPx(1.F, 1.F, GEO, 1920.F), Depth::comfortCeilingPx(GEO, 1920.F));
+}
+
+// ------------------------------------------------------- §6.1 the frame-violation clamp
+
+TEST(DepthTiers, clampLeavesAnInteriorElementAlone) {
+    // a floating window with room on both sides moves by its full disparity
+    EXPECT_FLOAT_EQ(Depth::clampToFrame(3.3F, 500, 300, 1920, 2.F), 3.3F);
+    EXPECT_FLOAT_EQ(Depth::clampToFrame(-3.3F, 500, 300, 1920, 2.F), -3.3F);
+}
+
+TEST(DepthTiers, clampPinsAnEdgeAnchoredBarToTheSlack) {
+    // waybar: full width, so BOTH vertical edges sit on the panel edge — §6.1's severe case, where
+    // the sliver visible to one eye is what wipes out the parallax cue. It still floats, but only
+    // by the sliver `decoration:depth_edge_slack` explicitly accepts.
+    EXPECT_FLOAT_EQ(Depth::clampToFrame(3.3F, 0, 1920, 1920, 2.F), 2.F);
+    EXPECT_FLOAT_EQ(Depth::clampToFrame(-3.3F, 0, 1920, 1920, 2.F), -2.F);
+
+    // and with the slack at zero it does not float at all, which is the strict reading of the rule
+    EXPECT_FLOAT_EQ(Depth::clampToFrame(3.3F, 0, 1920, 1920, 0.F), 0.F);
+}
+
+TEST(DepthTiers, clampIsGovernedByTheNEARERedge) {
+    // the pair moves the element BOTH ways at once, so the smaller margin binds even though only
+    // one pane moves toward it
+    EXPECT_FLOAT_EQ(Depth::clampToFrame(9.5F, 4, 100, 1920, 0.F), 4.F);    // 4 px from the left
+    EXPECT_FLOAT_EQ(Depth::clampToFrame(9.5F, 1816, 100, 1920, 0.F), 4.F); // 4 px from the right
+}
+
+TEST(DepthTiers, clampSurvivesABoxAlreadyOffTheEdge) {
+    // a window dragged half off screen has a negative margin; it must clamp to the slack, not to a
+    // negative limit that would invert the disparity
+    EXPECT_FLOAT_EQ(Depth::clampToFrame(3.3F, -200, 400, 1920, 2.F), 2.F);
+    EXPECT_FLOAT_EQ(Depth::clampToFrame(3.3F, -200, 400, 1920, 0.F), 0.F);
+}
+
+// ------------------------------------------------------- §8.1's sub-pixel warning
+
+// The report calls the box rounding in ElementRenderer "the thing to check first" and "the number
+// one implementation risk for D2". This is that risk, stated as a test rather than a worry: at the
+// shipped geometry the ENTIRE ladder spans ~3 px per pane, so rounding each rung to whole pixels
+// merges rungs that the design needs to be distinguishable. Hence the seam in
+// IElementRenderer::renderSurface rounds on the un-shifted grid and re-applies the disparity in
+// floating point — if that ever gets simplified away, the ladder quietly becomes a two-step stair.
+TEST(DepthTiers, integerRoundingWouldCollapseTheLadder) {
+    constexpr Depth::SGeometry GEO   = {};
+    const auto                 SHIFT = [&](float d) { return Depth::paneShiftPx(d, 0.12F, GEO, 1920.F, 0); };
+
+    // two adjacent rungs of a plausible ladder are genuinely different sub-pixel shifts...
+    EXPECT_NE(SHIFT(0.2F), SHIFT(0.3F));
+    EXPECT_GT(std::abs(SHIFT(0.3F) - SHIFT(0.2F)), 0.2F);
+
+    // ...and identical once rounded to whole pixels
+    EXPECT_FLOAT_EQ(std::round(SHIFT(0.2F)), std::round(SHIFT(0.3F)));
+
+    // the shipped unfocused rung is well under one pixel — an integer shift would not render it at
+    // all, which is exactly the "everything between 0 and 0.3 looks identical" §8.1 warns about
+    EXPECT_LT(SHIFT(0.2F), 1.F);
+    EXPECT_GT(SHIFT(0.2F), 0.F);
 }
 
 // ---------------------------------------------------------------- rule parse
