@@ -503,6 +503,7 @@ std::string CCommandFormatter::getWindowData(PHLWINDOW w, eHyprCtlOutputFormat f
     "xdgDescription": "{}",
     "contentType": "{}",
     "tearingHint": {},
+    "depth": {:.3f},
     "stableId": "{:x}"
 }},)#",
             rc<uintptr_t>(w.get()), (w->mapped() ? "true" : "false"), (w->isHidden() ? "true" : "false"), (VISIBLE ? "true" : "false"), (w->acceptsInput() ? "true" : "false"),
@@ -530,6 +531,7 @@ std::string CCommandFormatter::getWindowData(PHLWINDOW w, eHyprCtlOutputFormat f
             escapeJSONStrings(METADATA.tag.value_or("")),
             escapeJSONStrings(METADATA.description.value_or("")),
             escapeJSONStrings(NContentType::toString(w->getContentType())), ((w->m_hints & Desktop::View::WINDOW_HINT_TEAR) ? "true" : "false"),
+            (w->m_depth ? w->m_depth->goal() : 0.F),
             w->metadata().stableID());
     } else {
         return std::format(
@@ -540,7 +542,7 @@ std::string CCommandFormatter::getWindowData(PHLWINDOW w, eHyprCtlOutputFormat f
             "{}\n\tfullscreen: {}\n\tfullscreenClient: {}\n\tfullscreenHandler: {}\n\tallowedOverFullscreen: {}\n\tgrouped: {}\n\ttags: {}\n\tswallowing: {:x}\n\tfocusHistoryID: "
             "{}\n\tinhibitingIdle: "
             "{}\n\txdgTag: "
-            "{}\n\txdgDescription: {}\n\tcontentType: {}\n\ttearingHint: {}\n\tstableID: {:x}\n\n",
+            "{}\n\txdgDescription: {}\n\tcontentType: {}\n\ttearingHint: {}\n\tdepth: {:.3f}\n\tstableID: {:x}\n\n",
             rc<uintptr_t>(w.get()),
             w->metadata().title(),
             sc<int>(w->mapped()),
@@ -575,6 +577,7 @@ std::string CCommandFormatter::getWindowData(PHLWINDOW w, eHyprCtlOutputFormat f
             METADATA.description.value_or(""),
             NContentType::toString(w->getContentType()),
             sc<int>(sc<bool>(w->m_hints & Desktop::View::WINDOW_HINT_TEAR)),
+            (w->m_depth ? w->m_depth->goal() : 0.F),
             w->metadata().stableID());
     }
 }
@@ -807,11 +810,13 @@ static std::string layersRequest(eHyprCtlOutputFormat format, std::string reques
                     "w": {},
                     "h": {},
                     "alpha": {},
+                    "depth": {:.3f},
                     "namespace": "{}",
                     "pid": {}
                 }},)#",
                         rc<uintptr_t>(layer.get()), layer->m_geometry.x, layer->m_geometry.y, layer->m_geometry.width, layer->m_geometry.height,
-                        std::clamp(sc<double>(layer->alpha().goal()), 0.0, 1.0), escapeJSONStrings(layer->m_namespace), layer->getPID());
+                        std::clamp(sc<double>(layer->alpha().goal()), 0.0, 1.0), (layer->m_depth ? layer->m_depth->goal() : 0.F), escapeJSONStrings(layer->m_namespace),
+                        layer->getPID());
                 }
 
                 trimTrailingComma(result);

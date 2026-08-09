@@ -81,8 +81,12 @@ namespace Desktop::View {
         CBox                                    m_geometry = {0, 0, 0, 0};
         Vector2D                                m_position;
         std::string                             m_namespace = "";
+
+        PHLANIMVAR<float>                       m_depth; // 0..1 above the wallpaper plane, research/24 §7. See CWindow::m_depth.
+
         pid_t                                   getPID();
         void                                    updateSurfaceScaleTransformDetails();
+        void                                    updateDepth(bool warp = false);
 
         void                                    onDestroy();
         void                                    onMap();

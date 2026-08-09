@@ -191,6 +191,12 @@ namespace Desktop::View {
         // For the noclosefor windowrule
         Time::steady_tp m_closeableSince = Time::steadyNow();
 
+        // How high this window floats above the wallpaper plane, 0..1 (research/24 §7).
+        // WP D1 ships the STATE only: the value is correct and animated, and absolutely nothing
+        // reads it while rendering. WP D2 is the producer that turns it into per-pane disparity;
+        // until then this is inert by construction (hence AVARDAMAGE_NONE at creation).
+        PHLANIMVAR<float> m_depth;
+
         // For the list lookup
         bool operator==(const CWindow& rhs) const;
 
@@ -231,6 +237,7 @@ namespace Desktop::View {
         bool                       isScrollTouchpadOverridden();
         void                       updateWindowData();
         void                       updateWindowData(const Config::CWorkspaceRule&);
+        void                       updateDepth(bool warp = false);
         void                       warpCursor(bool force = false);
         bool                       shouldntFocus() const;
         bool                       suggestsFloat(bool pending = false) const;

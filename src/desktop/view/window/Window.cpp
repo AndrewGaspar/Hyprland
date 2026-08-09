@@ -32,6 +32,7 @@
 #include "../../state/GlobalWindowController.hpp"
 #include "../../state/WindowFadeout.hpp"
 #include "../../state/WindowState.hpp"
+#include "../../DepthTiers.hpp"
 #include "../../history/WindowHistoryTracker.hpp"
 #include "../../../Compositor.hpp"
 #include "../../../render/decorations/CHyprGroupBarDecoration.hpp"
@@ -122,6 +123,9 @@ void CWindow::initialize() {
     Animation::mgr()->createAnimation(Vector2D(0, 0), positionAnimation(), Config::animationTree()->getAnimationPropertyConfig("windowsIn"), SELF, AVARDAMAGE_ENTIRE);
     Animation::mgr()->createAnimation(Vector2D(0, 0), sizeAnimation(), Config::animationTree()->getAnimationPropertyConfig("windowsIn"), SELF, AVARDAMAGE_ENTIRE);
     m_presentation->initialize();
+    // AVARDAMAGE_NONE is the D1 assertion that depth is inert: nothing renders from it, so a depth
+    // change must not repaint anything. D2 flips this to AVARDAMAGE_ENTIRE with the producer.
+    Animation::mgr()->createAnimation(0.f, m_depth, Config::animationTree()->getAnimationPropertyConfig("windowsDepth"), SELF, AVARDAMAGE_NONE);
 
     m_target = Layout::CWindowTarget::create(SELF);
 
@@ -556,6 +560,7 @@ void CWindow::onMap() {
     m_realPosition->resetAllCallbacks();
     m_realSize->resetAllCallbacks();
     m_presentation->prepareMap();
+    m_depth->resetAllCallbacks();
 
     m_effects->reset();
 
@@ -726,6 +731,33 @@ bool CWindow::isScrollTouchpadOverridden() {
 bool CWindow::canBeTorn() {
     static auto PTEARING = CConfigValue<Config::INTEGER>("general:allow_tearing");
     return m_ruleApplicator->tearing().valueOr(sc<bool>(m_hints & WINDOW_HINT_TEAR)) && *PTEARING;
+}
+
+// Resolve which rung of the depth ladder this window sits on (research/24 §7.3) and hand it to the
+// animation. Called from CWindowPresentation::refreshValues(), which already runs on every focus,
+// fullscreen and rule change — the three discrete events §7.2 says depth is allowed to move on.
+// `warp` skips the easing for the map path, where there is no previous depth to ease from.
+void CWindow::updateDepth(bool warp) {
+    static auto PDEPTHFOCUSED   = CConfigValue<Config::FLOAT>("decoration:depth_focused");
+    static auto PDEPTHUNFOCUSED = CConfigValue<Config::FLOAT>("decoration:depth_unfocused");
+
+    if (!m_depth)
+        return;
+
+    const Desktop::Depth::STiers TIERS = {.focused = *PDEPTHFOCUSED, .unfocused = *PDEPTHUNFOCUSED};
+
+    const bool                   FOCUSED    = m_self == Desktop::focusState()->window();
+    const bool                   FULLSCREEN = Fullscreen::controller()->getFullscreenModes(m_self.lock()).internal == Fullscreen::FSMODE_FULLSCREEN;
+
+    // an explicit `windowrule = depth <z>` beats the tier, including on a fullscreen window
+    const auto  OVERRIDE = m_ruleApplicator->depth().hasValue() ? std::optional<float>{m_ruleApplicator->depth().value()} : std::nullopt;
+
+    const float GOAL = Desktop::Depth::resolve(OVERRIDE, Desktop::Depth::windowTier(TIERS, FOCUSED, FULLSCREEN));
+
+    if (warp)
+        m_depth->setValueAndWarp(GOAL);
+    else
+        *m_depth = GOAL;
 }
 
 void CWindow::setSuspended(bool suspend) {
@@ -1589,6 +1621,11 @@ void CWindow::mapWindow() {
         updateFullscreenInputState();
         m_presentation->alpha(WINDOW_ALPHA_FULLSCREEN)->setValueAndWarp(0.f);
     }
+
+    // a window that has never been on screen has no depth to ease FROM, so it arrives at its tier
+    // rather than climbing to it (research/24 §7.3: depth eases on discrete events, and a map is
+    // not one of them).
+    updateDepth(true);
 
     if (g_pSeatManager->m_mouse.expired() || !g_pInputManager->isConstrained())
         g_pInputManager->sendMotionEventsToFocused();
