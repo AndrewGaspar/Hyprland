@@ -776,12 +776,24 @@ TEST_CASE(stereoLegacyConfigFrontEnds) {
 // directions — empty desktop is 1, a window at the focused rung is 2, and §6.4's A/B toggle
 // (`depth_scale = 0`, i.e. "same ladder, no rise") puts it back to 1 without touching a rule.
 //
+// WHAT THE NUMBER MEANS, precisely, because it is load-bearing here: it is counted in
+// finishStereoPane as each finished pane is HANDED TO THE PACK, not predicted from the producer's
+// predicate. That distinction is the whole reason this test can see anything at all — the pane
+// buffer comes from a pool of eight, and when the pool is empty finishStereoPane logs a warning and
+// keeps the pane it drew, so end() blits ONE composite into both halves and the frame is flat. A
+// predicted `2` would report a stereo frame that was never presented, and the pixel test below
+// cannot tell the difference either, because it measures the last pane and the last pane is the
+// one that got duplicated. So: `2` here means two distinct composites reached the pack, and the
+// log check at the end means the fallback did not fire even once during the run.
+//
 // The disparity ARITHMETIC is not tested here — tests/desktop/DepthTiers.cpp owns §8.1's worked
 // table, the eye sign, §6.1's edge clamp and the sub-pixel warning. This test only proves the
 // predicate that chooses between one composite and two is wired to the real depth state.
 TEST_CASE(stereoDepthProducerFastPath) {
     Tests::killAllWindows();
     getFromSocket(std::format("/output remove {}", STEREO_MON));
+
+    const size_t LOGMARK = readHyprlandLog().size(); // only count warnings caused by THIS test
 
     OK(declareMonitor(STEREO_MON, STEREO_MODE, "sbs"));
     OK(getFromSocket(std::format("/output create headless {}", STEREO_MON)));
@@ -833,6 +845,14 @@ TEST_CASE(stereoDepthProducerFastPath) {
 
     // the compositor survived a frame that bound a second work buffer mid-pass
     EXPECT_CONTAINS(getFromSocket("/version"), "Hyprland");
+
+    // === 5. ...and it never ran out of them, i.e. no frame silently degraded to a flat pair ===
+    //
+    // The `2` above is counted at hand-over, so a frame that lost this race would have reported 1
+    // and failed the wait. This says the same thing about every OTHER frame in the run, including
+    // the ones nothing was waiting on.
+    const std::string LOGSINCE = readHyprlandLog().substr(std::min(LOGMARK, readHyprlandLog().size()));
+    EXPECT(LOGSINCE.contains("out of work buffers"), false);
 }
 
 // stereoDepthDisparityMovesTheWindow — WP D4's pixel assertion: the depth desktop, measured.

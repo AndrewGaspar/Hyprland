@@ -388,6 +388,34 @@ double IHyprRenderer::depthDamageSpread(const PHLLS& layer, const PHLMONITOR& mo
     return depthShiftLogical(layer->m_depth->value(), monitor, viewBoxLocal(layer, monitor));
 }
 
+// Is anything the PRECOMPUTED BLUR samples raised off the plane on this monitor?
+//
+// The pre-blur buffer (decoration:blur:new_optimizations) holds the background and bottom layers
+// blurred once per frame, and drawPreBlur clears m_blurFBDirty — so with the producer running, pane
+// 0 computes it and every later pane reuses it. That is exactly right as long as its content is
+// pane-invariant, and normally it is: layerTier pins background/bottom to MIN, so the wallpaper is
+// on the page in both eyes and one blur serves both.
+//
+// It stops being right the moment a `layerrule = depth` raises one of them, which §7.2 explicitly
+// permits ("rules beat the tier, including on a wallpaper layer"). Then pane 1's blurred windows
+// sample a background carrying pane 0's disparity — the two eyes disagree inside every blurred
+// region, which is the rivalry §6.1 is most concerned about. Rare, deliberate, and cheap to detect,
+// so detect it rather than pay for a second pre-blur on every stereo frame.
+static bool blurSourceIsRaised(const PHLMONITOR& monitor) {
+    if (!monitor)
+        return false;
+
+    for (uint32_t layer = Desktop::Depth::LAYER_BACKGROUND; layer <= Desktop::Depth::LAYER_BOTTOM; ++layer) {
+        for (const auto& LSREF : monitor->m_layerSurfaceLayers[layer]) {
+            const auto LS = LSREF.lock();
+            if (LS && LS->m_depth && LS->m_depth->value() > Desktop::Depth::MIN && LS->visible())
+                return true;
+        }
+    }
+
+    return false;
+}
+
 bool IHyprRenderer::depthProducerActive(const PHLMONITOR& monitor) {
     if (!monitor || !monitor->isStereo() || monitor->isMirror() || monitor->stereoPaneCount() < 2)
         return false;
@@ -1953,6 +1981,7 @@ bool IHyprRenderer::beginRender(PHLMONITOR pMonitor, CRegion& damage, eRenderMod
     // WP D2: no frame starts inside a per-eye composite. renderMonitor opts in explicitly.
     m_renderData.stereoPane = -1;
     m_renderData.stereoPaneFBs.clear();
+    m_renderData.stereoPaneDamage.clear();
 
     if (simple)
         setProjectionType(fb ? fb->m_size : buffer->m_texture->m_size);
@@ -2202,18 +2231,39 @@ void IHyprRenderer::finishStereoPane(PHLMONITOR pMonitor) {
     m_renderData.damage = m_renderPass.render(m_renderData.damage);
     m_renderPass.clear();
 
+    // ...and keep this pane's FINAL damage, which is the region end()'s pack has to blit out of the
+    // buffer we are about to set aside. finalDamage is a single slot that the NEXT pane's pass
+    // overwrites (Pass.cpp), and live blur expands it by the blur radius around a region that has
+    // itself moved by 2·disparity between the panes — so without the union, pane 0's extra blur
+    // damage is composited into pane 0's buffer and then scissored out of pane 0's blit, leaving a
+    // stale strip along one edge of a blurred raised window until the next full frame.
+    m_renderData.stereoPaneDamage.add(m_renderData.finalDamage);
+
     // a pane needs its own buffer because the panes carry different images; the DAMAGE is the same
     // in both, which is why partial damage survives the second composite (§6.5).
     const auto PANEFB = pMonitor->resources()->getUnusedWorkBuffer();
     if (!PANEFB) {
-        // the pool is capped at 8 and something else has them all. Keeping the pane we just drew
-        // means every pane shows it — a FLAT pair, which is the fast path's output and perfectly
-        // watchable. Dropping the frame instead would not be.
+        // the pool is capped at 8 and something else has them all. Without a buffer to set this
+        // pane aside in, the next pane simply draws over it in the same one — so the frame ends up
+        // holding the LAST pane's image and end() blits that into every destination box: a flat
+        // pair, which is the fast path's output and perfectly watchable, except that it is offset
+        // by one eye's disparity rather than centred. Dropping the frame instead would not be
+        // watchable. m_stereoComposites is NOT bumped, so `hyprctl monitors` reports the flat frame
+        // that was actually presented rather than the stereo one that was intended.
         Log::logger->log(Log::WARN, "stereo depth: out of work buffers on {}, this frame's panes will be flat", pMonitor->m_name);
         return;
     }
 
     m_renderData.stereoPaneFBs.emplace_back(m_renderData.currentFB);
+    ++pMonitor->m_stereoComposites;
+
+    // ...and if the precomputed blur samples something raised, the next pane needs its OWN — see
+    // blurSourceIsRaised. Both flags, because drawPreBlur cleared both and preBlurQueued wants
+    // both; untouched (so one pre-blur still serves every pane) on every ordinary depth desktop.
+    if UNLIKELY (blurSourceIsRaised(pMonitor)) {
+        pMonitor->m_blurFBDirty        = true;
+        pMonitor->m_blurFBShouldRender = true;
+    }
 
     bindFB(PANEFB);
     PANEFB->clearAfterInvalidation();
@@ -2421,7 +2471,17 @@ void IHyprRenderer::renderMonitor(PHLMONITOR pMonitor, bool commit) {
     const int     PANES      = depthProducerActive(pMonitor) ? pMonitor->stereoPaneCount() : 1;
     const CRegion PANEDAMAGE = m_renderData.damage;
 
-    pMonitor->m_stereoComposites = PANES;
+    // ...and how many DISTINCT composites actually reach the pack, counted as they are handed over
+    // rather than predicted from the predicate. The difference matters: finishStereoPane can fail
+    // to get a work buffer, in which case end() blits the one composite it has into both panes and
+    // the frame is flat. Reporting PANES there would claim a stereo frame that was never presented,
+    // and it is the only witness anything outside the process has — every capture protocol is
+    // sized at the pane by design (§3.6), so no client can see the pair.
+    pMonitor->m_stereoComposites = 1;
+
+    // the damage-blink tick, resolved before the loop and advanced after it — see the draw below
+    const bool DRAWDAMAGEBLINK = *PDAMAGEBLINK && damageBlinkCleanup == 0;
+    bool       damageBlinkReached = false; // ...only if the branch that used to own the counter ran
 
     for (int pane = 0; pane < PANES; ++pane) {
         bool renderCursor = true;

@@ -791,7 +791,11 @@ void CHyprOpenGLImpl::end() {
 
     // end the render, copy the data to the main framebuffer
     if LIKELY (m_offloadedFramebuffer) {
-        g_pHyprRenderer->m_renderData.damage = g_pHyprRenderer->m_renderData.finalDamage;
+        // WP D2: the pack below blits EVERY pane through this one region, and finalDamage only ever
+        // describes the pane whose pass ran last. stereoPaneDamage carries the earlier panes' —
+        // live blur expands each pane's final damage around a region that moved by 2·disparity
+        // between them, so the union is what covers all of them. Empty everywhere else.
+        g_pHyprRenderer->m_renderData.damage = g_pHyprRenderer->m_renderData.finalDamage.copy().add(g_pHyprRenderer->m_renderData.stereoPaneDamage);
         g_pHyprRenderer->pushMonitorTransformEnabled(true);
 
         CBox monbox = {0, 0, m_renderData.pMonitor->m_transformedSize.x, m_renderData.pMonitor->m_transformedSize.y};
@@ -932,6 +936,7 @@ void CHyprOpenGLImpl::end() {
     g_pHyprRenderer->m_renderData.mainFB.reset();
     g_pHyprRenderer->m_renderData.outFB.reset();
     g_pHyprRenderer->m_renderData.stereoPaneFBs.clear(); // hand the pane buffers back to the pool
+    g_pHyprRenderer->m_renderData.stereoPaneDamage.clear();
     g_pHyprRenderer->popMonitorTransformEnabled();
 
     // invalidate our render FBs to signal to the driver we don't need them anymore
