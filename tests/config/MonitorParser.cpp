@@ -1,4 +1,5 @@
 #include <config/shared/monitor/Parser.hpp>
+#include <output/StereoPacking.hpp>
 
 #include <gtest/gtest.h>
 
@@ -332,4 +333,39 @@ TEST(Config, monitorRuleStereoChangeIsAHardMismatch) {
     CMonitorRule c = a;
     c.m_offset     = {100, 100};
     EXPECT_EQ(a.compare(c), COMPARISON_SOFT_MISMATCH);
+}
+
+// The un-stereo guard on the wlr-output-management write-back path (MonitorRuleManager) and the
+// sanitizer in applyMonitorRule both ask Monitor::Stereo::modeIsAsRequested whether a committed
+// mode is the mode the pack was configured for. What they hand it is a rule field straight out of
+// THIS parser — and that field is a mode REQUEST, not a resolution. Driving the predicate with
+// values the real parser produced is what pins the bug it was written for: `preferred` (Vector2D())
+// skipped the guard entirely, and the high* sentinels (-1,-N) fired it unconditionally.
+TEST(Config, monitorParserStereoModeGuardTakesParsedRequests) {
+    const auto REQUEST = [](const char* mode) {
+        CMonitorRuleParser parser("DP-1");
+        parser.parseMode(mode);
+        parser.parseStereo("sbs");
+        EXPECT_EQ(parser.rule().m_stereo, STEREO_SBS) << mode;
+        return parser.rule().m_resolution;
+    };
+
+    using Monitor::Stereo::modeIsAsRequested;
+
+    // an explicit resolution is a contract: the pack survives exactly its own mode
+    EXPECT_TRUE(modeIsAsRequested({3840, 1080}, REQUEST("3840x1080@60")));
+    EXPECT_FALSE(modeIsAsRequested({1920, 1080}, REQUEST("3840x1080@60")));
+    EXPECT_FALSE(modeIsAsRequested({2560, 1440}, REQUEST("3840x1080@60")));
+
+    // `preferred` names no mode, so whatever was committed IS what was asked for — unless the
+    // search gave up and took any mode it could commit
+    EXPECT_TRUE(modeIsAsRequested({3840, 1080}, REQUEST("preferred")));
+    EXPECT_FALSE(modeIsAsRequested({3840, 1080}, REQUEST("preferred"), true));
+
+    // highrr / highres / maxwidth are sentinels, not resolutions; reading them as a mode would drop
+    // the pack on every stereo output configured with one of them
+    for (const auto* MODE : {"highrr", "highres", "maxwidth"}) {
+        EXPECT_TRUE(modeIsAsRequested({3840, 1080}, REQUEST(MODE))) << MODE;
+        EXPECT_FALSE(modeIsAsRequested({3840, 1080}, REQUEST(MODE), true)) << MODE;
+    }
 }
