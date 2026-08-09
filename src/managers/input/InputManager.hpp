@@ -228,6 +228,16 @@ class CInputManager {
     //
     bool m_emptyFocusCursorSet = false;
 
+    // What the pointer is over, as of the last refocus. WP D2 (research/24 §5.4) draws the cursor
+    // at that thing's depth — Daydream's rule is that a cursor may never sit BEHIND what it is
+    // over — and a render pass must not run a hit test to find out.
+    PHLWINDOW hoveredWindow() const {
+        return m_foundWindowToFocus.lock();
+    }
+    PHLLS hoveredLayer() const {
+        return m_foundLSToFocus.lock();
+    }
+
   private:
     // Listeners
     struct {

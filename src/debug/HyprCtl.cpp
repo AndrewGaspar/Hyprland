@@ -230,11 +230,17 @@ std::string CHyprCtl::getMonitorData(PHLMONITOR m, eHyprCtlOutputFormat format) 
     // stereo (research/24 §3.4 item 12): width/height report the presented per-eye pane (the ONE
     // logical monitor everything above the scanout sees); the true packed scanout mode is exposed
     // in these extra fields so the packing is discoverable. Empty (byte-identical output) when off.
-    const std::string STEREO_JSON = m->isStereo() ? std::format("\n    \"stereo\": \"{}\",\n    \"scanoutWidth\": {},\n    \"scanoutHeight\": {},",
-                                                                Config::stereoModeToString(m->m_stereoMode), sc<int>(m->m_pixelSize.x), sc<int>(m->m_pixelSize.y)) :
-                                                    "";
-    const std::string STEREO_TEXT =
-        m->isStereo() ? std::format("\n\tstereo: {} (scanout {}x{})", Config::stereoModeToString(m->m_stereoMode), sc<int>(m->m_pixelSize.x), sc<int>(m->m_pixelSize.y)) : "";
+    // `stereoComposites` is WP D2's fast-path witness (research/24 §6.4.1): 1 means both panes
+    // came from ONE composite because nothing on this output has depth, 2 means the depth producer
+    // is running. It is otherwise invisible from outside the process.
+    const std::string STEREO_JSON = m->isStereo() ?
+        std::format("\n    \"stereo\": \"{}\",\n    \"scanoutWidth\": {},\n    \"scanoutHeight\": {},\n    \"stereoComposites\": {},", Config::stereoModeToString(m->m_stereoMode),
+                    sc<int>(m->m_pixelSize.x), sc<int>(m->m_pixelSize.y), m->m_stereoComposites) :
+        "";
+    const std::string STEREO_TEXT = m->isStereo() ?
+        std::format("\n\tstereo: {} (scanout {}x{}, {} composite{})", Config::stereoModeToString(m->m_stereoMode), sc<int>(m->m_pixelSize.x), sc<int>(m->m_pixelSize.y),
+                    m->m_stereoComposites, m->m_stereoComposites == 1 ? "" : "s") :
+        "";
 
     if (format == eHyprCtlOutputFormat::FORMAT_JSON) {
 

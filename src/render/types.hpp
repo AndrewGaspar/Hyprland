@@ -104,6 +104,17 @@ namespace Render {
 
         bool                   transformDamage = true;
         bool                   noSimplify      = false;
+
+        // --- the stereo depth producer (research/24 §6.1, WP D2) ---
+        // Which pane of a stereo output is being composited RIGHT NOW; -1 means "not a per-eye
+        // pass", which is every frame on every ordinary monitor and every frame on a stereo
+        // monitor with nothing raised (§6.4.1's fast path). Every depth read is gated on this
+        // being >= 0, so the mono path costs an integer compare and is otherwise untouched.
+        int stereoPane = -1;
+        // The finished composite of each pane BEFORE the one still being built, for the pack in
+        // CHyprOpenGLImpl::end(). Empty in the fast path, where end() duplicates the single
+        // composite into every pane exactly as WP F1 shipped it.
+        std::vector<SP<IFramebuffer>> stereoPaneFBs;
     };
 
     struct STFRange {

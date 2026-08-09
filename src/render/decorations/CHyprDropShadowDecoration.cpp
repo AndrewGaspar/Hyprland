@@ -59,6 +59,8 @@ void CHyprDropShadowDecoration::damageEntire() {
     };
 
     applyOffset(shadowBox);
+    // stereo depth (research/24 §6.3): the shadow is drawn into both panes at ±disparity
+    shadowBox.expand(std::ceil(g_pHyprRenderer->depthDamageSpread(PWINDOW, PWINDOW->m_monitor.lock())));
 
     CRegion shadowRegion(shadowBox);
 
@@ -164,7 +166,8 @@ SShadowRenderData CHyprDropShadowDecoration::getRenderData(PHLMONITOR pMonitor, 
             },
     };
 
-    fullBox.translate(PWINDOW->m_floatingOffset);
+    // research/24 §6.2 injection point 1: the depth disparity rides in beside the floating offset
+    fullBox.translate(PWINDOW->m_floatingOffset + g_pHyprRenderer->depthRenderOffset(PWINDOW));
 
     if (fullBox.width < 1 || fullBox.height < 1)
         return {}; // don't draw invisible shadows

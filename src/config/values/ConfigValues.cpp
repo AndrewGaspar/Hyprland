@@ -236,6 +236,12 @@ std::vector<SP<IValue>> Values::getConfigValues() {
                   {.min = 0, .max = 1, .refresh = Supplementary::REFRESH_WINDOW_STATES}),
         MS<Float>("decoration:depth_scale", "metres of rise at depth 1.0. The comfort knob: keep the steps between tiers small", 0.12,
                   {.min = 0, .max = 1, .refresh = Supplementary::REFRESH_WINDOW_STATES}),
+        MS<Float>("decoration:depth_distance", "metres from your eyes to the screen plane. With depth_screen_width, turns a depth into pixels of disparity", 1.5,
+                  {.min = 0.1, .max = 20, .refresh = Supplementary::REFRESH_WINDOW_STATES}),
+        MS<Float>("decoration:depth_screen_width", "metres wide that ONE eye's image appears. 1.6 is a headset-sized virtual screen; measure your panel for a flat one", 1.6,
+                  {.min = 0.05, .max = 20, .refresh = Supplementary::REFRESH_WINDOW_STATES}),
+        MS<Float>("decoration:depth_edge_slack", "pixels of disparity an element pinned to the screen edge (a full-width bar) may still use. 0 keeps such elements flat", 2.0,
+                  {.min = 0, .max = 64, .refresh = Supplementary::REFRESH_WINDOW_STATES}),
         MS<String>("decoration:screen_shader", "a path to a custom shader to be applied at the end of rendering.", STRVAL_EMPTY, {.refresh = Supplementary::REFRESH_SCREEN_SHADER}),
         MS<Bool>("decoration:border_part_of_window", "whether the border should be treated as a part of the window.", true),
 

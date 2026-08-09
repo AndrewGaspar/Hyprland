@@ -662,3 +662,75 @@ TEST_CASE(stereoLegacyConfigFrontEnds) {
     EXPECT(monitorField(CONTROL, "stereo"), std::string(""));
     EXPECT(monitorField(CONTROL, "scanoutWidth"), std::string(""));
 }
+
+// stereoDepthProducerFastPath — WP D2's cost model, made observable (research/24 §6.4.1).
+//
+// The producer composites the desktop ONCE PER PANE, which doubles the compositing work on a
+// stereo output. The thing that keeps that acceptable is the fast path: when nothing on the output
+// is actually off the wallpaper plane the two panes are the same image, so one composite is built
+// and end()'s pack duplicates it — byte for byte the frame WP F1 shipped.
+//
+// `stereoComposites` in `hyprctl monitors` is the witness for which path ran, and it is the only
+// one: the panes are internal (every capture protocol is sized at the pane by design, §3.12) and
+// the second composite has no other outward sign. So this asserts the transition in both
+// directions — empty desktop is 1, a window at the focused rung is 2, and §6.4's A/B toggle
+// (`depth_scale = 0`, i.e. "same ladder, no rise") puts it back to 1 without touching a rule.
+//
+// The disparity ARITHMETIC is not tested here — tests/desktop/DepthTiers.cpp owns §8.1's worked
+// table, the eye sign, §6.1's edge clamp and the sub-pixel warning. This test only proves the
+// predicate that chooses between one composite and two is wired to the real depth state.
+TEST_CASE(stereoDepthProducerFastPath) {
+    Tests::killAllWindows();
+    getFromSocket(std::format("/output remove {}", STEREO_MON));
+
+    OK(declareMonitor(STEREO_MON, STEREO_MODE, "sbs"));
+    OK(getFromSocket(std::format("/output create headless {}", STEREO_MON)));
+
+    CScopeGuard guard = {[&]() {
+        Tests::killAllWindows();
+        getFromSocket("/eval hl.config({ decoration = { depth_scale = 0.12 } })");
+        getFromSocket(std::format("/output remove {}", STEREO_MON));
+    }};
+
+    ASSERT(waitForMonitorPresent(STEREO_MON, true), true);
+    ASSERT(waitForMonitorField(STEREO_MON, "width", "1920"), true);
+    Tests::sync();
+
+    // === 1. an empty output takes the fast path ===
+    //
+    // Nothing is on it, so nothing has depth, so both panes would be identical. One composite.
+    ASSERT(waitForMonitorField(STEREO_MON, "stereoComposites", "1"), true);
+
+    // === 2. a window arrives on the focused rung and the producer starts ===
+    {
+        OK(getFromSocket(std::format("/dispatch hl.dsp.focus({{ monitor = '{}' }})", STEREO_MON)));
+        const int     BEFORE = Tests::windowCount();
+        SWindowClient client;
+        ASSERT(client.waitForWindow(BEFORE), true);
+        Tests::sync();
+
+        // decoration:depth_focused is 0.6, so this window is 3.3 px of disparity off the page and
+        // the two panes can no longer be the same image
+        EXPECT(waitForMonitorField(STEREO_MON, "stereoComposites", "2"), true);
+
+        // === 3. §6.4's free A/B toggle: the ladder is untouched, the rise is zero ===
+        //
+        // The predicate asks "would anything actually MOVE", not "does anything have a depth", so
+        // flattening the comfort knob is enough to buy the cheap frame back with the same desktop
+        // on screen. This is the switch the ergonomics spike (D0) needs and the escape hatch for
+        // anyone who wants F1's exact cost on a stereo output.
+        OK(getFromSocket("/eval hl.config({ decoration = { depth_scale = 0 } })"));
+        EXPECT(waitForMonitorField(STEREO_MON, "stereoComposites", "1"), true);
+
+        OK(getFromSocket("/eval hl.config({ decoration = { depth_scale = 0.12 } })"));
+        EXPECT(waitForMonitorField(STEREO_MON, "stereoComposites", "2"), true);
+    }
+
+    Tests::waitUntilWindowsN(0);
+
+    // === 4. and the output goes back to one composite when the desktop empties ===
+    EXPECT(waitForMonitorField(STEREO_MON, "stereoComposites", "1"), true);
+
+    // the compositor survived a frame that bound a second work buffer mid-pass
+    EXPECT_CONTAINS(getFromSocket("/version"), "Hyprland");
+}

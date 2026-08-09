@@ -53,7 +53,12 @@ void CHyprBorderDecoration::draw(PHLMONITOR pMonitor, float const& a) {
     if (m_assignedGeometry.width < m_extents.topLeft.x + 1 || m_assignedGeometry.height < m_extents.topLeft.y + 1)
         return;
 
-    CBox windowBox = assignedBoxGlobal().translate(-pMonitor->m_position + m_window->m_floatingOffset).expand(-m_window->getRealBorderSize()).scale(pMonitor->m_scale).round();
+    // research/24 §6.2 injection point 1: the depth disparity rides in beside the floating offset
+    CBox windowBox = assignedBoxGlobal()
+                         .translate(-pMonitor->m_position + m_window->m_floatingOffset + g_pHyprRenderer->depthRenderOffset(m_window.lock()))
+                         .expand(-m_window->getRealBorderSize())
+                         .scale(pMonitor->m_scale)
+                         .round();
 
     if (windowBox.width < 1 || windowBox.height < 1)
         return;
@@ -129,7 +134,8 @@ void CHyprBorderDecoration::damageEntire() {
 
     CRegion    borderRegion(GLOBAL_BOX);
     borderRegion.subtract(GLOBAL_BOX.copy().expand(-(BORDERSIZE + ROUNDING)));
-    borderRegion.expand(2); // pad
+    // stereo depth (research/24 §6.3): the border is drawn into both panes at ±disparity
+    borderRegion.expand(2 + std::ceil(g_pHyprRenderer->depthDamageSpread(m_window.lock(), m_window->m_monitor.lock()))); // pad
 
     const CBox borderExtents = borderRegion.getExtents();
 
