@@ -253,6 +253,21 @@ static double depthShiftUnclamped(float depth, const PHLMONITOR& monitor) {
     if (depth <= Desktop::Depth::MIN || !monitor || monitor->m_scale <= 0)
         return 0.0;
 
+    // ...and only on an UNROTATED output. This is the one place the disparity becomes an axis, and
+    // the axis it picks is logical +x — which is the panel's horizontal axis only under the normal
+    // transform. deriveGeometry (StereoPacking.hpp) transposes the pane for transform % 2 == 1, so
+    // on a 90/270 output logical x runs down the panel and the "disparity" would be a VERTICAL
+    // offset between the eyes: not a depth cue at all, and one of the few things §8.2 names as a
+    // hazard rather than a nuisance. 180 and the flipped transforms keep the axis but reverse it,
+    // which silently swaps the eyes and inverts the whole ladder — everything sinks behind the
+    // page, against §8.2 point 2's one-sided design.
+    //
+    // The honest answer for all of them is to stay on the wallpaper plane: every spread is 0, so
+    // depthProducerActive() finds nothing raised and the output falls back to WP F1's single
+    // composite. Flat, correct, and identical to what a rotated stereo output rendered before D2.
+    if (monitor->m_transform != WL_OUTPUT_TRANSFORM_NORMAL)
+        return 0.0;
+
     return Desktop::Depth::damageSpreadPx(depth, *PSCALE, depthGeometry(), monitor->paneSize().x) / monitor->m_scale;
 }
 
