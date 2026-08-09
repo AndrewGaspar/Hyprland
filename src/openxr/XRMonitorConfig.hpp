@@ -138,6 +138,71 @@ namespace OpenXR {
     //   standby bug. The first-plug settle (xrDeferFirstPlug) still guards the create-time blip.
     bool wantXRMonitorsPlugged(eXRMonitorFollowMode mode, bool sessionUp, bool sessionVisible, bool presenceSupported, bool presenceKnown, bool userPresent);
 
+    // ---- default scale for XR-created monitors (task #129) ----
+
+    // Config::CMonitorRule::m_scale is a REQUEST, not a value: anything <= 0.1 means "auto" and sends
+    // CMonitor::applyMonitorRule to getDefaultScale(). Anything above it is a scale the user actually
+    // asked for. Same threshold as Monitor.cpp's `autoScale`, kept here so the policy below and the
+    // tests agree with the consumer.
+    constexpr float XR_RULE_SCALE_AUTO_MAX = 0.1F;
+    inline bool     xrRuleScaleIsExplicit(float ruleScale) {
+        return ruleScale > XR_RULE_SCALE_AUTO_MAX;
+    }
+
+    // The scale the user's config PINNED on one output: the newest monitor rule that names it, or the
+    // auto sentinel if none does. `rules` is the rule manager's list in declaration order (anything
+    // with .m_name / .m_scale); `matches` is the output's own selector match.
+    //
+    // Why not just read CMonitorRuleManager::get()'s merged scale: get() falls back to the first
+    // NAMELESS rule when nothing matches by selector — the `monitor = , preferred, auto, 1` catch-all
+    // almost every config carries — and that fallback is not an opinion about XR-2, it is exactly what
+    // "no rule for XR-2" looks like. Taking its scale would let one catch-all silently disable the XR
+    // default for everyone who has one. So the nameless rule is skipped here explicitly, rather than
+    // left to the selector matcher's incidental behavior.
+    template <typename Rules, typename Matcher>
+    float xrPinnedRuleScale(const Rules& rules, Matcher&& matches) {
+        float pinned = -1.F;
+        for (const auto& r : rules) {
+            if (r.m_name.empty())
+                continue;
+            if (matches(r.m_name))
+                pinned = r.m_scale; // keep walking: later rules outrank earlier ones, as in get()
+        }
+        return pinned;
+    }
+
+    // Which scale the compositor should write into an XR monitor's persistent rule, or nullopt to
+    // leave the rule's scale alone.
+    //
+    // Why this exists: a headless output has no EDID, so getDefaultScale()'s PPI heuristic reads a
+    // 1920x1080 quad as a tiny high-density panel and picks 2.0 — legible on a desk, unusably cramped
+    // through a headset. Voice/keybind-created monitors (`hyprctl openxr create` -> XR-2, XR-3, …)
+    // have no `monitor =` line to correct it, which is why configs grew XR-2..XR-8 workaround blocks
+    // with a cliff at XR-9. The compositor owns the default instead.
+    //
+    // Precedence, highest first — the same shape as the pixel-mode ladder (doc 05 §3.1):
+    //   1. an explicit scale in a matching `monitor =` rule (ruleScaleExplicit) — untouched;
+    //   2. this default, for XR-CREATED outputs only;
+    //   3. Hyprland's PPI guess, when the default is opted out of (configuredDefault <= 0).
+    // Never applied to a pre-existing output an `xrmonitor` line merely ADOPTED (createdByXR ==
+    // false): that is one of the user's real monitors with a real EDID, and its scale is not ours.
+    // Never applied to a stereo output either: the pack needs one buffer pixel per physical pixel per
+    // eye, so getDefaultScale() deliberately pins those to 1.0 (research/24 §3.8) and writing an
+    // explicit scale here would both defeat that and trip applyMonitorRule's "stereo with scale !=
+    // 1.0" warning. XR monitors are never stereo today; the guard keeps it that way by construction.
+    //
+    // And never applied unless it divides `pixelSize` (the mode this output will run) into whole
+    // logical pixels. A scale that doesn't divide is not merely imprecise: applyMonitorRule treats a
+    // non-auto scale as the USER's, so it snaps to the nearest clean divisor, logs an ERR and raises
+    // a red "Invalid scale passed to monitor" notification — blaming the user for a number the
+    // compositor picked. 1.25 is clean on every 16:9 mode (1920x1080 -> 1536x864, 2560x1440 ->
+    // 2048x1152) but not on 4:3 ones (1024x768 -> 819.2x614.4), so this is reachable in practice.
+    // When it doesn't divide we simply decline and the PPI guess stands, which is where such a
+    // monitor was already. pixelSize {} (mode not knowable yet) declines for the same reason: this
+    // only ever claims a scale it can prove.
+    std::optional<float> xrDefaultMonitorScale(bool createdByXR, bool ruleScaleExplicit, bool stereoOutput, const Vector2D& pixelSize, bool skipScaleChecks,
+                                               float configuredDefault);
+
     // ---- idle-inhibit policy (research/20 phase 2) ----
 
     // openxr:inhibit_idle mode. Governs WHEN a live XR session raises the compositor's
