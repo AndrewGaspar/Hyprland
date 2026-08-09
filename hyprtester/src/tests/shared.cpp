@@ -7,6 +7,7 @@
 #include <fstream>
 #include "../shared.hpp"
 #include "../hyprctlCompat.hpp"
+#include "../SafeKill.hpp"
 
 using namespace Hyprutils::OS;
 using namespace Hyprutils::Memory;
@@ -74,9 +75,7 @@ CUniquePointer<CProcess> Tests::spawnLayerKitty(const std::string& namespace_, c
 }
 
 bool Tests::processAlive(pid_t pid) {
-    errno   = 0;
-    int ret = kill(pid, 0);
-    return ret != -1 || errno != ESRCH;
+    return Safe::pidAlive(pid);
 }
 
 int Tests::windowCount() {
@@ -140,17 +139,18 @@ int Tests::layerCount() {
 }
 
 bool Tests::killAllLayers() {
-    auto str = getFromSocket("/layers");
-    auto pos = str.find("pid: ");
-    while (pos != std::string::npos) {
-        auto pid = stoi(str.substr(pos + 5, str.find('\n', pos)));
-        kill(pid, 15);
+    // A layer surface whose client is already gone reports pid -1 (CLayerSurface::getPID), which
+    // is exactly the state the sleep below was added to paper over. Handing that to kill() is a
+    // SIGTERM broadcast to the entire login session, so every pid goes through Safe::signalPid,
+    // which refuses anything that is not one real process. Skipping such an entry loses nothing:
+    // the client behind it is dead already.
+    for (const auto PID : Safe::pidsFromReply(getFromSocket("/layers"), "pid: ")) {
+        if (!Safe::signalPid(PID, SIGTERM))
+            continue;
 
         // we need to wait for a bit because for some reason otherwise we'll end up
         // with layers with pid -1 if they are all removed at the same time
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-        pos = str.find("pid: ", pos + 5);
     }
 
     int counter = 0;
