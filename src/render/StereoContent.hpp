@@ -138,6 +138,41 @@ namespace Render::Stereo {
         return result;
     }
 
+    // THE PRECEDENCE TABLE (§4.2, §4.3, §4.5), as a pure function of the rule and what the client
+    // said — so the whole matrix is exercised without a window, a surface or a compositor (WP S2).
+    //
+    // `tagged` is the client's own declaration: nullopt for "said nothing at all", CONTENT_OFF for
+    // the explicit `stereo:mono`. The two are NOT the same input and do not produce the same answer.
+    //
+    // The return is split rather than resolved because the fullscreen query is the expensive half
+    // and the caller runs per surface per frame: this decides WHETHER the gate applies, and the
+    // caller asks the fullscreen controller only when it does.
+    struct SResolution {
+        eContentLayout layout = CONTENT_OFF; // what to crop with, once `gated` is satisfied
+        bool           gated  = false;       // §4.3: engage only while the window owns the screen
+
+        bool           operator==(const SResolution&) const = default;
+    };
+
+    inline SResolution resolveDeclaration(const SDeclaration& rule, std::optional<eContentLayout> tagged) {
+        // `stereo off` is the user's off switch and beats everything, a client's tag included.
+        if (rule.layout == CONTENT_OFF)
+            return {};
+
+        // `auto` delegates to the client. Every other layout is a human instruction and therefore
+        // outranks the tag — §4.5's ecosystem warning is that correct-LOOKING content metadata is a
+        // liability, so the last human instruction has to win.
+        const auto LAYOUT = rule.layout == CONTENT_AUTO ? tagged.value_or(CONTENT_OFF) : rule.layout;
+        if (LAYOUT == CONTENT_OFF)
+            return {};
+
+        // Two things are not guesses and skip §4.3's gate: `always` (written by hand) and a client
+        // that declared its own packing. `stereo:mono` is a declaration of NOT-stereo, so it is not
+        // one of them — it can only ever suppress.
+        const bool CLIENT_DECLARED = tagged.has_value() && *tagged != CONTENT_OFF;
+        return {.layout = LAYOUT, .gated = rule.gate != GATE_ALWAYS && !CLIENT_DECLARED};
+    }
+
     // The cooperative channel (§4.2, F6): xdg-toplevel-tag-v1, which is already implemented and
     // already matchable as `xdg_tag`. THE GRAMMAR, which is what a client (the Dead Space mod) must
     // emit verbatim:
@@ -188,6 +223,36 @@ namespace Render::Stereo {
         return layout == CONTENT_HSBS || layout == CONTENT_HTAB ? 2.F : 1.F;
     }
 
+    // ONE eye's pixels inside a packed content buffer — the box §5.2 derives the presented aspect
+    // from. Identity for a mono layout.
+    inline Vector2D contentPaneSize(const Vector2D& bufferSize, eContentLayout layout) {
+        if (splitsHorizontally(layout))
+            return {bufferSize.x / 2, bufferSize.y};
+        if (splitsVertically(layout))
+            return {bufferSize.x, bufferSize.y / 2};
+        return bufferSize;
+    }
+
+    // §5.2's rule applied end to end: the presented HEIGHT/WIDTH of one eye, given the packed buffer
+    // it came out of. The squeezed axis is un-squeezed by `k` — for a side-by-side pack that is the
+    // pane's width, for an over-under pack its height ("axes swapped for TAB").
+    //
+    // The invariant worth stating out loud, because it is the entire reason the half layouts must be
+    // DECLARED rather than measured: every packing of the same picture lands on the same number
+    // here. A 3840x1080 `sbs` buffer, a 1920x1080 `hsbs` buffer, a 1920x2160 `tab` buffer and a
+    // 1920x1080 `htab` buffer all present 1080/1920 — and the last two are pixel-for-pixel the same
+    // SIZE as each other and as a mono 1920x1080 frame, so no pixel analysis can tell them apart.
+    //
+    // Consumer: the XR quad pair (WP X1), whose height is derived from content pixels. The flat
+    // presenter never calls it, for the reason aspectFactor above spells out.
+    inline float presentedAspect(const Vector2D& bufferSize, eContentLayout layout) {
+        const auto PANE = contentPaneSize(bufferSize, layout);
+        const auto K    = static_cast<double>(aspectFactor(layout));
+        const auto W    = splitsVertically(layout) ? PANE.x : PANE.x * K;
+        const auto H    = splitsVertically(layout) ? PANE.y * K : PANE.y;
+        return static_cast<float>(H / std::max(1.0, W));
+    }
+
     struct SUVRange {
         Vector2D tl = {0, 0};
         Vector2D br = {1, 1};
@@ -219,5 +284,33 @@ namespace Render::Stereo {
         }
 
         return out;
+    }
+
+    // §5.6, both directions. A ray or pointer hit is computed against ONE PANE — the half of the
+    // image an eye actually shows — while everything downstream of it (absolute pointer injection,
+    // which is keyed by monitor name plus a 0..1 UV) wants a coordinate in the whole packed image.
+    // Get this backwards and the cursor is offset by half a screen.
+    //
+    // Both are expressed through cropForEye so there is exactly ONE definition of where the halves
+    // are: §5.6's `u = u_pane / 2` (left) and `0.5 + u_pane / 2` (right) are these with a full base
+    // range. Identity for a mono layout in both directions, and exact inverses of each other.
+    //
+    // Consumer: the XR pointer un-mapping (WP X1/X3). It is named for the CONTENT producer on
+    // purpose — §5.6's real warning is that the DEPTH producer (D2) needs the other mapping
+    // entirely, because there both panes are the same desktop, so the un-map is the identity and it
+    // is the disparity that must come off instead. The mapping belongs to the producer, not to the
+    // presenter, and a function called "stereoUnmap" would have invited exactly that mistake.
+    inline Vector2D paneUVToContentUV(const Vector2D& paneUV, eContentLayout layout, int eye, const SUVRange& base = {}) {
+        const auto CROP = cropForEye(base, layout, eye);
+        return CROP.tl + (CROP.br - CROP.tl) * paneUV;
+    }
+
+    inline Vector2D contentUVToPaneUV(const Vector2D& contentUV, eContentLayout layout, int eye, const SUVRange& base = {}) {
+        const auto     CROP = cropForEye(base, layout, eye);
+        const Vector2D SPAN = CROP.br - CROP.tl;
+        return {
+            SPAN.x == 0 ? 0 : (contentUV.x - CROP.tl.x) / SPAN.x,
+            SPAN.y == 0 ? 0 : (contentUV.y - CROP.tl.y) / SPAN.y,
+        };
     }
 }
