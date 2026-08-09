@@ -842,93 +842,139 @@ void CHyprOpenGLImpl::end(CRenderContext& ctx) {
             const bool                      NEEDS_CM           = ctx.m_data.pMonitor->m_imageDescription->value() != ctx.m_data.mainFB->imageDescription()->value();
             const bool                      WANTS_FINAL_SHADER = !ctx.m_data.blockScreenShader && (m_finalScreenShader->program() >= 1 || g_pHyprRenderer->m_crashingInProgress);
 
-            auto                            finalTexture = ctx.m_data.currentFB->getTexture();
-            CBox                            finalBox     = monbox;
-            std::array<SP<IFramebuffer>, 2> postProcessFBs;
-            std::array<NColorManagement::PImageDescription, 2> savedDescriptions;
-            size_t                                             postProcessCount = 0;
-            bool                                               finalCMComplete  = false;
+            // The post-process chain (final CM, then the screen shader) for ONE source composite.
+            // Factored out of the single-composite path because the stereo depth producer
+            // (research/24 §6.1, WP D2) hands end() one DIFFERENT composite per pane — each needs its
+            // own resolve. In every other frame it runs exactly once, as upstream's inline chain did.
+            struct SResolvedComposite {
+                SP<ITexture>                                       texture;
+                CBox                                               box;
+                bool                                               cmComplete = false;
+                std::array<SP<IFramebuffer>, 2>                    fbs;
+                std::array<NColorManagement::PImageDescription, 2> savedDescriptions;
+                size_t                                             count = 0;
+            };
 
-            if (WANTS_FINAL_SHADER) {
+            const auto RESOLVE = [&](SP<ITexture> source) {
+                SResolvedComposite r{.texture = std::move(source), .box = monbox};
+
+                if (!WANTS_FINAL_SHADER)
+                    return r;
+
                 if (NEEDS_CM) {
-                    postProcessFBs[postProcessCount] = g_pHyprRenderer->getWorkBuffer(ctx);
-                    if (postProcessFBs[postProcessCount]) {
-                        savedDescriptions[postProcessCount] = postProcessFBs[postProcessCount]->imageDescription();
-                        postProcessFBs[postProcessCount]->setImageDescription(ctx.m_data.pMonitor->m_imageDescription);
+                    r.fbs[r.count] = g_pHyprRenderer->getWorkBuffer(ctx);
+                    if (r.fbs[r.count]) {
+                        r.savedDescriptions[r.count] = r.fbs[r.count]->imageDescription();
+                        r.fbs[r.count]->setImageDescription(ctx.m_data.pMonitor->m_imageDescription);
 
                         {
-                            auto guard = g_pHyprRenderer->bindTempFB(ctx, postProcessFBs[postProcessCount]);
-                            GLFB(postProcessFBs[postProcessCount])->clearAfterInvalidation();
+                            auto guard = g_pHyprRenderer->bindTempFB(ctx, r.fbs[r.count]);
+                            GLFB(r.fbs[r.count])->clearAfterInvalidation();
                             g_pHyprRenderer->setProjectionType(ctx, RPT_MONITOR);
                             ctx.m_data.transformDamage = false;
-                            renderTexture(ctx, finalTexture, finalBox, {.finalMonitorCM = true});
+                            renderTexture(ctx, r.texture, r.box, {.finalMonitorCM = true});
                         }
 
-                        finalTexture    = postProcessFBs[postProcessCount++]->getTexture();
-                        finalBox        = CBox{{}, m_renderData.pMonitor->m_transformedSize};
-                        finalCMComplete = true;
+                        r.texture    = r.fbs[r.count++]->getTexture();
+                        r.box        = CBox{{}, m_renderData.pMonitor->m_transformedSize};
+                        r.cmComplete = true;
                     } else {
                         LOG(Log::ERR, "Failed to acquire a work buffer for final color management");
-                        postProcessFBs[postProcessCount].reset();
+                        r.fbs[r.count].reset();
                     }
                 }
 
-                if (!NEEDS_CM || finalCMComplete) {
-                    postProcessFBs[postProcessCount] = g_pHyprRenderer->getWorkBuffer(ctx);
-                    if (postProcessFBs[postProcessCount]) {
-                        savedDescriptions[postProcessCount] = postProcessFBs[postProcessCount]->imageDescription();
-                        postProcessFBs[postProcessCount]->setImageDescription(ctx.m_data.pMonitor->m_imageDescription);
+                if (!NEEDS_CM || r.cmComplete) {
+                    r.fbs[r.count] = g_pHyprRenderer->getWorkBuffer(ctx);
+                    if (r.fbs[r.count]) {
+                        r.savedDescriptions[r.count] = r.fbs[r.count]->imageDescription();
+                        r.fbs[r.count]->setImageDescription(ctx.m_data.pMonitor->m_imageDescription);
 
                         {
-                            auto guard = g_pHyprRenderer->bindTempFB(ctx, postProcessFBs[postProcessCount]);
-                            GLFB(postProcessFBs[postProcessCount])->clearAfterInvalidation();
+                            auto guard = g_pHyprRenderer->bindTempFB(ctx, r.fbs[r.count]);
+                            GLFB(r.fbs[r.count])->clearAfterInvalidation();
                             g_pHyprRenderer->setProjectionType(ctx, RPT_MONITOR);
                             ctx.m_data.transformDamage = false;
                             ctx.m_gl.applyFinalShader  = true;
-                            renderTexture(ctx, finalTexture, finalBox, {.finalMonitorCM = true});
+                            renderTexture(ctx, r.texture, r.box, {.finalMonitorCM = true});
                             ctx.m_gl.applyFinalShader = false;
                         }
 
-                        finalTexture = postProcessFBs[postProcessCount++]->getTexture();
-                        finalBox     = CBox{{}, m_renderData.pMonitor->m_transformedSize};
+                        r.texture = r.fbs[r.count++]->getTexture();
+                        r.box     = CBox{{}, m_renderData.pMonitor->m_transformedSize};
                     } else {
                         LOG(Log::ERR, "Failed to acquire a work buffer for the final screen shader");
-                        postProcessFBs[postProcessCount].reset();
+                        r.fbs[r.count].reset();
                     }
                 }
-            }
 
-            g_pHyprRenderer->bindFB(ctx, ctx.m_data.outFB);
-            setViewport(0, 0, PMONITOR->m_pixelSize.x, PMONITOR->m_pixelSize.y);
-            g_pHyprRenderer->setProjectionType(ctx, RPT_OUTPUT);
-            ctx.m_data.transformDamage = true;
+                return r;
+            };
+
+            // hand a resolve's work buffers back (restoring their descriptions) so the next can reuse them
+            const auto RELEASE = [](SResolvedComposite& r) {
+                for (size_t i = 0; i < r.count; ++i) {
+                    r.fbs[i]->setImageDescription(r.savedDescriptions[i]);
+                    r.fbs[i].reset();
+                }
+                r.count = 0;
+            };
+
+            const auto BINDOUTPUT = [&]() {
+                g_pHyprRenderer->bindFB(ctx, ctx.m_data.outFB);
+                setViewport(0, 0, PMONITOR->m_pixelSize.x, PMONITOR->m_pixelSize.y);
+                g_pHyprRenderer->setProjectionType(ctx, RPT_OUTPUT);
+                ctx.m_data.transformDamage = true;
+            };
+
+            const auto BLIT = [&](const SResolvedComposite& r) {
+                if (NEEDS_CM && !r.cmComplete)
+                    renderTexture(ctx, r.texture, r.box, {.finalMonitorCM = true});
+                else
+                    renderTexturePrimitive(ctx, r.texture, r.box);
+            };
 
             if UNLIKELY (PMONITOR->isStereo() && !ctx.m_gl.fakeFrame) {
                 // stereo pack (research/24 §3.3(i)): everything above is ONE pane; assemble the
                 // mode-sized scanout frame with one blit per pane. The destination box is expressed as
                 // the GL viewport (the pane projection fills NDC, the viewport places it), and the
                 // damage scissors get the pane's origin added (glScissor is window-relative —
-                // m_scissorOffset). A pending screen shader has already been resolved into the
-                // pane-sized post-process buffer above; a still-pending CM resolve runs per pane.
+                // m_scissorOffset).
+                //
+                // WP D2 (research/24 §6.1): with the depth producer running, the panes are DIFFERENT
+                // images — ctx.m_data.stereoPaneFBs holds every composite but the last, which is still
+                // the offloaded buffer. Each then needs its own resolve. In the fast path that vector is
+                // empty, one resolve serves every pane, and this loop is what F1 shipped.
+                const bool         PERPANE = !ctx.m_data.stereoPaneFBs.empty();
+
+                SResolvedComposite shared;
+                if (!PERPANE)
+                    shared = RESOLVE(ctx.m_data.currentFB->getTexture());
+
                 for (int i = 0; i < PMONITOR->stereoPaneCount(); ++i) {
+                    SResolvedComposite perPane;
+                    if (PERPANE) // the last pane is the composite still in the offloaded buffer
+                        perPane = RESOLVE(i < sc<int>(ctx.m_data.stereoPaneFBs.size()) ? ctx.m_data.stereoPaneFBs[i]->getTexture() : ctx.m_data.currentFB->getTexture());
+
+                    BINDOUTPUT();
                     const auto DEST = PMONITOR->stereoPaneDestBox(i);
                     setViewport(DEST.x, DEST.y, DEST.width, DEST.height);
                     m_scissorOffset = {DEST.x, DEST.y};
-                    if (NEEDS_CM && !finalCMComplete)
-                        renderTexture(ctx, finalTexture, finalBox, {.finalMonitorCM = true});
-                    else
-                        renderTexturePrimitive(ctx, finalTexture, finalBox);
+                    BLIT(PERPANE ? perPane : shared);
+
+                    if (PERPANE)
+                        RELEASE(perPane); // hand the work buffers back before the next pane asks for them
                 }
 
                 m_scissorOffset = {};
                 setViewport(0, 0, PMONITOR->m_pixelSize.x, PMONITOR->m_pixelSize.y);
-            } else if (NEEDS_CM && !finalCMComplete)
-                renderTexture(ctx, finalTexture, finalBox, {.finalMonitorCM = true});
-            else
-                renderTexturePrimitive(ctx, finalTexture, finalBox);
-
-            for (size_t i = 0; i < postProcessCount; ++i)
-                postProcessFBs[i]->setImageDescription(savedDescriptions[i]);
+                RELEASE(shared);
+            } else {
+                auto resolved = RESOLVE(ctx.m_data.currentFB->getTexture());
+                BINDOUTPUT();
+                BLIT(resolved);
+                RELEASE(resolved);
+            }
 
             blend(true);
 
@@ -944,6 +990,7 @@ void CHyprOpenGLImpl::end(CRenderContext& ctx) {
     ctx.m_data.currentFB.reset();
     ctx.m_data.mainFB.reset();
     ctx.m_data.outFB.reset();
+    ctx.m_data.stereoPaneFBs.clear(); // hand the pane buffers back to the pool
     // invalidate our render FBs to signal to the driver we don't need them anymore
     ctx.m_data.pMonitor->resources()->forEachUnusedFB(
         [](const auto& fb) {
@@ -2300,7 +2347,8 @@ void CHyprOpenGLImpl::renderRoundedShadow(CRenderContext& ctx, const CBox& box, 
             if (const auto WINDOWBOX = PWINDOW->surfaceLogicalBox(); WINDOWBOX.has_value()) {
                 CBox scaledWindowBox = WINDOWBOX.value();
 
-                scaledWindowBox.translate(presentation.workspaceOffset + presentation.floatingOffset);
+                // research/24 §6.2 injection point 1: the blur cutout follows the raised window
+                scaledWindowBox.translate(presentation.workspaceOffset + presentation.floatingOffset + g_pHyprRenderer->depthRenderOffset(PWINDOW));
                 scaledWindowBox.translate(-m_renderData.pMonitor->m_position);
                 scaledWindowBox.scale(m_renderData.pMonitor->m_scale).round();
                 m_renderData.renderModif.applyToBox(scaledWindowBox);

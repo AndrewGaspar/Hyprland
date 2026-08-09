@@ -96,6 +96,8 @@ void CHyprGroupBarDecoration::updateWindow(PHLWINDOW pWindow) {
 void CHyprGroupBarDecoration::damageEntire() {
     auto box = assignedBoxGlobal();
     box.translate(m_window->presentation().floatingOffset());
+    // stereo depth (research/24 §6.3): the bar is drawn into both panes at ±disparity
+    box.expand(std::ceil(g_pHyprRenderer->depthDamageSpread(m_window.lock(), m_window->m_monitor.lock())));
     g_pHyprRenderer->damageBox(box);
 }
 
@@ -143,9 +145,12 @@ void CHyprGroupBarDecoration::draw(Render::CRenderContext& ctx, PHLMONITOR pMoni
 
     const auto  ASSIGNEDBOX = assignedBoxGlobal(presentation);
 
-    const auto  ONEBARHEIGHT = *POUTERGAP + *PINDICATORHEIGHT + *PINDICATORGAP + (*PGRADIENTS || *PRENDERTITLES ? *PHEIGHT : 0);
-    m_barWidth               = *PSTACKED ? ASSIGNEDBOX.w : (ASSIGNEDBOX.w - *PINNERGAP * (barsToDraw - 1)) / barsToDraw;
-    m_barHeight              = *PSTACKED ? ((ASSIGNEDBOX.h - *POUTERGAP * *PKEEPUPPERGAP) - *POUTERGAP * (barsToDraw)) / barsToDraw : ASSIGNEDBOX.h - *POUTERGAP * *PKEEPUPPERGAP;
+    // research/24 §6.2 injection point 1: the depth disparity rides in beside the floating offset
+    const auto DEPTHOFFSET = g_pHyprRenderer->depthRenderOffset(m_window.lock());
+
+    const auto ONEBARHEIGHT = *POUTERGAP + *PINDICATORHEIGHT + *PINDICATORGAP + (*PGRADIENTS || *PRENDERTITLES ? *PHEIGHT : 0);
+    m_barWidth              = *PSTACKED ? ASSIGNEDBOX.w : (ASSIGNEDBOX.w - *PINNERGAP * (barsToDraw - 1)) / barsToDraw;
+    m_barHeight             = *PSTACKED ? ((ASSIGNEDBOX.h - *POUTERGAP * *PKEEPUPPERGAP) - *POUTERGAP * (barsToDraw)) / barsToDraw : ASSIGNEDBOX.h - *POUTERGAP * *PKEEPUPPERGAP;
 
     const auto DESIREDHEIGHT = *PSTACKED ? (ONEBARHEIGHT * m_dwGroupMembers.size()) + *POUTERGAP * *PKEEPUPPERGAP : *POUTERGAP * (1 + *PKEEPUPPERGAP) + ONEBARHEIGHT;
     if (DESIREDHEIGHT != ASSIGNEDBOX.h)
@@ -159,7 +164,7 @@ void CHyprGroupBarDecoration::draw(Render::CRenderContext& ctx, PHLMONITOR pMoni
     for (int i = 0; i < barsToDraw; ++i) {
         const auto WINDOWINDEX = *PSTACKED ? m_dwGroupMembers.size() - i - 1 : i;
 
-        const auto FLOATING_OFFSET = presentation.floatingOffset;
+        const auto FLOATING_OFFSET = presentation.floatingOffset + DEPTHOFFSET;
         CBox rect = {ASSIGNEDBOX.x + xoff - pMonitor->m_position.x + FLOATING_OFFSET.x,
                      ASSIGNEDBOX.y + ASSIGNEDBOX.h - floor(yoff) - *PINDICATORHEIGHT - *POUTERGAP - pMonitor->m_position.y + FLOATING_OFFSET.y, m_barWidth, *PINDICATORHEIGHT};
 

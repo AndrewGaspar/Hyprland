@@ -36,7 +36,9 @@
 #include "../layout/LayoutManager.hpp"
 #include "../layout/space/Space.hpp"
 #include "../i18n/Engine.hpp"
+#include "../desktop/DepthTiers.hpp"
 #include "../desktop/DesktopTypes.hpp"
+#include "../desktop/state/WindowState.hpp"
 #include "../event/EventBus.hpp"
 #include "../helpers/CursorShapes.hpp"
 #include "../helpers/MainLoopExecutor.hpp"
@@ -232,6 +234,137 @@ WP<Render::GL::CHyprOpenGLImpl> IHyprRenderer::glBackend() {
     return Render::GL::g_pHyprOpenGL;
 }
 
+//
+// ---- the stereo depth producer (research/24 §6.1, §6.2 injection point 1, §8.1) --------------
+//
+
+// The virtual screen ONE eye of a stereo output is looking at. Two numeric config reads, no
+// strings, so this is safe on every render-hot path it is called from.
+static Desktop::Depth::SGeometry depthGeometry() {
+    static auto PDIST  = CConfigValue<Config::FLOAT>("decoration:depth_distance");
+    static auto PWIDTH = CConfigValue<Config::FLOAT>("decoration:depth_screen_width");
+    return {.distanceM = sc<float>(*PDIST), .screenWidthM = sc<float>(*PWIDTH)};
+}
+
+// The magnitude of ONE pane's shift for DEPTH on MONITOR, in LOGICAL pixels — logical because the
+// offset is folded in beside m_floatingOffset, which lives in logical coordinates; the buffer-space
+// value is this times m_scale. §8.1's formula plus §8.2's comfort ceiling, and nothing else.
+static double depthShiftUnclamped(float depth, const PHLMONITOR& monitor) {
+    static auto PSCALE = CConfigValue<Config::FLOAT>("decoration:depth_scale");
+
+    if (depth <= Desktop::Depth::MIN || !monitor || monitor->m_scale <= 0)
+        return 0.0;
+
+    return Desktop::Depth::damageSpreadPx(depth, *PSCALE, depthGeometry(), monitor->paneSize().x) / monitor->m_scale;
+}
+
+// ...and the same thing with §6.1's frame-violation clamp applied. BOXLOCAL is the element's box
+// in monitor-local logical coordinates: an element with room to move gets its full shift, one
+// pinned to the panel edge gets `decoration:depth_edge_slack` and no more.
+static double depthShiftLogical(float depth, const PHLMONITOR& monitor, const CBox& boxLocal) {
+    static auto  PSLACK = CConfigValue<Config::FLOAT>("decoration:depth_edge_slack");
+
+    const double SHIFT = depthShiftUnclamped(depth, monitor);
+    if (SHIFT == 0.0)
+        return 0.0;
+
+    return Desktop::Depth::clampToFrame(SHIFT, boxLocal.x, boxLocal.w, monitor->m_size.x, sc<float>(*PSLACK) / monitor->m_scale);
+}
+
+static CBox viewBoxLocal(const PHLWINDOW& window, const PHLMONITOR& monitor) {
+    return CBox{window->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT) - monitor->m_position, window->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT)};
+}
+
+static CBox viewBoxLocal(const PHLLS& layer, const PHLMONITOR& monitor) {
+    return CBox{layer->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT) - monitor->m_position, layer->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT)};
+}
+
+Vector2D IHyprRenderer::depthRenderOffset(const PHLWINDOW& window) {
+    if (m_context.m_data.stereoPane < 0 || !window || !window->m_depth)
+        return {};
+
+    const auto MON = m_context.m_data.pMonitor.lock();
+    if (!MON)
+        return {};
+
+    return Vector2D{Desktop::Depth::eyeSign(m_context.m_data.stereoPane) * depthShiftLogical(window->m_depth->value(), MON, viewBoxLocal(window, MON)), 0.0};
+}
+
+Vector2D IHyprRenderer::depthRenderOffset(const PHLLS& layer) {
+    if (m_context.m_data.stereoPane < 0 || !layer || !layer->m_depth)
+        return {};
+
+    const auto MON = m_context.m_data.pMonitor.lock();
+    if (!MON)
+        return {};
+
+    return Vector2D{Desktop::Depth::eyeSign(m_context.m_data.stereoPane) * depthShiftLogical(layer->m_depth->value(), MON, viewBoxLocal(layer, MON)), 0.0};
+}
+
+Vector2D IHyprRenderer::cursorDepthOffset(const PHLMONITOR& monitor) {
+    if (m_context.m_data.stereoPane < 0 || !monitor)
+        return {};
+
+    // What the pointer is over, as the input manager last resolved it — no hit test on the render
+    // path. Taking the MAX of the two is the conservative reading of Daydream's rule: never behind.
+    const auto  HOVEREDWIN = g_pInputManager->hoveredWindow();
+    const auto  HOVEREDLS  = g_pInputManager->hoveredLayer();
+
+    const float DEPTH = std::max(HOVEREDWIN && HOVEREDWIN->m_depth ? HOVEREDWIN->m_depth->value() : 0.F, HOVEREDLS && HOVEREDLS->m_depth ? HOVEREDLS->m_depth->value() : 0.F);
+    if (DEPTH <= Desktop::Depth::MIN)
+        return {};
+
+    // The cursor is a free-floating foreground element in ISU's sense — the one thing the second
+    // Golden Rule (§8.3) explicitly exempts from the stereo window — so it takes the unclamped
+    // shift, subject only to the comfort ceiling.
+    return Vector2D{Desktop::Depth::eyeSign(m_context.m_data.stereoPane) * depthShiftUnclamped(DEPTH, monitor), 0.0};
+}
+
+double IHyprRenderer::depthDamageSpread(const PHLWINDOW& window, const PHLMONITOR& monitor) {
+    if (!monitor || !monitor->isStereo() || !window || !window->m_depth)
+        return 0.0;
+
+    return depthShiftLogical(window->m_depth->value(), monitor, viewBoxLocal(window, monitor));
+}
+
+double IHyprRenderer::depthDamageSpread(const PHLLS& layer, const PHLMONITOR& monitor) {
+    if (!monitor || !monitor->isStereo() || !layer || !layer->m_depth)
+        return 0.0;
+
+    return depthShiftLogical(layer->m_depth->value(), monitor, viewBoxLocal(layer, monitor));
+}
+
+bool IHyprRenderer::depthProducerActive(const PHLMONITOR& monitor) {
+    if (!monitor || !monitor->isStereo() || monitor->isMirror() || monitor->stereoPaneCount() < 2)
+        return false;
+
+    static auto PSCALE = CConfigValue<Config::FLOAT>("decoration:depth_scale");
+    if (*PSCALE <= 0)
+        return false;
+
+    // §6.4.1: a main-thread predicate over things that are ACTUALLY on this monitor. The question
+    // it asks is not "does anything have a depth" but "would anything actually MOVE" — the tier,
+    // the scale, the comfort ceiling and §6.1's edge clamp all folded in — so zeroing the ladder,
+    // or `depth_scale = 0`, or an edge-pinned layout with no slack, each collapses back to a
+    // single composite on its own. That is the free A/B toggle §6.4 asked for.
+    for (const auto& W : Desktop::windowState()->windows()) {
+        if (!W->m_depth || W->m_depth->value() <= Desktop::Depth::MIN)
+            continue;
+        if (shouldRenderWindow(W, monitor) && depthDamageSpread(W, monitor) > 0.0)
+            return true;
+    }
+
+    for (const auto& LAYERS : monitor->m_layerSurfaceLayers) {
+        for (const auto& LSREF : LAYERS) {
+            const auto LS = LSREF.lock();
+            if (LS && LS->m_depth && LS->m_depth->value() > Desktop::Depth::MIN && LS->visible() && depthDamageSpread(LS, monitor) > 0.0)
+                return true;
+        }
+    }
+
+    return false;
+}
+
 bool IHyprRenderer::shouldRenderWindow(PHLWINDOW pWindow, PHLMONITOR pMonitor) {
     if (!pWindow->presentation().visibleOnMonitor(pMonitor))
         return false;
@@ -287,6 +420,9 @@ bool IHyprRenderer::shouldRenderWindow(PHLWINDOW pWindow, PHLMONITOR pMonitor) {
         if (PWINDOWWORKSPACE && PWINDOWWORKSPACE->m_renderOffset->isBeingAnimated())
             windowBox.translate(PWINDOWWORKSPACE->m_renderOffset->value());
         windowBox.translate(pWindow->presentation().floatingOffset());
+        // stereo depth: a raised window is drawn at ±disparity, so it can be visible on this
+        // monitor in one pane while its un-shifted box is not (research/24 §6.3)
+        windowBox.expand(depthDamageSpread(pWindow, pMonitor));
 
         const CBox monitorBox = {pMonitor->m_position, pMonitor->m_size};
         if (!windowBox.intersection(monitorBox).empty() && (pWindow->m_workspace == pMonitor->m_activeWorkspace || pWindow->presentation().movingFromMonitor()))
@@ -629,7 +765,10 @@ void IHyprRenderer::renderWindow(CRenderContext& ctx, PHLWINDOW pWindow, PHLMONI
     TRACY_GPU_ZONE("RenderWindow");
 
     const auto                       WORKSPACEOFFSET = presentation.workspaceOffset;
-    const auto                       FLOATINGOFFSET  = presentation.floatingOffset;
+    // research/24 §6.2 injection point 1: the depth disparity rides in beside the floating offset,
+    // which is what makes decorations, blur cutouts, clipping and occlusion follow it for free.
+    // depthRenderOffset() is {0,0} on every frame that is not a per-eye composite.
+    const auto                       FLOATINGOFFSET  = presentation.floatingOffset + depthRenderOffset(pWindow);
     const auto                       REALPOS         = pWindow->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT) + WORKSPACEOFFSET;
     static auto                      PDIMAROUND      = CConfigValue<Config::FLOAT>("decoration:dim_around");
 
@@ -1040,7 +1179,9 @@ void IHyprRenderer::renderLayer(CRenderContext& ctx, PHLLS pLayer, PHLMONITOR pM
 
     TRACY_GPU_ZONE("RenderLayer");
 
-    const auto                       REALPOS = pLayer->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+    // research/24 §6.2: the layer family's equivalent of the m_floatingOffset seam — a layer has no
+    // floating offset, so its position IS where depth is folded in. {0,0} outside a per-eye pass.
+    const auto                       REALPOS = pLayer->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT) + depthRenderOffset(pLayer);
     const auto                       REALSIZ = pLayer->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
 
     CSurfacePassElement::SRenderData renderdata = {pMonitor, time, REALPOS};
@@ -2221,6 +2362,39 @@ SCMSettings IHyprRenderer::getCMSettings(CRenderContext& ctx, const NColorManage
     return result;
 }
 
+void IHyprRenderer::finishStereoPane(CRenderContext& ctx, PHLMONITOR pMonitor) {
+    // run the pass we just built into the buffer it was aimed at — normally begin()'s offloaded
+    // work buffer, on later panes the one this function bound last time round
+    ctx.m_data.damage = ctx.m_pass.render(ctx, ctx.m_data.damage);
+    ctx.m_pass.clear();
+
+    // a pane needs its own buffer because the panes carry different images; the DAMAGE is the same
+    // in both, which is why partial damage survives the second composite (§6.5).
+    const auto PANEFB = getWorkBuffer(ctx);
+    if (!PANEFB) {
+        // the pool is capped and something else has them all. Keeping the pane we just drew
+        // means every pane shows it — a FLAT pair, which is the fast path's output and perfectly
+        // watchable. Dropping the frame instead would not be.
+        LOG(Log::WARN, "stereo depth: out of work buffers on {}, this frame's panes will be flat", pMonitor->m_name);
+        return;
+    }
+
+    ctx.m_data.stereoPaneFBs.emplace_back(ctx.m_data.currentFB);
+
+    bindFB(ctx, PANEFB);
+    PANEFB->clearAfterInvalidation();
+    ctx.m_data.mainFB = PANEFB; // blur samples the composite so far, and that is now this pane's
+
+    // begin() attaches the unmodified-copy mirror to whatever it made mainFB; follow it, so the
+    // mirror/screencopy texture ends up holding the LAST pane, matching saveBufferForMirror()
+    if UNLIKELY (pMonitor->needsUnmodifiedCopy() && !ctx.m_gl.fakeFrame) {
+        if (!pMonitor->resources()->m_mirrorTex)
+            pMonitor->resources()->enableMirror();
+        PANEFB->enableMirror(pMonitor->resources()->m_mirrorTex);
+    } else
+        PANEFB->disableMirror();
+}
+
 void IHyprRenderer::renderMirrored(CRenderContext& ctx) {
     auto monitor  = ctx.m_data.pMonitor;
     auto mirrored = monitor->m_mirrorOf;
@@ -2312,6 +2486,13 @@ void IHyprRenderer::renderMonitor(PHLMONITOR pMonitor, bool commit) {
         pMonitor->m_pendingFrame = true;
         return;
     }
+
+    // research/24 §6.3's bring-up crutch, and it is load-bearing rather than cosmetic: the depth
+    // animations are AVARDAMAGE_NONE (they schedule frames but damage nothing, so a depth change
+    // costs an ordinary monitor exactly zero), which means a stereo monitor watching one ease has
+    // nothing to repaint from. Repaint the lot while any depth is moving; measure later.
+    if UNLIKELY (pMonitor->isStereo() && pMonitor->depthIsAnimating())
+        pMonitor->m_forceFullFrames = std::max(pMonitor->m_forceFullFrames, 2);
 
     // tearing and DS first
     bool       shouldTear              = pMonitor->updateTearing();
@@ -2406,71 +2587,116 @@ void IHyprRenderer::renderMonitor(PHLMONITOR pMonitor, bool commit) {
 
     Event::bus()->m_events.render.stage.emit({RENDER_BEGIN, pMonitor, ctx});
 
-    bool renderCursor = true;
+    // --- the stereo depth producer (research/24 §6.1, §6.4.1, WP D2) -------------------------
+    //
+    // §6.4.1's SINGLE-COMPOSITE FAST PATH is the default and it is the entire performance story:
+    // with nothing raised off the wallpaper plane the two panes are the same image, so we build
+    // one composite and end()'s pack duplicates it — the frame WP F1 shipped, bit for bit
+    // (depthRenderOffset() early-outs on stereoPane < 0, so not one coordinate differs).
+    //
+    // When something DOES have depth we composite the desktop once per pane with the eye sign in
+    // the render data. This is layered stereo, not an image-space warp: what a raised window
+    // uncovers is drawn, because it was always going to be drawn (§6.1).
+    const int     PANES      = depthProducerActive(pMonitor) ? pMonitor->stereoPaneCount() : 1;
+    const CRegion PANEDAMAGE = ctx.m_data.damage;
 
-    if (pMonitor->m_solitaryClient && (!finalDamage.empty() || *PSOLDAMAGE))
-        renderWindow(ctx, pMonitor->m_solitaryClient.lock(), pMonitor, pMonitor->m_solitaryClient->presentation().renderPresentation(), NOW, false,
-                     RENDER_PASS_MAIN /* solitary = no popups */);
-    else if (!finalDamage.empty()) {
-        const bool    IS_MIRROR = pMonitor->isMirror();
-        CMonitorScene scene(pMonitor);
-        scene.draw(ctx, NOW);
+    pMonitor->m_stereoComposites = PANES;
 
-        if (IS_MIRROR)
-            renderCursor = false;
-        else {
-            if (pMonitor == Desktop::focusState()->monitor()) {
-                Notification::overlay()->draw(ctx, pMonitor);
-                ErrorOverlay::overlay()->draw(ctx);
-            }
+    for (int pane = 0; pane < PANES; ++pane) {
+        bool renderCursor = true;
 
-            // for drawing the debug overlay
-            if (!State::monitorState()->monitors().empty() && pMonitor == State::monitorState()->monitors().front() && *PDEBUGOVERLAY == 1) {
-                renderStartOverlay = std::chrono::high_resolution_clock::now();
-                Debug::overlay()->draw(ctx);
-                endRenderOverlay = std::chrono::high_resolution_clock::now();
-            }
-
-            if (*PDAMAGEBLINK && damageBlinkCleanup == 0) {
-                CRectPassElement::SRectData data;
-                data.box   = {0, 0, pMonitor->m_transformedSize.x, pMonitor->m_transformedSize.y};
-                data.color = CHyprColor(1.0, 0.0, 1.0, 100.0 / 255.0);
-                ctx.m_pass.add(makeUnique<CRectPassElement>(data));
-                damageBlinkCleanup = 1;
-            } else if (*PDAMAGEBLINK) {
-                damageBlinkCleanup++;
-                if (damageBlinkCleanup > 3)
-                    damageBlinkCleanup = 0;
-            }
+        if (PANES > 1) {
+            ctx.m_data.stereoPane = pane;
+            // every pane after the first is a repeat draw of the SAME frame: no second
+            // presentation feedback and no second wl_surface.frame — the §3.7 cursor rule,
+            // generalised to the whole composite
+            ctx.m_blockSurfaceFeedback = pane > 0;
+            if (pane > 0)
+                ctx.m_data.damage = PANEDAMAGE; // each pane is scissored to the same damage
         }
-    } else if (!pMonitor->isMirror()) {
-        if (pMonitor->m_activeWorkspace)
-            sendFrameEventsToWorkspace(pMonitor, pMonitor->m_activeWorkspace, NOW);
-        if (pMonitor->m_activeSpecialWorkspace)
-            sendFrameEventsToWorkspace(pMonitor, pMonitor->m_activeSpecialWorkspace, NOW);
+
+        if (pMonitor->m_solitaryClient && (!finalDamage.empty() || *PSOLDAMAGE))
+            renderWindow(ctx, pMonitor->m_solitaryClient.lock(), pMonitor, pMonitor->m_solitaryClient->presentation().renderPresentation(), NOW, false,
+                         RENDER_PASS_MAIN /* solitary = no popups */);
+        else if (!finalDamage.empty()) {
+            const bool    IS_MIRROR = pMonitor->isMirror();
+            CMonitorScene scene(pMonitor);
+            scene.draw(ctx, NOW);
+
+            if (IS_MIRROR)
+                renderCursor = false;
+            else {
+                if (pMonitor == Desktop::focusState()->monitor()) {
+                    Notification::overlay()->draw(ctx, pMonitor);
+                    ErrorOverlay::overlay()->draw(ctx);
+                }
+
+                // for drawing the debug overlay
+                if (!State::monitorState()->monitors().empty() && pMonitor == State::monitorState()->monitors().front() && *PDEBUGOVERLAY == 1) {
+                    renderStartOverlay = std::chrono::high_resolution_clock::now();
+                    Debug::overlay()->draw(ctx);
+                    endRenderOverlay = std::chrono::high_resolution_clock::now();
+                }
+
+                if (*PDAMAGEBLINK && damageBlinkCleanup == 0) {
+                    CRectPassElement::SRectData data;
+                    data.box   = {0, 0, pMonitor->m_transformedSize.x, pMonitor->m_transformedSize.y};
+                    data.color = CHyprColor(1.0, 0.0, 1.0, 100.0 / 255.0);
+                    ctx.m_pass.add(makeUnique<CRectPassElement>(data));
+                    damageBlinkCleanup = 1;
+                } else if (*PDAMAGEBLINK) {
+                    damageBlinkCleanup++;
+                    if (damageBlinkCleanup > 3)
+                        damageBlinkCleanup = 0;
+                }
+            }
+        } else if (!pMonitor->isMirror() && pane == 0) {
+            // pane 0 only: a frame callback is a statement about the FRAME, and a client told twice
+            // that its buffer was presented will render twice as fast as the display can show it
+            if (pMonitor->m_activeWorkspace)
+                sendFrameEventsToWorkspace(pMonitor, pMonitor->m_activeWorkspace, NOW);
+            if (pMonitor->m_activeSpecialWorkspace)
+                sendFrameEventsToWorkspace(pMonitor, pMonitor->m_activeSpecialWorkspace, NOW);
+        }
+
+        renderCursor = renderCursor && shouldRenderCursor();
+
+        if (renderCursor) {
+            TRACY_GPU_ZONE("RenderCursor");
+            // stereo (research/24 §3.7): on a stereo output the cursor is software-locked
+            // (CMonitor::updateStereoCursorLock). In the fast path this single draw lands in the
+            // pane composite and end()'s pack duplicates it into every pane — both eyes, zero
+            // disparity, which is correct for a desktop that is all on the screen plane.
+            if (PANES > 1) {
+                // ...but once the desktop has depth the cursor must be IN each pane at its own
+                // disparity, or it is the one flat thing in a scene that is not — the single most
+                // uncomfortable object you can put in a stereo display (§5.4). Its depth follows
+                // whatever it is over, which is Daydream's rule as quoted in §8.2 item 3.
+                const auto CURSORPOS = Pointer::mgr()->position() - pMonitor->m_position;
+                Pointer::mgr()->renderSoftwareCursorsFor(ctx, pMonitor->m_self.lock(), NOW, ctx.m_data.damage, CURSORPOS + cursorDepthOffset(pMonitor), false, pane > 0);
+            } else
+                Pointer::mgr()->renderSoftwareCursorsFor(ctx, pMonitor->m_self.lock(), NOW, ctx.m_data.damage);
+        }
+
+        if (pMonitor->m_dpmsBlackOpacity->value() != 0.F) {
+            // render the DPMS black if we are animating
+            CRectPassElement::SRectData data;
+            data.box   = {0, 0, pMonitor->m_transformedSize.x, pMonitor->m_transformedSize.y};
+            data.color = Colors::BLACK.modifyA(pMonitor->m_dpmsBlackOpacity->value());
+            ctx.m_pass.add(makeUnique<CRectPassElement>(data));
+        }
+
+        // inside the pane loop with everything else: whatever a plugin draws here has to land in
+        // EVERY pane, or a stereo output shows it to one eye
+        Event::bus()->m_events.render.stage.emit({RENDER_LAST_MOMENT, pMonitor, ctx});
+
+        if (pane + 1 < PANES)
+            finishStereoPane(ctx, pMonitor);
     }
 
-    renderCursor = renderCursor && shouldRenderCursor();
-
-    if (renderCursor) {
-        TRACY_GPU_ZONE("RenderCursor");
-        // stereo (research/24 §3.7): on a stereo output the cursor is software-locked
-        // (CMonitor::updateStereoCursorLock) and this single draw lands in the pane composite, which
-        // end()'s pack duplicates into every pane — both eyes see it at zero (screen-plane) disparity.
-        // Per-eye composites draw their own via renderSoftwareCursorsFor(..., overridePos, false, false, eyePass=true).
-        Pointer::mgr()->renderSoftwareCursorsFor(ctx, pMonitor->m_self.lock(), NOW, ctx.m_data.damage);
-    }
-
-    if (pMonitor->m_dpmsBlackOpacity->value() != 0.F) {
-        // render the DPMS black if we are animating
-        CRectPassElement::SRectData data;
-        data.box   = {0, 0, pMonitor->m_transformedSize.x, pMonitor->m_transformedSize.y};
-        data.color = Colors::BLACK.modifyA(pMonitor->m_dpmsBlackOpacity->value());
-        ctx.m_pass.add(makeUnique<CRectPassElement>(data));
-    }
-
-    Event::bus()->m_events.render.stage.emit({RENDER_LAST_MOMENT, pMonitor, ctx});
-
+    // endRender() runs the LAST pane's pass and then the pack in end(), so the eye state and the
+    // feedback block both have to survive until it returns — which they do: both live in the render
+    // context, and endRender() resets the context only after the pack.
     finishing               = true;
     const auto renderResult = endRender();
 
@@ -3034,6 +3260,14 @@ void IHyprRenderer::damageSurface(SP<CWLSurfaceResource> pSurface, double x, dou
 
     const auto EXTENTS = damageBox.getExtents();
 
+    // stereo depth (research/24 §6.3 pt 2): the same surface damage lands in BOTH panes at
+    // ±disparity. Windows are also covered by damageWindow(), but a layer surface has no such
+    // path — a raised bar repainting itself has to widen its own damage or the other pane keeps
+    // the stale pixels. Resolved once here, not per monitor, because the view does not change.
+    const auto VIEW     = WLSURF->view();
+    const auto DEPTHWIN = VIEW ? Desktop::View::CWindow::fromView(VIEW) : nullptr;
+    const auto DEPTHLS  = VIEW && !DEPTHWIN ? Desktop::View::CLayerSurface::fromView(VIEW) : nullptr;
+
     CRegion    damageBoxForEach;
 
     for (auto const& m : State::monitorState()->monitors()) {
@@ -3044,6 +3278,9 @@ void IHyprRenderer::damageSurface(SP<CWLSurfaceResource> pSurface, double x, dou
 
         damageBoxForEach.set(damageBox);
         damageBoxForEach.translate({-m->m_position.x, -m->m_position.y}).scale(m->m_scale);
+
+        if (const double SPREAD = DEPTHWIN ? depthDamageSpread(DEPTHWIN, m) : (DEPTHLS ? depthDamageSpread(DEPTHLS, m) : 0.0); SPREAD > 0.0)
+            damageBoxForEach.expand(std::ceil(SPREAD * m->m_scale));
 
         m->addDamage(damageBoxForEach);
     }
@@ -3066,6 +3303,10 @@ void IHyprRenderer::damageWindow(PHLWINDOW pWindow, bool forceFull) {
     for (auto const& m : State::monitorState()->monitors()) {
         if (forceFull || shouldRenderWindow(pWindow, m)) { // only damage if window is rendered on monitor
             CBox fixedDamageBox = {windowBox.x - m->m_position.x, windowBox.y - m->m_position.y, windowBox.width, windowBox.height};
+            // stereo depth (research/24 §6.3 pt 2): this window is composited into BOTH panes at
+            // ±disparity, so its damage has to reach both of them at their SHIFTED positions —
+            // otherwise the pane the un-shifted box misses keeps a stale copy of the window.
+            fixedDamageBox.expand(std::ceil(depthDamageSpread(pWindow, m)));
             fixedDamageBox.scale(m->m_scale).round();
             m->addDamage(fixedDamageBox);
         }

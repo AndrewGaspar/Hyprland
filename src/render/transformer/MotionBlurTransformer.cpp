@@ -82,7 +82,8 @@ void CMotionBlurTransformer::amendTransformedRenderData(CRenderContext& ctx, con
     if (!shouldEnable(PWINDOW))
         return;
 
-    const auto STATE = stateForOffset(presentation.workspaceOffset + presentation.floatingOffset, false);
+    // research/24 §6.2 injection point 1: the depth disparity rides in beside the floating offset
+    const auto STATE = stateForOffset(presentation.workspaceOffset + presentation.floatingOffset + g_pHyprRenderer->depthRenderOffset(m_window.lock()), false);
     if (!STATE)
         return;
 
@@ -116,8 +117,9 @@ std::optional<MotionBlur::SState> CMotionBlurTransformer::state(bool allowStale)
     if (!shouldEnable(PWINDOW))
         return std::nullopt;
 
+    // research/24 §6.2 injection point 1: the depth disparity rides in beside the floating offset
     const Vector2D RENDEROFFSET = ((PWINDOW->m_state & Desktop::View::WINDOW_STATE_PINNED) || !PWINDOW->m_workspace ? Vector2D{} : PWINDOW->m_workspace->m_renderOffset->value()) +
-        PWINDOW->presentation().floatingOffset();
+        PWINDOW->presentation().floatingOffset() + g_pHyprRenderer->depthRenderOffset(PWINDOW);
     return stateForOffset(RENDEROFFSET, allowStale);
 }
 
