@@ -1353,6 +1353,41 @@ wins** — you get the layout you wrote, and a client tagging `stereo:mono` cann
 That asymmetry is deliberate: in the shipping VR-video world, content metadata that looks correct
 is a known liability, so the last human instruction has to win.
 
+**If you are writing a game mod** — the Dead Space stereo-injection mod is the case this was
+designed around — the entire compositor-facing contract is one call at toplevel creation:
+`xdg_toplevel_tag_v1_set_toplevel_tag(mgr, toplevel, "stereo:sbs")` with the literal string
+`stereo:sbs` when the mod renders both eyes packed left-then-right at full width (use
+`stereo:hsbs` if you squeeze them into the native width instead, `stereo:tab`/`stereo:htab` for
+over-under, and re-tag `stereo:mono` the moment the user switches the mod off). Set it once, as
+early as you can — a tag change re-evaluates rules, but a window that maps untagged and tags
+itself a second later will be mono for that second. Do not encode anything else in the tag, do
+not add a version suffix, and do not tag `stereo:auto`: the string is the whole ABI, and any
+compositor that adopts this convention will be matching it exactly. Nothing else is required of
+the mod — no protocol, no IPC, no Hyprland-specific code — and on a compositor that ignores tags
+the call is a no-op.
+
+### Players that know: `contrib/mpv-hypxr-stereo.lua`
+
+A player cannot set an xdg tag from a script, but it does not need to. mpv is the one Linux player
+that exposes the container's stereo metadata (Matroska `StereoMode`, ISOBMFF `st3d`, read through
+FFmpeg) as the property `video-params/stereo-in`, and `contrib/mpv-hypxr-stereo.lua` observes it
+and **tags mpv's own window** — a plain Hyprland window tag, via `hyprctl dispatch tagwindow`, no
+XR verb anywhere. Copy it to `~/.config/mpv/scripts/` and add the static rules it expects:
+
+```ini
+windowrule = stereo sbs  always, match:tag stereo-sbs
+windowrule = stereo hsbs always, match:tag stereo-hsbs
+windowrule = stereo tab  always, match:tag stereo-tab
+windowrule = stereo htab always, match:tag stereo-htab
+```
+
+Now every 3D file that carries correct metadata engages by itself, and the tag is dropped when the
+next file is mono. Two caveats, both inherent: the containers do **not** record half-vs-full, so
+the script infers it from the display aspect (a full frame is 2× wide or 2× tall) — if a file
+lands squeezed, say so with an explicit rule; and correct metadata is a known liability in the
+VR-video world, which is why the script only ever *adds* a tag and your own
+`windowrule = stereo off, …` still wins.
+
 ### Heuristics belong in your config, not in the compositor
 
 The whole VR-video ecosystem detects layout from *filename tokens*, and every player's regex is
