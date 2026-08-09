@@ -1348,7 +1348,7 @@ windowrule = stereo auto, match:xdg_tag ^stereo:.*
 ```
 
 Under `auto` the tag *is* the declaration: it picks the layout, it skips the fullscreen gate, and
-`stereo:mono` turns it off. Under an explicit layout (`stereo sbs, xdg_tag:^stereo:`) **the rule
+`stereo:mono` turns it off. Under an explicit layout (`stereo sbs, match:xdg_tag ^stereo:.*`) **the rule
 wins** — you get the layout you wrote, and a client tagging `stereo:mono` cannot override you.
 That asymmetry is deliberate: in the shipping VR-video world, content metadata that looks correct
 is a known liability, so the last human instruction has to win.
