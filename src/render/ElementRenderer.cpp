@@ -1,6 +1,7 @@
 #include "ElementRenderer.hpp"
 #include "Renderer.hpp"
 #include "../layout/LayoutManager.hpp"
+#include "../desktop/DepthTiers.hpp"
 #include "../desktop/view/Window.hpp"
 #include "render/pass/ClearPassElement.hpp"
 #include <hyprutils/memory/SharedPtr.hpp>
@@ -260,19 +261,18 @@ void IElementRenderer::drawSurface(WP<CSurfacePassElement> element, const CRegio
     // the box position to whole pixels — which would collapse the ladder into two or three visible
     // steps and make everything between depth 0 and 0.3 look identical.
     //
-    // So: round on the UN-SHIFTED grid, which keeps the surface pixel-crisp exactly as it was, and
-    // re-apply the disparity in floating point afterwards. Linear filtering renders the fraction.
-    // The guard keeps the mono path bit-identical — outside a per-eye composite the disparity is
-    // not merely zero, it is never computed.
+    // Desktop::Depth::roundKeepingDisparity is the shared expression: round on the UN-SHIFTED grid,
+    // re-apply the disparity in floating point. Every decoration that frames this surface runs the
+    // same call, so the frame and its content never quantise differently. It is a no-op fast path
+    // on a zero shift, which is every frame outside a per-eye composite.
     const double DISPARITY = g_pHyprRenderer->depthRenderOffset(m_data.pWindow).x + g_pHyprRenderer->depthRenderOffset(m_data.pLS).x;
 
-    if UNLIKELY (DISPARITY != 0.0) {
-        const double SHIFT = DISPARITY * m_data.pMonitor->m_scale; // windowBox is in buffer pixels by now
-        windowBox.x -= SHIFT;
-        windowBox.round();
-        windowBox.x += SHIFT;
-    } else
-        windowBox.round();
+    Desktop::Depth::roundKeepingDisparity(windowBox, DISPARITY * m_data.pMonitor->m_scale); // windowBox is in buffer pixels by now
+
+    // ...and the scissor every draw below is clipped to. A fractional box truncates on its way into
+    // pixman, cutting the column the rasteriser does cover, so scissor to the box's integer
+    // footprint. Identity when the box is already whole (the mono path).
+    const CBox SCISSORBOX = Desktop::Depth::rasterCover(windowBox);
 
     if (windowBox.width <= 1 || windowBox.height <= 1) {
         element->discard();
@@ -343,7 +343,7 @@ void IElementRenderer::drawSurface(WP<CSurfacePassElement> element, const CRegio
                             .clipRegion            = clipRegion,
                             .currentLS             = m_data.pLS,
                         }),
-                        m_renderData.damage.copy().intersect(windowBox));
+                        m_renderData.damage.copy().intersect(SCISSORBOX));
         else
             drawElement(makeShared<CTexPassElement>(CTexPassElement::SRenderData{
                             .tex            = TEXTURE,
@@ -361,7 +361,7 @@ void IElementRenderer::drawSurface(WP<CSurfacePassElement> element, const CRegio
                             .clipRegion     = clipRegion,
                             .currentLS      = m_data.pLS,
                         }),
-                        m_renderData.damage.copy().intersect(windowBox));
+                        m_renderData.damage.copy().intersect(SCISSORBOX));
     } else {
         if (BLUR && m_data.popup)
             drawElement(makeShared<CTexPassElement>(CTexPassElement::SRenderData{
@@ -383,7 +383,7 @@ void IElementRenderer::drawSurface(WP<CSurfacePassElement> element, const CRegio
                             .clipRegion            = clipRegion,
                             .currentLS             = m_data.pLS,
                         }),
-                        m_renderData.damage.copy().intersect(windowBox));
+                        m_renderData.damage.copy().intersect(SCISSORBOX));
         else
             drawElement(makeShared<CTexPassElement>(CTexPassElement::SRenderData{
                             .tex            = TEXTURE,
@@ -401,7 +401,7 @@ void IElementRenderer::drawSurface(WP<CSurfacePassElement> element, const CRegio
                             .clipRegion     = clipRegion,
                             .currentLS      = m_data.pLS,
                         }),
-                        m_renderData.damage.copy().intersect(windowBox));
+                        m_renderData.damage.copy().intersect(SCISSORBOX));
     }
 
     g_pHyprRenderer->blend(true);

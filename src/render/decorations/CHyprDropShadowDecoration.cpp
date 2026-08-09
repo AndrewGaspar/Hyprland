@@ -8,6 +8,7 @@
 #include "../pass/RectPassElement.hpp"
 #include "../pass/TextureMatteElement.hpp"
 #include "../../state/MonitorState.hpp"
+#include "../../desktop/DepthTiers.hpp"
 
 CHyprDropShadowDecoration::CHyprDropShadowDecoration(PHLWINDOW pWindow) : IHyprWindowDecoration(pWindow), m_window(pWindow) {
     ;
@@ -167,14 +168,17 @@ SShadowRenderData CHyprDropShadowDecoration::getRenderData(PHLMONITOR pMonitor, 
     };
 
     // research/24 §6.2 injection point 1: the depth disparity rides in beside the floating offset
-    fullBox.translate(PWINDOW->m_floatingOffset + g_pHyprRenderer->depthRenderOffset(PWINDOW));
+    const auto DEPTHOFFSET = g_pHyprRenderer->depthRenderOffset(PWINDOW);
+    fullBox.translate(PWINDOW->m_floatingOffset + DEPTHOFFSET);
 
     if (fullBox.width < 1 || fullBox.height < 1)
         return {}; // don't draw invisible shadows
 
     g_pHyprRenderer->m_renderData.currentWindow = m_window;
 
-    fullBox.scale(pMonitor->m_scale).round();
+    fullBox.scale(pMonitor->m_scale);
+    // §8.1's seam, shared with the surface this shadow sits under — see roundKeepingDisparity
+    Desktop::Depth::roundKeepingDisparity(fullBox, DEPTHOFFSET.x * pMonitor->m_scale);
 
     return {
         .valid         = true,

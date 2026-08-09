@@ -13,6 +13,7 @@
 #include "../../managers/fullscreen/FullscreenController.hpp"
 #include "../../layout/LayoutManager.hpp"
 #include "../../layout/supplementary/DragController.hpp"
+#include "../../desktop/DepthTiers.hpp"
 
 using namespace Render;
 
@@ -164,7 +165,9 @@ void CHyprGroupBarDecoration::draw(PHLMONITOR pMonitor, float const& a) {
                            ASSIGNEDBOX.y + ASSIGNEDBOX.h - floor(yoff) - *PINDICATORHEIGHT - *POUTERGAP - pMonitor->m_position.y + m_window->m_floatingOffset.y + DEPTHOFFSET.y,
                            m_barWidth, *PINDICATORHEIGHT};
 
-        rect.scale(pMonitor->m_scale).round();
+        rect.scale(pMonitor->m_scale);
+        // §8.1's seam, shared with the window this bar belongs to — see roundKeepingDisparity
+        Desktop::Depth::roundKeepingDisparity(rect, DEPTHOFFSET.x * pMonitor->m_scale);
 
         const bool        GROUPLOCKED  = m_window->m_group->locked() || g_pKeybindManager->m_groupsLocked;
         const auto* const PCOLACTIVE   = GROUPLOCKED ? GROUPCOLACTIVELOCKED : GROUPCOLACTIVE;
@@ -255,7 +258,8 @@ void CHyprGroupBarDecoration::draw(PHLMONITOR pMonitor, float const& a) {
                 rect.height = titleTex->m_size.y;
                 rect.width  = titleTex->m_size.x;
                 rect.x += std::round((((m_barWidth + *PTEXTPADDING) * pMonitor->m_scale) / 2.0) - ((titleTex->m_size.x + *PTEXTPADDING) / 2.0));
-                rect.round();
+                // §8.1's seam again — the title rides at the bar's depth, not at a rounded one
+                Desktop::Depth::roundKeepingDisparity(rect, DEPTHOFFSET.x * pMonitor->m_scale);
 
                 CTexPassElement::SRenderData data;
                 data.tex = titleTex;
