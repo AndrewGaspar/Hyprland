@@ -2390,7 +2390,14 @@ void IHyprRenderer::renderMonitor(PHLMONITOR pMonitor, bool commit) {
     // animations are AVARDAMAGE_NONE (they schedule frames but damage nothing, so a depth change
     // costs an ordinary monitor exactly zero), which means a stereo monitor watching one ease has
     // nothing to repaint from. Repaint the lot while any depth is moving; measure later.
-    if UNLIKELY (pMonitor->isStereo() && pMonitor->depthIsAnimating())
+    //
+    // `depth_scale = 0` opts out: §6.4's A/B toggle means "same ladder, no rise", so the vars still
+    // ease on every focus change while no frame can ever carry a disparity. Repainting the whole
+    // output for those would charge the opt-out the cost it was chosen to avoid. Anything else —
+    // including an ease that is on its way DOWN to flat — still repaints, because the frame that
+    // erases the old disparity needs it most.
+    static auto PDEPTHSCALE = CConfigValue<Config::FLOAT>("decoration:depth_scale");
+    if UNLIKELY (pMonitor->isStereo() && *PDEPTHSCALE > 0 && pMonitor->depthIsAnimating())
         pMonitor->m_forceFullFrames = std::max(pMonitor->m_forceFullFrames, 2);
 
     // tearing and DS first
@@ -2481,10 +2488,16 @@ void IHyprRenderer::renderMonitor(PHLMONITOR pMonitor, bool commit) {
 
     // --- the stereo depth producer (research/24 §6.1, §6.4.1, WP D2) -------------------------
     //
-    // §6.4.1's SINGLE-COMPOSITE FAST PATH is the default and it is the entire performance story:
-    // with nothing raised off the wallpaper plane the two panes are the same image, so we build
-    // one composite and end()'s pack duplicates it — the frame WP F1 shipped, bit for bit
-    // (depthRenderOffset() early-outs on stereoPane < 0, so not one coordinate differs).
+    // §6.4.1's SINGLE-COMPOSITE FAST PATH: with nothing raised off the wallpaper plane the two
+    // panes are the same image, so we build one composite and end()'s pack duplicates it — the
+    // frame WP F1 shipped, bit for bit (depthRenderOffset() early-outs on stereoPane < 0, so not
+    // one coordinate differs).
+    //
+    // Note what it is NOT: with the shipped ladder (`depth_unfocused` 0.2) an ordinary window is
+    // already off the plane, so a populated stereo desktop composites twice and that is the
+    // intended steady state, not a degenerate case. The fast path is what an EMPTY output costs,
+    // and what the whole output costs the moment a user turns the ladder off — `depth_scale = 0`,
+    // or a zeroed ladder, or a layout with no slack — which is §6.4's free A/B toggle.
     //
     // When something DOES have depth we composite the desktop once per pane with the eye sign in
     // the render data. This is layered stereo, not an image-space warp: what a raised window
