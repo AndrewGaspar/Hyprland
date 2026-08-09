@@ -4634,8 +4634,22 @@ void COpenXRManager::syncLayout2D(bool force) {
             l->m_l2dAzDeg  = slot.azDeg;
             l->m_l2dElDeg  = slot.elDeg;
 
-            if (auto mon = l->m_monitor.lock())
+            if (auto mon = l->m_monitor.lock()) {
+                // "Nothing moved" must be judged against the COMPOSITOR, not against our own memory
+                // of the last pass. Applying a monitor rule replaces m_activeMonitorRule wholesale
+                // (CMonitor::applyMonitorRule takes the config-derived rule by value), so anything
+                // that re-applies rules — a reload, the rule manager's scheduled re-apply, a mode
+                // change — silently drops the offset we wrote here and the monitors fall back to
+                // plain append-right. Judged from our own m_l2dOffset the next pass computes the
+                // same number, concludes nothing moved, skips the recheck, and the fallback layout
+                // stands for the rest of the session: a monitor floating to your left keeps a
+                // layout x to your right, and no later sync ever repairs it (observed in the XR
+                // suite: engine offsets 0/2048, monitors at 2596/1572, stable across nine forced
+                // syncs). Noticing the disagreement here is what makes the sync self-healing.
+                if (mon->m_activeMonitorRule.m_offset != pos || mon->m_position != pos)
+                    changed = true;
                 mon->m_activeMonitorRule.m_offset = pos;
+            }
         }
     }
 
