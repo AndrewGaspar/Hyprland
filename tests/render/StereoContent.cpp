@@ -3,8 +3,12 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cmath>
+#include <optional>
+#include <string>
+#include <utility>
 
-// WP S1 — unit tests for per-window stereo CONTENT (research/24 §4.2, §5.2, §5.3).
+// WP S1/S2 — unit tests for per-window stereo CONTENT (research/24 §4.2, §5.2, §5.3, §5.6).
 //
 // The renderer calls these exact functions: the window rule parses with parseDeclaration, the
 // window resolves the tag with layoutFromTag, and calculateUVForSurface crops with cropForEye. So
@@ -81,6 +85,27 @@ TEST(StereoContent, parseToleratesTheWhitespaceUsersType) {
     EXPECT_EQ(DECL->gate, GATE_ALWAYS);
 }
 
+TEST(StereoContent, everyLayoutTokenParsesUnderEveryScope) {
+    // the accept half of the grammar, exhaustively — one entry per line a user can actually type.
+    // A token that parses in the .conf handler but not in the Lua mirror (or the reverse) is F8's
+    // failure mode, and both front-ends bottom out right here.
+    static const std::pair<const char*, eContentLayout> TOKENS[] = {
+        {"off", CONTENT_OFF},   {"mono", CONTENT_OFF}, {"none", CONTENT_OFF},  {"0", CONTENT_OFF},     {"sbs", CONTENT_SBS},
+        {"hsbs", CONTENT_HSBS}, {"tab", CONTENT_TAB},  {"htab", CONTENT_HTAB}, {"auto", CONTENT_AUTO},
+    };
+    static const std::pair<const char*, eContentGate> SCOPES[] = {{"", GATE_FULLSCREEN}, {" fullscreen", GATE_FULLSCREEN}, {" always", GATE_ALWAYS}};
+
+    for (const auto& [TOKEN, LAYOUT] : TOKENS) {
+        for (const auto& [SUFFIX, GATE] : SCOPES) {
+            const std::string RAW  = std::string{TOKEN} + SUFFIX;
+            const auto        DECL = parseDeclaration(RAW);
+            ASSERT_TRUE(DECL.has_value()) << RAW << ": " << DECL.error();
+            EXPECT_EQ(DECL->layout, LAYOUT) << RAW;
+            EXPECT_EQ(DECL->gate, GATE) << RAW;
+        }
+    }
+}
+
 TEST(StereoContent, parseRejectsWhatItCannotHonour) {
     // an unknown layout must be an error rather than a silent mono, or a typo means "stereo quietly
     // did nothing" — the failure mode that costs an evening of debugging.
@@ -125,6 +150,94 @@ TEST(StereoContent, tagRejectsEverythingElse) {
     for (const auto& tag :
          {"", "sbs", "STEREO:SBS", "stereo:", "stereo:lr", "stereo: sbs", "stereo:sbs ", "video:stereo:sbs", "stereo:auto"}) // a client cannot delegate the layout back to itself
         EXPECT_FALSE(layoutFromTag(tag).has_value()) << tag;
+}
+
+// --- the precedence table: which tier's instruction wins (§4.2, §4.3, §4.5) ---
+//
+// This is the whole of CWindow::stereoLayout() except the two lookups and the fullscreen query, so
+// every row below is a question a user can ask out loud ("why is my window cropped?" / "why is it
+// NOT cropped?") answered without a compositor.
+
+namespace {
+    // the shorthands the rows read in
+    SDeclaration ruleOf(eContentLayout layout, eContentGate gate = GATE_FULLSCREEN) {
+        return {.layout = layout, .gate = gate};
+    }
+
+    constexpr std::optional<eContentLayout> SILENT = std::nullopt; // the client set no tag at all
+}
+
+TEST(StereoContentResolution, noRuleIsOffNoMatterWhatTheClientClaims) {
+    // the state of every window in every session that never configured this. A client cannot opt
+    // ITSELF into a crop — the tag is only ever read because a rule asked for it.
+    for (const auto& tagged : {SILENT, std::optional{CONTENT_SBS}, std::optional{CONTENT_OFF}})
+        EXPECT_EQ(resolveDeclaration(ruleOf(CONTENT_OFF), tagged), SResolution{});
+}
+
+TEST(StereoContentResolution, offIsTheOffSwitchAndOutranksTheTag) {
+    // `windowrule = stereo off` on a client that declares `stereo:sbs`: the user wins, and there is
+    // no gate left to satisfy. This is the escape hatch for a client whose tag is simply wrong.
+    EXPECT_EQ(resolveDeclaration(ruleOf(CONTENT_OFF, GATE_ALWAYS), std::optional{CONTENT_SBS}), SResolution{});
+}
+
+TEST(StereoContentResolution, anExplicitLayoutBeatsTheTag) {
+    // §4.5: the last human instruction wins, in BOTH directions — a rule can promote a silent
+    // client and can override a client that declared something else.
+    EXPECT_EQ(resolveDeclaration(ruleOf(CONTENT_TAB, GATE_ALWAYS), SILENT), (SResolution{.layout = CONTENT_TAB}));
+    EXPECT_EQ(resolveDeclaration(ruleOf(CONTENT_TAB, GATE_ALWAYS), std::optional{CONTENT_SBS}), (SResolution{.layout = CONTENT_TAB}));
+    EXPECT_EQ(resolveDeclaration(ruleOf(CONTENT_TAB, GATE_ALWAYS), std::optional{CONTENT_OFF}), (SResolution{.layout = CONTENT_TAB}));
+}
+
+TEST(StereoContentResolution, autoIsTheOnlyRuleThatReadsTheTag) {
+    for (const auto& layout : PACKED_LAYOUTS)
+        EXPECT_EQ(resolveDeclaration(ruleOf(CONTENT_AUTO), std::optional{layout}).layout, layout) << layoutToString(layout);
+}
+
+TEST(StereoContentResolution, autoOnASilentClientResolvesToNothing) {
+    // NOT "assume sbs". A guess here crops half of every window the rule matched — the failure mode
+    // §4.3 exists to prevent — and `auto` is precisely the tier that promised not to guess.
+    EXPECT_EQ(resolveDeclaration(ruleOf(CONTENT_AUTO), SILENT), SResolution{});
+    EXPECT_EQ(resolveDeclaration(ruleOf(CONTENT_AUTO, GATE_ALWAYS), SILENT), SResolution{});
+}
+
+TEST(StereoContentResolution, aClientCanDeclareItselfMonoAndSuppressAuto) {
+    // the difference between `stereo:mono` and no tag at all, which is the ONLY reason
+    // layoutFromTag returns CONTENT_OFF rather than nullopt for it. Same answer here, different
+    // reason — and a player that switches a stereo file for a flat one relies on it.
+    EXPECT_EQ(resolveDeclaration(ruleOf(CONTENT_AUTO), std::optional{CONTENT_OFF}), SResolution{});
+}
+
+TEST(StereoContentResolution, aGuessedLayoutWaitsForTheWindowToOwnTheScreen) {
+    // §4.3's negative heuristic: `windowrule = stereo sbs, class:^(mpv)$` is a guess about what mpv
+    // happens to be playing, so it stays gated. The caller is the one that answers the gate.
+    EXPECT_EQ(resolveDeclaration(ruleOf(CONTENT_SBS), SILENT), (SResolution{.layout = CONTENT_SBS, .gated = true}));
+}
+
+TEST(StereoContentResolution, alwaysAndAClientDeclarationAreNotGuessesAndSkipTheGate) {
+    // the two ways to be exempt, and they are exempt independently: the hand-written verb...
+    EXPECT_FALSE(resolveDeclaration(ruleOf(CONTENT_SBS, GATE_ALWAYS), SILENT).gated);
+    // ...and a client that named its own packing, under a plain `auto` rule with no `always` on it.
+    EXPECT_FALSE(resolveDeclaration(ruleOf(CONTENT_AUTO), std::optional{CONTENT_SBS}).gated);
+    // a declaring client also lifts the gate off an explicit rule that disagrees with it: the layout
+    // is the user's, but the window is demonstrably stereo content, so windowed is fine.
+    EXPECT_FALSE(resolveDeclaration(ruleOf(CONTENT_HSBS), std::optional{CONTENT_SBS}).gated);
+    // ...and `stereo:mono` is a declaration of NOT-stereo, so it lifts nothing.
+    EXPECT_TRUE(resolveDeclaration(ruleOf(CONTENT_HSBS), std::optional{CONTENT_OFF}).gated);
+}
+
+TEST(StereoContentResolution, aResolvedLayoutIsNeverAutoAndNeverUnpacked) {
+    // the renderer crops with whatever comes out of here, and cropForEye treats CONTENT_AUTO as
+    // mono — so an `auto` leaking through would be a silent no-op, not a visible bug.
+    for (const auto& rule : {CONTENT_OFF, CONTENT_SBS, CONTENT_HSBS, CONTENT_TAB, CONTENT_HTAB, CONTENT_AUTO}) {
+        for (const auto& gate : {GATE_FULLSCREEN, GATE_ALWAYS}) {
+            for (const auto& tagged : {SILENT, std::optional{CONTENT_OFF}, std::optional{CONTENT_SBS}, std::optional{CONTENT_HTAB}}) {
+                const auto RES = resolveDeclaration(ruleOf(rule, gate), tagged);
+                EXPECT_NE(RES.layout, CONTENT_AUTO) << layoutToString(rule);
+                // and a gate is only ever attached to something worth gating
+                EXPECT_TRUE(RES.layout != CONTENT_OFF || !RES.gated) << layoutToString(rule);
+            }
+        }
+    }
 }
 
 // --- geometry ---
@@ -237,4 +350,98 @@ TEST(StereoContent, anOutOfRangePaneIndexClampsInsteadOfSamplingNowhere) {
     // sample past the end of the buffer.
     EXPECT_EQ(cropForEye(fullRange(), CONTENT_SBS, 5), cropForEye(fullRange(), CONTENT_SBS, 1));
     EXPECT_EQ(cropForEye(fullRange(), CONTENT_SBS, -3), cropForEye(fullRange(), CONTENT_SBS, 0));
+}
+
+// --- the aspect, derived from the destination box (§5.2) ---
+
+TEST(StereoContent, thePaneIsHalfTheBufferOnTheAxisTheLayoutNames) {
+    const Vector2D BUFFER{1920, 1080};
+    EXPECT_EQ(contentPaneSize(BUFFER, CONTENT_OFF), BUFFER);
+    EXPECT_EQ(contentPaneSize(BUFFER, CONTENT_AUTO), BUFFER); // unresolved is not packed
+    EXPECT_EQ(contentPaneSize(BUFFER, CONTENT_SBS), Vector2D(960, 1080));
+    EXPECT_EQ(contentPaneSize(BUFFER, CONTENT_HSBS), Vector2D(960, 1080));
+    EXPECT_EQ(contentPaneSize(BUFFER, CONTENT_TAB), Vector2D(1920, 540));
+    EXPECT_EQ(contentPaneSize(BUFFER, CONTENT_HTAB), Vector2D(1920, 540));
+}
+
+TEST(StereoContent, everyPackingOfTheSamePicturePresentsTheSameAspect) {
+    // §5.2, and the single most confusable number in this file. Each of these buffers carries the
+    // same 1920x1080 picture per eye, packed four different ways; getting `k` backwards (or applying
+    // it to the wrong axis) gives 4x, 2x or 0.5x here and a subtly-wrong, hard-to-name image on the
+    // headset. The XR quad pair (WP X1) derives its height from this.
+    constexpr float EYE = 1080.F / 1920.F;
+
+    EXPECT_FLOAT_EQ(presentedAspect({3840, 1080}, CONTENT_SBS), EYE);  // full: the frame is 2x wide
+    EXPECT_FLOAT_EQ(presentedAspect({1920, 1080}, CONTENT_HSBS), EYE); // half: each eye squeezed by 2
+    EXPECT_FLOAT_EQ(presentedAspect({1920, 2160}, CONTENT_TAB), EYE);  // full: the frame is 2x tall
+    EXPECT_FLOAT_EQ(presentedAspect({1920, 1080}, CONTENT_HTAB), EYE); // half: each eye squeezed by 2
+    EXPECT_FLOAT_EQ(presentedAspect({1920, 1080}, CONTENT_OFF), EYE);  // and mono is just the frame
+}
+
+TEST(StereoContent, theHalfLayoutsAreIndistinguishableFromMonoBySize) {
+    // the reason a layout must be DECLARED and can never be measured: an hsbs frame, an htab frame
+    // and a mono frame of the same picture are the same number of pixels in the same arrangement.
+    // §4.4's pixel detector exists because of this, and §5.2 is why it can never be complete.
+    const Vector2D FRAME{1920, 1080};
+    EXPECT_FLOAT_EQ(presentedAspect(FRAME, CONTENT_HSBS), presentedAspect(FRAME, CONTENT_OFF));
+    EXPECT_FLOAT_EQ(presentedAspect(FRAME, CONTENT_HTAB), presentedAspect(FRAME, CONTENT_OFF));
+    // whereas the FULL layouts are self-describing from the frame alone (2:1 and 1:2 of the eye)
+    EXPECT_FLOAT_EQ(presentedAspect({3840, 1080}, CONTENT_SBS), presentedAspect(FRAME, CONTENT_OFF));
+    EXPECT_FLOAT_EQ(presentedAspect({1920, 2160}, CONTENT_TAB), presentedAspect(FRAME, CONTENT_OFF));
+}
+
+TEST(StereoContent, aDegenerateBufferDoesNotDivideByZero) {
+    // a client can commit a 1x1 (or, briefly, a 0-sized) buffer; the aspect must be a number.
+    EXPECT_TRUE(std::isfinite(presentedAspect({0, 0}, CONTENT_SBS)));
+    EXPECT_TRUE(std::isfinite(presentedAspect({1, 1}, CONTENT_HTAB)));
+}
+
+// --- pane <-> content UV, both directions (§5.6) ---
+
+TEST(StereoContent, paneUVMapsIntoTheEyesHalfAndBackAgain) {
+    // §5.6 spelled out: u_content = u_pane / 2 for the left eye, 0.5 + u_pane / 2 for the right.
+    EXPECT_EQ(paneUVToContentUV({0.0, 0.5}, CONTENT_SBS, 0), Vector2D(0.0, 0.5));
+    EXPECT_EQ(paneUVToContentUV({1.0, 0.5}, CONTENT_SBS, 0), Vector2D(0.5, 0.5));
+    EXPECT_EQ(paneUVToContentUV({0.0, 0.5}, CONTENT_SBS, 1), Vector2D(0.5, 0.5));
+    EXPECT_EQ(paneUVToContentUV({1.0, 0.5}, CONTENT_SBS, 1), Vector2D(1.0, 0.5));
+
+    // over-under moves the SAME mapping to the other axis, and leaves u alone
+    EXPECT_EQ(paneUVToContentUV({0.25, 0.0}, CONTENT_TAB, 1), Vector2D(0.25, 0.5));
+    EXPECT_EQ(paneUVToContentUV({0.25, 1.0}, CONTENT_TAB, 1), Vector2D(0.25, 1.0));
+}
+
+TEST(StereoContent, theTwoDirectionsAreExactInverses) {
+    // get this backwards and the cursor is off by half a screen — so assert the round trip rather
+    // than a hand-computed table, over a non-trivial base range (a viewporter'd stereo player).
+    const SUVRange SOURCE{{0.2, 0.1}, {0.8, 0.9}};
+    for (const auto& layout : {CONTENT_OFF, CONTENT_SBS, CONTENT_HSBS, CONTENT_TAB, CONTENT_HTAB}) {
+        for (int eye = 0; eye < 2; ++eye) {
+            for (const auto& uv : {Vector2D{0, 0}, Vector2D{1, 1}, Vector2D{0.25, 0.75}, Vector2D{0.5, 0.5}}) {
+                const auto ROUND = contentUVToPaneUV(paneUVToContentUV(uv, layout, eye, SOURCE), layout, eye, SOURCE);
+                EXPECT_NEAR(ROUND.x, uv.x, 1e-9) << layoutToString(layout) << " eye " << eye;
+                EXPECT_NEAR(ROUND.y, uv.y, 1e-9) << layoutToString(layout) << " eye " << eye;
+            }
+        }
+    }
+}
+
+TEST(StereoContent, monoUnmapsToItself) {
+    // the identity is what makes this safe to call unconditionally — and it is also the mapping the
+    // DEPTH producer needs (§5.6), where both panes are the same desktop.
+    for (int eye = 0; eye < 2; ++eye) {
+        EXPECT_EQ(paneUVToContentUV({0.3, 0.7}, CONTENT_OFF, eye), Vector2D(0.3, 0.7));
+        EXPECT_EQ(contentUVToPaneUV({0.3, 0.7}, CONTENT_OFF, eye), Vector2D(0.3, 0.7));
+    }
+}
+
+TEST(StereoContent, thePaneMappingAgreesWithTheCropTheRendererUses) {
+    // the two must never drift: the crop decides which texels an eye shows, and the un-map decides
+    // where a hit in that eye landed. Expressed in terms of each other on purpose, asserted anyway.
+    for (const auto& layout : PACKED_LAYOUTS) {
+        for (int eye = 0; eye < 2; ++eye) {
+            const auto CROP = cropForEye(fullRange(), layout, eye);
+            EXPECT_EQ(paneUVToContentUV({0, 0}, layout, eye), CROP.tl) << layoutToString(layout);
+            EXPECT_EQ(paneUVToContentUV({1, 1}, layout, eye), CROP.br) << layoutToString(layout);
+        }
+    }
 }
