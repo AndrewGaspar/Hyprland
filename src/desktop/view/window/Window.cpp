@@ -743,6 +743,10 @@ bool CWindow::canBeTorn() {
 // Note that a client tag of `stereo:mono` suppresses `auto` but does NOT beat an explicit rule
 // layout: §4.5's ecosystem warning is that correct-looking content metadata is a liability, so the
 // last human instruction has to win.
+//
+// The precedence itself is Render::Stereo::resolveDeclaration — pure, and unit-tested as a full
+// matrix (WP S2). What stays here is the part that needs a window: the two lookups, and the
+// fullscreen query, which is asked ONLY when the gate is actually in play.
 Render::Stereo::eContentLayout CWindow::stereoLayout() {
     using namespace Render::Stereo;
 
@@ -750,20 +754,14 @@ Render::Stereo::eContentLayout CWindow::stereoLayout() {
     // rule anywhere" is the state of every window in every session that has not configured this.
     const auto DECL = unpackDeclaration(m_ruleApplicator->stereo().valueOrDefault());
     if (DECL.layout == CONTENT_OFF)
-        return CONTENT_OFF;
+        return CONTENT_OFF; // the common case: not even a rule. Nothing else is looked up.
 
-    const auto TAG    = m_backend->metadata().tag;
-    const auto TAGGED = TAG ? layoutFromTag(*TAG) : std::nullopt;
+    const auto TAG = m_backend->metadata().tag;
+    const auto RES = resolveDeclaration(DECL, TAG ? layoutFromTag(*TAG) : std::nullopt);
+    if (RES.layout == CONTENT_OFF || !RES.gated)
+        return RES.layout;
 
-    const auto LAYOUT = DECL.layout == CONTENT_AUTO ? TAGGED.value_or(CONTENT_OFF) : DECL.layout;
-    if (LAYOUT == CONTENT_OFF)
-        return CONTENT_OFF;
-
-    const bool CLIENT_DECLARED = TAGGED.has_value() && *TAGGED != CONTENT_OFF;
-    if (DECL.gate == GATE_ALWAYS || CLIENT_DECLARED)
-        return LAYOUT;
-
-    return Fullscreen::controller()->isFullscreen(m_self.lock(), Fullscreen::FSMODE_FULLSCREEN, true) ? LAYOUT : CONTENT_OFF;
+    return Fullscreen::controller()->isFullscreen(m_self.lock(), Fullscreen::FSMODE_FULLSCREEN, true) ? RES.layout : CONTENT_OFF;
 }
 
 void CWindow::setSuspended(bool suspend) {
