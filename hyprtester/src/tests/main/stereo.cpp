@@ -136,6 +136,28 @@ namespace {
         return proc.stdOut();
     }
 
+    // The suite's only pixel readback (§3.12's stated gap): clients/screencopy-crop captures the whole
+    // output and then a region of it over wlr-screencopy, and reports whether the region is
+    // byte-identical to the matching sub-rect of the full frame. Returns its stdout.
+    std::string screencopyCrop(const std::string& monitor, int x, int y, int w, int h) {
+        CProcess proc(binaryDir + "/screencopy-crop", {monitor, std::to_string(x), std::to_string(y), std::to_string(w), std::to_string(h)});
+        proc.addEnv("WAYLAND_DISPLAY", WLDISPLAY);
+        if (!proc.runSync() && proc.stdOut().empty())
+            return "";
+        return proc.stdOut();
+    }
+
+    // "varied <n>" — pixels in the reference crop that differ from its first pixel. Zero means the
+    // captured area was flat, which would make the crop comparison pass for the wrong reason.
+    int variedIn(const std::string& dump) {
+        const auto POS = dump.find("varied ");
+        if (POS == std::string::npos)
+            return -1;
+        try {
+            return std::stoi(dump.substr(POS + 7));
+        } catch (...) { return -1; }
+    }
+
     // the line for one output, or "" — e.g. "output HYPRTEST-STEREO mode 1920x1080@60000 scale 1 logical 1920x1080 at 1920,0"
     std::string outputInfoLine(const std::string& dump, const std::string& name) {
         std::istringstream iss(dump);
@@ -392,6 +414,74 @@ TEST_CASE(stereoSbsOneLogicalMonitor) {
     EXPECT(stereoWindowSize, controlWindowSize);
     // and it is derived from the pane, not the packed mode (which would be ~3840 wide)
     EXPECT(widthOf(stereoWindowSize) > 1000 && widthOf(stereoWindowSize) <= 1920, true);
+}
+
+// stereoRegionCaptureIsACrop — the one thing structural assertions cannot see: the IMAGE.
+//
+// A region capture must be a 1:1 crop of the monitor's own capture. On a stereo monitor every draw
+// is projected through outputProjection(paneSize), so a capture buffer smaller than the pane has to
+// CLIP that projection; give the pass a viewport of the buffer's own size instead and the whole
+// desktop is squeezed into the region rectangle. Both captures go through the shm path, which is
+// what grim / the screenshot portal / hyprshot use.
+//
+// The plain monitor is checked with the same client and the same rectangle, which is what makes
+// this a stereo assertion rather than a screencopy smoke test.
+TEST_CASE(stereoRegionCaptureIsACrop) {
+    // a rectangle in the bottom-right corner: offset on BOTH axes (a crop that ignored the offset
+    // would still match at the origin) and guaranteed structure — it straddles the tiled window's
+    // corner, its border and the gap behind it.
+    constexpr int CROP_X = 1600, CROP_Y = 800, CROP_W = 320, CROP_H = 280;
+
+    getFromSocket(std::format("/output remove {}", STEREO_MON));
+    getFromSocket(std::format("/output remove {}", CONTROL_MON));
+
+    OK(declareMonitor(STEREO_MON, STEREO_MODE, "sbs"));
+    OK(declareMonitor(CONTROL_MON, CONTROL_MODE, nullptr));
+
+    OK(getFromSocket(std::format("/output create headless {}", STEREO_MON)));
+    OK(getFromSocket(std::format("/output create headless {}", CONTROL_MON)));
+
+    CScopeGuard guard = {[&]() {
+        Tests::killAllWindows();
+        getFromSocket(std::format("/output remove {}", STEREO_MON));
+        getFromSocket(std::format("/output remove {}", CONTROL_MON));
+    }};
+
+    ASSERT(waitForMonitorPresent(STEREO_MON, true), true);
+    ASSERT(waitForMonitorPresent(CONTROL_MON, true), true);
+    ASSERT(waitForMonitorField(STEREO_MON, "width", "1920"), true);
+
+    const auto cropCheck = [&](const char* monitor) {
+        OK(getFromSocket(std::format("/dispatch hl.dsp.focus({{ monitor = '{}' }})", monitor)));
+
+        // the window (borders, rounding, the gap behind it) is what puts structure under the crop
+        // rectangle; it must be gone again before the next monitor's turn, so it lives in its own
+        // scope — waitUntilWindowsN(0) can only succeed after the client has been reaped.
+        std::string DUMP;
+        {
+            const int     BEFORE = Tests::windowCount();
+            SWindowClient client;
+            ASSERT(client.waitForWindow(BEFORE), true);
+            Tests::sync();
+
+            DUMP = screencopyCrop(monitor, CROP_X, CROP_Y, CROP_W, CROP_H);
+        }
+        Tests::waitUntilWindowsN(0);
+        Tests::sync();
+
+        if (!DUMP.contains("result ok"))
+            NLog::log("{}screencopy-crop on {} said:\n{}", Colors::YELLOW, monitor, DUMP);
+
+        // the monitor capture is the LOGICAL view — one pane, never the packed frame (§3.6)
+        EXPECT_CONTAINS(DUMP, "full 1920x1080");
+        EXPECT_CONTAINS(DUMP, std::format("region {}x{}", CROP_W, CROP_H));
+        // a flat capture would make the comparison below vacuous
+        EXPECT(variedIn(DUMP) > 0, true);
+        EXPECT_CONTAINS(DUMP, "result ok");
+    };
+
+    cropCheck(STEREO_MON);
+    cropCheck(CONTROL_MON); // the same assertion on an ordinary output, as the control
 }
 
 // stereoLiveToggleRestoresState — the hot-reload ordering risk.

@@ -686,7 +686,12 @@ void CHyprOpenGLImpl::beginSimple(PHLMONITOR pMonitor, const CRegion& damage, SP
 
     const auto FBO = rb ? rb->getFB() : fb;
 
-    setViewport(0, 0, pMonitor->m_pixelSize.x, pMonitor->m_pixelSize.y);
+    // stereo: a simple pass still projects through getScaleMatrix() == outputProjection(paneSize()),
+    // so the viewport is the pane and a smaller target (a region screencopy buffer) clips it. This is
+    // load-bearing for renderbuffer targets: those FBs are raw-bound and never set a viewport of their
+    // own, so the mode size would survive here and stretch the pane across the whole packed frame.
+    // paneSize() == m_pixelSize when stereo is off (research/24 §3.4 item 3).
+    setViewport(0, 0, pMonitor->paneSize().x, pMonitor->paneSize().y);
 
     if (!m_shadersInitialized)
         initShaders();
