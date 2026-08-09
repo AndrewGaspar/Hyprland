@@ -980,3 +980,94 @@ TEST_CASE(stereoDepthDisparityMovesTheWindow) {
     EXPECT_MAX_DELTA(FULL.y - FLAT.y, 0.0, 0.5);
     EXPECT_MAX_DELTA(HALF.y - FLAT.y, 0.0, 0.5);
 }
+
+// stereoDepthShippedLadderIsSubPixel — the same measurement, in the regime users actually run.
+//
+// stereoDepthDisparityMovesTheWindow deliberately turns the comfort knob up to `depth_scale = 0.30`
+// so the shift (9.45 px) is far larger than any rounding the render path might do. That makes it a
+// good test of the SIGN and the PROPORTIONALITY and a useless test of §8.1's number-one risk: at
+// nine pixels, quantising the disparity to whole pixels is a 5 % error and every assertion there
+// still passes.
+//
+// The shipped ladder is the opposite regime. At `depth_scale = 0.12` the rungs are 0.61 px (depth
+// 0.2) and 0.93 px (depth 0.3) — two different rungs and the SAME INTEGER. Round the shifted box
+// and they render identically; everything between depth 0 and 0.3 collapses into one plane, which
+// is exactly the failure §8.1 predicted. So this measures those two rungs and asserts they are
+// distinguishable on screen.
+//
+// It is the pixel-level counterpart to DepthTiers.theSubPixelSeamKeepsTwoNearbyRungsApart, which
+// asserts the same property of the expression; this one asserts it of the composited frame, i.e.
+// that every drawer in the frame — surface, border, shadow, glow — really does run that expression.
+TEST_CASE(stereoDepthShippedLadderIsSubPixel) {
+    // §8.1 at the SHIPPED `decoration:depth_scale = 0.12`, one pane of a 3840x1080 sbs output.
+    constexpr double SHIFT_LOW  = 0.61; // depth 0.2 — the shipped unfocused rung
+    constexpr double SHIFT_HIGH = 0.93; // depth 0.3
+    // A whole pixel of tolerance on each absolute shift, which is generous — but the assertion that
+    // matters is the SEPARATION, and there a whole pixel would be meaningless: integer rounding
+    // makes it exactly zero and the sub-pixel path makes it 0.32.
+    constexpr double TOL_ABS = 1.0;
+    constexpr double TOL_SEP = 0.15;
+
+    Tests::killAllWindows();
+    getFromSocket(std::format("/output remove {}", STEREO_MON));
+
+    OK(declareMonitor(STEREO_MON, STEREO_MODE, "sbs"));
+    OK(getFromSocket(std::format("/output create headless {}", STEREO_MON)));
+
+    CScopeGuard guard = {[&]() {
+        Tests::killAllWindows();
+        getFromSocket("/eval hl.config({ decoration = { depth_scale = 0.12, depth_focused = 0.6 } })");
+        getFromSocket("/eval hl.config({ misc = { disable_hyprland_logo = false, disable_splash_rendering = false } })");
+        getFromSocket(std::format("/output remove {}", STEREO_MON));
+    }};
+
+    ASSERT(waitForMonitorPresent(STEREO_MON, true), true);
+    ASSERT(waitForMonitorField(STEREO_MON, "width", "1920"), true);
+
+    OK(getFromSocket("/eval hl.config({ misc = { disable_hyprland_logo = true, disable_splash_rendering = true } })"));
+    OK(getFromSocket("/eval hl.config({ decoration = { depth_scale = 0.12, depth_focused = 0 } })"));
+
+    OK(getFromSocket(std::format("/dispatch hl.dsp.focus({{ monitor = '{}' }})", STEREO_MON)));
+
+    const int     BEFORE = Tests::windowCount();
+    SWindowClient client;
+    ASSERT(client.waitForWindow(BEFORE), true);
+    Tests::sync();
+
+    const auto measureAt = [&](double depth, const char* composites) -> SCentroid {
+        EXPECT(getFromSocket(std::format("/eval hl.config({{ decoration = {{ depth_focused = {} }} }})", depth)), std::string("ok"));
+        EXPECT(waitForWindowDepth(std::format("{:.3f}", depth)), true);
+        EXPECT(waitForMonitorField(STEREO_MON, "stereoComposites", composites), true);
+
+        getFromSocket("/dismissnotify");
+        Tests::sync();
+
+        const auto MEASURED = measureSettledCentroid(STEREO_MON);
+        EXPECT(MEASURED.usable(), true);
+        NLog::log("{}shipped ladder, depth {}: centroid {:.3f}, {:.3f}", Colors::YELLOW, depth, MEASURED.x, MEASURED.y);
+        return MEASURED;
+    };
+
+    const auto FLAT = measureAt(0.0, "1");
+    ASSERT(FLAT.usable(), true);
+
+    const auto LOW  = measureAt(0.2, "2");
+    const auto HIGH = measureAt(0.3, "2");
+
+    // === 1. both rungs are where the formula says, to within a pixel ===
+    EXPECT_MAX_DELTA(LOW.x - FLAT.x, -SHIFT_LOW, TOL_ABS);
+    EXPECT_MAX_DELTA(HIGH.x - FLAT.x, -SHIFT_HIGH, TOL_ABS);
+
+    // === 2. ...and they are NOT the same place, which is the whole assertion ===
+    //
+    // 0.32 px apart. A render path that rounded the disparity would put both at exactly 1 px and
+    // this difference would be 0.00 — the ladder collapsed, silently, in the only regime anyone
+    // ships. Note the direction as well as the magnitude: higher is further left in this pane.
+    EXPECT(HIGH.x < LOW.x - TOL_SEP, true);
+    EXPECT_MAX_DELTA(HIGH.x - LOW.x, -(SHIFT_HIGH - SHIFT_LOW), 0.35);
+
+    // === 3. and neither of them moved vertically ===
+    EXPECT_MAX_DELTA(LOW.y - FLAT.y, 0.0, 0.5);
+    EXPECT_MAX_DELTA(HIGH.y - FLAT.y, 0.0, 0.5);
+}
+
