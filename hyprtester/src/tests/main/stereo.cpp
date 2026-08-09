@@ -1595,3 +1595,135 @@ TEST_CASE(stereoDepthStaysFlatOnARotatedOutput) {
     EXPECT(waitForMonitorField(STEREO_MON, "stereoComposites", "2"), true);
 }
 
+// stereoContentInsideADepthRaisedPane — the composition matrix, and the case the merge of WP S1 and
+// WP D2 exists to make true (research/24 §5.3 × §6.1).
+//
+// The two per-eye producers were built independently and each got its own second-eye mechanism.
+// There is now ONE: renderMonitor composites the desktop once per pane, and both effects happen
+// inside that one loop — depth while the pane's SCENE is built (the window's box moves by ±the
+// disparity), content while the pane's UVs are RESOLVED (the window's own surface is cropped to
+// that pane's half). Neither knows about the other; they meet only in `stereoPane`.
+//
+// So there are four corners, and they are all asserted somewhere:
+//
+//   neither         stereoDepthProducerFastPath case 1     — 1 composite, F1's exact frame
+//   content only    stereoContentSecondComposite           — 2 composites, no depth anywhere
+//   depth only      stereoDepthDisparityMovesTheWindow     — 2 composites, disparity measured
+//   BOTH            here
+//
+// WHY THE MEASUREMENT WORKS HERE. stereoDepthDisparityMovesTheWindow compares a flat frame against
+// a raised one and reads the difference as disparity. That comparison would be worthless with a
+// stereo window in it, because the flat frame would be the single-composite one and the raised
+// frame a per-eye one, and those two sample DIFFERENT halves of the client's buffer — the centroid
+// would move because the picture changed, not because the window did.
+//
+// The unification is what fixes it: with a declared window on the output the pane loop runs at
+// every rung of the ladder, depth 0 included. Both captures are therefore the same pane showing
+// the same half, and the only thing that differs between them is the disparity. That the depth-0
+// measurement reports `stereoComposites: 2` at all is itself the assertion that content alone
+// drives the loop.
+TEST_CASE(stereoContentInsideADepthRaisedPane) {
+    // the same regime as stereoDepthDisparityMovesTheWindow, so the numbers are comparable: at
+    // `depth_scale = 0.30` a depth of 1.0 is 9.45 px per pane on a 1920-wide pane (§8.1's table).
+    constexpr double DEPTH_SCALE = 0.30;
+    constexpr double SHIFT_FULL  = 9.45;
+    constexpr double TOL         = 1.5;
+
+    Tests::killAllWindows();
+    getFromSocket(std::format("/output remove {}", STEREO_MON));
+
+    OK(declareMonitor(STEREO_MON, STEREO_MODE, "sbs"));
+    OK(getFromSocket(std::format("/output create headless {}", STEREO_MON)));
+
+    CScopeGuard guard = {[&]() {
+        Tests::killAllWindows();
+        // a named rule is updated in place, and `off` is the one layout that wins outright — the
+        // suite's cases after this one must not inherit a crop
+        getFromSocket("/eval hl.window_rule({ name = 'sd-stereo', stereo = 'off' })");
+        getFromSocket("/eval hl.config({ decoration = { depth_scale = 0.12, depth_focused = 0.6 } })");
+        getFromSocket("/eval hl.config({ misc = { disable_hyprland_logo = false, disable_splash_rendering = false } })");
+        getFromSocket(std::format("/output remove {}", STEREO_MON));
+    }};
+
+    ASSERT(waitForMonitorPresent(STEREO_MON, true), true);
+    ASSERT(waitForMonitorField(STEREO_MON, "width", "1920"), true);
+
+    // the centroid's one precondition (see stereoDepthDisparityMovesTheWindow)
+    OK(getFromSocket("/eval hl.config({ misc = { disable_hyprland_logo = true, disable_splash_rendering = true } })"));
+    OK(getFromSocket(std::format("/eval hl.config({{ decoration = {{ depth_scale = {}, depth_focused = 0 }} }})", DEPTH_SCALE)));
+
+    // `always`, because §4.3's fullscreen gate belongs to window.cpp's case and this one is about
+    // the two producers meeting
+    OK(getFromSocket("/eval hl.window_rule({ name = 'sd-stereo', match = { xwayland = false }, stereo = 'sbs always' })"));
+    OK(getFromSocket(std::format("/dispatch hl.dsp.focus({{ monitor = '{}' }})", STEREO_MON)));
+
+    // painted with four distinct quadrants: the same client the S2 case uses, so the signature
+    // below means exactly what it means there
+    const int     BEFORE = Tests::windowCount();
+    SWindowClient client({"--paint"});
+    ASSERT(client.waitForWindow(BEFORE), true);
+    Tests::sync();
+
+    EXPECT_CONTAINS(getFromSocket("/activewindow"), "stereo: sbs");
+
+    const auto measureAt = [&](double depth) -> SCentroid {
+        EXPECT(getFromSocket(std::format("/eval hl.config({{ decoration = {{ depth_focused = {} }} }})", depth)), std::string("ok"));
+        EXPECT(waitForWindowDepth(std::format("{:.3f}", depth)), true);
+
+        // THE COMPOSITION ASSERTION, and it is made at every rung including 0: the crop reached a
+        // drawn surface in a pane that depth had already moved. A build where the pane loop ran the
+        // scene twice but resolved UVs once — or one where the crop read a different eye index than
+        // the disparity did — reads "abcd" here while every depth number below still passes.
+        EXPECT(waitForMonitorField(STEREO_MON, "stereoComposites", "2"), true);
+        EXPECT(waitForMonitorField(STEREO_MON, "stereoContent", "true"), true);
+        EXPECT(waitForPaneSignature(STEREO_MON, "aacc"), true);
+
+        getFromSocket("/dismissnotify"); // a toast is mass, and worth about 6 px of centroid
+        Tests::sync();
+
+        const auto MEASURED = measureSettledCentroid(STEREO_MON);
+        if (!MEASURED.usable())
+            NLog::log("{}screencopy-crop --centroid at depth {} said:\n{}", Colors::YELLOW, depth, MEASURED.dump);
+        EXPECT(MEASURED.usable(), true);
+        NLog::log("{}stereo window at depth {}: centroid {:.3f}, {:.3f} (mass {:.0f})", Colors::YELLOW, depth, MEASURED.x, MEASURED.y, MEASURED.mass);
+        return MEASURED;
+    };
+
+    // === 1. on the plane: the pane loop is running for CONTENT alone, and the crop fired ===
+    const auto FLAT = measureAt(0.0);
+    ASSERT(FLAT.usable(), true); // nothing below means anything without a reference
+
+    // === 2. raised: the same window, the same half, moved by its disparity ===
+    //
+    // Sign as in stereoDepthDisparityMovesTheWindow — the capture follows the LAST pane, whose eye
+    // sign is negative (§8.1: "left pane +, right pane −").
+    const auto RAISED = measureAt(1.0);
+    EXPECT_MAX_DELTA(RAISED.x - FLAT.x, -SHIFT_FULL, TOL);
+    // ...and vertically nowhere: disparity is horizontal, or it is eye strain
+    EXPECT_MAX_DELTA(RAISED.y - FLAT.y, 0.0, 0.5);
+
+    // === 3. and back down lands where it started, so 2 was depth and not drift ===
+    const auto BACK = measureAt(0.0);
+    EXPECT_MAX_DELTA(BACK.x - FLAT.x, 0.0, 0.5);
+    EXPECT_MAX_DELTA(BACK.y - FLAT.y, 0.0, 0.5);
+
+    // === 4. drop the declaration with the window still raised: depth alone still composites ===
+    //
+    // The other diagonal of the matrix, on the same window in the same frame — and the proof that
+    // the two halves of the predicate are independent. The crop stops (`stereoContent` false, the
+    // signature goes back to the client's own four quadrants) while the loop keeps running for
+    // depth (`stereoComposites` stays 2).
+    OK(getFromSocket(std::format("/eval hl.config({{ decoration = {{ depth_focused = {} }} }})", 1.0)));
+    ASSERT(waitForWindowDepth("1.000"), true);
+    OK(getFromSocket("/eval hl.window_rule({ name = 'sd-stereo', stereo = 'off' })"));
+
+    EXPECT(waitForMonitorField(STEREO_MON, "stereoContent", "false"), true);
+    EXPECT(monitorField(STEREO_MON, "stereoComposites"), std::string("2"));
+    EXPECT_CONTAINS(getFromSocket("/activewindow"), "stereo: off");
+    EXPECT(waitForPaneSignature(STEREO_MON, "abcd"), true);
+
+    // === 5. ...and with BOTH off the output is back to one composite ===
+    OK(getFromSocket("/eval hl.config({ decoration = { depth_focused = 0 } })"));
+    ASSERT(waitForWindowDepth("0.000"), true);
+    EXPECT(waitForMonitorField(STEREO_MON, "stereoComposites", "1"), true);
+}
