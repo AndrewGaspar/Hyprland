@@ -50,7 +50,7 @@ above; when one ships, move it to `archive/` with a disposition line like the ta
 | [21-wivrn-variable-bitrate](21-wivrn-variable-bitrate.md) | variable-rate encoding for WiVRn streaming (+ erratum `e66b91b4`) | unimplemented |
 | [22-spatial-persistence-locations](22-spatial-persistence-locations.md) | spatial persistence and named locations | unimplemented |
 | [23-xr-native-launcher](23-xr-native-launcher.md) | head-leashed presentation of transient layer-shell UI (walker, mako, OSDs) | unimplemented — WPs N0–N10 |
-| [24-stereo-content-and-depth-desktop](24-stereo-content-and-depth-desktop.md) | stereoscopic (SBS/half-SBS/over-under) client content, and "depth" as a first-class window/layer styling axis | unimplemented — WPs S0–S8, D0–D7 |
+| [24-stereo-content-and-depth-desktop](24-stereo-content-and-depth-desktop.md) | a flat side-by-side **stereo output** as a generic Hyprland feature (one monitor, logical = one pane, mode = the pack), stereoscopic client content, and "depth" as a first-class window/layer styling axis | unimplemented — WPs F0–F5, S0–S8, D0–D7, X1–X4 (rev. 2026-08-08: flat SBS is the **primary** presenter, OpenXR the upgrade tier) |
 
 ---
 
