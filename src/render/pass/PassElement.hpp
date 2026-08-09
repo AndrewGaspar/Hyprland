@@ -42,13 +42,6 @@ class IPassElement {
     virtual bool                disableSimplification(Render::CRenderContext& ctx);
     virtual bool                requiresFullDamage(Render::CRenderContext& ctx);
 
-    // research/24 §5.3 (WP S1): may CRenderPass::replay() run this element a SECOND time in the same
-    // frame? True for everything that only paints — a second eye repaints the same geometry with
-    // different UVs. False for an element whose output is a per-frame side effect computed from what
-    // the framebuffer held BEFORE the pass reached it, because by replay time the framebuffer holds
-    // the finished first eye and the "before" is gone.
-    virtual bool replayable();
-
     // cached results, computed once per frame in CRenderPass::render()
     bool needsLiveBlurCached       = false;
     bool needsPrecomputeBlurCached = false;

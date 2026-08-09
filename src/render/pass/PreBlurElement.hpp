@@ -11,7 +11,6 @@ class CPreBlurElement : public IPassElement {
     virtual bool        disableSimplification(Render::CRenderContext& ctx);
     virtual bool        requiresFullDamage(Render::CRenderContext& ctx);
     virtual bool        undiscardable(Render::CRenderContext& ctx);
-    virtual bool        replayable();
 
     virtual const char* passName() {
         return "CPreBlurElement";

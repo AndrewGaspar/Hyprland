@@ -2,6 +2,7 @@
 #include "SceneResources.hpp"
 #include "Renderer.hpp"
 #include "../layout/LayoutManager.hpp"
+#include "../desktop/DepthTiers.hpp"
 #include "../desktop/view/window/Window.hpp"
 #include "../desktop/view/window/WindowEffectsController.hpp"
 #include "../desktop/view/window/WindowPresentation.hpp"
@@ -67,10 +68,19 @@ static std::optional<Vector2D> getSurfaceExpectedSize(PHLWINDOW pWindow, SP<CWLS
 // It is deliberately confined to the window's MAIN surface: subsurfaces (a player's OSD) and popups
 // are chrome the client drew once, not packed content, and they belong at screen depth in both eyes.
 //
-// The flag it raises is the trigger for the second composite (CHyprOpenGLImpl::end()). Setting it
-// HERE rather than from a scan of the monitor's windows is what makes the fast path exact: if a
-// stereo window was occluded, discarded or simply not on this pane, nothing was cropped, the panes
-// really are identical, and the frame costs one composite plus one extra blit.
+// The eye is ctx.m_data.stereoPane, the ONE index the pane loop in renderMonitor sets — the same
+// one depth signs its disparity from, which is what makes S-in-D compose without either producer
+// knowing about the other: the pane's scene was built with the window shifted by ±disparity, and
+// this crops that window's own surface to the matching half.
+//
+// Off a per-eye pass (stereoPane < 0 — an ordinary monitor never gets here, but a screencopy or a
+// fake frame of a stereo monitor does) the eye is 0: a capture is one pane wide by §3.6, and the
+// pane it hands out is the left eye, which is also the one the loop draws first.
+//
+// The flag it raises is NOT the producer's trigger — the pane count is decided before the frame is
+// built, exactly as depth's is (IHyprRenderer::stereoContentActive). It is the witness: did the
+// crop actually reach a drawn surface, i.e. did the declaration survive the fullscreen gate,
+// occlusion and "not on this output". `hyprctl monitors` reports it as `stereoContent`.
 static void applyStereoContentCrop(CRenderContext& ctx, PHLWINDOW pWindow, PHLMONITOR pMonitor, bool main) {
     auto& renderData = ctx.m_data;
 
@@ -86,7 +96,7 @@ static void applyStereoContentCrop(CRenderContext& ctx, PHLWINDOW pWindow, PHLMO
     const Render::Stereo::SUVRange BASE =
         SENTINEL ? Render::Stereo::SUVRange{} : Render::Stereo::SUVRange{renderData.primarySurfaceUVTopLeft, renderData.primarySurfaceUVBottomRight};
 
-    const auto CROPPED = Render::Stereo::cropForEye(BASE, LAYOUT, renderData.stereoEye);
+    const auto CROPPED = Render::Stereo::cropForEye(BASE, LAYOUT, std::max(renderData.stereoPane, 0));
 
     renderData.primarySurfaceUVTopLeft     = CROPPED.tl;
     renderData.primarySurfaceUVBottomRight = CROPPED.br;
@@ -305,7 +315,25 @@ void IElementRenderer::drawSurface(CRenderContext& ctx, WP<CSurfacePassElement> 
     const auto  PROJSIZEUNSCALED = windowBox.size();
 
     windowBox.scale(m_data.pMonitor->m_scale);
-    windowBox.round();
+
+    // research/24 §8.1 — the number-one implementation risk this WP was told to check, and this is
+    // the seam the report named. Tasteful depth is SINGLE-DIGIT pixels of disparity (±3.3 px at
+    // depth 1.0 with the shipped defaults, ±0.5 px for a 2 cm rise), and CBox::round() quantises
+    // the box position to whole pixels — which would collapse the ladder into two or three visible
+    // steps and make everything between depth 0 and 0.3 look identical.
+    //
+    // Desktop::Depth::roundKeepingDisparity is the shared expression: round on the UN-SHIFTED grid,
+    // re-apply the disparity in floating point. Every decoration that frames this surface runs the
+    // same call, so the frame and its content never quantise differently. It is a no-op fast path
+    // on a zero shift, which is every frame outside a per-eye composite.
+    const double DISPARITY = g_pHyprRenderer->depthRenderOffset(m_data.pWindow).x + g_pHyprRenderer->depthRenderOffset(m_data.pLS).x;
+
+    Desktop::Depth::roundKeepingDisparity(windowBox, DISPARITY * m_data.pMonitor->m_scale); // windowBox is in buffer pixels by now
+
+    // ...and the scissor every draw below is clipped to. A fractional box truncates on its way into
+    // pixman, cutting the column the rasteriser does cover, so scissor to the box's integer
+    // footprint. Identity when the box is already whole (the mono path).
+    const CBox SCISSORBOX = Desktop::Depth::rasterCover(windowBox);
 
     if (windowBox.width <= 1 || windowBox.height <= 1) {
         element->discard(ctx);
@@ -331,11 +359,11 @@ void IElementRenderer::drawSurface(CRenderContext& ctx, WP<CSurfacePassElement> 
         }
     }
 
-    const auto surfaceDamage = [&m_renderData, &windowBox] {
+    const auto surfaceDamage = [&m_renderData, &SCISSORBOX] {
         if (m_renderData.renderingTransformedSource)
             return m_renderData.damage.copy();
 
-        CRegion renderDamage = m_renderData.damage.copy().intersect(windowBox);
+        CRegion renderDamage = m_renderData.damage.copy().intersect(SCISSORBOX);
         m_renderData.renderModif.applyToRegion(renderDamage);
         return renderDamage;
     };

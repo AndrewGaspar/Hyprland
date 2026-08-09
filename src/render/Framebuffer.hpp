@@ -36,6 +36,11 @@ namespace Render {
         Vector2D                            m_size;
         DRMFormat                           m_drmFormat = DRM_FORMAT_INVALID;
 
+        // Clear a framebuffer whose contents were invalidated, at most once per invalidation. On the
+        // interface because the stereo depth producer binds a fresh pane buffer mid-frame
+        // (research/24 §6.1) from renderer-agnostic code; a no-op on backends that never invalidate.
+        virtual void clearAfterInvalidation() {}
+
       protected:
         virtual bool                        internalAlloc(int w, int h, DRMFormat format = DRM_FORMAT_ARGB8888) = 0;
 

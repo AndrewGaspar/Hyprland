@@ -192,6 +192,13 @@ namespace Desktop::View {
         // For the noclosefor windowrule
         Time::steady_tp m_closeableSince = Time::steadyNow();
 
+        // How high this window floats above the wallpaper plane, 0..1 (research/24 §7).
+        // WP D1 shipped the state; WP D2 added the producer that turns it into per-pane disparity
+        // on a STEREO output. On every other output it is still inert — nothing reads it while
+        // rendering — which is why it is AVARDAMAGE_NONE at creation and why the repaint it does
+        // need is booked explicitly by CMonitor::bookDepthRepaint() rather than by a damage policy.
+        PHLANIMVAR<float> m_depth;
+
         // For the list lookup
         bool operator==(const CWindow& rhs) const;
 
@@ -232,6 +239,7 @@ namespace Desktop::View {
         bool                       isScrollTouchpadOverridden();
         void                       updateWindowData();
         void                       updateWindowData(const Config::CWorkspaceRule&);
+        void                       updateDepth(bool warp = false);
         // research/24 §5.3 (WP S1): the resolved per-window stereo content layout — the rule, the
         // client's tag and the fullscreen gate folded into one enum. CONTENT_OFF for every window
         // that has no stereo rule, which is every window in an unconfigured session.

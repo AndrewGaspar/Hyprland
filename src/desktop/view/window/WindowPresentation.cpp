@@ -500,6 +500,8 @@ void CWindowPresentation::refreshValues() {
     }
 
     updateDecorations();
+
+    m_window.updateDepth();
 }
 
 Animation::SViewAnimationContext CWindowPresentation::animateOut() const {

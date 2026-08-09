@@ -2,6 +2,7 @@
 #include "../../../debug/log/Logger.hpp"
 #include "../../../helpers/MiscFunctions.hpp"
 #include "../../view/LayerSurface.hpp"
+#include "../../DepthTiers.hpp"
 
 #include <algorithm>
 #include <format>
@@ -74,6 +75,14 @@ static std::expected<LayerRuleEffectValue, std::string> parseLayerRuleEffect(CLa
             if (!parsed)
                 return std::unexpected(parsed.error());
             return *parsed;
+        }
+        // the layerrule half of research/24 §7.1 level 3 — same effect name, same clamp, same
+        // meaning as the windowrule one. This is the rule that raises waybar off the page.
+        case LAYER_RULE_EFFECT_DEPTH: {
+            auto parsed = parseFloat(EFFECT_NAME, raw);
+            if (!parsed)
+                return std::unexpected(parsed.error());
+            return Depth::clamp(*parsed);
         }
         case LAYER_RULE_EFFECT_IGNORE_ALPHA: {
             auto parsed = parseFloat(EFFECT_NAME, raw);

@@ -11,6 +11,7 @@
 #include "../pass/RectPassElement.hpp"
 #include "../pass/TextureMatteElement.hpp"
 #include "../../state/MonitorState.hpp"
+#include "../../desktop/DepthTiers.hpp"
 
 CHyprDropShadowDecoration::CHyprDropShadowDecoration(PHLWINDOW pWindow) : IHyprWindowDecoration(pWindow), m_window(pWindow) {
     ;
@@ -101,6 +102,8 @@ void CHyprDropShadowDecoration::damageEntire() {
     };
 
     applyOffset(shadowBox);
+    // stereo depth (research/24 §6.3): the shadow is drawn into both panes at ±disparity
+    shadowBox.expand(std::ceil(g_pHyprRenderer->depthDamageSpreadAnyMonitor(PWINDOW)));
 
     CRegion shadowRegion(shadowBox);
 
@@ -222,14 +225,18 @@ SShadowRenderData CHyprDropShadowDecoration::getRenderData(Render::CRenderContex
             },
     };
 
-    fullBox.translate(presentation.floatingOffset);
+    // research/24 §6.2 injection point 1: the depth disparity rides in beside the floating offset
+    const auto DEPTHOFFSET = g_pHyprRenderer->depthRenderOffset(PWINDOW);
+    fullBox.translate(presentation.floatingOffset + DEPTHOFFSET);
 
     if (fullBox.width < 1 || fullBox.height < 1)
         return {}; // don't draw invisible shadows
 
     ctx.m_data.currentWindow = m_window;
 
-    fullBox.scale(pMonitor->m_scale).round();
+    fullBox.scale(pMonitor->m_scale);
+    // §8.1's seam, shared with the surface this shadow sits under — see roundKeepingDisparity
+    Desktop::Depth::roundKeepingDisparity(fullBox, DEPTHOFFSET.x * pMonitor->m_scale);
 
     return {
         .valid         = true,

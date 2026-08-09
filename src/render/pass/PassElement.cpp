@@ -24,10 +24,6 @@ bool IPassElement::undiscardable(Render::CRenderContext& ctx) {
     return false;
 }
 
-bool IPassElement::replayable() {
-    return true;
-}
-
 std::vector<UP<IPassElement>> IPassElement::draw(Render::CRenderContext& ctx) {
     return {};
 }

@@ -20,6 +20,7 @@
 #include "../config/ConfigValue.hpp"
 #include "../config/ConfigManager.hpp"
 #include "../pointer/PointerManager.hpp"
+#include "../desktop/DepthTiers.hpp"
 #include "../desktop/view/LayerSurface.hpp"
 #include "../desktop/state/FocusState.hpp"
 #include "../protocols/LayerShell.hpp"
@@ -759,11 +760,10 @@ bool CHyprOpenGLImpl::begin(CRenderContext& ctx, PHLMONITOR pMonitor, const CReg
 
     ctx.m_gl.fakeFrame = !!fb;
 
-    // stereo content (research/24 §5.3): every composite starts as the LEFT eye with nothing
-    // stereo drawn. Anything that renders a monitor without going through the pack — screencopy,
-    // a fake frame, a mirror source — therefore sees the left eye, which is the same half the
-    // capture path already hands out. (A fresh render context already starts there; this states it.)
-    ctx.m_data.stereoEye          = 0;
+    // stereo content (research/24 §5.3): every frame starts with nothing stereo drawn. The eye
+    // itself lives in ctx.m_data.stereoPane and is reset with the render context — a render that
+    // never enters the pane loop (a fake frame, a simple render, a mirror source) leaves it at -1,
+    // and the crop reads that as the LEFT eye, which is the pane such a render is standing in for.
     ctx.m_data.stereoContentDrawn = false;
 
     if (!ctx.readOnlyEffects() && g_pHyprRenderer->m_reloadScreenShader) {
@@ -810,7 +810,11 @@ void CHyprOpenGLImpl::end(CRenderContext& ctx) {
 
     // end the render, copy the data to the main framebuffer
     if LIKELY (ctx.m_gl.offloadedFramebuffer) {
-        ctx.m_data.damage = ctx.m_data.finalDamage;
+        // WP D2: the pack below blits EVERY pane through this one region, and finalDamage only ever
+        // describes the pane whose pass ran last. stereoPaneDamage carries the earlier panes' —
+        // live blur expands each pane's final damage around a region that moved by 2·disparity
+        // between them, so the union is what covers all of them. Empty everywhere else.
+        ctx.m_data.damage = ctx.m_data.finalDamage.copy().add(ctx.m_data.stereoPaneDamage);
         if UNLIKELY (ctx.m_mode != RENDER_MODE_NORMAL) {
             const auto TARGET_SIZE = ctx.m_data.outFB->m_size;
             const auto TEXTURE     = ctx.m_data.currentFB->getTexture();
@@ -849,10 +853,10 @@ void CHyprOpenGLImpl::end(CRenderContext& ctx) {
             const bool                      NEEDS_CM           = ctx.m_data.pMonitor->m_imageDescription->value() != ctx.m_data.mainFB->imageDescription()->value();
             const bool                      WANTS_FINAL_SHADER = !ctx.m_data.blockScreenShader && (m_finalScreenShader->program() >= 1 || g_pHyprRenderer->m_crashingInProgress);
 
-            // The post-process chain (final CM, then the screen shader) for ONE source composite,
-            // factored out of upstream's inline chain because the stereo content producer
-            // (research/24 §5.3, WP S1) resolves a second, re-composited eye. In every other frame
-            // it runs exactly once, as upstream's chain did.
+            // The post-process chain (final CM, then the screen shader) for ONE source composite.
+            // Factored out of the single-composite path because the stereo depth producer
+            // (research/24 §6.1, WP D2) hands end() one DIFFERENT composite per pane — each needs its
+            // own resolve. In every other frame it runs exactly once, as upstream's inline chain did.
             struct SResolvedComposite {
                 SP<ITexture>                                       texture;
                 CBox                                               box;
@@ -948,76 +952,41 @@ void CHyprOpenGLImpl::end(CRenderContext& ctx) {
                 // damage scissors get the pane's origin added (glScissor is window-relative —
                 // m_scissorOffset).
                 //
-                // research/24 §3.3's producer table, decided by what the frame actually drew: the panes
-                // differ only if a stereo-declared window was cropped into this composite (WP S1). An
-                // ordinary desktop on a stereo output — the overwhelmingly common frame — takes the
-                // floor: ONE composite, blitted into every pane.
-                const bool PER_EYE             = ctx.m_data.stereoContentDrawn && PMONITOR->stereoPaneCount() > 1;
-                PMONITOR->m_stereoContentPanes = PER_EYE;
+                // WP D2 (research/24 §6.1): with the depth producer running, the panes are DIFFERENT
+                // images — ctx.m_data.stereoPaneFBs holds every composite but the last, which is still
+                // the offloaded buffer. Each then needs its own resolve. In the fast path that vector is
+                // empty, one resolve serves every pane, and this loop is what F1 shipped.
+                const bool         PERPANE = !ctx.m_data.stereoPaneFBs.empty();
 
-                // re-run this frame's pass with the next eye, back into the main work buffer. Safe to
-                // overwrite: the previous pane is already in the scanout frame, and every blit is
-                // scissored to damage, so the parts of the work buffer the replay does not repaint can
-                // never reach the output. The state dance restores the composite's own conventions
-                // (monitor projection, blending on, no final shader) before the pack takes over again.
-                //
-                // Surface feedback is blocked for the duration: this is the SAME frame, so every frame
-                // callback and wp_presentation feedback this pass owed was already sent by the first
-                // composite. Without the block each replayed surface queues a second (now empty)
-                // presentation record per pane per frame, and each discard path re-sends a discarded
-                // feedback for a surface that was already reported.
-                const auto RECOMPOSITE = [&](int eye) {
-                    const auto SAVED_DAMAGE   = ctx.m_data.damage;
-                    const auto SAVED_FEEDBACK = ctx.m_blockSurfaceFeedback;
+                // ...and WP S1's witness, which is a different question from PERPANE: the pane loop
+                // may be running for DEPTH alone, for stereo content alone, or for both. This one says
+                // whether the per-window UV crop actually reached a drawn surface this frame — the
+                // fullscreen gate, occlusion and "not on this output" all resolve into it — and it is
+                // what `hyprctl monitors` reports as `stereoContent` (research/24 §5.3).
+                PMONITOR->m_stereoContentPanes = ctx.m_data.stereoContentDrawn && PMONITOR->stereoPaneCount() > 1;
 
-                    g_pHyprRenderer->bindFB(ctx, ctx.m_data.mainFB);
-                    g_pHyprRenderer->setProjectionType(ctx, RPT_MONITOR);
-                    ctx.m_data.transformDamage = false;
-                    blend(true);
-                    ctx.m_blockSurfaceFeedback = true;
+                SResolvedComposite shared;
+                if (!PERPANE)
+                    shared = RESOLVE(ctx.m_data.currentFB->getTexture());
 
-                    ctx.m_data.stereoEye = eye;
-                    ctx.m_pass.replay(ctx);
-                    ctx.m_data.stereoEye = 0;
-
-                    ctx.m_blockSurfaceFeedback = SAVED_FEEDBACK;
-                    blend(false);
-
-                    ctx.m_data.damage = SAVED_DAMAGE;
-                    ctx.m_data.currentWindow.reset();
-                    ctx.m_data.surface.reset();
-                    ctx.m_data.clipBox = {};
-                };
-
-                SResolvedComposite resolved;
                 for (int i = 0; i < PMONITOR->stereoPaneCount(); ++i) {
-                    if (i == 0 || PER_EYE) {
-                        // everything in this block draws into a PANE-sized buffer at its own origin,
-                        // while m_scissorOffset still holds the previous iteration's destination origin
-                        // from the blit below. It is {0,0} for every layout shipped today (pane 0 sits
-                        // at the origin in both sbs and tab), so this is a guard rather than a fix —
-                        // but the guard is what keeps a future packing whose first pane is elsewhere
-                        // from scissoring the replay and the colour/shader resolves out of existence.
-                        m_scissorOffset = {};
-
-                        if (i > 0) {
-                            RELEASE(resolved);
-                            RECOMPOSITE(i);
-                        }
-
-                        resolved = RESOLVE(ctx.m_data.currentFB->getTexture());
-                    }
+                    SResolvedComposite perPane;
+                    if (PERPANE) // the last pane is the composite still in the offloaded buffer
+                        perPane = RESOLVE(i < sc<int>(ctx.m_data.stereoPaneFBs.size()) ? ctx.m_data.stereoPaneFBs[i]->getTexture() : ctx.m_data.currentFB->getTexture());
 
                     BINDOUTPUT();
                     const auto DEST = PMONITOR->stereoPaneDestBox(i);
                     setViewport(DEST.x, DEST.y, DEST.width, DEST.height);
                     m_scissorOffset = {DEST.x, DEST.y};
-                    BLIT(resolved);
+                    BLIT(PERPANE ? perPane : shared);
+
+                    if (PERPANE)
+                        RELEASE(perPane); // hand the work buffers back before the next pane asks for them
                 }
 
                 m_scissorOffset = {};
                 setViewport(0, 0, PMONITOR->m_pixelSize.x, PMONITOR->m_pixelSize.y);
-                RELEASE(resolved);
+                RELEASE(shared);
             } else {
                 auto resolved = RESOLVE(ctx.m_data.currentFB->getTexture());
                 BINDOUTPUT();
@@ -1039,6 +1008,8 @@ void CHyprOpenGLImpl::end(CRenderContext& ctx) {
     ctx.m_data.currentFB.reset();
     ctx.m_data.mainFB.reset();
     ctx.m_data.outFB.reset();
+    ctx.m_data.stereoPaneFBs.clear(); // hand the pane buffers back to the pool
+    ctx.m_data.stereoPaneDamage.clear();
     // invalidate our render FBs to signal to the driver we don't need them anymore
     ctx.m_data.pMonitor->resources()->forEachUnusedFB(
         [](const auto& fb) {
@@ -2208,9 +2179,15 @@ void CHyprOpenGLImpl::renderBorder(CRenderContext& ctx, const CBox& box, const C
     glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
 
     // calculate the border's region, which we need to render over. No need to run the shader on
-    // things outside there
-    CRegion borderRegion = ctx.m_data.damage.copy().intersect(newBox);
-    borderRegion.subtract(innerBox.copy().expand(-scaledBorderSize - round));
+    // things outside there.
+    //
+    // research/24 §8.1: with the stereo depth producer running, `box` carries a SUB-PIXEL disparity
+    // and both of these boxes become fractional on their way into pixman, which takes int32. The
+    // outer one must round outward or the ring loses the column the shader does cover; the inner
+    // one must round inward or the hole eats it instead. Untouched on a whole-pixel box, which is
+    // every box on an ordinary monitor.
+    CRegion borderRegion = ctx.m_data.damage.copy().intersect(Desktop::Depth::rasterCover(newBox));
+    borderRegion.subtract(Desktop::Depth::rasterInner(innerBox.copy().expand(-scaledBorderSize - round)));
 
     if (ctx.m_data.clipBox.width != 0 && ctx.m_data.clipBox.height != 0)
         borderRegion.intersect(ctx.m_data.clipBox);
@@ -2294,9 +2271,15 @@ void CHyprOpenGLImpl::renderBorder(CRenderContext& ctx, const CBox& box, const C
     glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
 
     // calculate the border's region, which we need to render over. No need to run the shader on
-    // things outside there
-    CRegion borderRegion = ctx.m_data.damage.copy().intersect(newBox);
-    borderRegion.subtract(innerBox.copy().expand(-scaledBorderSize - round));
+    // things outside there.
+    //
+    // research/24 §8.1: with the stereo depth producer running, `box` carries a SUB-PIXEL disparity
+    // and both of these boxes become fractional on their way into pixman, which takes int32. The
+    // outer one must round outward or the ring loses the column the shader does cover; the inner
+    // one must round inward or the hole eats it instead. Untouched on a whole-pixel box, which is
+    // every box on an ordinary monitor.
+    CRegion borderRegion = ctx.m_data.damage.copy().intersect(Desktop::Depth::rasterCover(newBox));
+    borderRegion.subtract(Desktop::Depth::rasterInner(innerBox.copy().expand(-scaledBorderSize - round)));
 
     if (ctx.m_data.clipBox.width != 0 && ctx.m_data.clipBox.height != 0)
         borderRegion.intersect(ctx.m_data.clipBox);
@@ -2395,9 +2378,13 @@ void CHyprOpenGLImpl::renderRoundedShadow(CRenderContext& ctx, const CBox& box, 
             if (const auto WINDOWBOX = PWINDOW->surfaceLogicalBox(); WINDOWBOX.has_value()) {
                 CBox scaledWindowBox = WINDOWBOX.value();
 
-                scaledWindowBox.translate(presentation.workspaceOffset + presentation.floatingOffset);
+                // research/24 §6.2 injection point 1: the blur cutout follows the raised window
+                const auto DEPTHOFFSET = g_pHyprRenderer->depthRenderOffset(PWINDOW);
+                scaledWindowBox.translate(presentation.workspaceOffset + presentation.floatingOffset + DEPTHOFFSET);
                 scaledWindowBox.translate(-m_renderData.pMonitor->m_position);
-                scaledWindowBox.scale(m_renderData.pMonitor->m_scale).round();
+                scaledWindowBox.scale(m_renderData.pMonitor->m_scale);
+                // §8.1's seam: the cutout is the WINDOW's outline, so it quantises with the window
+                Desktop::Depth::roundKeepingDisparity(scaledWindowBox, DEPTHOFFSET.x * m_renderData.pMonitor->m_scale);
                 m_renderData.renderModif.applyToBox(scaledWindowBox);
 
                 const auto cutoutTopLeft     = scaledWindowBox.pos() - newBox.pos();
@@ -2410,7 +2397,9 @@ void CHyprOpenGLImpl::renderRoundedShadow(CRenderContext& ctx, const CBox& box, 
                 shader->setUniformFloat2(SHADER_WINDOW_BOTTOM_RIGHT, sc<float>(cutoutBottomRight.x), sc<float>(cutoutBottomRight.y));
                 shader->setUniformFloat(SHADER_THICK, cutoutRadius);
 
-                drawRegion.subtract(scaledWindowBox.copy().expand(-sc<int>(std::round(cutoutRadius))));
+                // rounded INWARD: a subtracted box that truncates outward punches a column out of
+                // the shadow the shader would have drawn (see renderBorder)
+                drawRegion.subtract(Desktop::Depth::rasterInner(scaledWindowBox.copy().expand(-sc<int>(std::round(cutoutRadius)))));
             }
         }
     }

@@ -22,7 +22,7 @@ namespace Render::GL {
         void   invalidate(const std::vector<GLenum>& attachments);
 
         // clear at most once per invalidate()
-        void clearAfterInvalidation();
+        void clearAfterInvalidation() override;
 
       protected:
         bool internalAlloc(int w, int h, DRMFormat format = DRM_FORMAT_ARGB8888) override;
