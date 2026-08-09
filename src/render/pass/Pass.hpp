@@ -19,6 +19,17 @@ namespace Render {
 
         CRegion render(const CRegion& damage_);
 
+        // research/24 §3.3/§5.3 (WP S1): re-execute the pass THIS FRAME, unchanged, into whatever
+        // framebuffer is bound now. The stereo producer uses it for the second eye: the elements
+        // already know what they draw, the only thing that differs is the stereo eye in render
+        // data, so a second composite is a replay rather than a second scene build (which would
+        // double-send frame callbacks and re-run every layout query).
+        //
+        // Deliberately reuses render()'s simplify/blur decisions and its per-element damage — the
+        // eye changes UVs, never geometry — and deliberately does NOT re-discard: presentFeedback
+        // for an invisible surface is a per-frame protocol event, not a per-composite one.
+        CRegion replay();
+
       private:
         CRegion              m_damage;
         std::vector<CRegion> m_occludedRegions;

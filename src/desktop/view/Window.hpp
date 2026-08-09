@@ -22,6 +22,7 @@
 #include "../rule/windowRule/WindowRuleApplicator.hpp"
 #include "../../protocols/types/ContentType.hpp"
 #include "../../render/Framebuffer.hpp"
+#include "../../render/StereoContent.hpp"
 #include "types/GeometricMovableAnimated.hpp"
 #include "types/AlphaModifiable.hpp"
 #include "animationControllers/WindowAnimationController.hpp"
@@ -415,6 +416,10 @@ namespace Desktop::View {
         void                              deactivateGroupMembers();
         bool                              isNotResponding();
         std::optional<std::string>        xdgTag();
+        // research/24 §5.3 (WP S1): the resolved per-window stereo content layout — the rule, the
+        // client's tag and the fullscreen gate folded into one enum. CONTENT_OFF for every window
+        // that has no stereo rule, which is every window in an unconfigured session.
+        Render::Stereo::eContentLayout    stereoLayout();
         std::optional<std::string>        xdgDescription();
         PHLWINDOW                         parent();
         bool                              priorityFocus();

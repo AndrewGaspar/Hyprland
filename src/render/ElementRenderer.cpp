@@ -50,9 +50,48 @@ static std::optional<Vector2D> getSurfaceExpectedSize(PHLWINDOW pWindow, SP<CWLS
     return std::nullopt;
 }
 
+// research/24 §5.3 + F7 (WP S1): the whole per-window stereo producer, at the one seam where UVs are
+// decided. While pane i of a stereo output is composited, a window whose content is declared packed
+// samples only its eye-i half of whatever UV range it had already resolved to — so it composes with
+// a wp_viewporter source box instead of fighting it, and the destination box is untouched, which is
+// what keeps input, layout and decorations completely unaware that any of this happened.
+//
+// It is deliberately confined to the window's MAIN surface: subsurfaces (a player's OSD) and popups
+// are chrome the client drew once, not packed content, and they belong at screen depth in both eyes.
+//
+// The flag it raises is the trigger for the second composite (CHyprOpenGLImpl::end()). Setting it
+// HERE rather than from a scan of the monitor's windows is what makes the fast path exact: if a
+// stereo window was occluded, discarded or simply not on this pane, nothing was cropped, the panes
+// really are identical, and the frame costs one composite plus one extra blit.
+static void applyStereoContentCrop(PHLWINDOW pWindow, PHLMONITOR pMonitor, bool main) {
+    auto& renderData = g_pHyprRenderer->m_renderData;
+
+    if (!main || !pWindow || !pMonitor || !pMonitor->isStereo())
+        return;
+
+    const auto LAYOUT = pWindow->stereoLayout();
+    if (Render::Stereo::viewCount(LAYOUT) < 2)
+        return;
+
+    // (-1,-1) is the pass-wide "no UV mods" sentinel, i.e. the whole buffer.
+    const bool                     SENTINEL = renderData.primarySurfaceUVTopLeft == Vector2D(-1, -1) || renderData.primarySurfaceUVBottomRight == Vector2D(-1, -1);
+    const Render::Stereo::SUVRange BASE =
+        SENTINEL ? Render::Stereo::SUVRange{} : Render::Stereo::SUVRange{renderData.primarySurfaceUVTopLeft, renderData.primarySurfaceUVBottomRight};
+
+    const auto CROPPED = Render::Stereo::cropForEye(BASE, LAYOUT, renderData.stereoEye);
+
+    renderData.primarySurfaceUVTopLeft     = CROPPED.tl;
+    renderData.primarySurfaceUVBottomRight = CROPPED.br;
+    renderData.stereoContentDrawn          = true;
+}
+
 void IElementRenderer::calculateUVForSurface(PHLWINDOW pWindow, SP<CWLSurfaceResource> pSurface, PHLMONITOR pMonitor, bool main, const Vector2D& projSize,
                                              const Vector2D& projSizeUnscaled, bool fixMisalignedFSV1) {
     auto& m_renderData = g_pHyprRenderer->m_renderData;
+
+    // the stereo crop runs on the way out of every branch below (the early return above it is the
+    // !main || !pWindow case, where the crop is a no-op by definition)
+    const Hyprutils::Utils::CScopeGuard STEREO_CROP{[pWindow, pMonitor, main] { applyStereoContentCrop(pWindow, pMonitor, main); }};
 
     if (!pWindow || !pWindow->m_isX11) {
         static auto PEXPANDEDGES = CConfigValue<Hyprlang::INT>("render:expand_undersized_textures");

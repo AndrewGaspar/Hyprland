@@ -7,6 +7,7 @@
 #include "../../../managers/fullscreen/FullscreenController.hpp"
 #include "../../../desktop/state/FocusState.hpp"
 #include "../../../protocols/types/ContentType.hpp"
+#include "../../../render/StereoContent.hpp"
 #include "../../../config/shared/parserUtils/ParserUtils.hpp"
 #include "desktop/rule/windowRule/WindowRuleEffectContainer.hpp"
 
@@ -282,6 +283,18 @@ static std::expected<WindowRuleEffectValue, std::string> parseWindowRuleEffect(C
         case WINDOW_RULE_EFFECT_SUPPRESSEVENT: return parseStringList(raw);
 
         case WINDOW_RULE_EFFECT_CONTENT: return sc<int64_t>(NContentType::fromString(raw));
+
+        // stereo content (research/24 §5.3, WP S1): `stereo <layout> [always|fullscreen]`. Parsed
+        // here, once, into the packed integer the renderer reads per surface per frame — the parser
+        // itself lives in a pure header so the .conf front-end, the Lua binding and the gtests all
+        // run the same grammar.
+        case WINDOW_RULE_EFFECT_STEREO: {
+            auto parsed = Render::Stereo::parseDeclaration(raw);
+            if (!parsed)
+                return std::unexpected(parsed.error());
+            return Render::Stereo::packDeclaration(*parsed);
+        }
+
         case WINDOW_RULE_EFFECT_TONEMAP: {
             if (raw == "1" || raw == "on")
                 return 1;

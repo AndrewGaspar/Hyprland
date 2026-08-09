@@ -601,6 +601,59 @@ TEST_CASE(contentWindowRules) {
 #undef TEST_PROPS
 }
 
+// WP S1 — `windowrule = stereo <layout>` (research/24 §4.3, §5.3, §7.1).
+//
+// This asserts the DECLARATION, not the pixels: what `hyprctl clients` reports is the layout the
+// renderer would crop with, resolved from the rule, the client's tag and the fullscreen gate. The
+// crop itself only engages on a monitor that is producing a pane pair, and asserting the two panes
+// differ needs a readback of the packed scanout buffer, which no client can see (see the note at
+// the top of tests/main/stereo.cpp).
+//
+// It runs under the LUA config, which is the point: a stereo effect wired only into the classic
+// front-end would silently do nothing here — research/24 F8's exact failure, and the reason the
+// effect went into windowrule rather than into a new keyword.
+TEST_CASE(stereoWindowRules) {
+    OK(getFromSocket("/eval hl.window_rule({ match = { class = 'kitty_stereo_always' }, stereo = 'sbs always' })"));
+    OK(getFromSocket("/eval hl.window_rule({ match = { class = 'kitty_stereo_gated' }, stereo = 'hsbs' })"));
+    OK(getFromSocket("/eval hl.window_rule({ match = { class = 'kitty_stereo_off' }, stereo = 'off' })"));
+
+    // `always` is the manual verb: the user said so, so it engages windowed
+    SPAWN_KITTY("kitty_stereo_always");
+    EXPECT(waitForActiveWindow("kitty_stereo_always"), true);
+    EXPECT_CONTAINS(getFromSocket("/activewindow"), "stereo: sbs");
+
+    Tests::killAllWindows();
+    ASSERT(Tests::windowCount(), 0);
+
+    // and without it, §4.3's negative heuristic holds: half-cropping a windowed desktop is the
+    // failure mode users report as "the compositor broke", so a plain rule waits for fullscreen
+    SPAWN_KITTY("kitty_stereo_gated");
+    EXPECT(waitForActiveWindow("kitty_stereo_gated"), true);
+    EXPECT_CONTAINS(getFromSocket("/activewindow"), "stereo: off");
+
+    OK(getFromSocket("/dispatch hl.dsp.window.fullscreen()"));
+    EXPECT(waitForActiveWindow("kitty_stereo_gated", '2'), true);
+    EXPECT_CONTAINS(getFromSocket("/activewindow"), "stereo: hsbs");
+
+    OK(getFromSocket("/dispatch hl.dsp.window.fullscreen()"));
+    EXPECT(waitForActiveWindow("kitty_stereo_gated", '0'), true);
+    EXPECT_CONTAINS(getFromSocket("/activewindow"), "stereo: off");
+
+    Tests::killAllWindows();
+    ASSERT(Tests::windowCount(), 0);
+
+    // `off` is the off switch, and every window without a rule at all is already off
+    SPAWN_KITTY("kitty_stereo_off");
+    EXPECT(waitForActiveWindow("kitty_stereo_off"), true);
+    EXPECT_CONTAINS(getFromSocket("/activewindow"), "stereo: off");
+
+    Tests::killAllWindows();
+    ASSERT(Tests::windowCount(), 0);
+
+    // a layout the grammar does not have must be refused, not silently ignored
+    EXPECT_CONTAINS(getFromSocket("/eval hl.window_rule({ match = { class = 'kitty_stereo_bad' }, stereo = 'lr' })"), "unknown layout");
+}
+
 TEST_CASE(issue14038) {
     SPAWN_KITTY("kitty_14038");
 

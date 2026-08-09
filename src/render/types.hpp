@@ -104,6 +104,15 @@ namespace Render {
 
         bool                   transformDamage = true;
         bool                   noSimplify      = false;
+
+        // stereo content (research/24 §5.3, WP S1). `stereoEye` names which pane of a stereo output
+        // is currently being composited — 0 is the left eye and is what every non-stereo render is.
+        // `stereoContentDrawn` is set by the UV crop when a stereo-declared surface actually made it
+        // onto this pane, and is what tells the pack in CHyprOpenGLImpl::end() that the panes differ
+        // and a second composite is owed. Nothing stereo drawn ⇒ one composite blitted N times, the
+        // §3.3 floor, which is the ordinary desktop on a stereo output.
+        int  stereoEye          = 0;
+        bool stereoContentDrawn = false;
     };
 
     struct STFRange {

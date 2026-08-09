@@ -104,6 +104,10 @@ namespace Config::Lua::Bindings::Internal {
         {"stay_focused", []() -> ILuaConfigValue* { return new CLuaConfigBool(false); }, WE::WINDOW_RULE_EFFECT_STAY_FOCUSED},
         {"confine_pointer", []() -> ILuaConfigValue* { return new CLuaConfigBool(false); }, WE::WINDOW_RULE_EFFECT_CONFINE_POINTER},
         {"tonemap", []() -> ILuaConfigValue* { return new CLuaConfigString(STRVAL_EMPTY); }, WE::WINDOW_RULE_EFFECT_TONEMAP},
+        // stereo content (research/24 §5.3, WP S1). This table is name-keyed and NOT enum-ordered, so
+        // omitting this line would silently mean "unavailable from Lua" with no compile error — the
+        // exact F8 failure the whole design is built to avoid.
+        {"stereo", []() -> ILuaConfigValue* { return new CLuaConfigString(STRVAL_EMPTY); }, WE::WINDOW_RULE_EFFECT_STEREO},
     };
 
     std::string                                        argStr(lua_State* L, int idx);
