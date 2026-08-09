@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../SafeKill.hpp"
+
 #include <hyprutils/os/Process.hpp>
 #include <hyprutils/memory/WeakPtr.hpp>
 #include <sys/types.h>

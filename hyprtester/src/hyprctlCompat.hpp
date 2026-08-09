@@ -1,5 +1,9 @@
 #pragma once
 
+// Safe::signalPid / Safe::pidAlive. Pulled in here because every test TU already includes this
+// header, and the harness must never reach for raw kill(2) — see SafeKill.hpp.
+#include "SafeKill.hpp"
+
 #include <vector>
 #include <string>
 #include <cstdint>
