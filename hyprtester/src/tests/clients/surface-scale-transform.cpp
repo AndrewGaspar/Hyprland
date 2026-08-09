@@ -179,9 +179,17 @@ TEST_CASE(surfaceScaleTransform) {
         client.emplace();
     } catch (const std::exception& e) { FAIL_TEST("Couldn't start the surface scale/transform client: {}", e.what()); }
 
-    ASSERT_CONTAINS(client->command("report"), "root_scale=2");
-    ASSERT_CONTAINS(client->command("report"), "root_fraction=180");
-    ASSERT_CONTAINS(client->command("report"), "root_transform=0");
+    // The scale/fraction the client reports arrives on its own wl_surface events, which it has to
+    // receive and process after the roundtrip that made it mappable — asking for the report in the
+    // same breath as creating the client is a race, and one the (nested, loaded) test container
+    // loses often enough to be seen. The rest of this test already waits for exactly this kind of
+    // client-side settling; do the same for the first report. It also stops the failure message
+    // lying: EXPECT/ASSERT_CONTAINS evaluates its haystack twice, so a side-effecting one printed a
+    // SECOND, later report that did contain what the first one lacked.
+    const std::string firstReport = waitCommandContains(*client, "report", "root_scale=2");
+    ASSERT_CONTAINS(firstReport, "root_scale=2");
+    ASSERT_CONTAINS(firstReport, "root_fraction=180");
+    ASSERT_CONTAINS(firstReport, "root_transform=0");
 
     OK(getFromSocket("/eval hl.monitor({ output = 'HEADLESS-2', mode = '1920x1080@60', position = '0x0', scale = '1.5', transform = 1 })"));
     ASSERT_CONTAINS(waitCommandContains(*client, "report", "root_transform=1"), "root_transform=1");
