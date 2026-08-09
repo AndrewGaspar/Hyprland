@@ -828,6 +828,39 @@ TEST_CASE(stereoTaggedWindowSamplesOneHalfPerPane) {
     NLog::log("{}4. tagged stereo:sbs on a MONO output — the packed frame, shown as-is", Colors::YELLOW);
     probeCase(CONTROL_MON, "stereo:sbs", "sbs", "abcd");
     EXPECT(monitorField(CONTROL_MON, "stereoContent"), std::string("")); // no stereo, no content panes
+
+    Tests::killAllWindows();
+    Tests::waitUntilWindowsN(0);
+
+    // 3 above is a control across FRAMES: nothing stereo was on screen, so the pack took its fast
+    // path and the replay never ran. This is the control WITHIN one frame — a declared and an
+    // undeclared window composited together, so every frame goes through the second composite while
+    // one of the two windows must come out of it byte-identical to the first.
+    //
+    // That is the property the crop's placement buys (it hangs off ONE surface's UV resolution, not
+    // off the monitor), and the one a replay that leaked eye state — into the pass's shared render
+    // data, into a neighbouring surface, into a cached UV — would break while leaving cases 1-3
+    // green. Spawning the undeclared client second makes it the focused window without unmapping the
+    // declared one, so a single probe answers it.
+    NLog::log("{}5. a declared and an undeclared window in the SAME frame — only the declared one is cropped", Colors::YELLOW);
+    OK(getFromSocket(std::format("/dispatch hl.dsp.focus({{ monitor = '{}' }})", STEREO_MON)));
+
+    const int     BEFORE_TAGGED = Tests::windowCount();
+    SWindowClient tagged({"--paint", "--tag", "stereo:sbs"});
+    ASSERT(tagged.waitForWindow(BEFORE_TAGGED), true);
+    Tests::sync();
+    EXPECT(waitForPaneSignature(STEREO_MON, "aacc"), true);
+
+    const int     BEFORE_PLAIN = Tests::windowCount();
+    SWindowClient plain({"--paint"});
+    ASSERT(plain.waitForWindow(BEFORE_PLAIN), true);
+    Tests::sync();
+
+    // the declared window is still on screen, so the replay is still running on every frame...
+    EXPECT(waitForMonitorField(STEREO_MON, "stereoContent", "true"), true);
+    // ...and the window that declared nothing sampled its whole buffer anyway
+    EXPECT_CONTAINS(getFromSocket("/activewindow"), "stereo: off");
+    EXPECT(waitForPaneSignature(STEREO_MON, "abcd"), true);
 }
 
 // stereoRuleFoldAndProvenance — which instruction wins when several apply (research/24 §4.2, §4.5).
