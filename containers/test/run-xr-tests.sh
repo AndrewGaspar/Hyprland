@@ -83,8 +83,15 @@ command -v labwc >/dev/null || { log "FATAL: labwc not installed"; FINAL_RC=2; e
 [[ -e "$XR_GPU_NODE" ]]    || log "WARNING: GPU node $XR_GPU_NODE does not exist inside the container"
 
 # --- 1. bring up labwc (headless nesting host, GPU-pinned) ---------------------
-log "starting labwc headless (WLR_RENDER_DRM_DEVICE=$XR_GPU_NODE)"
+# Clear stale sockets first: a compositor under test is SIGKILLed at the end of a
+# run and leaves its wayland-N behind, so the "first wayland-* in the dir" pick
+# below can name a socket nobody is listening on — which then looks exactly like a
+# nesting failure ("failed to launch in both headless and nested modes").
+systemctl --user stop "$LABWC_UNIT"        2>/dev/null || true
 systemctl --user reset-failed "$LABWC_UNIT" 2>/dev/null || true
+rm -f "$XDG_RUNTIME_DIR"/wayland-* 2>/dev/null || true
+
+log "starting labwc headless (WLR_RENDER_DRM_DEVICE=$XR_GPU_NODE)"
 systemd-run --user --quiet --unit="$LABWC_UNIT" \
     --setenv=XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
     --setenv=WLR_BACKENDS=headless \

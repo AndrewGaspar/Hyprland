@@ -58,8 +58,9 @@ cmake -S "$SRC" -B "$BUILD" -G Ninja \
 # --target list that omits them leaves them missing. Tests that need one then SKIP — and a skip
 # counts as a PASS in this harness, so the suite stays green while silently losing coverage
 # (xr_idle_inhibit / xr_idle_inhibit_modes need `idle-notify`, xr_plugged_* need `pointer-scroll`).
-# Build them explicitly.
-HYPRTESTER_CLIENTS=(pointer-warp surface-scale-transform pointer-scroll child-window xdg-interactive shortcut-inhibitor keyboard-modifiers idle-notify)
+# Build them explicitly — this list must stay in sync with `clientNew()` in that CMakeLists, or
+# the missing ones go back to skipping silently.
+HYPRTESTER_CLIENTS=(pointer-warp surface-scale-transform pointer-scroll child-window xdg-interactive shortcut-inhibitor keyboard-modifiers idle-notify layer-surface output-info screencopy-crop screencopy-probe)
 
 echo "==> Building targets: Hyprland hyprtester ${HYPRTESTER_CLIENTS[*]}"
 cmake --build "$BUILD" --target Hyprland hyprtester "${HYPRTESTER_CLIENTS[@]}" -j"$JOBS"

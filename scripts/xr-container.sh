@@ -27,16 +27,23 @@
 #   check-gpu [--gpu amd|nvidia|intel|/dev/dri/renderD*]
 #       Standalone GPU smoke test (same as build --check-gpu).
 #
-#   test [--gpu amd|nvidia|intel|/dev/dri/renderD*] [--build] [--keep] [TEST_NAMES...]
-#       Hermetic in-container `hyprtester --xr` (WP2). Boots :session with NO
-#       host wayland/X/wivrn mounts, brings up a headless labwc as the nesting
-#       host inside, runs the XR suite nested into it, and reports the real
+#   test [--full] [--gpu amd|nvidia|intel|/dev/dri/renderD*] [--build] [--keep]
+#        [TEST_NAMES...]
+#       Hermetic in-container `hyprtester` (WP2). Boots :session with NO host
+#       wayland/X/wivrn mounts, brings up a headless labwc as the nesting
+#       host inside, runs the suite nested into it, and reports the real
 #       exit code (sentinel file — machinectl shell always exits 0). Everything
 #       (Hyprland + vendored monado null-compositor) runs inside the container.
+#       (default) the `--xr` suite (containers/test/run-xr-tests.sh).
+#       --full    the FULL non-XR suite instead (containers/test/run-full-tests.sh):
+#                 tests/{main,clients,misc}. This suite cannot run on the host at
+#                 all — the host has no kitty (108 of the cases spawn one) and a
+#                 non-`--xr` hyprtester there can select the developer's LIVE
+#                 compositor. In here there is no live session to hit.
 #       --build   force an in-container build (build-in-ctr.sh) before testing;
 #                 otherwise auto-builds only if /build has no binaries.
 #       --keep    leave the container running afterwards (for debugging).
-#       TEST_NAMES  optional subset of xr test names to run (else the whole
+#       TEST_NAMES  optional subset of test names to run (else the whole
 #                 group), passed straight through to hyprtester.
 #       On failure, artifacts (run log + preserved /tmp/hyprtester-xr-* dirs
 #       with hyprland + monado logs) are copied to containers/artifacts/<ts>/.
@@ -127,6 +134,7 @@ INSTALL_IN_CTR="/tmp/omarchy-install-ctr.sh"
 CCACHE_DIR_IN_CTR="/home/dev/.cache/ccache"
 BUILD_IN_CTR_SCRIPT="$REPO/containers/build-in-ctr.sh"
 RUN_XR_TESTS_SCRIPT="$REPO/containers/test/run-xr-tests.sh"
+RUN_FULL_TESTS_SCRIPT="$REPO/containers/test/run-full-tests.sh"
 ARTIFACTS_DIR="$REPO/containers/artifacts"
 
 # GPU render nodes are resolved at run time by resolve_render_node (scripts/lib/
@@ -525,14 +533,14 @@ cmd_shell() {
     log "Shell exited; container removed."
 }
 
-# --- test (WP2): hermetic in-container `hyprtester --xr` ----------------------
+# --- test (WP2): hermetic in-container `hyprtester` ---------------------------
 # Boots :session (no host wayland/X/wivrn mounts — hermetic by construction),
 # ensures /build is populated (auto-builds if not), runs containers/test/
-# run-xr-tests.sh as dev via machinectl (labwc headless nest -> hyprtester --xr),
+# run-{xr,full}-tests.sh as dev via machinectl (labwc headless nest -> hyprtester),
 # reads the real exit code from a sentinel, copies artifacts out on failure, and
 # removes the container on ALL exit paths.
 cmd_test() {
-    local gpu="amd" keep=0 do_build=0
+    local gpu="amd" keep=0 do_build=0 suite="xr"
     local -a testnames=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -540,6 +548,7 @@ cmd_test() {
             --gpu=*)   gpu="${1#--gpu=}" ;;
             --keep)    keep=1 ;;
             --build)   do_build=1 ;;
+            --full)    suite="full" ;;
             -h|--help) usage; exit 0 ;;
             -*)        die "test: unknown flag $1" ;;
             *)         testnames+=("$1") ;;   # hyprtester test-name filter (subset)
@@ -547,7 +556,17 @@ cmd_test() {
         shift
     done
     podman image exists "$IMG_SESSION" || die "session image not built (run: $0 build)"
-    [[ -f $RUN_XR_TESTS_SCRIPT ]] || die "missing $RUN_XR_TESTS_SCRIPT"
+
+    # Per-suite wiring: which runner, which sentinel/log, what the messages call it.
+    local runner sentinel runlog label
+    if [[ $suite == full ]]; then
+        runner="$RUN_FULL_TESTS_SCRIPT"; sentinel="/tmp/hypxrland-full-tests.exit"
+        runlog="/tmp/hypxrland-full-tests.log"; label="full (non-XR)"
+    else
+        runner="$RUN_XR_TESTS_SCRIPT";   sentinel="/tmp/hypxrland-xr-tests.exit"
+        runlog="/tmp/hypxrland-xr-tests.log"; label="XR"
+    fi
+    [[ -f $runner ]] || die "missing $runner"
 
     # GPU device args (host-side). The render node the suite pins (gpu_node) is
     # resolved INSIDE the container after boot — see gpu_node_in_ctr below — so a
@@ -597,26 +616,27 @@ cmd_test() {
     fi
 
     # Run the suite. machinectl shell always exits 0 -> real rc from the sentinel.
-    local sentinel="/tmp/hypxrland-xr-tests.exit"
-    log "Running hermetic XR suite in-container (labwc nest -> hyprtester --xr)"
+    log "Running hermetic $label suite in-container (labwc nest -> hyprtester)"
     podman exec "$ctr" rm -f "$sentinel" >/dev/null 2>&1 || true
     podman exec "$ctr" machinectl shell dev@.host /usr/bin/bash -lc \
-        "XR_GPU_NODE='$gpu_node' bash /src/containers/test/run-xr-tests.sh ${testnames[*]:-}" || true
+        "XR_GPU_NODE='$gpu_node' bash /src/containers/test/$(basename "$runner") ${testnames[*]:-}" || true
 
     local rc
     rc=$(podman exec "$ctr" cat "$sentinel" 2>/dev/null || echo missing)
-    log "XR suite sentinel exit code: $rc"
+    log "$label suite sentinel exit code: $rc"
 
     if [[ "$rc" != 0 ]]; then
-        # Preserve artifacts: the combined run log + every preserved
-        # /tmp/hyprtester-xr-* dir (the harness keeps these on failure, incl.
-        # hyprland logs + monado.log).
+        # Preserve artifacts: the combined run log, every preserved
+        # /tmp/hyprtester-xr-* dir (the XR harness keeps these on failure, incl.
+        # hyprland logs + monado.log), and the per-test dumps hyprtester writes
+        # into hyprtester/artifacts/ — which lives in the /src OVERLAY and would
+        # otherwise die with the container.
         local ts stamp
         ts=$(date +%Y%m%d-%H%M%S)
         stamp="$ARTIFACTS_DIR/$ts"
         mkdir -p "$stamp"
-        warn "XR suite failed (rc=$rc) — collecting artifacts into $stamp"
-        podman cp "$ctr:/tmp/hypxrland-xr-tests.log" "$stamp/xr-tests.log" >/dev/null 2>&1 || true
+        warn "$label suite failed (rc=$rc) — collecting artifacts into $stamp"
+        podman cp "$ctr:$runlog" "$stamp/$(basename "$runlog")" >/dev/null 2>&1 || true
         # copy each preserved run dir
         local dirs
         dirs=$(podman exec "$ctr" bash -lc 'ls -d /tmp/hyprtester-xr-* 2>/dev/null' || true)
@@ -624,6 +644,8 @@ cmd_test() {
         for d in $dirs; do
             podman cp "$ctr:$d" "$stamp/$(basename "$d")" >/dev/null 2>&1 || true
         done
+        podman exec "$ctr" bash -lc 'ls /src/hyprtester/artifacts >/dev/null 2>&1' \
+            && podman cp "$ctr:/src/hyprtester/artifacts" "$stamp/test-artifacts" >/dev/null 2>&1 || true
         echo "   Artifacts: $stamp"
         ls -la "$stamp" 2>/dev/null | sed 's/^/     /' || true
     fi
@@ -637,10 +659,10 @@ cmd_test() {
     trap - EXIT INT TERM
 
     if [[ "$rc" == 0 ]]; then
-        log "XR suite PASSED in-container (hermetic, --gpu $gpu)"
+        log "$label suite PASSED in-container (hermetic, --gpu $gpu)"
         return 0
     fi
-    die "XR suite FAILED in-container (rc=$rc)"
+    die "$label suite FAILED in-container (rc=$rc)"
 }
 
 # --- session -----------------------------------------------------------------
