@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <csignal>
+#include <format>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -70,6 +71,34 @@ namespace {
             return "";
 
         return depthAfter(json, KEYPOS);
+    }
+
+    // every window's address, in the order `hyprctl clients` lists them. Two windows from the same
+    // binary share a class and a title, so the address is the only handle that tells them apart.
+    std::vector<std::string> clientAddresses() {
+        const auto               JSON = getFromSocket("j/clients");
+        static const std::string KEY  = "\"address\": \"";
+
+        std::vector<std::string> out;
+        for (auto pos = JSON.find(KEY); pos != std::string::npos; pos = JSON.find(KEY, pos + KEY.length())) {
+            const auto START = pos + KEY.length();
+            const auto END   = JSON.find('"', START);
+            if (END == std::string::npos)
+                break;
+            out.emplace_back(JSON.substr(START, END - START));
+        }
+        return out;
+    }
+
+    // ...and that window's depth. `depth` is printed near the end of each client object and
+    // `address` at the start of it, so the first depth AFTER the address is this window's.
+    std::string depthOfWindow(const std::string& address) {
+        const auto JSON = getFromSocket("j/clients");
+        const auto POS  = JSON.find("\"address\": \"" + address + "\"");
+        if (POS == std::string::npos)
+            return "";
+
+        return depthAfter(JSON, POS);
     }
 
     // poll until the predicate holds; every step here is asynchronous (map, rule refresh, animation
@@ -148,4 +177,93 @@ TEST_CASE(depthLadderIsObservable) {
 
     const auto LAYER_DEPTH = pollFor([] { return layerDepth(getFromSocket("j/layers"), DEPTH_LAYER_NS); }, DEPTH_LAYERS);
     EXPECT(LAYER_DEPTH, std::string{DEPTH_LAYERS});
+}
+
+// depthFocusRaiseSwapsTheRungs — §7.3's central claim, wired end to end (WP D4).
+//
+// "The rise IS the focus indicator." depthLadderIsObservable proves ONE window arrives on the
+// focused rung; this proves the ladder is a ladder — the focused window and an ordinary one sit on
+// different rungs at the same time, and they SWAP the moment focus does. That is the property the
+// whole design rests on, and it is the one that would break silently if updateDepth() stopped
+// running on the events §7.2 allows depth to move on.
+//
+// The third event is fullscreen, which is not a rung but a demotion: a fullscreen window IS the
+// plane, so it drops to 0 and takes the whole panel with it rather than floating the desktop.
+//
+// Nothing here is timing-sensitive despite the name: hyprtester's config disables animations, so
+// `hyprctl clients` reports the settled value the instant the goal moves. With the windowsDepth
+// animation on, the same polling waits out the ease.
+TEST_CASE(depthFocusRaiseSwapsTheRungs) {
+    // ConfigValues.cpp's shipped tiers, and the plane a fullscreen window falls back to
+    constexpr const char* UNFOCUSED = "0.200";
+    constexpr const char* PLANE     = "0.000";
+
+    // depthLadderIsObservable leaves a `depth 0.35` rule matching every window behind — a named Lua
+    // rule lives as long as the compositor — and §7.2 says a rule beats the tier, so it would pin
+    // both windows to the same rung. Switch it off before asking what the tiers are.
+    OK(getFromSocket("/eval hl.window_rule({ name = 'depth-integration', enabled = false })"));
+
+    struct SWindow {
+        CSharedPointer<CProcess> proc;
+        int                      stdinWrite = -1;
+
+        SWindow() {
+            int pipeFds[2];
+            if (pipe(pipeFds) != 0)
+                return;
+
+            proc       = makeShared<CProcess>(binaryDir + "/xdg-interactive", std::vector<std::string>{});
+            stdinWrite = pipeFds[1];
+            proc->setStdinFD(pipeFds[0]);
+            proc->addEnv("WAYLAND_DISPLAY", WLDISPLAY);
+            proc->runAsync();
+        }
+
+        ~SWindow() {
+            if (proc && Tests::processAlive(proc->pid()))
+                kill(proc->pid(), SIGTERM);
+            if (stdinWrite >= 0)
+                close(stdinWrite);
+        }
+    };
+
+    SWindow     first, second;
+    CScopeGuard guard = {[&]() { Tests::killAllWindows(); }};
+
+    bool        bothUp = false;
+    for (int i = 0; i < 100 && !bothUp; ++i) {
+        bothUp = Tests::windowCount() == 2;
+        if (!bothUp)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    ASSERT(bothUp, true);
+    Tests::sync();
+
+    const auto ADDRESSES = clientAddresses();
+    ASSERT(ADDRESSES.size(), sc<size_t>(2));
+
+    // the two rungs, checked as a PAIR each time: what matters is that they differ and which way
+    const auto expectRungs = [&](const std::string& focused, const std::string& other, const char* focusedWants) {
+        EXPECT(pollFor([&] { return depthOfWindow(focused); }, focusedWants), std::string{focusedWants});
+        EXPECT(pollFor([&] { return depthOfWindow(other); }, UNFOCUSED), std::string{UNFOCUSED});
+    };
+
+    // --- focus the first window: it rises, the other one sits one step off the page ---
+    OK(getFromSocket(std::format("/dispatch hl.dsp.focus({{ window = 'address:{}' }})", ADDRESSES[0])));
+    expectRungs(ADDRESSES[0], ADDRESSES[1], DEPTH_FOCUSED);
+
+    // --- focus the other one and the rungs swap, both of them ---
+    //
+    // Both halves are asserted because a producer that only ever raised the newly focused window
+    // (and never lowered the old one) would leave the desktop climbing, one window at a time, until
+    // everything was at the top of the ladder and the focus cue was gone.
+    OK(getFromSocket(std::format("/dispatch hl.dsp.focus({{ window = 'address:{}' }})", ADDRESSES[1])));
+    expectRungs(ADDRESSES[1], ADDRESSES[0], DEPTH_FOCUSED);
+
+    // --- fullscreen is not a rung: the focused window becomes the plane, and comes back ---
+    OK(getFromSocket("/dispatch hl.dsp.window.fullscreen()"));
+    expectRungs(ADDRESSES[1], ADDRESSES[0], PLANE);
+
+    OK(getFromSocket("/dispatch hl.dsp.window.fullscreen()"));
+    expectRungs(ADDRESSES[1], ADDRESSES[0], DEPTH_FOCUSED);
 }

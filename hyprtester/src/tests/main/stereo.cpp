@@ -161,6 +161,79 @@ namespace {
         return proc.stdOut();
     }
 
+    // The same client's OTHER verb (WP D4): the mass-weighted centroid of everything on the output
+    // that is not the background. A rigid translation of the foreground moves it by exactly the
+    // translation, sub-pixel included, which is how a few pixels of stereo disparity become
+    // measurable from outside the process.
+    std::string screencopyCentroid(const std::string& monitor) {
+        CProcess proc(binaryDir + "/screencopy-crop", {"--centroid", monitor});
+        proc.addEnv("WAYLAND_DISPLAY", WLDISPLAY);
+        if (!proc.runSync() && proc.stdOut().empty())
+            return "";
+        return proc.stdOut();
+    }
+
+    struct SCentroid {
+        double      x = -1.0, y = -1.0, mass = 0.0;
+        int         corners = 0;
+        bool        stable  = false;
+        std::string dump;
+
+        bool        usable() const {
+            return stable && corners == 4 && mass > 0.0 && x >= 0.0;
+        }
+    };
+
+    // the token after `key `, as a double. -1 when absent.
+    double doubleAfter(const std::string& dump, const std::string& key) {
+        const auto POS = dump.find(key + " ");
+        if (POS == std::string::npos)
+            return -1.0;
+        try {
+            return std::stod(dump.substr(POS + key.length() + 1));
+        } catch (...) { return -1.0; }
+    }
+
+    SCentroid measureCentroid(const std::string& monitor) {
+        SCentroid out;
+        out.dump = screencopyCentroid(monitor);
+
+        const auto POS = out.dump.find("centroid ");
+        if (POS != std::string::npos) {
+            std::istringstream iss(out.dump.substr(POS + 9));
+            iss >> out.x >> out.y;
+        }
+
+        out.mass    = doubleAfter(out.dump, "mass");
+        out.corners = static_cast<int>(doubleAfter(out.dump, "corners"));
+        out.stable  = doubleAfter(out.dump, "stable") == 1.0;
+        return out;
+    }
+
+    // ...and the same measurement, repeated until two consecutive runs agree.
+    //
+    // The client already rejects a scene that moves between its own two captures; this rejects one
+    // that moves between two RUNS of it, which is the slower kind — a client's first commit at its
+    // real size, a fade timing out, a notification sliding away. Two independent runs agreeing to a
+    // twentieth of a pixel is the cheapest available definition of "the picture is holding still".
+    // (A notification that is simply THERE holds perfectly still and would pass; that one is
+    // handled by dismissing notifications before measuring, not here.)
+    SCentroid measureSettledCentroid(const std::string& monitor, int tries = 25) {
+        SCentroid previous, current;
+
+        for (int i = 0; i < tries; ++i) {
+            current = measureCentroid(monitor);
+            if (current.usable() && previous.usable() && std::abs(current.x - previous.x) < 0.05 && std::abs(current.y - previous.y) < 0.05)
+                return current;
+
+            previous = current;
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+
+        NLog::log("{}the picture on {} never held still — measurements will be noisy", Colors::YELLOW, monitor);
+        return current;
+    }
+
     // "varied <n>" — pixels in the reference crop that differ from its first pixel. Zero means the
     // captured area was flat, which would make the crop comparison pass for the wrong reason.
     int variedIn(const std::string& dump) {
@@ -246,6 +319,33 @@ namespace {
         try {
             return std::stoi(size);
         } catch (...) { return -1; }
+    }
+
+    // The depth of the first window `hyprctl clients` lists, which in these tests is the only one.
+    // This is WP D1's observable state and the synchronisation point for D4's pixel measurements:
+    // the depth ladder is resolved on the main thread, so a capture taken after this reports the
+    // new rung is a capture of the new rung.
+    std::string windowDepth() {
+        const auto JSON   = getFromSocket("j/clients");
+        const auto KEYPOS = JSON.find("\"depth\":");
+        if (KEYPOS == std::string::npos)
+            return "";
+
+        const auto VALSTART = JSON.find_first_not_of(" \t", KEYPOS + 8);
+        if (VALSTART == std::string::npos)
+            return "";
+
+        const auto VALEND = JSON.find_first_of(",\n", VALSTART);
+        return JSON.substr(VALSTART, (VALEND == std::string::npos ? JSON.length() : VALEND) - VALSTART);
+    }
+
+    bool waitForWindowDepth(const std::string& want, int seconds = 5) {
+        for (int i = 0; i < seconds * 10; ++i) {
+            if (windowDepth() == want)
+                return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return windowDepth() == want;
     }
 
     // --- the log (the only in-process view of what damage was submitted) ---
@@ -733,4 +833,130 @@ TEST_CASE(stereoDepthProducerFastPath) {
 
     // the compositor survived a frame that bound a second work buffer mid-pass
     EXPECT_CONTAINS(getFromSocket("/version"), "Hyprland");
+}
+
+// stereoDepthDisparityMovesTheWindow — WP D4's pixel assertion: the depth desktop, measured.
+//
+// stereoDepthProducerFastPath proves the producer RUNS. This proves it produces the right picture:
+// a window on a rung of the depth ladder is drawn at a different horizontal position than the same
+// window on the wallpaper plane, by the number of pixels §8.1's formula asks for — and by a
+// different number on a different rung, which is what says the shift belongs to the ELEMENT.
+//
+// HOW A FEW PIXELS BECOME MEASURABLE. The client (`screencopy-crop --centroid`) reports the
+// mass-weighted centroid of everything that is not the background. Under a uniform background —
+// hence the logo and splash going off for the duration — the foreground is the window, its border
+// and its shadow, all of which the producer translates together; and the first moment of a rigid
+// translation is exact, so antialiasing, linear filtering, the rounded corners and the sub-pixel
+// seam in ElementRenderer all wash out of the measurement instead of quantising it. That is what
+// lets a 9.45 px disparity be checked against 9.45 rather than against "it moved".
+//
+// WHICH EYE THIS IS. One pane, not two: every capture protocol is sized at the pane by design
+// (§3.6), and on a depth-producing output the mirror texture the capture is taken from follows the
+// LAST pane — the right eye, whose sign is negative (§8.1: "left pane +, right pane −"). So the
+// numbers below are the right eye's, and the left eye is its exact negation by construction —
+// tests/desktop/DepthTiers.cpp asserts that antisymmetry on the shared expression both panes run.
+// A capture that started showing pane 0 would flip every sign here, and this comment is the place
+// to change.
+//
+// THE DEPTH-0 CONTROL is the same window at the same size in the same place with the rung set to
+// 0: it must land back on the flat centroid, which is what makes the middle measurements a
+// statement about depth rather than about capture noise.
+TEST_CASE(stereoDepthDisparityMovesTheWindow) {
+    // §8.1's worked table at `depth_scale = 0.30`: a rise of 0.30 m is ±9.5 px per pane on a
+    // 1920-wide pane, and 0.15 m is ±4.2 px (the formula is not linear in depth — parallax goes as
+    // 1 − D/d). Both are inside the 1° comfort ceiling (15.7 px) and well inside the tiled window's
+    // 20 px gap, so §6.1's edge clamp does not bite.
+    //
+    // The measured numbers are −9.46 and −4.47 px against −9.45 and −4.20 predicted; the tolerance
+    // is a pixel and a half, which leaves room for whatever the texture path rounds while staying
+    // well under the 5 px gap between the two rungs.
+    constexpr double DEPTH_SCALE = 0.30;
+    constexpr double SHIFT_FULL  = 9.45; // depth 1.0
+    constexpr double SHIFT_HALF  = 4.20; // depth 0.5
+    constexpr double TOL         = 1.5;
+
+    Tests::killAllWindows();
+    getFromSocket(std::format("/output remove {}", STEREO_MON));
+
+    OK(declareMonitor(STEREO_MON, STEREO_MODE, "sbs"));
+    OK(getFromSocket(std::format("/output create headless {}", STEREO_MON)));
+
+    CScopeGuard guard = {[&]() {
+        Tests::killAllWindows();
+        getFromSocket("/eval hl.config({ decoration = { depth_scale = 0.12, depth_focused = 0.6 } })");
+        getFromSocket("/eval hl.config({ misc = { disable_hyprland_logo = false, disable_splash_rendering = false } })");
+        getFromSocket(std::format("/output remove {}", STEREO_MON));
+    }};
+
+    ASSERT(waitForMonitorPresent(STEREO_MON, true), true);
+    ASSERT(waitForMonitorField(STEREO_MON, "width", "1920"), true);
+
+    // the measurement's one precondition: a uniform background. The wallpaper is a photograph and
+    // the splash is text — both are static mass that would dilute the centroid of the thing that
+    // moves, and the client reports `corners 4` so a run where this did not take cannot pass
+    // quietly.
+    OK(getFromSocket("/eval hl.config({ misc = { disable_hyprland_logo = true, disable_splash_rendering = true } })"));
+    OK(getFromSocket(std::format("/eval hl.config({{ decoration = {{ depth_scale = {}, depth_focused = 0 }} }})", DEPTH_SCALE)));
+
+    OK(getFromSocket(std::format("/dispatch hl.dsp.focus({{ monitor = '{}' }})", STEREO_MON)));
+
+    const int     BEFORE = Tests::windowCount();
+    SWindowClient client;
+    ASSERT(client.waitForWindow(BEFORE), true);
+    Tests::sync();
+
+    // The window's depth comes from the FOCUSED tier (it is the only window, and it is focused), so
+    // `decoration:depth_focused` walks it up and down the ladder without touching a rule — and
+    // every step is confirmed in `hyprctl clients` before the capture is taken.
+    // (plain EXPECTs, never OK/ASSERT: those return from the enclosing function, which a lambda
+    // with a return value cannot do)
+    const auto measureAt = [&](double depth, const char* composites) -> SCentroid {
+        EXPECT(getFromSocket(std::format("/eval hl.config({{ decoration = {{ depth_focused = {} }} }})", depth)), std::string("ok"));
+        EXPECT(waitForWindowDepth(std::format("{:.3f}", depth)), true);
+        EXPECT(waitForMonitorField(STEREO_MON, "stereoComposites", composites), true);
+
+        // An on-screen notification is mass like any other, it sits in the top-right corner, and it
+        // outlives the test that raised it — the stereo suite alone leaves two behind (a mode that
+        // cannot be split, a monitor un-stereo'd by a write-back). One in a capture is worth about
+        // 6 px of centroid, i.e. most of the disparity being measured, so the screen is cleared
+        // before every measurement rather than hoping the timers have run out.
+        getFromSocket("/dismissnotify");
+        Tests::sync();
+
+        const auto MEASURED = measureSettledCentroid(STEREO_MON);
+        if (!MEASURED.usable())
+            NLog::log("{}screencopy-crop --centroid at depth {} said:\n{}", Colors::YELLOW, depth, MEASURED.dump);
+        EXPECT(MEASURED.usable(), true);
+        NLog::log("{}depth {}: centroid {:.3f}, {:.3f} (mass {:.0f})", Colors::YELLOW, depth, MEASURED.x, MEASURED.y, MEASURED.mass);
+        return MEASURED;
+    };
+
+    // === 1. the flat reference — nothing is off the plane, so this is WP F1's frame ===
+    const auto FLAT = measureAt(0.0, "1");
+    ASSERT(FLAT.usable(), true); // nothing below means anything without a reference
+
+    // === 2. depth 1.0 is 9.45 px of disparity, toward the left in the right eye ===
+    const auto FULL = measureAt(1.0, "2");
+    EXPECT_MAX_DELTA(FULL.x - FLAT.x, -SHIFT_FULL, TOL);
+
+    // === 3. half as high is half as far — the shift is the ELEMENT's depth, not a frame offset ===
+    //
+    // This is the assertion a whole-pane translation bug cannot pass: if the producer offset the
+    // pane's projection instead of each raised element, every rung would move by the same amount.
+    const auto HALF = measureAt(0.5, "2");
+    EXPECT_MAX_DELTA(HALF.x - FLAT.x, -SHIFT_HALF, TOL);
+    EXPECT(std::abs(FULL.x - FLAT.x) > std::abs(HALF.x - FLAT.x) + 2.0, true); // the rungs are distinguishable
+
+    // === 4. the depth-0 control lands back exactly where it started ===
+    //
+    // Half a pixel, not zero: the scene is a live desktop and the cursor, a fading toast or a
+    // border gradient can be worth a fraction of a pixel of mass. It is an order of magnitude below
+    // the shift being measured, which is all this has to be.
+    const auto BACK = measureAt(0.0, "1");
+    EXPECT_MAX_DELTA(BACK.x - FLAT.x, 0.0, 0.5);
+    EXPECT_MAX_DELTA(BACK.y - FLAT.y, 0.0, 0.5);
+
+    // === 5. and nothing ever moved VERTICALLY: disparity is horizontal, or it is eye strain ===
+    EXPECT_MAX_DELTA(FULL.y - FLAT.y, 0.0, 0.5);
+    EXPECT_MAX_DELTA(HALF.y - FLAT.y, 0.0, 0.5);
 }
