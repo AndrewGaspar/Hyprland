@@ -287,7 +287,7 @@ CRegion CRenderPass::render(CRenderContext& ctx, const CRegion& damage_) {
 
 CRegion CRenderPass::replay(CRenderContext& ctx) {
     for (auto& el : m_passElements) {
-        if (el.discard)
+        if (el.discard || !el.element->replayable())
             continue;
 
         ctx.m_data.damage = el.elementDamage;
