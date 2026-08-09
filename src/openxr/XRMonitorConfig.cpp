@@ -367,6 +367,34 @@ bool OpenXR::wantXRMonitorsPlugged(eXRMonitorFollowMode mode, bool sessionUp, bo
     return true;                             // no presence ext: visibility alone is the signal
 }
 
+std::optional<float> OpenXR::xrDefaultMonitorScale(bool createdByXR, bool ruleScaleExplicit, bool stereoOutput, const Vector2D& pixelSize, bool skipScaleChecks,
+                                                   float configuredDefault) {
+    // task #129. See the header for the precedence ladder. Every rejection is a "leave the rule's
+    // scale exactly as it is" — this function never returns the auto sentinel, so a caller can write
+    // its result unconditionally when it has one.
+    if (!createdByXR)         // adopted real monitor: its scale is the user's business
+        return std::nullopt;
+    if (ruleScaleExplicit)    // an explicit `monitor = NAME, ..., <scale>` outranks us
+        return std::nullopt;
+    if (stereoOutput)         // packed per-eye scanout wants 1.0, which getDefaultScale() already pins
+        return std::nullopt;
+    if (!(configuredDefault > XR_RULE_SCALE_AUTO_MAX)) // opted out (0) -> fall through to the PPI guess
+        return std::nullopt;
+    if (skipScaleChecks)      // debug:disable_scale_checks — the user took the wheel; no divisor gate
+        return configuredDefault;
+    if (pixelSize.x <= 0 || pixelSize.y <= 0) // mode not knowable yet: claim only what we can prove
+        return std::nullopt;
+
+    // The divisor gate, in exactly the arithmetic the consumer uses — Monitor::Stereo::
+    // scaleValidationSize() is `pane / scale` with the float scale promoted to double, and
+    // applyMonitorRule compares that against its own round(). Computing it any other way here would
+    // let a value through that trips the ERR path we exist to avoid.
+    const Vector2D LOGICAL = pixelSize / static_cast<double>(configuredDefault);
+    if (LOGICAL != LOGICAL.round())
+        return std::nullopt;
+    return configuredDefault;
+}
+
 OpenXR::eXRIdleInhibitMode OpenXR::parseIdleInhibitMode(const std::string& v) {
     // Same normalization as parseMonitorFollowMode: lower-case, strip whitespace.
     std::string s;

@@ -2240,10 +2240,14 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
     //    own declared-mode rule (report-20 issue E), so we never clobber theirs. Then register the
     //    persistent rule (durable across plug/unplug/reload) and apply the effective rule now so the
     //    initial swapchain is the right size (registration only schedules an ensureMonitorStatus pass).
-    if (params.m_resolution && Config::monitorRuleMgr()) {
-        layer->m_userProvidedMode = Config::monitorRuleMgr()->get(mon).m_resolution != Vector2D{};
-        if (layer->m_userProvidedMode)
-            Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}' keeps its explicit monitor= resolution", params.m_name);
+    //    The registration is NOT gated on a requested mode: it also carries this monitor's default
+    //    scale (task #129), which a mode-less create needs just as much.
+    if (Config::monitorRuleMgr()) {
+        if (params.m_resolution) {
+            layer->m_userProvidedMode = Config::monitorRuleMgr()->get(mon).m_resolution != Vector2D{};
+            if (layer->m_userProvidedMode)
+                Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}' keeps its explicit monitor= resolution", params.m_name);
+        }
         registerDeclaredMonitorRule(mon, layer);
         Config::CMonitorRule rule = Config::monitorRuleMgr()->get(mon);
         mon->applyMonitorRule(std::move(rule));
@@ -2407,9 +2411,10 @@ void COpenXRManager::registerDeclaredMonitorRule(const PHLMONITOR& mon, const PX
     // ensureMonitorStatus refresh) re-derives the mode from a rule manager that has no XR entry and
     // falls back to the headless default (1920x1080@60), silently dropping the declared 2560x1440@90.
     // Precedence: an explicit user `monitor=NAME,<mode>,...` wins — captured once at create as
-    // layer->m_userProvidedMode, so we never clobber it. Building the rule from get(mon) preserves any
-    // other user-set fields (scale/transform) while we override only the mode. add() replaces our own
-    // prior rule by name (idempotent) and schedules an ensureMonitorStatus pass to apply it.
+    // layer->m_userProvidedMode, so we never clobber it. Building the rule from get(mon) preserves
+    // every user-set field we do not deliberately own (mode, offset, and — task #129 — scale).
+    // add() replaces our own prior rule by name (idempotent) and schedules an ensureMonitorStatus
+    // pass to apply it.
     if (!mon || !layer || !Config::monitorRuleMgr())
         return;
     const bool wantMode = layer->m_reqResolution && !layer->m_userProvidedMode;
@@ -2418,11 +2423,43 @@ void COpenXRManager::registerDeclaredMonitorRule(const PHLMONITOR& mon, const PX
     // light path — no rule-manager traffic, no mode re-apply), but a rule refresh from any other
     // source re-derives m_activeMonitorRule from the rule MANAGER, which would otherwise hand back
     // the {-INT32_MAX,-INT32_MAX} "auto" sentinel and drop us back to append-right.
-    const bool wantOffset = layer->m_l2dPlaced;
-    if (!wantMode && !wantOffset)
+    const bool           wantOffset = layer->m_l2dPlaced;
+    Config::CMonitorRule rule       = Config::monitorRuleMgr()->get(mon);
+
+    // task #129: the same durability, for SCALE. A headless output has no EDID, so getDefaultScale()'s
+    // PPI heuristic reads an XR quad as a tiny dense panel and picks 2.0 — cramped through a headset,
+    // and a monitor a voice command or keybind minted seconds ago has no `monitor =` line to correct
+    // it. Fill in openxr:default_monitor_scale when nothing else owns the field.
+    //
+    // Who owns it is asked of the rules that NAME this output (xrPinnedRuleScale), not of
+    // rule.m_scale: get() falls back to the nameless catch-all almost every config carries, and
+    // reading that back would disable the default for everyone who has one. A wlr-output-management
+    // override is not consulted either, and needs not be — get() re-applies it on top of whatever we
+    // store, every time, so a display GUI still wins.
+    //
+    // Re-deciding from the live rules on every call (rather than from a flag captured at create, as
+    // the mode does) is what keeps the precedence live in both directions: a reload clears the rule
+    // manager, so a scale the user ADDS later — or a retuned default — lands on the next reassert
+    // instead of being shadowed by a stale capture. One caveat, shared with the mode above: our own
+    // rule outlives a destroy, so re-creating the same NAME before any reload re-reads our previous
+    // default as if it were the user's. A reload clears it.
+    static auto PDEFAULTSCALE = CConfigValue<Hyprlang::FLOAT>("openxr:default_monitor_scale");
+    static auto PNOSCALECHECK = CConfigValue<Hyprlang::INT>("debug:disable_scale_checks");
+    const float PINNEDSCALE   = OpenXR::xrPinnedRuleScale(Config::monitorRuleMgr()->all(), [&mon](const std::string& sel) { return mon->matchesStaticSelector(sel); });
+    // The mode the output will run once this rule lands — the divisor gate needs it. What we are
+    // about to ask for, else what the rule asks for, else what it is scanning out now: `preferred` /
+    // `highres` / `maxwidth` leave m_resolution zeroed or at a negative sentinel, and the mode those
+    // resolve to is precisely the one the monitor already has. Zero everywhere = not knowable, and
+    // xrDefaultMonitorScale declines rather than guessing.
+    Vector2D effectiveMode = wantMode ? *layer->m_reqResolution : rule.m_resolution;
+    if (effectiveMode.x <= 0 || effectiveMode.y <= 0)
+        effectiveMode = mon->m_pixelSize;
+    const auto WANTSCALE = OpenXR::xrDefaultMonitorScale(layer->m_createdByXR, OpenXR::xrRuleScaleIsExplicit(PINNEDSCALE), rule.m_stereo != Config::STEREO_OFF, effectiveMode,
+                                                         *PNOSCALECHECK, (float)*PDEFAULTSCALE);
+
+    if (!wantMode && !wantOffset && !WANTSCALE)
         return;
-    Config::CMonitorRule rule = Config::monitorRuleMgr()->get(mon);
-    rule.m_name               = mon->m_name;
+    rule.m_name = mon->m_name;
     if (wantMode) {
         rule.m_resolution = *layer->m_reqResolution;
         if (layer->m_reqRefresh)
@@ -2430,6 +2467,8 @@ void COpenXRManager::registerDeclaredMonitorRule(const PHLMONITOR& mon, const PX
     }
     if (wantOffset)
         rule.m_offset = layer->m_l2dOffset;
+    if (WANTSCALE)
+        rule.m_scale = *WANTSCALE;
     // Keep the output ENABLED in the rule — the unplug lifecycle is driven separately through
     // onConnect/onDisconnect + the m_xrManagedPlug guard (issue A), not the rule's disabled bit.
     rule.m_disabled = false;
@@ -2443,8 +2482,13 @@ void COpenXRManager::reassertMonitorModeRules() {
     // are never touched by declaration reconciliation, doc 05 §2.5). That left the mode of a
     // `hyprctl openxr create NAME 2560x1440@60` monitor un-owned after any reload: the user's
     // `monitor = NAME, preferred` line (or the headless preferred mode) took it back to 1920x1080,
-    // which is what the live 2026-08-01 report saw. Re-install for every live layer that requested a
-    // mode; registerDeclaredMonitorRule() itself skips layers whose mode the user pinned.
+    // which is what the live 2026-08-01 report saw. Re-install for every live layer;
+    // registerDeclaredMonitorRule() itself skips layers whose mode the user pinned.
+    //
+    // The reload also drops the default SCALE we own (task #129), and re-deriving it here is what
+    // lets a retuned openxr:default_monitor_scale — or a scale the user has just added to their
+    // config — land on monitors that already exist. So this walks every live layer now, not only the
+    // ones that requested a mode.
     //
     // add() schedules an ensureMonitorStatus() pass, and that pass compares before applying, so this
     // costs no modeset when the effective mode is already right.
@@ -2455,7 +2499,7 @@ void COpenXRManager::reassertMonitorModeRules() {
     {
         std::scoped_lock lock(m_layersMu);
         for (auto& l : m_layers) {
-            if (!l || l->m_pendingRemoval.load(std::memory_order_acquire) || !l->m_reqResolution)
+            if (!l || l->m_pendingRemoval.load(std::memory_order_acquire))
                 continue;
             if (auto mon = l->m_monitor.lock())
                 pending.emplace_back(mon, l);

@@ -68,6 +68,7 @@ Every variable, grouped by area. The "applies" column notes when a change takes 
 |---|---|---|---|---|
 | `default_size` | float (m) | `1.6` | Default quad width for a new XR monitor with no explicit `size:`. | hot |
 | `default_distance` | float (m) | `1.5` | Default placement distance for a new / re-centered monitor. | hot |
+| `default_monitor_scale` | float | `1.25` | Scale given to an **XR-created** monitor that has no explicit scale of its own. A headless output has no EDID, so Hyprland's PPI heuristic reads a 1920x1080 quad as a tiny dense panel and picks `2.0` — cramped through a headset. An explicit `monitor = <name>, …, <scale>` still wins (§3.1); `0` opts out and restores the PPI guess. Applies to the next monitor created — and, on a config reload, to existing XR monitors whose scale nobody else owns. Your real monitors are never touched. | hot |
 | `recenter_on_plug` | bool | `true` | On the **first** don of a session, re-seat `anchor:local` monitors relative to your current head pose instead of the runtime's (often arbitrary) `LOCAL_FLOOR` origin — they land in front of you at their configured height/distance. Multi-monitor layouts are recentered rigidly (relative arrangement preserved). A brief doff-and-don within the same session does not re-seat. | hot |
 | `monitors_follow_session` | string | `visible` | When XR monitors behave like **unplugged external monitors** (held disabled — workspaces evacuate to your remaining monitors, then return by name on replug, exactly like a physical display): `off` = never; `session` = while no OpenXR session exists; `visible` (default) = while the headset is not actually **worn**. The `visible` plug gate needs BOTH session visibility AND — when the runtime exposes `XR_EXT_user_presence` (e.g. WiVRn) — user presence, so a session created with the headset on the shelf never plugs. Legacy values parse: `false/0` → `off`, `true/1` → `session`. | hot |
 | `monitor_unplug_grace_ms` | int | `20000` | Under `visible`: how long the headset must stay doffed before its monitors unplug and workspaces evacuate — anti-flap so a quick doff-and-don or proximity-sensor churn never rearranges workspaces. Donning re-plugs immediately regardless. | hot |
@@ -411,8 +412,8 @@ An XR monitor's pixel mode can be asked for in three places. The order, highest 
 1. **An explicit mode in a `monitor =` rule matching the name** — `monitor = XR-code,
    2560x1440@90, auto, 1.25`. If such a rule exists *when the monitor is created*, it owns the
    mode outright and nothing below is applied. (`preferred` / `highres` / `highrr` / `maxwidth`
-   are **not** explicit modes — they defer, so `monitor = XR-2, preferred, auto, 1.25` is the
-   normal way to set scale without claiming the mode.)
+   are **not** explicit modes — they defer, so `monitor = XR-2, preferred, auto, 1.6` is how you
+   override one monitor's scale without claiming its mode. You rarely need to: see §3.2.)
 2. **The mode on the `xrmonitor =` line, or the create args** — `xrmonitor = XR-code,
    2560x1440@90, …` and `hyprctl openxr create XR-2 2560x1440@60` are equivalent here. The
    compositor installs this as a persistent named monitor rule so it survives plug/unplug cycles
@@ -423,10 +424,39 @@ An XR monitor's pixel mode can be asked for in three places. The order, highest 
 
 Refresh is optional wherever a mode is: `2560x1440` means `2560x1440@60`.
 
-Scale is deliberately *not* an `xrmonitor` / `create` argument — `monitor = <name>, preferred,
-auto, <scale>` is the mechanism, and it composes with rule 2 above. Pre-declaring such a line for
-names a script or voice daemon will mint later is harmless while the monitor doesn't exist and
-gives the created monitor a sane scale the moment it appears.
+### 3.2 Scale precedence (`openxr:default_monitor_scale`)
+
+Scale is deliberately *not* an `xrmonitor` / `create` argument. It has its own two-rung ladder,
+highest first:
+
+1. **An explicit scale in a `monitor =` rule matching the name** — `monitor = XR-code, preferred,
+   auto, 1.6`. It owns the scale outright, and keeps it across plug/unplug cycles and config
+   reloads. (`auto` is *not* an explicit scale — it defers, exactly like `preferred` does for the
+   mode.)
+2. **`openxr:default_monitor_scale`** (default `1.25`), for monitors the compositor created. It
+   rides the same persistent named rule as the mode from §3.1, so it is equally durable.
+
+Set `openxr:default_monitor_scale = 0` to opt out entirely and hand the decision back to
+Hyprland's PPI heuristic.
+
+Why the default exists: a headless output has no EDID, so `getDefaultScale()` reads a 1920x1080 XR
+quad as a tiny high-density panel and picks `2.0`. That is legible on a desk and unusably cramped
+through a headset — and a monitor a keybind or voice command minted seconds ago (`XR-2`, `XR-3`, …)
+has no `monitor =` line to correct it. **A pre-declared `monitor = XR-2, …, XR-8, preferred, auto,
+1.25` block is no longer needed and can be deleted** — it only ever covered the names you thought
+to enumerate, and fell off a cliff at `XR-9`. Keep such a line only where you want a *particular*
+monitor at a scale other than the default.
+
+Two monitors this never touches: an output an `xrmonitor` line merely **adopted** (a real display
+of yours, with a real EDID), and a **stereo** output — the per-eye pack needs scale `1.0` and
+§8.5 pins it there.
+
+The default is applied only when it **divides the monitor's mode into whole logical pixels**, the
+same requirement any `monitor =` scale has. `1.25` is clean on every 16:9 mode — 1920x1080 →
+1536x864, 2560x1440 → 2048x1152 — but not on 4:3 ones (1024x768 → 819.2x614.4). On a mode it can't
+divide the compositor simply declines and the PPI guess stands, rather than handing you a red
+"invalid scale" notification for a number you never typed. Set that monitor's scale explicitly with
+a `monitor =` line if you want a different one.
 
 ### Mirroring onto a physical screen
 
@@ -623,7 +653,7 @@ transports, one implementation.
 
 | Verb | Args | Effect |
 |---|---|---|
-| `create` | `<name> [WxH[@Hz]] [anchor-spec]` | Create a runtime-owned XR monitor. Mode defaults to 1920x1080@60 and is durable across reloads (§3.1 for how it ranks against a `monitor =` rule); anchor defaults to `anchor:local` placed at `openxr:default_distance` facing you. |
+| `create` | `<name> [WxH[@Hz]] [anchor-spec]` | Create a runtime-owned XR monitor. Mode defaults to 1920x1080@60 and is durable across reloads (§3.1 for how it ranks against a `monitor =` rule); scale defaults to `openxr:default_monitor_scale` (§3.2), so a monitor minted by a keybind or voice command needs no `monitor =` line at all; anchor defaults to `anchor:local` placed at `openxr:default_distance` facing you. |
 | `destroy` | `<name\|active>` | Destroy the named monitor, or the selected one. |
 | `select` | `<name\|next\|prev>` | Set the explicit selection target for the verbs below. |
 | `anchor` | `<name\|active> <mode-spec>` | Re-anchor without moving the quad visually: `local`, `head [offset:x,y,z]`, `body [offset:x,y,z]`, `device:left\|right [offset:x,y,z]`. |

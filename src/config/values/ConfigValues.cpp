@@ -762,6 +762,11 @@ std::vector<SP<IValue>> Values::getConfigValues() {
         MS<Float>("openxr:floor_offset", "fallback eye height in meters when the runtime lacks LOCAL_FLOOR", 1.5, {.min = 0.0, .max = 3.0}),
         MS<Float>("openxr:default_size", "default width of a new XR monitor quad, in meters", 1.6, {.min = 0.2, .max = 4.0}),
         MS<Float>("openxr:default_distance", "default distance from the viewer for newly placed monitors, in meters", 1.5, {.min = 0.3, .max = 5.0}),
+        MS<Float>("openxr:default_monitor_scale",
+                  "scale given to an XR-created monitor that has no explicit scale in a matching monitor= rule. Hyprland's headless PPI guess lands such an output at 2.0 "
+                  "(cramped through a headset); an explicit `monitor = NAME, ..., <scale>` still wins, and so does the PPI guess on a mode this value cannot divide into "
+                  "whole logical pixels. 0 = always keep the PPI guess",
+                  1.25, {.min = 0.0, .max = 8.0}),
         MS<Float>("openxr:leash_response", "head/body leash spring response time in seconds (smaller = snappier)", 0.35, {.min = 0.01, .max = 5.0}),
         MS<Float>("openxr:leash_deadzone_angle", "head/body leash angular deadzone in degrees", 15.0, {.min = 0.0, .max = 180.0}),
         MS<Float>("openxr:leash_deadzone_distance", "head/body leash positional deadzone in meters", 0.25, {.min = 0.0, .max = 5.0}),
