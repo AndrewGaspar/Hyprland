@@ -149,10 +149,120 @@ TEST(StereoPacking, modeIsAsRequestedSentinelsAreNotResolutions) {
 TEST(StereoPacking, modeIsAsRequestedGuardsAModeWriteBack) {
     // the wlr-output-management shape: a GUI writes a mode over a monitor that is already packed.
     const Vector2D COMMITTED = {3840, 1080};
-    EXPECT_TRUE(modeIsAsRequested(COMMITTED, COMMITTED));            // the GUI kept the mode
-    EXPECT_FALSE(modeIsAsRequested({1920, 1080}, COMMITTED));        // it picked the pane's size
-    EXPECT_FALSE(modeIsAsRequested({2560, 1440}, COMMITTED));        // or anything else
-    EXPECT_TRUE(modeIsAsRequested({2560, 1440}, Vector2D()));        // nothing committed yet, no opinion
+    EXPECT_TRUE(modeIsAsRequested(COMMITTED, COMMITTED));     // the GUI kept the mode
+    EXPECT_FALSE(modeIsAsRequested({1920, 1080}, COMMITTED)); // it picked the pane's size
+    EXPECT_FALSE(modeIsAsRequested({2560, 1440}, COMMITTED)); // or anything else
+    EXPECT_TRUE(modeIsAsRequested({2560, 1440}, Vector2D())); // nothing committed yet, no opinion
+}
+
+// --- the mode-list watch: the pack must never OUTLIVE the mode it was validated on ---
+//
+// (§3.4 item 15b, task #142.) modeIsAsRequested above is an apply-time predicate, and it is right,
+// but it only ever runs when a rule is applied. Live on 2026-08-09 the XREAL fell from its 3D
+// personality (3840x1080-only EDID) to its 2D one (1920x1080-only) on a USB re-enumeration under a
+// connector that kept its name, with the rule unchanged. Nothing re-applied it — aquamarine's
+// IOutput has no modes-changed signal, m_output->modes is read nowhere but applyMonitorRule, and
+// ensureMonitorStatus skips a monitor whose rule did not change — so `hyprctl monitors` reported a
+// live availableModes of 1920x1080 next to a frozen `stereo: sbs, scanoutWidth: 3840`, and the
+// compositor kept packing two panes into a scanout the panel had stopped splitting.
+//
+// The invariant these pin: the pack is never live while the panel does not advertise the packed
+// mode. Everything else the watch does (the re-adopt) is a convenience on top of that.
+
+namespace {
+    const std::vector<Vector2D> THREE_D_PERSONALITY = {{3840, 1080}}; // XREAL after `xreal-ctl mode 3d`
+    const std::vector<Vector2D> TWO_D_PERSONALITY   = {{1920, 1080}}; // ... and after it falls back
+}
+
+TEST(StereoPacking, watchLeavesAHealthyPackAlone) {
+    EXPECT_EQ(watchAction(STEREO_SBS, STEREO_SBS, {3840, 1080}, {3840, 1080}, THREE_D_PERSONALITY), STEREO_WATCH_NOTHING);
+}
+
+TEST(StereoPacking, watchDropsAPackWhoseModeVanished) {
+    // the live #142 state: packed at 3840, panel now offers 1920 only
+    EXPECT_EQ(watchAction(STEREO_SBS, STEREO_SBS, {3840, 1080}, {3840, 1080}, TWO_D_PERSONALITY), STEREO_WATCH_DROP);
+    // and with nothing advertised at all (a connector mid-re-enumeration) — still not a mode we can
+    // pack, so still a drop rather than a guess
+    EXPECT_EQ(watchAction(STEREO_SBS, STEREO_SBS, {3840, 1080}, {3840, 1080}, {}), STEREO_WATCH_DROP);
+}
+
+TEST(StereoPacking, watchDropsRegardlessOfHowTheModeWasRequested) {
+    // the drop is a safety action: it is about the PANEL, not about the request form, so a pack
+    // configured with `preferred` or a sentinel is guarded exactly as tightly as an explicit mode.
+    for (const auto& REQUEST : {Vector2D(), Vector2D(-1, -1), Vector2D(-1, -2), Vector2D(-1, -3), Vector2D(3840, 1080)}) {
+        EXPECT_EQ(watchAction(STEREO_SBS, STEREO_SBS, {3840, 1080}, REQUEST, TWO_D_PERSONALITY), STEREO_WATCH_DROP) << REQUEST.x << "," << REQUEST.y;
+    }
+}
+
+TEST(StereoPacking, watchNeverDropsACustomModeline) {
+    // a user modeline is legitimately absent from the advertised list; reading that as a fall would
+    // drop the pack on every `monitor = ..., modeline ...` stereo output, forever.
+    EXPECT_EQ(watchAction(STEREO_SBS, STEREO_SBS, {3840, 1080}, {3840, 1080}, TWO_D_PERSONALITY, /* onCustomMode */ true), STEREO_WATCH_NOTHING);
+}
+
+TEST(StereoPacking, watchIsInertOnAMonitorThatIsNotStereo) {
+    // stereo:off must cost nothing and decide nothing — the whole feature's no-regression promise
+    for (const auto& ADVERTISED : {THREE_D_PERSONALITY, TWO_D_PERSONALITY, std::vector<Vector2D>{}}) {
+        EXPECT_EQ(watchAction(STEREO_OFF, STEREO_OFF, {1920, 1080}, {1920, 1080}, ADVERTISED), STEREO_WATCH_NOTHING);
+        EXPECT_EQ(watchAction(STEREO_OFF, STEREO_OFF, {1920, 1080}, Vector2D(), ADVERTISED), STEREO_WATCH_NOTHING);
+    }
+}
+
+TEST(StereoPacking, watchReAdoptsWhenTheConfiguredModeComesBack) {
+    // stereo-by-default: the rule stays in the config, so when the glasses return to their 3D
+    // personality the desktop must follow them back without the user reloading anything.
+    EXPECT_EQ(watchAction(STEREO_OFF, STEREO_SBS, {1920, 1080}, {3840, 1080}, THREE_D_PERSONALITY), STEREO_WATCH_READOPT);
+    // ... and not while they are still down
+    EXPECT_EQ(watchAction(STEREO_OFF, STEREO_SBS, {1920, 1080}, {3840, 1080}, TWO_D_PERSONALITY), STEREO_WATCH_NOTHING);
+    // ... and not when we are already committed on it (that is a pack that sanitize dropped for a
+    // reason of its own — divisibility — and a timer must not fight it)
+    EXPECT_EQ(watchAction(STEREO_OFF, STEREO_SBS, {3840, 1080}, {3840, 1080}, THREE_D_PERSONALITY), STEREO_WATCH_NOTHING);
+}
+
+TEST(StereoPacking, watchDoesNotChaseANonResolutionRequest) {
+    // `preferred`/`highrr`/`highres`/`maxwidth` mean "whatever the mode search picks". Re-adopting
+    // re-modesets the panel, and a timer has no business deciding that on a request with no mode in
+    // it — those recover on the next reload, as the docs say.
+    for (const auto& REQUEST : {Vector2D(), Vector2D(-1, -1), Vector2D(-1, -2), Vector2D(-1, -3)}) {
+        EXPECT_EQ(watchAction(STEREO_OFF, STEREO_SBS, {1920, 1080}, REQUEST, THREE_D_PERSONALITY), STEREO_WATCH_NOTHING) << REQUEST.x << "," << REQUEST.y;
+    }
+}
+
+TEST(StereoPacking, watchReplaysTheLivePersonalityFall) {
+    // the whole #142 sequence, as the watch sees it one tick at a time.
+    const Vector2D RULE_MODE = {3840, 1080};
+
+    // 1. healthy: rule applied, panel in 3D personality, pack live on the mode it was validated on
+    auto advertised = THREE_D_PERSONALITY;
+    auto pack       = STEREO_SBS;
+    auto committed  = RULE_MODE;
+    EXPECT_EQ(watchAction(pack, STEREO_SBS, committed, RULE_MODE, advertised), STEREO_WATCH_NOTHING);
+
+    // 2. the fall. Same connector, same rule, new mode list — and this is the tick that used to not
+    //    exist, which is the whole bug.
+    advertised = TWO_D_PERSONALITY;
+    ASSERT_EQ(watchAction(pack, STEREO_SBS, committed, RULE_MODE, advertised), STEREO_WATCH_DROP);
+
+    // 3. applyMonitorRule re-runs: the search lands on 1920 and sanitizeStereoMode drops the pack
+    //    because the committed mode is not the requested one. THE invariant — the pack is not live
+    //    while the committed width differs from the stereo-configured width.
+    committed = {1920, 1080};
+    pack      = modeIsAsRequested(committed, RULE_MODE) ? STEREO_SBS : STEREO_OFF;
+    ASSERT_EQ(pack, STEREO_OFF);
+    EXPECT_NE(committed.x, RULE_MODE.x);
+
+    // 4. settled: no further re-modeset while the glasses stay down (no timer storm)
+    EXPECT_EQ(watchAction(pack, STEREO_SBS, committed, RULE_MODE, advertised), STEREO_WATCH_NOTHING);
+
+    // 5. the glasses come back
+    advertised = THREE_D_PERSONALITY;
+    ASSERT_EQ(watchAction(pack, STEREO_SBS, committed, RULE_MODE, advertised), STEREO_WATCH_READOPT);
+
+    // 6. re-applied, sanitize passes, the pack is back and the watch goes quiet again
+    committed = RULE_MODE;
+    pack      = modeIsAsRequested(committed, RULE_MODE) ? STEREO_SBS : STEREO_OFF;
+    ASSERT_EQ(pack, STEREO_SBS);
+    EXPECT_EQ(watchAction(pack, STEREO_SBS, committed, RULE_MODE, advertised), STEREO_WATCH_NOTHING);
 }
 
 // --- the derivation: stereo:off must be bit-identical to the stock expression ---

@@ -1214,6 +1214,37 @@ accept — then the display is not in side-by-side mode, and packing it would pu
 across the whole panel. The pack is dropped with the same log line and toast; fix the mode and it
 comes back on the next reload.
 
+### The display can leave side-by-side mode on its own
+
+Both checks above run when a monitor rule is *applied*. The hazard is continuous: a display can
+swap its mode list under a connector that never disconnects. An XREAL that falls from its 3D
+personality (a 3840×1080-only EDID) back to its 2D one (1920×1080-only) on a USB re-enumeration
+does exactly that — same connector, same name, same rule, different panel. There is no
+"mode list changed" event for Hyprland to listen to, so without help the pack would sit at the old
+mode forever, packing two panes into a scanout the display had stopped splitting. That looks like a
+squished side-by-side frame, and `hyprctl monitors` shows the contradiction directly: a live
+`availableModes` of `1920x1080` next to a frozen `stereo: sbs, scanoutWidth: 3840`.
+
+So a **stereo output watches its own mode list**, once a second, and re-applies its rule when the
+answer changes:
+
+- the packed mode stops being advertised → the rule is re-applied, the mode search lands wherever
+  the panel now is, and the sanitizer above drops the pack with its usual log line and toast;
+- the mode the rule asked for is advertised again → the rule is re-applied and the pack comes back
+  by itself. This is what makes a permanent `stereo:sbs` line in your config survive the glasses
+  power-cycling: the desktop follows the panel in both directions with nothing to reload.
+
+Three things it deliberately does not do. It never runs on a monitor that is neither packed nor
+configured for stereo, so `stereo:off` allocates nothing and behaves exactly as before. It never
+reads a **custom modeline** as a fall — a `modeline` mode is legitimately absent from the
+advertised list. And it only re-adopts for a rule that **names a resolution**: `preferred`,
+`highrr`, `highres` and `maxwidth` mean "whatever the mode search picks", which is not a thing a
+timer should chase, so those still come back on the next reload.
+
+It also acts once per hardware state. If the re-apply cannot commit a mode at all, the watch does
+not retry every second — the existing mode retry owns that — it waits for the panel to change
+again.
+
 Live toggling needs no new command — monitor rules already re-apply:
 
 ```bash
