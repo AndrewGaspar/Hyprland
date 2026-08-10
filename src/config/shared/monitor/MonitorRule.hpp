@@ -67,9 +67,16 @@ namespace Config {
         // drm-lease-v1 clients (monado direct mode owns the flip). Default false ⇒ ordinary desktop
         // monitor, byte-identical to stock. Toggling it reconfigures the output (see MonitorRuleManager).
         bool                         m_lease         = false;
-        // Stereo pane packing for this output (research/24 §3.10). The rule's resolution is always
-        // the MODE that is scanned out; the logical desktop is derived from it (mode / pack).
+        // Stereo pane packing for this output (research/24 §3.10). For a PHYSICAL stereo output the
+        // rule's resolution is the MODE that is scanned out and the logical desktop is derived from
+        // it (mode / pack) — that is what the `monitor = …, stereo:sbs` token means.
         eMonitorStereoMode           m_stereo        = STEREO_OFF;
+        // …and the inversion, for an output with no panel (research/24 WP X3). When set, m_resolution
+        // is ONE PANE and the scanned-out mode is DERIVED from it (pane * pack divisor). This is how
+        // an XR monitor becomes a depth-desktop producer without its declared size changing meaning:
+        // an `xrmonitor` at 2560x1440 keeps 2560x1440 per eye and scans out 5120x1440. Never set by
+        // the `stereo:` token — a real panel's mode is not ours to invent (Monitor::Stereo::requestedMode).
+        bool                         m_stereoVirtualMode = false;
         wl_output_transform          m_transform     = WL_OUTPUT_TRANSFORM_NORMAL;
         std::string                  m_mirrorOf      = "";
         bool                         m_enable10bit   = false;
