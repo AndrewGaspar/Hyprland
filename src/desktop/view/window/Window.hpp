@@ -17,6 +17,7 @@
 #include "../../rule/windowRule/WindowRuleApplicator.hpp"
 #include "../../../protocols/types/ContentType.hpp"
 #include "../../../render/StereoContent.hpp"
+#include "../ProcIdentity.hpp"
 #include "../types/GeometricMovableAnimated.hpp"
 #include "../types/AlphaModifiable.hpp"
 #include "../focusable/Focusable.hpp"
@@ -253,7 +254,13 @@ namespace Desktop::View {
         void                       setContentType(NContentType::eContentType contentType);
         void                       deactivateGroupMembers();
         bool                       isNotResponding();
-        bool                       priorityFocus();
+        // task #143: the owning process's identity, for `match:exe` / `match:cmdline`. Read from
+        // /proc once, on first use, and cached for the window's life — a later exec by the same
+        // process does not re-trigger, exactly like the initial class. A dead or unreadable /proc
+        // entry caches as empty, and an empty string never matches, so a matcher on a gone process
+        // quietly does not fire rather than erroring. See ProcIdentity.hpp.
+        const Desktop::Proc::SIdentity& procIdentity();
+        bool                            priorityFocus();
         SP<CWLSurfaceResource>     getSolitaryResource() const;
         std::optional<Vector2D>    calculateExpression(const Math::SExpressionVec2& expr);
         std::optional<Vector2D>    minSize();
@@ -299,6 +306,8 @@ namespace Desktop::View {
         bool        m_isMapped  = false;
         std::string m_lastWorkspaceAddress;
         bool        m_lastWorkspaceSpecial = false;
+        // task #143: lazily filled by procIdentity(), never refreshed. nullopt = not read yet.
+        std::optional<Desktop::Proc::SIdentity> m_procIdentity;
 
         struct {
             bool activate            = false;

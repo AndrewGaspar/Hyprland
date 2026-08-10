@@ -32,6 +32,11 @@ namespace Desktop::Rule {
         RULE_PROP_NAMESPACE                = (1 << 17),
         RULE_PROP_EXEC_TOKEN               = (1 << 18),
         RULE_PROP_EXEC_PID                 = (1 << 19),
+        // task #143: identity by PROCESS rather than by surface. See ProcIdentity.hpp for why a
+        // Wine/Proton game needs these — its class and title belong to the wrapper, and its exe is
+        // wine-preloader, so its argv is the only string that names the game.
+        RULE_PROP_EXE     = (1 << 20),
+        RULE_PROP_CMDLINE = (1 << 21),
 
         RULE_PROP_ALL = std::numeric_limits<std::underlying_type_t<eRuleProperty>>::max(),
     };

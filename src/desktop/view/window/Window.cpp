@@ -1163,6 +1163,18 @@ bool CWindow::isNotResponding() {
     return g_pANRManager->isNotResponding(m_self.lock());
 }
 
+const Desktop::Proc::SIdentity& CWindow::procIdentity() {
+    // One /proc read per window, on the main thread, memoized for the window's life. The backend's
+    // pid already spans both client kinds (wl_client credentials for Wayland, the XWayland surface's
+    // pid for X11) and is the same plumbing `hyprctl clients` reports, so there is no second
+    // credential path here. It is -1 once the surface is gone, which readIdentity() caches as an
+    // empty identity — and an empty string never matches a full-match regex.
+    if (!m_procIdentity)
+        m_procIdentity = Desktop::Proc::identityFor(m_backend->pid());
+
+    return *m_procIdentity;
+}
+
 bool CWindow::priorityFocus() {
     return !m_backend->isX11() && CAsyncDialogBox::isPriorityDialogBox(m_backend->pid());
 }
