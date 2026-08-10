@@ -268,6 +268,13 @@ class COpenXRManager {
         // `hyprctl openxr status` explains where the mouse will cross. source is
         // "auto" (the projection placed it) | "pinned" (an explicit user monitor= offset owns it) |
         // "off" (2D-plane sync disabled, or nothing placed yet — the historic append-right).
+        // Stereo CONTENT, the OpenXR quad pair (research/24 §5.1, WP X1). `stereo` is the layout
+        // the MAIN thread declared for this monitor — "off" | "sbs" | "hsbs" | "tab" | "htab" — and
+        // `quads` is how many composition layers its LAST submitted frame actually cost. They are
+        // reported separately on purpose: a declared pair that reads `quads: 1` is one the layer
+        // budget refused, which is the only way this feature fails with no visual tell at all.
+        std::string stereo = "off";
+        int         quads  = 1;
         std::string l2dSource = "off";
         int         l2dCol = 0, l2dRow = 0;
         double      l2dX = 0.0, l2dY = 0.0;
@@ -665,6 +672,7 @@ class COpenXRManager {
     // modeOverride: use this blend mode for the gate instead of m_session's (start() calls it with the
     // freshly-picked mode before the session object is adopted). nullopt + no session = gate closed.
     void               publishBlackAlphaTuning(std::optional<OpenXR::eXRBlendMode> modeOverride = std::nullopt); // main thread only
+    void               publishStereoPairTuning();                                                                 // main thread only (WP X1)
     std::atomic<float> m_blackAlpha{1.F};         // EFFECTIVE alpha for pure black; 1.0 = feature off
     std::atomic<float> m_blackAlphaKnee{0.1F};    // luma at which content is fully opaque
     std::atomic<float> m_blackAlphaConfigured{1.F};
@@ -967,6 +975,10 @@ class COpenXRManager {
     // corner_size), to detect a hot-reload change (WP-G2 chrome hot-reload fix). Empty until first
     // compared.
     std::optional<std::array<double, 5>> m_lastChromeGeom;
+
+    // WP X1: last seen openxr:stereo_quad_pair, so a keyword toggle can be told apart from an
+    // unrelated reload and only the real change pays for a forced re-composite of every XR monitor.
+    std::optional<bool>                  m_lastStereoQuadPair;
 
     CHyprSignalListener m_configReloadListener;
     CHyprSignalListener m_propsRefreshedListener;
