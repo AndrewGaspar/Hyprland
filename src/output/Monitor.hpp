@@ -108,6 +108,17 @@ namespace Monitor {
         // stock. Set from the active monitor rule in applyMonitorRule/Soft (before the size derivation).
         Config::eMonitorStereoMode m_stereoMode = Config::STEREO_OFF;
 
+        // …and whether that pack is VIRTUAL (research/24 WP X3): the mode was DERIVED from the rule's
+        // per-pane resolution rather than named by a panel. Mirrors Config::CMonitorRule::
+        // m_stereoVirtualMode and is set beside m_stereoMode on both apply paths.
+        //
+        // Three behaviours key off it, and all three exist because a virtual pack has no physical
+        // per-eye pixel grid to respect: the scale is NOT pinned to 1.0 (an XR monitor keeps
+        // openxr:default_monitor_scale — pinning it would resize every XR desktop the moment depth
+        // engaged), a scale != 1 is not warned about, and the mode-list watch stays disarmed (there
+        // is no EDID that can fall out from under us).
+        bool m_stereoVirtualMode = false;
+
         // stereo CONTENT (research/24 §5.3, WP S1): the last frame actually cropped a stereo-declared
         // window into a pane — the declaration survived the fullscreen gate, the window was on this
         // output, and it was not occluded away. Written by the pack in CHyprOpenGLImpl::end() from
@@ -335,6 +346,10 @@ namespace Monitor {
         Vector2D paneSize() const;          // m_pixelSize / divisor, scanout orientation; == m_pixelSize when off
         int      stereoPaneCount() const;
         CBox     stereoPaneDestBox(int idx) const; // pane idx's destination box inside the mode-sized scanout buffer
+        // the MODE a rule asks this output for — the rule's resolution, doubled when the pack is
+        // virtual (research/24 WP X3). The one expression that knows a virtual pack's resolution is
+        // per-PANE, and the input to every mode comparison the pack makes.
+        Vector2D stereoRequestedMode(const Config::CMonitorRule& rule) const;
 
         // the stereo per-eye producer (research/24 §5.3 WP S1 + §6 WP D2)
         //
