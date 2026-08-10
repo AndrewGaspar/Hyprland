@@ -77,6 +77,34 @@ namespace Monitor::Stereo {
         return PANE == PANE.floor() && PANE.x >= 1 && PANE.y >= 1;
     }
 
+    // ADOPTING AN EXTERNAL MODE INTO A RULE WHOSE RESOLUTION MAY MEAN ONE PANE.
+    //
+    // Two writers hand a monitor rule the mode the output is SCANNING OUT: a display GUI through
+    // wlr-output-management (the head advertises the current mode, so that is what a read-modify-
+    // write commits back) and the backend's own state event (CMonitor's m_forceSize path). For a
+    // physical pack that is exactly what the field means and there is nothing to do. For a VIRTUAL
+    // pack the field means ONE PANE and they are handing us TWO — and left alone that is not a
+    // one-off error but a RUNAWAY, because the next apply doubles the already-doubled mode and the
+    // next commit reports that: 5120 → 10240 → 20480, until a modeset finally fails.
+    //
+    // So convert back to a pane when the mode divides cleanly, and drop the pack when it does not —
+    // a GUI that has genuinely picked another mode outranks a packing we invented.
+    struct SAdoptedMode {
+        Vector2D                   resolution;
+        Config::eMonitorStereoMode stereo      = Config::STEREO_OFF;
+        bool                       virtualPack = false;
+
+        bool                       operator==(const SAdoptedMode&) const = default;
+    };
+
+    inline SAdoptedMode adoptExternalMode(const Vector2D& mode, Config::eMonitorStereoMode stereo, bool virtualPack) {
+        if (!virtualPack || stereo == Config::STEREO_OFF)
+            return {.resolution = mode, .stereo = stereo, .virtualPack = virtualPack};
+        if (!modeDivides(mode, stereo))
+            return {.resolution = mode, .stereo = Config::STEREO_OFF, .virtualPack = false};
+        return {.resolution = paneSize(mode, stereo), .stereo = stereo, .virtualPack = true};
+    }
+
     // sanitize predicate 2 (§3.4 item 15): the pack is only valid on the mode it was CONFIGURED
     // for. A display that is not in side-by-side mode shows one eye's half stretched across the
     // whole panel, so a mode fallback landing anywhere else has to drop the packing.

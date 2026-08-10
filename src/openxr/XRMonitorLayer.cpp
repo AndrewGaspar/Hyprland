@@ -160,7 +160,7 @@ void CXRMonitorLayer::publishCursorDisparity(const PHLMONITOR& mon, bool depthPa
     // on it: the hovered view is a global, and lending monitor B's hover depth to monitor A's ray
     // cursor would float it over nothing. In practice they agree — pointing a ray at a monitor is
     // what moves the pointer there — so this is a guard, not a policy.
-    if (depthPaired && g_pHyprRenderer && mon->m_size.x > 0 && mon->logicalBox().containsPoint(Pointer::mgr()->position())) {
+    if (depthPaired && g_pHyprRenderer && Pointer::mgr() && mon->m_size.x > 0 && mon->logicalBox().containsPoint(Pointer::mgr()->position())) {
         const double SHIFTLOGICAL = g_pHyprRenderer->cursorDepthDamageSpread(mon);
         target                    = (float)(SHIFTLOGICAL / mon->m_size.x);
     }

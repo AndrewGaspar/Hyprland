@@ -555,6 +555,10 @@ class COpenXRManager {
     // Frame thread: (re)create a layer's swapchain at the given pixel size. Returns false on
     // failure (leaves m_swapchain == XR_NULL_HANDLE).
     bool createLayerSwapchain(CXRMonitorLayer& layer, const Vector2D& size, int panes = 1);
+    // FRAME THREAD (WP X1/X3): the published stereo declaration, checked against the image the layer
+    // is holding. The ONE reader — split, pane rects and quad aspect must all agree about which
+    // image they are describing, or a mode change pops a frame.
+    static OpenXR::Stereo::SPairDecl layerDecl(const CXRMonitorLayer& layer);
     // Main thread: bind still-existing layers on start() and drop those whose monitor
     // disappeared while disabled (doc 02 lazy binding).
     void bindExistingLayers();

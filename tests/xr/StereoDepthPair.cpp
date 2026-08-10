@@ -356,9 +356,75 @@ TEST(XRDepthPair, VirtualPackDerivesTheModeWhilePhysicalPackNamesIt) {
 
 // Mode REQUESTS are not resolutions: `preferred` is (0,0) and highrr/highres/maxwidth are negative
 // sentinels. Doubling one of those would invent a mode out of a sentinel.
+//
+// Note what this leaves the CALLER to handle, because it is the more dangerous half: a virtual pack
+// whose rule names no resolution has nothing to derive from, and packing on top of whatever the mode
+// search then picks would HALVE that desktop. Returning the sentinel unchanged is how this function
+// says "I cannot answer"; CMonitor::sanitizeStereoMode drops the pack loudly when it sees one, and
+// registerDeclaredMonitorRule makes sure one never gets that far.
 TEST(XRDepthPair, VirtualPackNeverDoublesAModeSentinel) {
     for (const Vector2D SENTINEL : {Vector2D{}, Vector2D{-1, -1}, Vector2D{-1, -2}, Vector2D{-1, -3}})
         EXPECT_EQ(Monitor::Stereo::requestedMode(SENTINEL, Config::STEREO_SBS, true), SENTINEL);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Adopting a mode from OUTSIDE — the runaway this exists to stop
+// ---------------------------------------------------------------------------------------------
+
+// A display GUI reads the head's current mode and commits it straight back; the backend's state
+// event does the same. Both hand a rule the PACKED mode, and a virtual pack's resolution field means
+// ONE PANE — so writing it in verbatim doubles an already-doubled mode, and the next commit reports
+// THAT. Not a one-off error: a runaway, 5120 -> 10240 -> 20480 until a modeset finally fails.
+TEST(XRDepthPair, AdoptingThePackedModeIsIdempotentOnAVirtualPack) {
+    using Monitor::Stereo::adoptExternalMode;
+
+    // the packed mode comes back in; the pane goes into the rule
+    const auto ONCE = adoptExternalMode({5120, 1440}, Config::STEREO_SBS, true);
+    EXPECT_EQ(ONCE.resolution, (Vector2D{2560, 1440}));
+    EXPECT_EQ(ONCE.stereo, Config::STEREO_SBS);
+    EXPECT_TRUE(ONCE.virtualPack);
+
+    // ...and doing it again from the mode THAT rule produces is a fixed point, which is the whole
+    // property: no sequence of GUI commits can walk the mode upward.
+    Vector2D rule = ONCE.resolution;
+    for (int i = 0; i < 5; ++i) {
+        const auto MODE = Monitor::Stereo::requestedMode(rule, Config::STEREO_SBS, true);
+        EXPECT_EQ(MODE, (Vector2D{5120, 1440}));
+        rule = adoptExternalMode(MODE, Config::STEREO_SBS, true).resolution;
+        EXPECT_EQ(rule, (Vector2D{2560, 1440}));
+    }
+}
+
+// A GUI that has genuinely picked another mode outranks a packing we invented — but only when that
+// mode cannot be a pack. An odd width has no clean halves, so the pack goes rather than deriving a
+// fractional pane.
+TEST(XRDepthPair, AdoptingAnIndivisibleModeDropsTheVirtualPack) {
+    const auto GONE = Monitor::Stereo::adoptExternalMode({1921, 1080}, Config::STEREO_SBS, true);
+    EXPECT_EQ(GONE.resolution, (Vector2D{1921, 1080}));
+    EXPECT_EQ(GONE.stereo, Config::STEREO_OFF);
+    EXPECT_FALSE(GONE.virtualPack);
+}
+
+// A PHYSICAL pack and a mono output are untouched: their resolution field already means the mode,
+// which is exactly what the writer handed us. This is what keeps `monitor = …, stereo:sbs` and every
+// ordinary monitor bit-identical through the same code path.
+TEST(XRDepthPair, AdoptingAModeIsTheIdentityOffAVirtualPack) {
+    using Monitor::Stereo::adoptExternalMode;
+
+    const auto PHYS = adoptExternalMode({3840, 1080}, Config::STEREO_SBS, false);
+    EXPECT_EQ(PHYS.resolution, (Vector2D{3840, 1080}));
+    EXPECT_EQ(PHYS.stereo, Config::STEREO_SBS);
+    EXPECT_FALSE(PHYS.virtualPack);
+
+    const auto MONO = adoptExternalMode({1920, 1080}, Config::STEREO_OFF, false);
+    EXPECT_EQ(MONO.resolution, (Vector2D{1920, 1080}));
+    EXPECT_EQ(MONO.stereo, Config::STEREO_OFF);
+
+    // ...and the nonsensical "virtual but not packed" state resolves to the identity too, rather
+    // than dividing by a {1,1} divisor and pretending something happened.
+    const auto ODD = adoptExternalMode({1920, 1080}, Config::STEREO_OFF, true);
+    EXPECT_EQ(ODD.resolution, (Vector2D{1920, 1080}));
+    EXPECT_TRUE(ODD.virtualPack);
 }
 
 // ---------------------------------------------------------------------------------------------
