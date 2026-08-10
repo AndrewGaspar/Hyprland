@@ -866,8 +866,10 @@ cmd_session() {
     fi
 
     local ctr="hypxrland-session-$$"
-    cleanup_session() { podman rm -f "$ctr" >/dev/null 2>&1 || true; }
-    trap cleanup_session EXIT INT TERM
+    # Expand $ctr NOW: the EXIT trap can fire after this function's scope is gone (podman run
+    # dying under set -e), where a `local` is unbound — and a partial container still needs
+    # removing in exactly that case.
+    trap "podman rm -f '$ctr' >/dev/null 2>&1 || true" EXIT INT TERM
 
     log "Booting $IMG_SESSION (session, --gpu $gpu, mode $([[ $use_wivrn -eq 1 ]] && echo wivrn || echo windowed), devices: ${devargs[*]})"
     podman rm -f "$ctr" >/dev/null 2>&1 || true
