@@ -1199,6 +1199,14 @@ std::string CConfigManager::parseKeyword(const std::string& COMMAND, const std::
     // is what makes `hyprctl keyword openxr:black_alpha 0.2` a live, in-headset tuning knob.
     if (COMMAND.starts_with("openxr:black_alpha") && g_pOpenXRManager)
         g_pOpenXRManager->onConfigReload();
+
+    // openxr:stereo_quad_pair (research/24 WP X1) is the stereo kill switch, folded into each XR
+    // monitor's published declaration on the main thread by onConfigReload()->publishStereoPairTuning(),
+    // which also damages the monitors so the flatten happens on the next frame rather than the next
+    // repaint. Same legacy-keyword gap as the vars above, and it matters more here: the whole reason
+    // to reach for this keyword is that a runtime is showing something wrong right now.
+    if (COMMAND == "openxr:stereo_quad_pair" && g_pOpenXRManager)
+        g_pOpenXRManager->onConfigReload();
 #endif
 
     // Update window border colors

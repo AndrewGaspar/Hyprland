@@ -311,6 +311,7 @@ void COpenXRManager::start() {
     publishHandInputPolicy(); // research/16 Part A: seed the hand-input policy from openxr:hand_input
     publishGrabStringTuning(); // task #25: seed hand_grab / hand_grab_anywhere / grab_filter_scope enums
     publishBlackAlphaTuning(); // report 09: seed the luma key (re-published below once the blend mode is picked)
+    publishStereoPairTuning(); // WP X1: seed the stereo kill switch before any layer publishes a declaration
 
     // Concurrency guard for the off-main handshake below. A previously-in-flight OR abandoned handshake
     // worker may still be blocked in xrCreateInstance against a wedged runtime, or an abandoned bring-up
@@ -3347,6 +3348,9 @@ void COpenXRManager::onConfigReload() {
     // report 09: re-resolve the luma key (openxr:black_alpha / :black_alpha_knee) — clamped, gated on
     // the session blend mode, and damaging the XR monitors so a live re-tune shows up immediately.
     publishBlackAlphaTuning();
+    // WP X1: re-resolve each monitor's stereo declaration (a windowrule change moves it) and apply
+    // openxr:stereo_quad_pair immediately rather than at the next repaint.
+    publishStereoPairTuning();
     // doc 05 §xrrule: re-snapshot the declared transparency rules and re-resolve every monitor. Must
     // run AFTER publishBlackAlphaTuning — the black_alpha globals are the DEFAULT layer it folds on.
     reloadXRRules();
@@ -3499,6 +3503,38 @@ void COpenXRManager::publishBlackAlphaTuning(std::optional<OpenXR::eXRBlendMode>
         for (auto& mon : mons)
             g_pHyprRenderer->damageMonitor(mon);
     }
+}
+
+// MAIN THREAD (WP X1). Each layer's stereo declaration is normally re-published from its `presented`
+// listener, which means it only moves when the monitor draws. Two things must not wait for that: a
+// windowrule change (the fold that produces the declaration just changed under us) and, above all,
+// `hyprctl keyword openxr:stereo_quad_pair 0` — the kill switch exists for the case where a runtime
+// is showing something wrong, and "it applies once the desktop next repaints" is not good enough
+// when the whole point is to get out of a broken picture. Re-resolve every monitor unconditionally
+// (cheap: one fullscreen lookup each), and force a composite only when the switch itself moved.
+void COpenXRManager::publishStereoPairTuning() {
+    static auto PPAIR = CConfigValue<Hyprlang::INT>("openxr:stereo_quad_pair");
+
+    const bool  want    = *PPAIR != 0;
+    const bool  changed = !m_lastStereoQuadPair.has_value() || *m_lastStereoQuadPair != want;
+    m_lastStereoQuadPair = want;
+
+    std::vector<PHLMONITOR> mons;
+    {
+        std::scoped_lock lock(m_layersMu);
+        for (auto& l : m_layers) {
+            if (auto mon = l->m_monitor.lock()) {
+                l->publishStereoPairLayout(mon);
+                mons.push_back(mon);
+            }
+        }
+    }
+
+    if (!changed || !m_running.load(std::memory_order_acquire) || !g_pHyprRenderer)
+        return;
+
+    for (auto& mon : mons)
+        g_pHyprRenderer->damageMonitor(mon);
 }
 
 COpenXRManager::SXRBlackAlpha COpenXRManager::blackAlphaStatus() const {
