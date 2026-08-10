@@ -73,14 +73,27 @@ CMonitorRule CMonitorRuleManager::get(const PHLMONITOR PMONITOR) {
             // there is none, and then an explicit resolution in the rule is the mode it is about
             // to get. Both are "no opinion" when unset, which modeIsAsRequested() reads as keep.
             const Vector2D PACKMODE = PMONITOR->m_pixelSize.x > 0 ? PMONITOR->m_pixelSize : rule.m_resolution;
-            if (rule.m_stereo != STEREO_OFF && !Monitor::Stereo::modeIsAsRequested(CONFIG->resolution, PACKMODE)) {
+            if (rule.m_stereo != STEREO_OFF && !rule.m_stereoVirtualMode && !Monitor::Stereo::modeIsAsRequested(CONFIG->resolution, PACKMODE)) {
                 Log::logger->log(Log::WARN, " > wlr-output-management picked mode {:.0f}x{:.0f} over the stereo mode {:.0f}x{:.0f} on {} — disabling stereo packing",
                                  CONFIG->resolution.x, CONFIG->resolution.y, PACKMODE.x, PACKMODE.y, PMONITOR->m_name);
                 rule.m_stereo = STEREO_OFF;
             }
 
-            rule.m_resolution  = CONFIG->resolution;
-            rule.m_refreshRate = CONFIG->refresh / 1000.F;
+            // …and a VIRTUAL pack (research/24 WP X3) needs the opposite treatment, because its
+            // resolution field means ONE PANE while the head advertises — and a GUI therefore
+            // commits back — the PACKED mode. Writing that in verbatim doubles an already-doubled
+            // mode on the next apply, and again on the next commit: a runaway, not a one-off.
+            // adoptExternalMode() converts it back to a pane, or drops the pack when the GUI has
+            // genuinely picked something else (in which case the GUI outranks us).
+            const auto ADOPTED = Monitor::Stereo::adoptExternalMode(CONFIG->resolution, rule.m_stereo, rule.m_stereoVirtualMode);
+            if (rule.m_stereoVirtualMode && ADOPTED.stereo == STEREO_OFF)
+                Log::logger->log(Log::WARN, " > wlr-output-management picked mode {:.0f}x{:.0f} on {}, which does not divide into stereo panes — dropping the depth pack",
+                                 CONFIG->resolution.x, CONFIG->resolution.y, PMONITOR->m_name);
+
+            rule.m_resolution        = ADOPTED.resolution;
+            rule.m_stereo            = ADOPTED.stereo;
+            rule.m_stereoVirtualMode = ADOPTED.virtualPack;
+            rule.m_refreshRate       = CONFIG->refresh / 1000.F;
         }
 
         if (CONFIG->committedProperties & OUTPUT_HEAD_COMMITTED_POSITION) {

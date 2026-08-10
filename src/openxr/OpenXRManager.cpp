@@ -1454,7 +1454,7 @@ void COpenXRManager::frameThread() {
             // producer, the split, whether to submit a pair, and the pixel mode all of that describes.
             // Read ONCE here and used for the whole iteration — a re-read mid-frame could see a
             // different declaration for the same image.
-            const auto DECL = OpenXR::Stereo::unpackDecl(l->m_stereoPairDecl.load(std::memory_order_acquire));
+            const auto DECL = layerDecl(*l);
             // WP X4: a depth-packed monitor's swapchain is TWO independently-margined panes, so the
             // pane count is part of the swapchain's shape, not just of the submission. It only ever
             // changes together with the mode (the pack IS the doubled mode), but deriving it here and
@@ -1828,7 +1828,7 @@ void COpenXRManager::frameThread() {
                     // and `hsbs` must be DECLARED rather than measured: they are the same pixels and
                     // ask for different shapes. `hsbs`/`htab` come back as the mode itself, so the
                     // common case (a half-packed 3D video on a 16:9 monitor) leaves geometry alone.
-                    const auto PANEPX = Render::Stereo::presentedPaneSize(l->m_contentSize, OpenXR::Stereo::unpackDecl(l->m_stereoPairDecl.load(std::memory_order_acquire)).layout);
+                    const auto PANEPX = Render::Stereo::presentedPaneSize(l->m_contentSize, layerDecl(*l).layout);
                     in.pxW       = (uint32_t)std::max(1.0, PANEPX.x);
                     in.pxH       = (uint32_t)std::max(1.0, PANEPX.y);
                     results[i]   = l->m_anchor.solve(in, tune);
@@ -1858,8 +1858,7 @@ void COpenXRManager::frameThread() {
                     // Same pane-aspect rule as the solve path above (WP X1) — a tracking dropout
                     // must not silently un-pair the geometry and pop the quad's height.
                     results[i].heightMeters =
-                        results[i].widthMeters *
-                        Render::Stereo::presentedAspect(l->m_contentSize, OpenXR::Stereo::unpackDecl(l->m_stereoPairDecl.load(std::memory_order_acquire)).layout);
+                        results[i].widthMeters * Render::Stereo::presentedAspect(l->m_contentSize, layerDecl(*l).layout);
                     solved[i]               = true;
                 }
             }
@@ -1915,21 +1914,7 @@ void COpenXRManager::frameThread() {
             // WP X1: what the MAIN thread declared for this monitor (research/24 §5.1). CONTENT_OFF
             // is the ordinary one-quad path and is what every monitor in a session that has never
             // configured stereo reads, every frame, forever.
-            auto       DECL         = OpenXR::Stereo::unpackDecl(l->m_stereoPairDecl.load(std::memory_order_acquire));
-            // WP X3: does that declaration describe the image we are actually holding? A monitor
-            // mid-mode-change (depth engaging, a mode retry) briefly has a swapchain from before the
-            // change and a declaration from after it, and splitting on that mismatch shows each eye
-            // half of a mono desktop. Fall back to one honest quad until the two agree — at most one
-            // frame, and it is invisible instead of wrong.
-            //
-            // "One honest quad" is not the same rect in both directions, and the SWAPCHAIN knows
-            // which: if it is itself two panes, the whole image is a side-by-side picture and
-            // submitting it would double the desktop in both eyes, so the fallback is pane 0. The
-            // frame thread never has to guess — m_paneGeom is what it built the image with.
-            if (!OpenXR::Stereo::describes(DECL, (int32_t)l->m_contentSize.x, (int32_t)l->m_contentSize.y)) {
-                DECL = l->m_paneGeom.panes >= 2 ? OpenXR::Stereo::SPairDecl{.producer = OpenXR::Stereo::PRODUCER_DEPTH, .layout = Render::Stereo::CONTENT_SBS, .submit = false} :
-                                                  OpenXR::Stereo::SPairDecl{};
-            }
+            const auto DECL         = layerDecl(*l);
             const auto STEREOLAYOUT = DECL.layout;
             const bool STEREOPAIR   = DECL.submit && OpenXR::Stereo::pairActive(STEREOLAYOUT);
             const bool DEPTHPACKED  = DECL.producer == OpenXR::Stereo::PRODUCER_DEPTH && l->m_paneGeom.panes >= 2;
@@ -2156,6 +2141,22 @@ void COpenXRManager::frameThread() {
             xrEndFrame(m_session->m_session, &endInfo);
         }
     }
+}
+
+// FRAME THREAD (research/24 WP X1/X3). The published declaration, checked against the image the
+// layer is actually holding. Everything the frame thread derives from the declaration — the split,
+// the pane rects, and the ASPECT the anchor solve turns into quad metres — has to come through
+// here, or a monitor mid-mode-change gets its geometry from the new declaration and its pixels from
+// the old image and pops a frame. A declaration that does not describe the image degrades to one
+// quad: pane 0 when the image is itself two panes (submitting the whole thing would put a
+// side-by-side picture in both eyes), the whole image otherwise.
+OpenXR::Stereo::SPairDecl COpenXRManager::layerDecl(const CXRMonitorLayer& layer) {
+    const auto DECL = OpenXR::Stereo::unpackDecl(layer.m_stereoPairDecl.load(std::memory_order_acquire));
+    if (OpenXR::Stereo::describes(DECL, (int32_t)layer.m_contentSize.x, (int32_t)layer.m_contentSize.y))
+        return DECL;
+
+    return layer.m_paneGeom.panes >= 2 ? OpenXR::Stereo::SPairDecl{.producer = OpenXR::Stereo::PRODUCER_DEPTH, .layout = Render::Stereo::CONTENT_SBS, .submit = false} :
+                                         OpenXR::Stereo::SPairDecl{};
 }
 
 bool COpenXRManager::createLayerSwapchain(CXRMonitorLayer& layer, const Vector2D& size, int panes) {
@@ -2630,8 +2631,16 @@ void COpenXRManager::registerDeclaredMonitorRule(const PHLMONITOR& mon, const PX
     // Only monitors WE created. An `xrmonitor`-adopted real output has a panel, a mode list and a
     // user who chose them; doubling its mode is not ours to do — the same line xrDefaultMonitorScale
     // draws, for the same reason.
+    // A virtual pack DERIVES its mode from a per-pane resolution, so it needs one. `preferred` and
+    // the highrr/highres/maxwidth sentinels name no resolution, and packing on top of whatever the
+    // mode search then picks would halve that desktop — the regression the inversion exists to
+    // prevent. When nothing names one, adopt the pane the monitor is already running (for a
+    // headless output that is simply its current mode); if even that is unknown, decline.
     static auto PDEPTHDESKTOP = CConfigValue<Hyprlang::INT>("openxr:depth_desktop");
-    const bool  WANTDEPTH     = *PDEPTHDESKTOP != 0 && layer->m_createdByXR;
+    Vector2D    depthPane     = wantMode && layer->m_reqResolution ? *layer->m_reqResolution : rule.m_resolution;
+    if (depthPane.x <= 0 || depthPane.y <= 0)
+        depthPane = mon->paneSize();
+    const bool WANTDEPTH = *PDEPTHDESKTOP != 0 && layer->m_createdByXR && depthPane.x > 0 && depthPane.y > 0;
     const auto  WANTSTEREO    = WANTDEPTH ? Config::STEREO_SBS : Config::STEREO_OFF;
     // A user who wrote an explicit `stereo:` token on this output keeps it when depth is off; depth
     // on takes over, because a virtual pack and a physical one are not composable.
@@ -2642,8 +2651,10 @@ void COpenXRManager::registerDeclaredMonitorRule(const PHLMONITOR& mon, const PX
     // resolve to is precisely the one the monitor already has. Zero everywhere = not knowable, and
     // xrDefaultMonitorScale declines rather than guessing.
     Vector2D effectiveMode = wantMode ? *layer->m_reqResolution : rule.m_resolution;
+    // paneSize(), not m_pixelSize: applyMonitorRule validates pane/scale, so proving the divisor on
+    // a packed mode would prove the wrong quantity. Identical off a pack.
     if (effectiveMode.x <= 0 || effectiveMode.y <= 0)
-        effectiveMode = mon->m_pixelSize;
+        effectiveMode = mon->paneSize();
     // `stereoOutput` asks "is this a PHYSICAL per-eye panel", because that is the only case whose
     // scale must be pinned to 1.0. A virtual pack has no physical pixel grid, its pane IS the
     // declared size, and openxr:default_monitor_scale still divides that pane cleanly — so the XR
@@ -2657,6 +2668,9 @@ void COpenXRManager::registerDeclaredMonitorRule(const PHLMONITOR& mon, const PX
     if (WANTDEPTH) {
         rule.m_stereo            = WANTSTEREO;
         rule.m_stereoVirtualMode = true;
+        // ...and NAME the pane, so the derivation has something to derive from even when the rule
+        // only asked for `preferred`. Writing it is what makes the pack expressible at all.
+        rule.m_resolution        = depthPane;
     } else if (rule.m_stereoVirtualMode) {
         // Ours to clear, and only ours: a physical `stereo:` token never sets the virtual flag.
         rule.m_stereo            = Config::STEREO_OFF;
@@ -3553,7 +3567,7 @@ void COpenXRManager::onConfigReload() {
     publishBlackAlphaTuning();
     // WP X1: re-resolve each monitor's stereo declaration (a windowrule change moves it) and apply
     // openxr:stereo_quad_pair immediately rather than at the next repaint.
-publishStereoPairTuning();
+    publishStereoPairTuning();
 
     // research/24 WP X3: openxr:depth_desktop decides whether each XR monitor scans out a per-eye
     // PAIR of panes. Unlike its neighbours this changes the output's MODE, so it re-registers the
@@ -3769,10 +3783,12 @@ void COpenXRManager::publishDepthDesktopTuning() {
     Log::logger->log(Log::DEBUG, "[OPENXR] depth desktop {} — re-deriving XR monitor modes", want ? "ON (per-eye composite, packed mode)" : "OFF (single composite)");
     reassertMonitorModeRules();
 
-    // The declaration the frame thread reads is derived from the monitor's live packing state, which
-    // the rules above have only SCHEDULED. Re-publishing here costs one fullscreen lookup per monitor
-    // and makes the OFF direction take effect on the very next frame instead of the next repaint —
-    // the same reason publishStereoPairTuning exists.
+    // The declaration the frame thread reads is derived from the monitor's live packing state, and
+    // the reassert above has only SCHEDULED the rule pass that changes it — so this republish sees
+    // the OLD state and cannot, by itself, make the toggle land sooner. It is here for the monitors
+    // the pass does not touch (nothing to re-apply, so nothing would ever republish them) and to
+    // keep every layer's declaration on one code path. The pack itself lands on the first `presented`
+    // after the modeset, which is where the frame thread picks it up.
     publishStereoPairTuning();
 }
 
@@ -5012,8 +5028,16 @@ void COpenXRManager::refreshCrossQuads(int64_t nowMs) {
             continue;
         // Content (not chrome-expanded) metres, derived exactly as CXRAnchor::solve does, so the
         // rectangle we intersect is the rectangle of desktop pixels the user sees.
-        const double pxW = l->m_contentSize.x > 0.0 ? l->m_contentSize.x : 1.0;
-        const double pxH = l->m_contentSize.y > 0.0 ? l->m_contentSize.y : 1.0;
+        //
+        // "Exactly as solve does" is load-bearing and used to be wrong here: solve feeds itself
+        // presentedPaneSize(), so widthMeters is ONE PANE's width, while m_contentSize is the whole
+        // packed mode. Dividing the two mixes the units and the crossing rectangle comes out at half
+        // its height on every paired monitor — a ray aimed at the bottom of a quad would cross to
+        // nothing. Latent while only a fullscreen 3D film paired (WP X1); the steady state once
+        // every XR monitor is a depth pack (WP X3).
+        const auto   PANEPX = Render::Stereo::presentedPaneSize(l->m_contentSize, layerDecl(*l).layout);
+        const double pxW    = PANEPX.x > 0.0 ? PANEPX.x : 1.0;
+        const double pxH    = PANEPX.y > 0.0 ? PANEPX.y : 1.0;
 
         OpenXR::SXRCrossQuad q;
         q.id      = id;
