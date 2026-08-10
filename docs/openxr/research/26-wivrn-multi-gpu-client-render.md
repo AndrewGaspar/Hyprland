@@ -48,6 +48,25 @@ directions. This matters more than it sounds: Monado's per-frame client→compos
 creation** rather than degrading to the `sync_fd` fence path that would have worked. That is a
 one-line-ish gate, not an architecture problem.
 
+**The Vulkan spec agrees with the measurements, normatively** (§6.1): `OPAQUE_FD` memory *and*
+`OPAQUE_FD` semaphores are required to match `deviceUUID`+`driverUUID`, while `DMA_BUF` memory and
+`SYNC_FD` semaphores carry **"No restriction"**. Monado's swapchain interchange uses exactly the two
+handle types that are spec-illegal across devices. That reframes the work from "make cross-GPU work"
+to **"stop doing something the spec forbids"**. And the OpenXR spec turns out *not* to require a
+runtime to reject a foreign `physicalDevice` at `xrCreateSession` — the match is an
+application-side Valid Usage, and Vulkan deliberately lacks the "runtime **must** return
+`XR_ERROR_GRAPHICS_DEVICE_INVALID`" sentence that OpenGL and D3D both carry (§6.2). **Monado's
+rejection is a choice, not a requirement.**
+
+**We would be finishing a six-year-old upstream commit, not inventing a direction.**
+`XRT_COMPOSITOR_FORCE_CLIENT_GPU_INDEX` was added by Christoph Haag in 2020 with a commit message
+naming the intended mechanism — *"if compositor and client run on different GPUs, the swapchains use
+linear tiling instead of optimal tiling"* — **and that code has never existed in Monado** (§6.3).
+Upstream shipped the policy seam without the mechanism, and its own multi-GPU page documents our
+exact failure (`vkAllocateMemory: VK_ERROR_INVALID_EXTERNAL_HANDLE`) and prescribes our exact fix.
+Nobody upstream has built it: WiVRn closed the request *"not planned"* in Jan 2026 and Valve declined
+too — **but both judged it against a GPU→host→GPU copy model that §4 shows is unnecessary** (§6.4–6.5).
+
 **The dev cost is real but bounded, and it is almost entirely in Monado, not WiVRn.** WiVRn's own
 collapse of the two device UUIDs (`W/server/compositor/compositor.cpp:797-798`) is a two-line
 change. The actual work is four patches to the vendored Monado, extending the existing
@@ -728,7 +747,13 @@ early converts a confusing late failure into an obvious early one. **Removing th
 alone would not help** — Monado would reject the session. The fix has to be on the runtime side
 (item 5 in §3), which is what the workplan does.
 
-See §6 for the spec-language confirmation from the upstream research pass.
+**§6.2 confirms this from the spec text:** the `physicalDevice` match is a Khronos **Valid Usage**
+item — an *application* obligation whose violation is UB and which the runtime is *not required to
+detect*. Vulkan deliberately lacks the "runtime **must** return `XR_ERROR_GRAPHICS_DEVICE_INVALID`"
+sentence that OpenGL and D3D both carry. **A runtime may legally accept a foreign
+`physicalDevice`.** Monado's rejection is a choice, and xrizer's own source comment
+(*"Monado seems to (incorrectly) give validation errors unless we call this"*) shows its author
+thought so too.
 
 ### 5.3 Does anything else break with two clients on two GPUs?
 
@@ -744,7 +769,199 @@ throughout and it behaves correctly on both drivers.
 
 ## 6. Q5 — Upstream state of the art
 
-*(Pending the upstream research pass; see §9 Q1. The structural findings above do not depend on it.)*
+**Nobody upstream has shipped this, and two of the three relevant projects have explicitly declined.**
+But the spec is on our side in a way that matters, and Monado's own documentation prescribes exactly
+the fix this report recommends.
+
+### 6.1 The Vulkan spec says, normatively, what §4 measured
+
+This is the single most satisfying result of the research pass: the empirical PoC findings and the
+Vulkan specification's normative compatibility table agree **exactly**. From `Vulkan-Docs` `main`,
+`chapters/capabilities.adoc` ("Some external memory handle types can only be shared within the same
+underlying physical device and/or the same driver version"):
+
+| Handle type | `driverUUID` | `deviceUUID` |
+|---|---|---|
+| `EXTERNAL_MEMORY_..._OPAQUE_FD_BIT` | **Must match** | **Must match** |
+| `EXTERNAL_MEMORY_..._DMA_BUF_BIT_EXT` | **No restriction** | **No restriction** |
+| `EXTERNAL_SEMAPHORE_..._OPAQUE_FD_BIT` | **Must match** | **Must match** |
+| `EXTERNAL_SEMAPHORE_..._SYNC_FD_BIT` | **No restriction** | **No restriction** |
+| `EXTERNAL_FENCE_..._OPAQUE_FD_BIT` | Must match | Must match |
+| `EXTERNAL_FENCE_..._SYNC_FD_BIT` | **No restriction** | **No restriction** |
+
+`VkImportMemoryFdInfoKHR`'s man page is literally titled *"**Import memory created on the same
+physical device** from a file descriptor"*, with `VUID-VkImportMemoryFdInfoKHR-fd-00668` requiring
+same-device provenance — and `handleType` restricted to `OPAQUE_FD` **or** `DMA_BUF_BIT_EXT`.
+Ownership transfer across the boundary requires `VK_QUEUE_FAMILY_FOREIGN_EXT`, **not**
+`VK_QUEUE_FAMILY_EXTERNAL_KHR` (which itself demands same physical device and driver version) —
+which is precisely §3 item 9's bug.
+
+> **So Monado's swapchain interchange is not merely *untested* cross-device; it is
+> spec-illegal cross-device, on both the memory and the semaphore side.** That reframes WP-XG1–XG3
+> from "make it work" to "stop doing something the spec forbids". It also explains the exact failures
+> the PoC saw: `OPAQUE_FD` semaphore import returned `VK_ERROR_UNKNOWN` / `VK_ERROR_INITIALIZATION_FAILED`,
+> while `DMA_BUF` memory and `SYNC_FD` semaphores worked first try.
+
+⚠️ Trap for whoever writes the patches: the auto-generated `docs.vulkan.org` refpage for
+`VkExternalSemaphoreHandleTypeFlagBits` claims `OPAQUE_FD` has "No restriction". **That is wrong** —
+the spec source says "Must match". Cite the spec source, not the refpage.
+
+### 6.2 What the OpenXR spec actually requires of the runtime — less than everyone assumes
+
+Read from OpenXR **1.1.62**. `XR_KHR_vulkan_enable` §12.23 is advisory: the device
+*"**should** be passed to `xrCreateSession`"*. `XR_KHR_vulkan_enable2` §12.24.2 obliges only the
+*runtime* to *report* a compatible device.
+
+The `physicalDevice` **must** match line on `XrGraphicsBindingVulkanKHR` /
+`XrGraphicsBindingVulkan2KHR` is a **Valid Usage** item — in Khronos grammar an *application*
+obligation whose violation is undefined behaviour and which **the runtime is not required to
+detect**. There is no "otherwise `xrCreateSession` must return …" clause for Vulkan.
+
+**The contrast with OpenGL and D3D proves the omission is deliberate.**
+`XrGraphicsBindingOpenGLWin32KHR` says: *"If the GPU used by the runtime does not match the GPU on
+which the OpenGL context of the application was created, `xrCreateSession` **must** return
+`XR_ERROR_GRAPHICS_DEVICE_INVALID`."* D3D11/D3D12 carry equivalent language. **Vulkan has no such
+sentence.**
+
+The one place the spec *does* bind the runtime is `xrCreateVulkanDeviceKHR`: if
+`vulkanPhysicalDevice` doesn't match, the runtime **must** return `XR_ERROR_HANDLE_INVALID`. Note
+that attaches to *device creation*, not to `xrCreateSession` — a distinction commonly misquoted.
+
+> **Conclusion for §5.2: a runtime may legally accept a foreign `physicalDevice` at `xrCreateSession`.**
+> Monado's rejection at `oxr_session.c:1285-1292` is a **choice**, not a spec requirement — a
+> runtime-side enforcement of an application-side Valid Usage. That is exactly one `if`, and it is
+> what WP-XG4 relaxes. (The app is still in UB territory by the letter of the spec; the honest
+> framing is that we are choosing to define that behaviour in our runtime.)
+
+**[NF]** No spec language anywhere about a runtime returning different devices per instance or
+session. The contract is per-`(instance, systemId)` and simply silent on variance — so §5.1's
+per-client suggestion is not prohibited, merely unmodelled.
+
+### 6.3 Monado: the seam was added in 2020, with a mitigation that was never built
+
+`XRT_COMPOSITOR_FORCE_CLIENT_GPU_INDEX` came from **Christoph Haag, 2020-08-07**, commit
+[`e48c748a5`](https://gitlab.freedesktop.org/monado/monado/-/commit/e48c748a57ea8426814e2bce369d314964a87c34),
+[MR !472](https://gitlab.freedesktop.org/monado/monado/-/merge_requests/472). The commit message
+states the rationale:
+
+> The reason this is both done on the service side is that **if compositor and client run on
+> different GPUs, the swapchains use linear tiling instead of optimal tiling.**
+
+**That code does not exist in Monado today, and may never have.** Checked against current `main`
+(`f037264d2`, 2026-08-07): `VK_IMAGE_TILING_LINEAR` appears exactly once in `src/`, in a readback
+helper; `vk_image_allocator.c` and `vk_create_image_from_native` both hardcode
+`VK_IMAGE_TILING_OPTIMAL` unconditionally; `VK_EXT_image_drm_format_modifier` appears only as an
+error-string enum in `vk_print.c`. **Monado implements DRM format modifiers nowhere.**
+
+> **This is the report's most useful upstream finding.** Upstream shipped the *policy* seam
+> (two env vars, two UUIDs) together with a stated *mechanism* (linear tiling for the cross-GPU
+> case) that was never implemented. WP-XG1/XG2 are not inventing a new direction — **they are
+> finishing a six-year-old commit**, using the modifier mechanism that did not exist in 2020.
+
+Upstream's own docs are candid about the consequence:
+
+- [getting-started.html](https://monado.freedesktop.org/getting-started.html): *"`XRT_COMPOSITOR_FORCE_CLIENT_GPU_INDEX` … **Expect breakage when choosing a different GPU.**"*
+- [multi-gpu.html](https://monado.freedesktop.org/multi-gpu.html) (created by Haag the same day) documents **our exact failure**: *"Vulkan client on intel GPU: `vkAllocateMemory: VK_ERROR_INVALID_EXTERNAL_HANDLE`"*, and prescribes the fix: *"The solution should simply be to either **attempt to provide vkFormat LINEAR between GPUs in your own software implementation** or to ensure all applications are operating on the same GPU."*
+
+**[NF] There is no open Monado issue for cross-GPU *client* rendering.** Everything in the tracker is
+compositor/display-side: #287 (pick the GPU the HMD is plugged into, open), #204 (DRM lease, closed),
+MR !2820 (DRM-lease device selection, **closed unmerged** 2026-07-15), MR !2834 (Wayland direct
+backend device selection, open). The only real multi-GPU *implementation* attempt is
+[MR !2174](https://gitlab.freedesktop.org/monado/monado/-/merge_requests/2174) (CAVE support), which
+uses `VK_KHR_device_group` — **same-vendor only**, and has sat unmerged since 2024-03-14.
+
+*Sourcing caveat: freedesktop GitLab's notes API needs auth and the web UI is behind anti-bot, so
+issue/MR descriptions are verbatim but comment threads were not readable — including why !2820 was
+closed.*
+
+### 6.4 WiVRn: declined once, and the capability was lost in a rewrite
+
+[WiVRn#203 "Encode on alternate GPU (NVENC)"](https://github.com/WiVRn/WiVRn/issues/203), opened
+2024-12-07, **closed "not planned" 2026-01-05** by maintainer `xytovl`: *"Closing as not planned,
+**this would add complexity with little benefit**."* Earlier in the thread he scoped it as
+`VK_KHR_device_group` or *"a second logical device, and in the `present_image` method do a GPU to
+host then host to GPU copy."*
+
+**A user reported our exact failure in that thread and it did not change the outcome** —
+`Bruno5430`, 2025-09-30: forcing WiVRn onto the iGPU with `MESA_VK_DEVICE_SELECT` enables vaapi, but
+then *"the game has to use the same iGPU… Otherwise the runtime (**both xrizer and OpenComposite**)
+crashes with `The VkPhysicalDevice that the OpenVR app used is different from the one that the OpenXR
+runtime used!`"*
+
+**A capability regression worth knowing:** WiVRn commit
+[`22a819b8c`](https://github.com/WiVRn/WiVRn/commit/22a819b8c) (2026-03-29, "Implement main
+compositor") replaced Monado's `comp_main` with WiVRn's own compositor. `comp_settings` now has zero
+hits in WiVRn. **On WiVRn ≤ 26.2.x, `XRT_COMPOSITOR_FORCE_CLIENT_GPU_INDEX` would have been live;
+from v26.6 it is dead.** So §2.5's "dead code in WiVRn" is a recent loss, not an eternal state —
+which slightly strengthens the case that WP-XG5 is restoration rather than novelty.
+
+Also confirmed: the vaapi `device` key is the **only** GPU/render-node key in WiVRn's entire config
+schema, and WiVRn's default device heuristic is `Discrete(4) > Integrated(3)` — **so on this laptop
+WiVRn would pick the NVIDIA dGPU by default**; the AMD-only result comes entirely from the
+`VK_DRIVER_FILES` pin. (Minor upstream bug spotted in passing: the `XRT_COMPOSITOR_FORCE_GPU_INDEX`
+bound check is `index > phys_devices.size()`, should be `>=`.)
+
+### 6.5 xrizer, OpenComposite, Proton, SteamVR — three strategies, none of them copying
+
+**xrizer's assert is at `src/openxr_data.rs:471-478`** (not in `vulkan.rs`), in `SessionData::new`:
+
+```rust
+// Monado seems to (incorrectly) give validation errors unless we call this.
+let pd = unsafe { instance.vulkan_graphics_device(system_id, info.instance) }.unwrap();
+assert_eq!(pd, info.physical_device);
+```
+
+Note the comment: xrizer calls `xrGetVulkanGraphicsDeviceKHR` **purely to silence Monado's
+validation**, then panics if it disagrees. It otherwise uses the *game's* device throughout
+(`graphics_backends/vulkan.rs:509`, straight from the OpenVR `VRVulkanTextureData_t`). The
+runtime-suggested device is used only for the throwaway pre-Submit session.
+
+The only upstream response to date is [PR #297](https://github.com/Supreeeme/xrizer/pull/297)
+(opened 2026-02-05, **still unmerged**), which replaces the bare assert with a **better panic
+message** naming both devices. **[NF]** xrizer has no `DRI_PRIME`/`VK_DRIVER_FILES` override
+anywhere.
+
+**OpenComposite** aborts identically (`DrvOpenXR/XrBackend.cpp:265-273`) and its message names the
+only known workaround: *"…except for on multi-gpu, in which case `DRI_PRIME=1` should fix things on
+Linux."* `DRI_PRIME` occurs exactly once in that repo — in that string.
+
+**Proton is the one project that does something different** (`wineopenxr/openxr.c`): for native
+Vulkan apps it passes the app's devices through **unchecked**; for D3D11 it warns and then
+**overrides** `our_vk_binding.physicalDevice = wine_instance->vk_phys_dev`. Its real mechanism is
+*steering*, not copying — it reads the runtime device's `vendorID`/`deviceID` and reports the
+matching DXGI adapter LUID so the D3D app naturally initialises on the runtime's GPU.
+
+**SteamVR/Valve declined too.** `SteamVR-for-Linux#869` (open), contributor Packetdancer,
+2026-04-28: *"To allow them to work on separate GPUs would mean the texture would need to be copied
+Steam GPU -> CPU -> SteamVR GPU every time it updated… The performance hit involved would be…
+'Not Great'."* Reproduced on both AMD-iGPU+NVIDIA-dGPU and Intel-iGPU+AMD-dGPU — **cross-device, not
+merely cross-vendor**. SteamVR's own runtime matches by `deviceUUID` and hard-fails
+(*"IVRSystem::GetOutputDevice: failed to find VkPhysicalDevice matching deviceUUID"*).
+
+Worth noting Valve's stated cost model assumes a **GPU→CPU→GPU** round trip. §4 shows that is not
+necessary here: a dma-buf import is a direct device read, no host bounce.
+
+### 6.6 The received wisdom, corrected by measurement
+
+| Folklore | Status | Evidence |
+|---|---|---|
+| "NVIDIA can't import foreign dma-bufs" | **Stale since driver 525.** | NVIDIA's `cubanismo`, 2024-10-22: *"we've supported importing 'foreign' dma-bufs for several releases now via EGL and Vulkan"* ([open-gpu-kernel-modules#243](https://github.com/NVIDIA/open-gpu-kernel-modules/discussions/243)) |
+| "Cross-vendor semaphore sharing doesn't work" | **True for `OPAQUE_FD`, false for `SYNC_FD`.** | NVIDIA added `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT` in **545.23.06** (2023-10-17), gated on `nvidia-drm modeset=1`; broadly usable from 555.58; needs kernel ≥ 6.8. We run 610.43.03. **§4.5 confirms it works and orders.** |
+| "Only LINEAR is shareable NVIDIA↔RADV" | **True, and independently confirmed.** | KWin [MR !4177](https://invent.kde.org/plasma/kwin/-/merge_requests/4177): *"to import a buffer from a non-NVidia GPU to a NVidia GPU, **only the linear modifier is valid**."* Mesa's `ac_get_supported_modifiers()` emits only `AMD_FMT_MOD` + LINEAR. Matches §4.2 exactly. |
+| "NVIDIA ignores the explicit stride on LINEAR dma-buf import" | **Not reproduced here — we tested it.** | [forum 364360](https://forums.developer.nvidia.com/t/egl-import-via-egl-ext-image-dma-buf-import-modifiers-ignores-explicit-stride-causes-image-distortion-in-virtio-gpu-venus/364360) reports this for **EGL/virtio-gpu Venus**. §4.3 imported an AMD buffer with `rowPitch=8448` at width 2064 (tight would be 8256) into NVIDIA's **Vulkan** and got pixel-exact results. Treat as EGL/Venus-specific; **re-verify in WP-XG0 anyway**, because a silent stride bug would be a nightmare to diagnose. |
+| "The shared buffer lives in dGPU VRAM" | **False.** | §4.7 — neither driver ever placed a shareable dma-buf in VRAM. Xaver Hugl, 2026-07-31: *"the driver will not share the buffers on the GPU with the compositor, but actually create a copy in system memory."* |
+
+**Everyone who solved a version of this converged on LINEAR + a copy.** `linux-dmabuf-v1` is
+normative about it (*"the client must force the buffer to have a linear layout"* when allocating on
+a non-main device without explicit modifiers); wlroots 0.14.1 shipped *"backend/drm: force linear
+layout for multi-GPU buffers"*; KWin went CPU-copy (2021) → EGL import + a `glFinish` costing up to
+**3 ms** (2023) → compositor-side copies via linux-dmabuf v6 (2025, taking Cyberpunk on an eGPU from
+27 → 50 fps). **[NF] No project anywhere shares a *tiled or compressed* image cross-vendor.**
+
+For a latency sanity check, NVIDIA's own [`nvpro-samples/xr_multi_gpu`](https://github.com/nvpro-samples/xr_multi_gpu)
+measures device→device image transfer at **0.7–2.2 ms over PCIe 5.0** (same-vendor, Windows,
+SLI-gated). Our measured 1.43 ms/eye sits inside that band, which is mild independent corroboration
+that §4.6's numbers are the right order of magnitude even if the absolutes need redoing.
 
 ---
 
@@ -807,9 +1024,27 @@ local write), not a whole extra copy.**
 The one place a genuine extra copy would appear is if the pitch-alignment problem (§4.4) had to be
 solved by staging rather than padding — it doesn't, padding is free.
 
-### Shape D — anything upstream suggests
+### Shape D — what upstream suggests
 
-*(Pending §6.)*
+**Upstream suggests Shape A, in writing, and has since 2020.** Monado's own multi-GPU page
+prescribes *"attempt to provide vkFormat LINEAR between GPUs in your own software implementation"*
+(§6.3), and the `FORCE_CLIENT_GPU_INDEX` commit message names linear tiling as the intended
+mitigation for exactly this case. There is no alternative upstream design to evaluate: the only
+other multi-GPU implementation in the ecosystem is Monado MR !2174's `VK_KHR_device_group`, which is
+**same-vendor only** (NVIDIA SLI Mosaic) and cannot express an NVIDIA↔AMD pair.
+
+The two shapes upstream *rejected* are both worse than Shape A and worth naming so they are not
+re-proposed:
+
+- **`VK_KHR_device_group`** (WiVRn#203's first suggestion, Monado MR !2174) — same-vendor only.
+  Not applicable.
+- **GPU → host → GPU copy** (WiVRn#203's second suggestion; Valve's stated model in
+  SteamVR-for-Linux#869) — a full host round trip per eye per frame. **§4 shows this is unnecessary:
+  a dma-buf import is a direct device read with no host bounce.** Both maintainers' "not worth the
+  complexity" verdicts were reached against this more expensive model, which is a meaningful reason
+  their conclusion need not be ours.
+
+**0 tasks — this is Shape A under a different name.**
 
 ### Ranking
 
@@ -830,7 +1065,7 @@ Sized in agent-tasks. **A** = required for Shape A. **B** = the Shape B unblock.
 | WP | Scope | Tasks | Variant |
 |---|---|---|---|
 | **WP-XG-B1** | **Shape B unblock.** Pass `.device` through `prober::check_vaapi` and the 10-bit probe (`W/server/encoder/encoder_settings.cpp:136-146`, `:362-372`) so vaapi capability is probed on the *configured* encode device, not the compositor's. Then flip the live config (drop the `VK_DRIVER_FILES` pin, `openxr:gpu = renderD128`, keep `device: renderD129`) and confirm the game runs. **Headset-in-the-loop; needs the user.** Upstream this as a WiVRn PR. | 1 | **B** |
-| **WP-XG0** | **Re-measure properly, and prove the no-regression baseline.** Rework the PoC benchmark to use timestamp queries and pipelined submission (kill the per-iteration barrier, §4.6 caveat) and re-run; add a `VK_IMAGE_USAGE_COLOR_ATTACHMENT` *render-into-imported-LINEAR* case, which the current PoC does not cover and which is unknown (i) in §7. Separately: build WiVRn 26.6.2 unmodified and confirm a same-GPU session is healthy, as the regression baseline every later WP is judged against. | 1 | A |
+| **WP-XG0** | **Re-measure properly, and prove the no-regression baseline.** Rework the PoC benchmark to use timestamp queries and pipelined submission (kill the per-iteration barrier, §4.6 caveat) and re-run; add a `VK_IMAGE_USAGE_COLOR_ATTACHMENT` *render-into-imported-LINEAR* case, which the current PoC does not cover and which is unknown (i) in §7. Also re-verify the NVIDIA explicit-stride behaviour under Vulkan (§6.6 row 4) — we got pixel-exact results, but a silent stride bug would be brutal to diagnose later. Separately: build WiVRn 26.6.2 unmodified and confirm a same-GPU session is healthy, as the regression baseline every later WP is judged against. | 1 | A |
 | **WP-XG1** | **Monado patch 0009 — dma-buf export with explicit modifiers.** `xrt_swapchain_create_info` gains a modifier/cross-GPU field (`xrt_compositor.h:894-912`). `vk_image_allocator.c` `:63`/`:256` become `DMA_BUF` + `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` with a LINEAR modifier list when the flag is set, keeping the existing `OPAQUE_FD`/`OPTIMAL` path byte-identical when it is not. Plumb `vkGetImageDrmFormatModifierPropertiesEXT` + per-plane `vkGetImageSubresourceLayout` so the layouts can travel. | 2 | A |
 | **WP-XG2** | **Monado patch 0010 — client import via dma-buf.** `vk_create_image_from_native` (`vk_helpers.c:1115,1172,1189-1196`): `DMA_BUF` handle type, explicit-modifier image create, and **memory type from `vkGetMemoryFdPropertiesKHR`** — closing the tree's own TODO. Model it on the working import at `W/server/encoder/ffmpeg/video_encoder_va.cpp:363-467`. Carry the plane layouts over IPC (new fields in the swapchain-create reply). Also relax the `requirements.size` abort at `:1253-1259` for the cross-device case. | 2 | A |
 | **WP-XG3** | **Monado patch 0011 — force the `SYNC_FD` fence path when cross-GPU.** Suppress the `OPAQUE_FD` timeline-semaphore negotiation (`comp_vk_client.c:149-201`, gate at `:891-893`) so `submit_fence` (`:203-237`) is chosen, and make `setup_semaphore` failure **degrade** instead of `goto err_pool`. §4.5 says the fence path is correct cross-vendor; this WP is what makes it reachable. | 1 | A |
@@ -855,13 +1090,11 @@ mechanical.
 
 ## 9. Open questions for the user
 
-1. **Upstream reconnaissance is still outstanding.** The web research pass covering Monado GitLab
-   (existing MRs/issues on client GPU selection), WiVRn GitHub (maintainer position on multi-GPU /
-   PRIME), the exact OpenXR spec language on `xrGetVulkanGraphicsDevice2KHR`, and the xrizer assert's
-   permalink had not returned when this report was written. **§6 and Shape D are placeholders.** If
-   an upstream MR already does WP-XG1/XG2, the workplan could shrink by several tasks — worth
-   waiting for before starting XG1. Do you want that filled in as an erratum, or should the report
-   be held until it lands?
+1. **Upstream-first or fork-first, given that upstream has twice said no?** §6.4 and §6.5 show WiVRn
+   closed the request *"not planned, complexity with little benefit"* and Valve declined too — but
+   **both reached that verdict against a GPU→host→GPU copy model that §4 shows is unnecessary.** A
+   PR carrying the measured dma-buf numbers might land where the 2024 request didn't. That is a
+   judgement call about your appetite for upstream advocacy, not a technical one. (See also Q4.)
 2. **Do you want Shape B applied now, before Shape A is built?** It unblocks The Big Walk this week
    at the cost of ending the AMD-only evaluation and moving the compositor to the dGPU. Given
    research/25's finding that the dGPU never actually sleeps today, the power argument for AMD-only
