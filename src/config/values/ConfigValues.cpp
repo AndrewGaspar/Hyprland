@@ -1019,6 +1019,11 @@ std::vector<SP<IValue>> Values::getConfigValues() {
                   4.0, {.min = 0.0, .max = 45.0}),
         MS<Int>("openxr:layout2d:debounce_ms", "coalescing window for 2D-plane-sync recompute triggers, in milliseconds — a burst of grab releases costs one relayout", 300,
                 {.min = 0, .max = 5000}),
+        MS<String>("openxr:cursor_crossing",
+                   "how the cursor decides where to land when it pushes past an XR monitor's edge: raycast (default — cast from your head through the exit point and land on the "
+                   "monitor you actually SEE over there, so depth/elevation/yaw are respected) | layout (the 2D-plane sync's grid adjacency alone). raycast falls back to layout "
+                   "whenever it cannot answer: no XR session, a stale head pose, a non-XR source monitor, or a ray that meets nothing",
+                   "raycast"),
 
         /*
          * experimental:

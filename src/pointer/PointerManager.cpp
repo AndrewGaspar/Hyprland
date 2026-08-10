@@ -22,6 +22,7 @@
 #include "../helpers/Drm.hpp"
 #include "../event/EventBus.hpp"
 #include "../state/MonitorState.hpp"
+#include "../openxr/OpenXRManager.hpp" // ray-cast cursor edge crossing (self-guarded by HAVE_OPENXR)
 #include <climits>
 #include <cstring>
 #include <gbm.h>
@@ -862,6 +863,23 @@ void CPointerManager::move(const Vector2D& deltaLogical) {
 
     if (PROTO::inputCapture->isCaptured())
         return;
+
+#ifdef HAVE_OPENXR
+    // Ray-cast cursor edge crossing (task #139, src/openxr/XRCursorCross.hpp). THIS is the moment
+    // the overshoot past a monitor edge still exists: warpTo() -> closestValid() is about to clamp
+    // newPos into the union of monitor boxes and throw the leftover delta away. When the cursor is
+    // leaving an XR monitor, ask the room instead of the layout — cast from the head through the
+    // exit point on the source quad's plane and land where that line meets the monitor the user can
+    // actually see over there. nullopt (the common case, and every failure) leaves the motion
+    // untouched, so the 2D-plane sync's layout adjacency decides exactly as it did before.
+    //
+    // Deliberately AFTER the input-capture hooks: they still see the raw candidate position, so a
+    // capture region behaves identically whether or not an XR session is up.
+    if (g_pOpenXRManager) {
+        if (const auto REDIRECT = g_pOpenXRManager->redirectCursorCrossing(oldPos, newPos))
+            newPos = *REDIRECT;
+    }
+#endif
 
     warpTo(newPos);
 }
