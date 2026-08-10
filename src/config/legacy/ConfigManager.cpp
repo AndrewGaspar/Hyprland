@@ -1214,6 +1214,14 @@ std::string CConfigManager::parseKeyword(const std::string& COMMAND, const std::
     // to reach for this keyword is that a runtime is showing something wrong right now.
     if (COMMAND == "openxr:stereo_quad_pair" && g_pOpenXRManager)
         g_pOpenXRManager->onConfigReload();
+
+    // openxr:depth_desktop (research/24 WP X3) turns each XR monitor's per-eye composite on and off,
+    // which means re-deriving its scanout mode — onConfigReload()->publishDepthDesktopTuning()
+    // re-registers the monitor rules and lets the ordinary apply path do the rest. Same legacy-keyword
+    // gap as the vars above, and the same reason it matters: this is the A/B switch for the whole
+    // depth desktop, and it is meant to be bindable from inside the headset.
+    if (COMMAND == "openxr:depth_desktop" && g_pOpenXRManager)
+        g_pOpenXRManager->onConfigReload();
 #endif
 
     // Update window border colors

@@ -24,7 +24,7 @@
 
 #include "XRQueue.hpp"
 #include "XRMath.hpp"               // OpenXR::SXRPose
-#include "../render/StereoContent.hpp" // Render::Stereo::eContentLayout (WP X1 pane un-map)
+#include "XRStereoPair.hpp" // OpenXR::Stereo::SPairDecl (WP X1/X3 pane un-map, pure)
 #include "XRAnchor.hpp"             // OpenXR::eXRHand
 #include "../SharedDefs.hpp"        // MONITORID
 #include "../helpers/math/Math.hpp" // Vector2D + wl_pointer_axis
@@ -101,11 +101,14 @@ struct SXRPointerTarget {
     OpenXR::CXRAnchor*        anchor = nullptr;
     OpenXR::SXRChromeGeometry chrome;           // WP-G1: normalized chrome layout for hit classification + content-uv remap
 
-    // WP X1 (research/24 §5.6): the stereo layout this monitor is being SUBMITTED with, if any.
+    // WP X1/X3 (research/24 §5.6): the stereo declaration this monitor is being SUBMITTED with.
     // A paired monitor's quad shows one PANE, so a ray hit on it is a pane uv — and the pointer
-    // wants a coordinate in the whole packed image. Without the un-map the cursor is off by half a
-    // screen, which is §5.6's exact warning. CONTENT_OFF (the default) makes the un-map an identity.
-    Render::Stereo::eContentLayout stereo = Render::Stereo::CONTENT_OFF;
+    // wants a coordinate in the whole logical desktop. Without the un-map the cursor is off by half
+    // a screen, which is §5.6's exact warning. The whole declaration travels rather than just the
+    // layout because the un-map belongs to the PRODUCER: the CONTENT producer squeezes the uv back
+    // into its half of a packed image, the DEPTH producer's panes are each the whole desktop and its
+    // un-map is the identity. A default-constructed declaration makes it an identity either way.
+    OpenXR::Stereo::SPairDecl stereo;
 };
 
 // Schmitt trigger for analog buttons (doc 04 §4). update() returns true on an edge.
