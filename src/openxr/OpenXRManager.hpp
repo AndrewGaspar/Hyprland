@@ -641,6 +641,7 @@ class COpenXRManager {
     // modeOverride: use this blend mode for the gate instead of m_session's (start() calls it with the
     // freshly-picked mode before the session object is adopted). nullopt + no session = gate closed.
     void               publishBlackAlphaTuning(std::optional<OpenXR::eXRBlendMode> modeOverride = std::nullopt); // main thread only
+    void               publishStereoPairTuning();                                                                 // main thread only (WP X1)
     std::atomic<float> m_blackAlpha{1.F};         // EFFECTIVE alpha for pure black; 1.0 = feature off
     std::atomic<float> m_blackAlphaKnee{0.1F};    // luma at which content is fully opaque
     std::atomic<float> m_blackAlphaConfigured{1.F};
@@ -928,6 +929,10 @@ class COpenXRManager {
     // corner_size), to detect a hot-reload change (WP-G2 chrome hot-reload fix). Empty until first
     // compared.
     std::optional<std::array<double, 5>> m_lastChromeGeom;
+
+    // WP X1: last seen openxr:stereo_quad_pair, so a keyword toggle can be told apart from an
+    // unrelated reload and only the real change pays for a forced re-composite of every XR monitor.
+    std::optional<bool>                  m_lastStereoQuadPair;
 
     CHyprSignalListener m_configReloadListener;
     CHyprSignalListener m_propsRefreshedListener;

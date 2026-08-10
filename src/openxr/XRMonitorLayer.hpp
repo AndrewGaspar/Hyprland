@@ -58,6 +58,10 @@ class CXRMonitorLayer {
     // Stop queueing new buffers/mode changes (removal barrier step 1).
     void stopMainListeners();
 
+    // MAIN THREAD ONLY. Resolve + publish m_stereoPairLayout for this monitor (WP X1). Called from
+    // the `presented` listener, and directly on a config change so the kill switch applies at once.
+    void publishStereoPairLayout(const PHLMONITOR& mon);
+
     // ---- frame thread ----
     // Grab the latest presented buffer, if any (nulls m_haveNewFrame). Returns null when no
     // new frame is pending. The returned SP is MOVED out (no refcount op); the caller must
@@ -249,6 +253,21 @@ class CXRMonitorLayer {
     // What the uniform fade last RENDERED into the swapchain (frame thread only, redraw diff): a
     // change means an animation-only frame must recompose even with no new desktop buffer.
     float              m_fxAlphaDrawn = 1.F;
+
+    // Stereo CONTENT declaration for this monitor (research/24 §5.1, WP X1), as one published byte:
+    // a Render::Stereo::eContentLayout, or CONTENT_OFF for "submit one ordinary quad".
+    //
+    // The MAIN thread resolves it — it takes a fullscreen-controller lookup and a window's rule
+    // fold, none of which the frame thread may touch — and stores it here from the `presented`
+    // listener, i.e. at the moment it hands over the very buffer this layout describes. The frame
+    // thread loads it once per frame and turns it into an imageRect + eyeVisibility per eye.
+    //
+    // A byte rather than the enum because the frame thread must never read anything whose backing
+    // store the main thread can reallocate under it; the same reason m_handGrabMode is a uint8_t.
+    // On a transition the pairing can be one frame behind the buffer it describes (the layout is
+    // published with frame N while the frame thread may still be showing N-1) — the same tolerance
+    // the m_fx* envelopes already run under, and the worst case is one frame of a doubled image.
+    std::atomic<uint8_t> m_stereoPairLayout{0};
 
     // Fade-envelope state (frame thread only; only the blit loop touches these). Alpha is advanced
     // every frame from predicted-display-time deltas via OpenXR::chromeFadeAdvance; the *Drawn*
