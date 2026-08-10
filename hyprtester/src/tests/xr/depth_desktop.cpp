@@ -179,9 +179,17 @@ TEST_CASE(xr_depth_desktop_pair) {
     ASSERT(waitForDecl(MON, "sbs", "depth", 2), true);
 
     // THE INVARIANT. The declared size is PER EYE and does not move: the pack doubled the scanout
-    // mode, not the desktop. A `width` of 640 here would mean every window just got reflowed.
+    // mode, not the desktop. `hyprctl monitors` reports paneSize(), so a `width` of 640 here would
+    // mean every window on this monitor just got reflowed into half the space.
     ASSERT(waitForMonitorField(MON, "width", "1280"), true);
     EXPECT(monitorField(MON, "height"), std::string("720"));
+    // ...and the SCALE with it, which is the half `width` cannot show. A physical stereo output is
+    // pinned to scale 1.0 because its per-eye pixel grid is real; a virtual pack has no such grid,
+    // and pinning it would silently resize every XR desktop the moment depth engaged. Captured here
+    // and compared against the unpacked value at the end of the test, so this asserts the property
+    // (nothing moved) rather than a number that depends on openxr:default_monitor_scale.
+    const std::string SCALE_PACKED = monitorField(MON, "scale");
+    EXPECT(SCALE_PACKED.empty(), false);
     ASSERT(waitForMonitorField(MON, "scanoutWidth", "2560"), true);
     EXPECT(monitorField(MON, "scanoutHeight"), std::string("720"));
     EXPECT(monitorField(MON, "stereo"), std::string("sbs"));
@@ -229,6 +237,9 @@ TEST_CASE(xr_depth_desktop_pair) {
     ASSERT(waitForDecl(MON, "off", "off", 1), true);
     ASSERT(waitForMonitorField(MON, "width", "1280"), true);
     EXPECT(monitorField(MON, "height"), std::string("720"));
+    // THE OTHER HALF OF THE INVARIANT: same scale packed and unpacked. If these ever differ, the
+    // depth toggle is a resize, and every window on the monitor moved.
+    EXPECT(monitorField(MON, "scale"), SCALE_PACKED);
     // stereo/scanout* are only emitted while the monitor IS stereo, so their absence is the assertion.
     EXPECT(monitorField(MON, "scanoutWidth"), std::string(""));
     ASSERT(waitForChrome(MON, true), true); // an ordinary quad has chrome too
