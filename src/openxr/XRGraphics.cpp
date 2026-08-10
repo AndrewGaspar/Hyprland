@@ -425,14 +425,33 @@ void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer
     // swapchain image has a BOTTOM-left origin (the shader / blit already flip v), so the content
     // rect's GL-space bottom edge is dstH - top - height. Content-less layers (no chrome computed
     // yet) fall back to the full swapchain.
-    int contentW = (int)layer.m_contentSize.x;
-    int contentH = (int)layer.m_contentSize.y;
-    if (contentW <= 0 || contentH <= 0) {
-        contentW = dstW;
-        contentH = dstH;
+    //
+    // WP X4: on a depth-packed monitor the presented buffer holds TWO panes and the swapchain holds
+    // two INDEPENDENTLY MARGINED panes, so the two destinations are not contiguous — a pane's right
+    // margin and its neighbour's left margin sit between them. That is the whole reason the draws
+    // below run in a loop: one blit cannot land a contiguous source into two separated rects.
+    // PANES == 1 for every ordinary monitor and the loop body is then byte-for-byte the shipped path.
+    const int PANES = std::clamp(layer.m_paneGeom.panes, 1, 2);
+
+    OpenXR::Stereo::SImageRect dest[2]{};
+    int                        paneCount = PANES;
+    if (layer.m_paneGeom.paneContent.x >= 1 && layer.m_paneGeom.paneContent.y >= 1 && layer.m_paneGeom.paneFull.x >= 1) {
+        for (int i = 0; i < PANES; ++i)
+            dest[i] = OpenXR::Stereo::paneContentDestGL(layer.m_paneGeom, i);
+    } else {
+        // Content-less layer (no chrome geometry computed yet): the whole image, exactly as before.
+        paneCount = 1;
+        dest[0]   = {0, 0, dstW, dstH};
     }
-    const int contentX  = (int)layer.m_contentOffsetPx.x;                   // from left
-    const int contentGL = dstH - (int)layer.m_contentOffsetPx.y - contentH; // GL bottom-left y
+
+    // Place the WHOLE source across `paneCount` pane-widths and scissor to pane i, so pane i of the
+    // source lands exactly on dest[i]. Used by both shader paths (a fullscreen triangle cannot take
+    // a source sub-rect, but a viewport wider than the scissor is the same thing).
+    auto viewportForPane = [&](int i) {
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(dest[i].x, dest[i].y, (GLsizei)dest[i].w, (GLsizei)dest[i].h);
+        glViewport(dest[i].x - i * dest[i].w, dest[i].y, (GLsizei)(dest[i].w * paneCount), (GLsizei)dest[i].h);
+    };
 
     // Clear the WHOLE swapchain image to premultiplied-transparent (0,0,0,0). Because the quad is
     // submitted premultiplied (no XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT), bilinear
@@ -483,19 +502,21 @@ void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer
             glGenFramebuffers(1, &fbo);
             glBindFramebuffer(GL_FRAMEBUFFER, fbo);
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
-            // Draw the content into the INNER content rect only (the viewport confines the
+            // Draw the content into the INNER content rect(s) only (the viewport confines the
             // fullscreen triangle); the shader pins content alpha to 1.0 (or luma-keys it when
-            // openxr:black_alpha < 1). Margin stays transparent.
-            glViewport(contentX, contentGL, (GLsizei)contentW, (GLsizei)contentH);
-
+            // openxr:black_alpha < 1). Margins stay transparent.
             glUseProgram(m_blitProg);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_EXTERNAL_OES, m_extTex);
             glUniform1i(glGetUniformLocation(m_blitProg, "uTex"), 0);
             glUniform2f(glGetUniformLocation(m_blitProg, "uBlackKey"), keyBA, keyKnee);
             glBindVertexArray(m_blitVAO);
-            glDrawArrays(GL_TRIANGLES, 0, 3);
+            for (int i = 0; i < paneCount; ++i) {
+                viewportForPane(i);
+                glDrawArrays(GL_TRIANGLES, 0, 3);
+            }
             glBindVertexArray(0);
+            glDisable(GL_SCISSOR_TEST);
             glDeleteFramebuffers(1, &fbo);
             return;
         }
@@ -545,16 +566,18 @@ void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer
                 glGenFramebuffers(1, &fbo);
                 glBindFramebuffer(GL_FRAMEBUFFER, fbo);
                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
-                glDisable(GL_SCISSOR_TEST);
-                glViewport(contentX, contentGL, (GLsizei)contentW, (GLsizei)contentH);
                 glUseProgram(m_blitProg2D);
                 glActiveTexture(GL_TEXTURE0);
                 glBindTexture(GL_TEXTURE_2D, layer.m_cpuTex);
                 glUniform1i(glGetUniformLocation(m_blitProg2D, "uTex"), 0);
                 glUniform2f(glGetUniformLocation(m_blitProg2D, "uBlackKey"), keyBA, keyKnee);
                 glBindVertexArray(m_blitVAO);
-                glDrawArrays(GL_TRIANGLES, 0, 3);
+                for (int i = 0; i < paneCount; ++i) {
+                    viewportForPane(i);
+                    glDrawArrays(GL_TRIANGLES, 0, 3);
+                }
                 glBindVertexArray(0);
+                glDisable(GL_SCISSOR_TEST);
                 glDeleteFramebuffers(1, &fbo);
                 layer.m_contentPath.store(OpenXR::XR_CONTENT_CPU, std::memory_order_relaxed);
                 return;
@@ -568,16 +591,22 @@ void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dstFBO);
             glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
             // Source Y inverted: same top-left -> bottom-left origin flip as the dmabuf shader.
-            // Dst is the INNER content rect (transparent margin already cleared around it).
-            glBlitFramebuffer(0, (GLint)buf->size.y, (GLint)buf->size.x, 0, contentX, contentGL, contentX + contentW, contentGL + contentH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
-            // Force dst alpha opaque within the CONTENT rect only (same reason as the dmabuf shader's
-            // fragColor.a = 1.0): the XRGB source has undefined alpha which would punch holes under
-            // ALPHA_BLEND. Scissor to the content rect so the transparent margin keeps alpha 0.
+            // Dst is the INNER content rect(s) (transparent margins already cleared around them).
+            // This path CAN take a source sub-rect, so each pane reads its own half directly.
+            const GLint SRCW = (GLint)buf->size.x / paneCount;
+            for (int i = 0; i < paneCount; ++i)
+                glBlitFramebuffer(SRCW * i, (GLint)buf->size.y, SRCW * (i + 1), 0, dest[i].x, dest[i].y, dest[i].x + dest[i].w, dest[i].y + dest[i].h, GL_COLOR_BUFFER_BIT,
+                                  GL_LINEAR);
+            // Force dst alpha opaque within the CONTENT rects only (same reason as the dmabuf
+            // shader's fragColor.a = 1.0): the XRGB source has undefined alpha which would punch
+            // holes under ALPHA_BLEND. Scissor so the transparent margins keep alpha 0.
             glEnable(GL_SCISSOR_TEST);
-            glScissor(contentX, contentGL, (GLsizei)contentW, (GLsizei)contentH);
             glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
             glClearColor(0.f, 0.f, 0.f, 1.f);
-            glClear(GL_COLOR_BUFFER_BIT);
+            for (int i = 0; i < paneCount; ++i) {
+                glScissor(dest[i].x, dest[i].y, (GLsizei)dest[i].w, (GLsizei)dest[i].h);
+                glClear(GL_COLOR_BUFFER_BIT);
+            }
             glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
             glDisable(GL_SCISSOR_TEST);
             glDeleteFramebuffers(1, &srcFBO);
@@ -602,9 +631,11 @@ void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
         glEnable(GL_SCISSOR_TEST);
-        glScissor(contentX, contentGL, (GLsizei)contentW, (GLsizei)contentH);
         glClearColor(cr, cg, cb, ca);
-        glClear(GL_COLOR_BUFFER_BIT);
+        for (int i = 0; i < paneCount; ++i) {
+            glScissor(dest[i].x, dest[i].y, (GLsizei)dest[i].w, (GLsizei)dest[i].h);
+            glClear(GL_COLOR_BUFFER_BIT);
+        }
         glDisable(GL_SCISSOR_TEST);
         glDeleteFramebuffers(1, &fbo);
     }
@@ -719,13 +750,19 @@ bool CXRGraphics::restoreSnapshot(CXRMonitorLayer& layer, XR_GLuint dstTex) {
     return true;
 }
 
-void CXRGraphics::drawChrome(CXRMonitorLayer& layer, XR_GLuint dstTex, float alpha, uint8_t hoverRegion, bool grabbed) {
+void CXRGraphics::drawChrome(CXRMonitorLayer& layer, XR_GLuint dstTex, float alpha, uint8_t hoverRegion, bool grabbed, int pane) {
     const OpenXR::SXRChromeGeometry& g = layer.m_chrome;
     if (alpha <= 0.f || !g.hasChrome())
         return;
 
-    const int W = (int)layer.m_swapchainSize.x;
-    const int H = (int)layer.m_swapchainSize.y;
+    // WP X4: the chrome fractions describe ONE PANE, which on a mono monitor is the whole swapchain
+    // and on a depth-packed one is its half. Drawing into the pane's sub-rect is the entire change —
+    // the geometry, the hit classifier and the grab machine all keep working in per-pane uv, because
+    // that is the space the submitted quad already lives in (each eye's quad IS one margined pane).
+    const auto PR = OpenXR::Stereo::paneFullRect(layer.m_paneGeom, pane);
+    const int  PX = layer.m_paneGeom.paneFull.x >= 1 ? PR.x : 0;
+    const int  W  = layer.m_paneGeom.paneFull.x >= 1 ? PR.w : (int)layer.m_swapchainSize.x;
+    const int  H  = layer.m_paneGeom.paneFull.y >= 1 ? PR.h : (int)layer.m_swapchainSize.y;
     if (W <= 0 || H <= 0)
         return;
 
@@ -755,8 +792,8 @@ void CXRGraphics::drawChrome(CXRMonitorLayer& layer, XR_GLuint dstTex, float alp
         const float cg = ((argb >> 8) & 0xff) / 255.f;
         const float cb = (argb & 0xff) / 255.f;
         const float ea = ca * alpha; // effective (fade-scaled) alpha
-        const int   x0 = (int)std::lround(u0 * W);
-        const int   x1 = (int)std::lround(u1 * W);
+        const int   x0 = PX + (int)std::lround(u0 * W);
+        const int   x1 = PX + (int)std::lround(u1 * W);
         const int   glY0 = (int)std::lround((1.f - v1) * H); // v1 is the lower (in-screen) edge -> smaller GL y
         const int   glY1 = (int)std::lround((1.f - v0) * H);
         if (x1 <= x0 || glY1 <= glY0)
@@ -794,7 +831,7 @@ void CXRGraphics::drawChrome(CXRMonitorLayer& layer, XR_GLuint dstTex, float alp
     glDeleteFramebuffers(1, &fbo);
 }
 
-void CXRGraphics::drawCursor(CXRMonitorLayer& layer, XR_GLuint dstTex, uint32_t packedL, uint32_t packedR, uint32_t packedGaze) {
+void CXRGraphics::drawCursor(CXRMonitorLayer& layer, XR_GLuint dstTex, uint32_t packedL, uint32_t packedR, uint32_t packedGaze, int pane, float disparityContentFrac) {
     static auto PCURSOR   = CConfigValue<Hyprlang::INT>("openxr:cursor");
     static auto PGAZECUR  = CConfigValue<Hyprlang::INT>("openxr:gaze_cursor");
     const bool  handsOn   = *PCURSOR != 0;
@@ -802,10 +839,19 @@ void CXRGraphics::drawCursor(CXRMonitorLayer& layer, XR_GLuint dstTex, uint32_t 
     if (!handsOn && !gazeOn)
         return;
 
-    const int W = (int)layer.m_swapchainSize.x;
-    const int H = (int)layer.m_swapchainSize.y;
+    // WP X3/X4: draw into ONE PANE's sub-rect (identity on a mono monitor — the pane is the whole
+    // image), shifted by this pane's share of the cursor's depth disparity (§5.4).
+    const auto PR = OpenXR::Stereo::paneFullRect(layer.m_paneGeom, pane);
+    const int  PX = layer.m_paneGeom.paneFull.x >= 1 ? PR.x : 0;
+    const int  W  = layer.m_paneGeom.paneFull.x >= 1 ? PR.w : (int)layer.m_swapchainSize.x;
+    const int  H  = layer.m_paneGeom.paneFull.y >= 1 ? PR.h : (int)layer.m_swapchainSize.y;
     if (W <= 0 || H <= 0)
         return;
+
+    // The disparity arrives as a fraction of the pane's CONTENT width (that is the space the depth
+    // ladder computes in); the cursor's uv is over the pane's FULL quad. contentFracW is exactly the
+    // ratio between the two, and it is the same number the chrome geometry is built from.
+    const float DU = disparityContentFrac * (layer.m_chrome.contentFracW() > 0.f ? layer.m_chrome.contentFracW() : 1.f);
 
     static auto PSIZE  = CConfigValue<Hyprlang::FLOAT>("openxr:cursor_size");
     static auto PPRESS = CConfigValue<Hyprlang::FLOAT>("openxr:cursor_press_scale");
@@ -853,10 +899,12 @@ void CXRGraphics::drawCursor(CXRMonitorLayer& layer, XR_GLuint dstTex, uint32_t 
         const float cb = (argb & 0xff) / 255.f * ca;
 
         // uv rect (top-left origin, v down) clamped to the quad; flip v -> GL y (bottom-left origin).
-        const float fu0 = std::clamp(u - ru, 0.f, 1.f), fu1 = std::clamp(u + ru, 0.f, 1.f);
+        // DU is this pane's depth shift — the dot floats at the depth of what it is over.
+        const float uc  = u + DU;
+        const float fu0 = std::clamp(uc - ru, 0.f, 1.f), fu1 = std::clamp(uc + ru, 0.f, 1.f);
         const float fv0 = std::clamp(v - rv, 0.f, 1.f), fv1 = std::clamp(v + rv, 0.f, 1.f);
-        const int   x0   = (int)std::lround(fu0 * W);
-        const int   x1   = (int)std::lround(fu1 * W);
+        const int   x0   = PX + (int)std::lround(fu0 * W);
+        const int   x1   = PX + (int)std::lround(fu1 * W);
         const int   glY0 = (int)std::lround((1.f - fv1) * H);
         const int   glY1 = (int)std::lround((1.f - fv0) * H);
         if (x1 <= x0 || glY1 <= glY0)

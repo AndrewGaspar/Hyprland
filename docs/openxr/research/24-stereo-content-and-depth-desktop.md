@@ -2239,8 +2239,8 @@ optional; it is now Phase F.
 |---|---|---|---|
 | **X1** ✅ | S | Quest + XREAL | **The quad pair.** The quad-assembly change (pair emission, `eyeVisibility`, `imageRect`, pair-aware budget check, pair-aware depth sort), aspect `k` (§5.2), the pane-pair declaration published to the frame thread as atomics, chrome suppressed while stereo ≠ off, `xrmonitor`/`xrrule` tokens as a *convenience* layer over the generic state. Under 100 lines because §3 and Phase S did the producer |
 | **X2** ✅ | S | flat | **Tests.** hyprtester (null runtime): a stereo monitor submits exactly 2 quads with the expected rects and eye bits; `stereo off` submits 1; the pair is never half-submitted |
-| **X3** | S | Quest + XREAL | **The XR presenter for depth panes.** Double-wide swapchain, two `blitBuffer` calls, pair submission (reuses X1); pointer un-mapping for the depth producer (§5.6); the XR ray cursor drawn per pane with content-depth disparity |
-| **X4** | M | Quest | **Chrome in stereo.** Double-wide swapchain with two margined panes, `drawChrome` per pane, per-pane grab geometry. Removes X1's chrome suppression |
+| **X3** ✅ | S | Quest + XREAL | **The XR presenter for depth panes.** Double-wide swapchain, two `blitBuffer` calls, pair submission (reuses X1); pointer un-mapping for the depth producer (§5.6); the XR ray cursor drawn per pane with content-depth disparity |
+| **X4** ✅ | M | Quest | **Chrome in stereo.** Double-wide swapchain with two margined panes, `drawChrome` per pane, per-pane grab geometry. Removes X1's chrome suppression |
 
 > **STATUS (WP X1 + X2): IMPLEMENTED.** The pair is emitted from the quad-assembly loop, and the
 > shape it took confirms §5.1(a)'s central claim — **there is no producer at all**. A fullscreen
@@ -2288,6 +2288,93 @@ optional; it is now Phase F.
 > §14's open question 1 (does the XREAL's scanline split interact with a half-covering quad) is
 > still open and this is what would answer it.
 
+> **STATUS (WP X3 + X4): IMPLEMENTED**, shipped together because splitting them would have shipped
+> a regression — see point 3. `openxr:depth_desktop`, default ON.
+>
+> The headline is that **X3 barely exists as rendering work**, and for the mirror-image reason X1
+> barely existed. X1 found there was no producer; X3 found the producer was already written. Phase D
+> composites a stereo monitor once per eye with the eye sign in render data, Phase F packs the panes
+> at the final blit, and *neither looks at the backend* — both gate on `CMonitor::isStereo()`. So the
+> XR presenter for depth panes is: make the XR monitor a stereo output. §6.2's "this needs no change
+> to the monitor's mode" is the one line of the memo this WP had to contradict, and doing so is what
+> the rest of it is about.
+>
+> **Six things the line items did not name:**
+>
+> 1. **The pack has TWO directions, and the token only knows one.** `monitor = …, stereo:sbs` names a
+>    mode a panel really has and HALVES the logical desktop out of it. An XR output has no panel: it
+>    invents its scanout, so the fixed quantity is the size the user declared and the mode must be
+>    DOUBLED into existence. Halving a declared XR size would shrink every XR desktop the moment
+>    depth engaged — a silent reflow of the whole session, far worse than the feature is good. Hence
+>    `CMonitorRule::m_stereoVirtualMode` and `Monitor::Stereo::requestedMode`, the one place the two
+>    kinds differ; everything downstream is shared. Three behaviours had to learn the difference and
+>    all three for the same reason (no physical per-eye pixel grid): the scale is no longer pinned to
+>    1.0, the scale ≠ 1 warning does not fire, and §3.4 item 15b's mode-list watch stays disarmed —
+>    a headless output has no EDID to fall, and `watchAction` would read its absence as a fall and
+>    re-modeset it every second forever.
+> 2. **Precedence went the other way from §13's line item.** The item assumed a fullscreen stereo
+>    client on a depth monitor would keep X1's cheap content pair ("the packed frame IS both eyes").
+>    It cannot: on a packed monitor the swapchain content is already two panes, and splitting it a
+>    second time halves the desktop. Recovering the cheap path would mean dropping the pack when a
+>    window goes fullscreen — a **modeset on every fullscreen toggle of a 3D video**, which is worse
+>    than the composite it saves. So the DEPTH producer owns the pair whenever the monitor is packed
+>    and Phase S's per-surface crop un-packs the window *inside* the composite. That is strictly
+>    better than the trade it replaces: it works while the window is merely WINDOWED (§5.3's general
+>    case, which X1 structurally cannot do), it keeps chrome and cursor, and the quad never changes
+>    shape — `presentedAspect` of a full pack is the monitor's own aspect, so `hsbs` no longer
+>    reshapes the panel on the way into fullscreen. X1's tier is what an unpacked monitor does, and
+>    `openxr:depth_desktop = 0` is how you ask for it.
+> 3. **X4 is not polish, it is the thing that makes X3 shippable.** X1 suppressed chrome for a
+>    fullscreen film, which is a real trade. The same suppression on EVERY monitor removes the
+>    primary grab affordance from the whole session. The geometry is the whole of it: a depth
+>    swapchain is **two independently margined panes**, because one ring around a double-wide content
+>    rect puts the left eye's right-hand margin inside the right eye's picture. That makes each eye's
+>    `imageRect` simply its half of the image, and it costs `blitBuffer` a loop — a contiguous
+>    double-wide source cannot land in two SEPARATED destination rects with one draw. The hit
+>    classifier needed **nothing**: it already works in full-quad uv, and each eye's quad IS one
+>    margined pane, at the per-pane meters the anchor already solved.
+> 4. **§5.6's "the disparity must be subtracted" has nothing to subtract**, and it is worth writing
+>    down because the phrasing sends you looking for a hit test. The two eye quads are COINCIDENT —
+>    one pose, one size — so a ray crosses them at one point, and what the wearer fuses there is the
+>    cyclopean image, which sits at zero disparity by construction (pane 0 shifts a raised window
+>    +s, pane 1 −s). The un-shifted desktop coordinate is exactly what they are pointing at, so the
+>    DEPTH un-map is the identity, full stop. The disparity enters on the way OUT instead: the ray
+>    cursor is DRAWN into each pane with the shift of whatever it is over (§5.4), eased over ~80 ms.
+>    Same fact, other side.
+> 5. **The declaration must carry the mode it describes.** A monitor mid-mode-change has a swapchain
+>    from before and a declaration from after, and splitting across that mismatch shows each eye half
+>    of a mono desktop. So the published word is one 64-bit `SPairDecl` (producer, layout, submit,
+>    modeW, modeH) and the frame thread checks `describes()` before pairing. X1 needed none of this —
+>    its swapchain never changes size when the pair engages — which is why the guard is opt-in on the
+>    mode fields rather than mandatory.
+> 6. **The kill switch degrades differently on a packed monitor.** `openxr:stereo_quad_pair 0` cannot
+>    unpack it (that is a modeset), so it submits ONE quad of **pane 0** — a mono desktop at the right
+>    shape. Submitting the whole image would put a side-by-side picture in both eyes, which is not a
+>    degradation anyone can work in. Hence `submit` is a separate field from `layout`: the layout is a
+>    property of the pixels, the switch is a property of the submission.
+>
+> **Cost, honestly.** The buffers are double-wide for the whole session, because sizing them per
+> frame would mean a modeset every time a window took focus. So the fixed cost is a doubled blit and
+> roughly **+100 MB per 2560×1440 monitor** (the XR swapchain and the output's own swapchain both
+> double, ~44 MB each at three images, plus one pane-sized work buffer), and §6.4.1's fast path
+> governs only the SECOND COMPOSITE — which, with `depth_unfocused` at 0.2, means any monitor with a
+> window on it pays it. §6.4's mitigation 1 is therefore worth less on the XR tier than the memo
+> expected: it saves the composite, never the pack. What does NOT change is the encode — the runtime
+> renders its own eye views at their own resolution, so a WiVRn link sees no extra work. Two knobs,
+> in order: `decoration:depth_scale = 0` (same ladder, no rise, one composite, still a pair) and
+> `openxr:depth_desktop = 0` (no pack at all).
+>
+> **Observability** grew a third field for the same reason X1 needed a second: `stereo` is the split,
+> `stereoProducer` is who made the panes (it decides the pointer un-map, so it is the field to check
+> when the cursor lands somewhere odd), `quads` is what was submitted, and `chrome` is whether the
+> chrome pass ran — otherwise "my monitor stopped being grabbable" is a bug report with nothing to
+> look at.
+>
+> **Not yet validated in a headset.** The depth desktop has never been looked at through a Quest or
+> an XREAL, and §14's open questions 4 (`depth_scale` default) and 11 (reading at a rung) are exactly
+> what an XR monitor at arm's length answers. D0's ergonomics spike is now runnable in the place it
+> was always meant for.
+
 **Suggested order:** F0 → **F1** → F2 → F3 → F4 → S0 → **S1** → S2 → S3 → S5 → **ship Q1, flat**
 → X1 → X2 → **ship Q1, XR** → D0 → D1 → **D2** → D4 → **ship Q2, flat** → X3 → D5 → F5 → X4 →
 D7/S8 as appetite allows.
@@ -2303,8 +2390,11 @@ helper. Only S0 (a headset eyeball check) and the XR tier (X1) remain before "sh
 **Phase D core (D1–D2, D4) **Phase D core (D1–D2, D4)
 ≈ 700–900 lines**, dominated by the producer and the 14 `m_floatingOffset` call sites. **Phase X
 (X1–X3) ≈ 250–350 lines** — the cheapest phase, and now the last one, which is the whole point of
-the inversion. **X1 + X2 are IMPLEMENTED** and came in at the low end of that: the submission change
-is ~90 lines in the frame loop, on top of a ~135-line pure header and its tests.
+the inversion. **X1–X4 are IMPLEMENTED.** X1 + X2 came in at the low end: the submission change is
+~90 lines in the frame loop, on top of a ~135-line pure header and its tests. X3 + X4 overran it,
+but not where the estimate expected — the pane geometry and the second producer are ~180 lines of
+pure header, and the largest single piece is not OpenXR at all but the two-directional pack in
+`CMonitor` (item 1 of the STATUS block above).
 
 ---
 
