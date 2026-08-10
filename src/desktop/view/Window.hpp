@@ -23,6 +23,7 @@
 #include "../../protocols/types/ContentType.hpp"
 #include "../../render/Framebuffer.hpp"
 #include "../../render/StereoContent.hpp"
+#include "ProcIdentity.hpp"
 #include "types/GeometricMovableAnimated.hpp"
 #include "types/AlphaModifiable.hpp"
 #include "animationControllers/WindowAnimationController.hpp"
@@ -159,20 +160,22 @@ namespace Desktop::View {
         Vector2D m_floatingOffset = Vector2D(0, 0);
 
         // for recovering relative cursor position
-        Vector2D      m_relativeCursorCoordsOnLastWarp = Vector2D(-1, -1);
+        Vector2D    m_relativeCursorCoordsOnLastWarp = Vector2D(-1, -1);
 
-        bool          m_firstMap     = false; // for layouts
-        bool          m_isFloating   = false;
-        std::string   m_title        = "";
-        std::string   m_class        = "";
-        std::string   m_initialTitle = "";
-        std::string   m_initialClass = "";
-        PHLWORKSPACE  m_workspace;
-        PHLMONITORREF m_monitor, m_prevMonitor;
+        bool        m_firstMap     = false; // for layouts
+        bool        m_isFloating   = false;
+        std::string m_title        = "";
+        std::string m_class        = "";
+        std::string m_initialTitle = "";
+        std::string m_initialClass = "";
+        // task #143: lazily filled by procIdentity(), never refreshed. nullopt = not read yet.
+        std::optional<Desktop::Proc::SIdentity> m_procIdentity;
+        PHLWORKSPACE                            m_workspace;
+        PHLMONITORREF                           m_monitor, m_prevMonitor;
 
-        bool          m_isMapped = false;
+        bool                                    m_isMapped = false;
 
-        bool          m_requestsFloat = false;
+        bool                                    m_requestsFloat = false;
 
         // This is for fullscreen apps
         bool m_allowedOverFullscreen = true;
@@ -424,19 +427,25 @@ namespace Desktop::View {
         void                              deactivateGroupMembers();
         bool                              isNotResponding();
         std::optional<std::string>        xdgTag();
+        // task #143: the owning process's identity, for `match:exe` / `match:cmdline`. Read from
+        // /proc once, on first use, and cached for the window's life — a later exec by the same
+        // process does not re-trigger, exactly like m_initialClass. A dead or unreadable /proc entry
+        // caches as empty, and an empty string never matches, so a matcher on a gone process quietly
+        // does not fire rather than erroring. See ProcIdentity.hpp.
+        const Desktop::Proc::SIdentity& procIdentity();
         // research/24 §5.3 (WP S1): the resolved per-window stereo content layout — the rule, the
         // client's tag and the fullscreen gate folded into one enum. CONTENT_OFF for every window
         // that has no stereo rule, which is every window in an unconfigured session.
-        Render::Stereo::eContentLayout    stereoLayout();
-        std::optional<std::string>        xdgDescription();
-        PHLWINDOW                         parent();
-        bool                              priorityFocus();
-        SP<CWLSurfaceResource>            getSolitaryResource();
-        Vector2D                          getReportedSize();
-        std::optional<Vector2D>           calculateExpression(const std::string& s);
-        std::optional<Vector2D>           calculateExpression(const Math::SExpressionVec2& expr);
-        std::optional<Vector2D>           minSize();
-        std::optional<Vector2D>           maxSize();
+        Render::Stereo::eContentLayout stereoLayout();
+        std::optional<std::string>     xdgDescription();
+        PHLWINDOW                      parent();
+        bool                           priorityFocus();
+        SP<CWLSurfaceResource>         getSolitaryResource();
+        Vector2D                       getReportedSize();
+        std::optional<Vector2D>        calculateExpression(const std::string& s);
+        std::optional<Vector2D>        calculateExpression(const Math::SExpressionVec2& expr);
+        std::optional<Vector2D>        minSize();
+        std::optional<Vector2D>        maxSize();
         // Returns the highest level target of a window
         // e.g. if the window is a part of a group, this returns the window group target
         SP<Layout::ITarget> layoutTarget();
