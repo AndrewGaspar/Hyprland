@@ -4391,6 +4391,10 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
         }
         if (l->m_reqRefresh)
             info.refresh = *l->m_reqRefresh;
+        // WP X1: the declared layout (main thread wrote it) and what the frame thread last actually
+        // submitted. Both are plain atomics — no refcount, no string crosses a thread here.
+        info.stereo = Render::Stereo::layoutToString((Render::Stereo::eContentLayout)l->m_stereoPairLayout.load(std::memory_order_acquire));
+        info.quads  = (int)l->m_quadsSubmitted.load(std::memory_order_relaxed);
         if (auto mon = l->m_monitor.lock()) {
             info.id      = mon->m_id;
             info.plugged = mon->m_enabled; // research/18: unplugged (disabled) while sessionless
