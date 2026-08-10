@@ -2353,12 +2353,16 @@ optional; it is now Phase F.
 >    degradation anyone can work in. Hence `submit` is a separate field from `layout`: the layout is a
 >    property of the pixels, the switch is a property of the submission.
 >
-> **Cost, honestly.** The swapchain is double-wide for the whole session, because sizing it per frame
-> would mean a modeset every time a window took focus. So the fixed cost is a doubled blit and
-> doubled swapchain memory (~120 MB for two 2560×1440 monitors), and §6.4.1's fast path governs only
-> the SECOND COMPOSITE — which, with `depth_unfocused` at 0.2, means any monitor with a window on it
-> pays it. Two knobs, in order: `decoration:depth_scale = 0` (same ladder, no rise, one composite,
-> still a pair) and `openxr:depth_desktop = 0` (no pack at all).
+> **Cost, honestly.** The buffers are double-wide for the whole session, because sizing them per
+> frame would mean a modeset every time a window took focus. So the fixed cost is a doubled blit and
+> roughly **+100 MB per 2560×1440 monitor** (the XR swapchain and the output's own swapchain both
+> double, ~44 MB each at three images, plus one pane-sized work buffer), and §6.4.1's fast path
+> governs only the SECOND COMPOSITE — which, with `depth_unfocused` at 0.2, means any monitor with a
+> window on it pays it. §6.4's mitigation 1 is therefore worth less on the XR tier than the memo
+> expected: it saves the composite, never the pack. What does NOT change is the encode — the runtime
+> renders its own eye views at their own resolution, so a WiVRn link sees no extra work. Two knobs,
+> in order: `decoration:depth_scale = 0` (same ladder, no rise, one composite, still a pair) and
+> `openxr:depth_desktop = 0` (no pack at all).
 >
 > **Observability** grew a third field for the same reason X1 needed a second: `stereo` is the split,
 > `stereoProducer` is who made the panes (it decides the pointer un-map, so it is the field to check

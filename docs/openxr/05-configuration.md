@@ -1944,12 +1944,17 @@ actually move**. A monitor with nothing raised composites once and shows the sam
 `stereoComposites` in `hyprctl monitors` tells you which happened. Since `depth_unfocused` is 0.2,
 in practice any window on an XR monitor puts it at two composites, which is the feature working.
 
-The swapchain is double-wide for the whole session either way, because sizing it per frame would
+The buffers are double-wide for the whole session either way, because sizing them per frame would
 mean a modeset every time you focused a window. So the honest accounting is: **a fixed doubling of
-the blit and of swapchain memory, plus a second composite whenever the panes differ.** Two
-2560x1440 XR monitors cost about 120 MB more of swapchain images. If you are chasing frame time on
-a small iGPU, `openxr:depth_desktop = 0` is the switch, and `decoration:depth_scale = 0` is the
-cheaper half-measure (same ladder, no rise, one composite, still a pair).
+the blit and of buffer memory, plus a second composite whenever the panes differ.** For a 2560x1440
+monitor that is roughly **+100 MB** — the XR swapchain and the output's own swapchain both double
+(~44 MB each at three images), plus one pane-sized work buffer for the second composite. What does
+*not* change is what your headset encodes: the runtime still renders its own two eye views at their
+own resolution, so a remote-streaming link (WiVRn) sees no extra encode work at all.
+
+If you are chasing frame time on a small iGPU, `openxr:depth_desktop = 0` is the switch, and
+`decoration:depth_scale = 0` is the cheaper half-measure (same ladder, no rise, one composite, still
+a pair).
 
 ### What you get that §8.8 does not
 

@@ -91,31 +91,55 @@ namespace {
             timeout);
     }
 
-    // One field out of `hyprctl -j monitors` for one monitor, as a raw token (numbers and strings
-    // both come back without their quotes).
-    std::string monitorField(const std::string& mon, const std::string& key) {
-        const std::string  JSON   = getFromSocket("j/monitors");
-        const std::string  MARKER = "\"name\": \"" + mon + "\"";
-        const size_t       POS    = JSON.find(MARKER);
+    // --- `hyprctl -j monitors` field readers, the tests/main/stereo.cpp idiom ---
+    //
+    // Bounding the search to ONE monitor's object is not fussiness: a monitor object contains two
+    // NESTED objects (activeWorkspace, specialWorkspace) which each carry their own "name", so
+    // "scan forward to the next name" stops in the middle of the block and every key after it reads
+    // empty. The nested objects close with "\n    }," and only the outer one closes at "\n}".
+    std::string fieldIn(const std::string& json, const std::string& key) {
+        const auto KEYPOS = json.find("\"" + key + "\":");
+        if (KEYPOS == std::string::npos)
+            return "";
+        auto valStart = json.find_first_not_of(" \t", KEYPOS + key.length() + 3);
+        if (valStart == std::string::npos)
+            return "";
+        auto valEnd = json.find_first_of(",\n", valStart);
+        if (valEnd == std::string::npos)
+            valEnd = json.length();
+        std::string out = json.substr(valStart, valEnd - valStart);
+        while (!out.empty() && (out.back() == ' ' || out.back() == '"' || out.back() == '\r'))
+            out.pop_back();
+        if (!out.empty() && out.front() == '"')
+            out.erase(out.begin());
+        return out;
+    }
+
+    std::string monitorObject(const std::string& mon) {
+        const auto JSON = getFromSocket("j/monitors");
+        const auto POS  = JSON.find("\"name\": \"" + mon + "\"");
         if (POS == std::string::npos)
             return "";
-        const size_t BLOCKEND = JSON.find("\"name\":", POS + MARKER.size());
-        const size_t KEYPOS   = JSON.find("\"" + key + "\":", POS);
-        if (KEYPOS == std::string::npos || (BLOCKEND != std::string::npos && KEYPOS > BLOCKEND))
+        const auto START = JSON.rfind('{', POS);
+        const auto END   = JSON.find("\n}", POS);
+        if (START == std::string::npos)
             return "";
-        size_t from = JSON.find(':', KEYPOS) + 1;
-        while (from < JSON.size() && (JSON[from] == ' ' || JSON[from] == '"'))
-            ++from;
-        size_t to = from;
-        while (to < JSON.size() && JSON[to] != ',' && JSON[to] != '\n' && JSON[to] != '"')
-            ++to;
-        return JSON.substr(from, to - from);
+        return JSON.substr(START, END == std::string::npos ? std::string::npos : END - START);
+    }
+
+    std::string monitorField(const std::string& mon, const std::string& key) {
+        return fieldIn(monitorObject(mon), key);
     }
 
     bool waitForMonitorField(const std::string& mon, const std::string& key, const std::string& want, int seconds = 10) {
         for (int i = 0; i < seconds * 10; ++i) {
             if (monitorField(mon, key) == want)
                 return true;
+            // stereoComposites and stereoContent are written BY a frame, so a monitor that has
+            // stopped repainting reports the last one. Nudge it once the natural path has had its
+            // chance (the tests/main/stereo.cpp idiom, in the dispatcher the legacy config has).
+            if (i == 8)
+                getFromSocket("/dispatch forcerendererreload");
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         return monitorField(mon, key) == want;
@@ -158,7 +182,7 @@ TEST_CASE(xr_depth_desktop_pair) {
     // mode, not the desktop. A `width` of 640 here would mean every window just got reflowed.
     ASSERT(waitForMonitorField(MON, "width", "1280"), true);
     EXPECT(monitorField(MON, "height"), std::string("720"));
-    EXPECT(monitorField(MON, "scanoutWidth"), std::string("2560"));
+    ASSERT(waitForMonitorField(MON, "scanoutWidth", "2560"), true);
     EXPECT(monitorField(MON, "scanoutHeight"), std::string("720"));
     EXPECT(monitorField(MON, "stereo"), std::string("sbs"));
 
@@ -169,7 +193,7 @@ TEST_CASE(xr_depth_desktop_pair) {
     // The §6.4.1 fast path is live: nothing on this monitor has depth yet, so the two panes are
     // identical and the compositor draws ONE composite and shows it to both eyes. The pair is still
     // submitted (the pack is a property of the mode, not of the frame), and it costs one composite.
-    EXPECT(monitorField(MON, "stereoComposites"), std::string("1"));
+    ASSERT(waitForMonitorField(MON, "stereoComposites", "1"), true);
 
     // ...and now something with depth. A focused window sits at decoration:depth_focused, so the
     // producer engages and the monitor genuinely composites twice — the panes stop being identical,

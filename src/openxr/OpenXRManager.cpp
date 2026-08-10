@@ -1921,8 +1921,15 @@ void COpenXRManager::frameThread() {
             // change and a declaration from after it, and splitting on that mismatch shows each eye
             // half of a mono desktop. Fall back to one honest quad until the two agree — at most one
             // frame, and it is invisible instead of wrong.
-            if (!OpenXR::Stereo::describes(DECL, (int32_t)l->m_contentSize.x, (int32_t)l->m_contentSize.y))
-                DECL = {};
+            //
+            // "One honest quad" is not the same rect in both directions, and the SWAPCHAIN knows
+            // which: if it is itself two panes, the whole image is a side-by-side picture and
+            // submitting it would double the desktop in both eyes, so the fallback is pane 0. The
+            // frame thread never has to guess — m_paneGeom is what it built the image with.
+            if (!OpenXR::Stereo::describes(DECL, (int32_t)l->m_contentSize.x, (int32_t)l->m_contentSize.y)) {
+                DECL = l->m_paneGeom.panes >= 2 ? OpenXR::Stereo::SPairDecl{.producer = OpenXR::Stereo::PRODUCER_DEPTH, .layout = Render::Stereo::CONTENT_SBS, .submit = false} :
+                                                  OpenXR::Stereo::SPairDecl{};
+            }
             const auto STEREOLAYOUT = DECL.layout;
             const bool STEREOPAIR   = DECL.submit && OpenXR::Stereo::pairActive(STEREOLAYOUT);
             const bool DEPTHPACKED  = DECL.producer == OpenXR::Stereo::PRODUCER_DEPTH && l->m_paneGeom.panes >= 2;
