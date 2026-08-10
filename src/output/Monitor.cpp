@@ -345,8 +345,7 @@ void CMonitor::onConnect(bool noRule) {
         // XR plug/unplug applicator) keeps the CMonitor object alive while dropping it from
         // monitors(), so ws->m_monitor.lock() still resolves — to a monitor that can never show the
         // workspace again. Without this the workspace stays welded to a dead output forever.
-        const bool ORPHANED = !CURRENTMON || !CURRENTMON->m_enabled ||
-            std::ranges::none_of(State::monitorState()->monitors(), [&](const auto& mon) { return mon == CURRENTMON; });
+        const bool ORPHANED  = !CURRENTMON || !CURRENTMON->m_enabled || std::ranges::none_of(State::monitorState()->monitors(), [&](const auto& mon) { return mon == CURRENTMON; });
         const bool RETURNING = ws->m_lastMonitor == m_name;
         // temporarily recover orphaned workspaces when there is at most one *other* real monitor.
         // NOTE the `mon.get() != this` and the `<= 1`: monitor.added — which is what registers us in
@@ -354,8 +353,8 @@ void CMonitor::onConnect(bool noRule) {
         // whenever we were the first real monitor coming back, i.e. exactly the case it needed to
         // catch (last monitor soft-disconnected -> fallback -> real monitor returns). This is a
         // strict widening of the old predicate by the zero case.
-        const bool RECOVERY = ORPHANED &&
-            std::ranges::count_if(State::monitorState()->monitors(), [this](const auto& mon) { return !mon->m_isUnsafeFallback && mon.get() != this; }) <= 1;
+        const bool RECOVERY =
+            ORPHANED && std::ranges::count_if(State::monitorState()->monitors(), [this](const auto& mon) { return !mon->m_isUnsafeFallback && mon.get() != this; }) <= 1;
 
         if (RETURNING || RECOVERY) {
             State::workspacePlacementController()->moveWorkspaceToMonitor(ws, m_self.lock());
@@ -429,6 +428,9 @@ void CMonitor::onDisconnect(bool destroy) {
 
     m_frameScheduler.reset();
     clearModeRetry();
+    // §3.4 item 15b: unconditionally, and before the !m_enabled bail — a disconnected output has no
+    // mode list to watch, and the timer holds a WP to us that would keep polling a dead connector.
+    clearStereoWatch();
 
     if (!m_enabled || g_pCompositor->m_isShuttingDown)
         return;
@@ -753,6 +755,9 @@ bool CMonitor::applyMonitorRuleSoft(Config::CMonitorRule&& pMonitorRule) {
         m_pixelSize = Monitor::Stereo::backComputeMode(m_transformedSize, m_transform, m_stereoMode);
 
     updateStereoCursorLock();
+    // §3.4 item 15b: arm/disarm the mode-list watch on the same edge the pack itself moves. Both
+    // apply paths end here, so this is the one place that sees every stereo transition.
+    updateStereoWatch();
 
     updateMatrix();
 
@@ -1958,6 +1963,95 @@ void CMonitor::sanitizeStereoMode(const Vector2D& requestedMode) {
     }
 }
 
+void CMonitor::updateStereoWatch() {
+    // research/24 §3.4 item 15b. sanitizeStereoMode() is a rule-apply-time gate and it is correct,
+    // but the thing it guards against does not only happen when a rule is applied: an XREAL that
+    // falls from its 3D personality (3840x1080-only EDID) to its 2D one (1920x1080-only) re-presents
+    // a different mode list on a connector that never disconnected. There is no modes-changed
+    // signal to listen to, `m_output->modes` is read nowhere but applyMonitorRule, and
+    // ensureMonitorStatus skips a monitor whose rule is unchanged — so the pack would sit at the
+    // old mode forever, packing two panes into a scanout the panel has stopped splitting, which is
+    // exactly the squished SBS frame this fixes. Poll instead, on the same shape as the mode-retry
+    // timer above: cheap, off the render path, and safe to re-modeset from.
+    const bool WANT = m_enabled && m_output && (isStereo() || m_activeMonitorRule.m_stereo != Config::STEREO_OFF);
+    if (!WANT) {
+        clearStereoWatch();
+        return;
+    }
+
+    if (m_stereoWatchTimer)
+        return;
+
+    static constexpr auto WATCH_INTERVAL = std::chrono::seconds(1);
+
+    m_stereoWatchTimer = makeShared<CEventLoopTimer>(
+        WATCH_INTERVAL,
+        [self = m_self](SP<CEventLoopTimer> timer, void*) {
+            const auto PMONITOR = self.lock();
+            if (!PMONITOR)
+                return;
+
+            if (!PMONITOR->m_enabled || !PMONITOR->m_output) {
+                PMONITOR->clearStereoWatch();
+                return;
+            }
+
+            std::vector<Vector2D> advertised;
+            advertised.reserve(PMONITOR->m_output->modes.size());
+            for (const auto& m : PMONITOR->m_output->modes)
+                advertised.emplace_back(m->pixelSize);
+
+            const auto ACTION = Monitor::Stereo::watchAction(PMONITOR->m_stereoMode, PMONITOR->m_activeMonitorRule.m_stereo, PMONITOR->m_pixelSize,
+                                                             PMONITOR->m_activeMonitorRule.m_resolution, advertised, PMONITOR->m_customDrmMode.vdisplay > 0);
+
+            // Act once per hardware state. A re-apply whose modeset cannot commit leaves the monitor
+            // exactly as the watch found it, and re-modesetting every second forever is worse than
+            // the stale pack — scheduleModeRetry() already owns retrying a failed modeset, this
+            // watch owns noticing that the PANEL changed.
+            if (ACTION == Monitor::Stereo::STEREO_WATCH_NOTHING || advertised == PMONITOR->m_stereoWatchActedOn) {
+                if (ACTION == Monitor::Stereo::STEREO_WATCH_NOTHING)
+                    PMONITOR->m_stereoWatchActedOn.clear();
+                timer->updateTimeout(WATCH_INTERVAL);
+                return;
+            }
+
+            PMONITOR->m_stereoWatchActedOn = advertised;
+
+            Log::logger->log(Log::WARN, "Monitor {}: stereo watch — the panel's mode list changed under the pack ({}), re-applying the monitor rule", PMONITOR->m_name,
+                             ACTION == Monitor::Stereo::STEREO_WATCH_DROP ? std::format("mode {:X0} is no longer advertised", PMONITOR->m_pixelSize) :
+                                                                            std::format("mode {:X0} is advertised again", PMONITOR->m_activeMonitorRule.m_resolution));
+
+            // Re-apply the whole rule rather than poking m_stereoMode: everything the pack changes
+            // (the pane-derived size, the matrix, the damage ring, the render resources, the cursor
+            // lock) is derived inside applyMonitorRule, and a monitor with the pack flipped under
+            // those is the half-converted state the rest of this file is careful to never produce.
+            // The re-apply runs the mode search and sanitizeStereoMode, which is what makes the
+            // drop loud and the re-adopt honest.
+            auto rule = PMONITOR->m_activeMonitorRule;
+            PMONITOR->applyMonitorRule(std::move(rule));
+
+            // applyMonitorRule re-arms us through applyMonitorRuleSoft; if it disarmed us instead
+            // (the rule no longer wants stereo) this timer is already gone.
+            if (PMONITOR->m_stereoWatchTimer == timer)
+                timer->updateTimeout(WATCH_INTERVAL);
+        },
+        nullptr);
+
+    g_pEventLoopManager->addTimer(m_stereoWatchTimer);
+}
+
+void CMonitor::clearStereoWatch() {
+    m_stereoWatchActedOn.clear();
+
+    if (!m_stereoWatchTimer)
+        return;
+
+    // Safe from inside the timer's own callback: CEventLoopManager::onTimerFire iterates a copy.
+    m_stereoWatchTimer->cancel();
+    g_pEventLoopManager->removeTimer(m_stereoWatchTimer);
+    m_stereoWatchTimer.reset();
+}
+
 void CMonitor::updateStereoCursorLock() {
     // research/24 §3.7: a hardware cursor plane places ONE cursor in the packed scanout buffer —
     // visible to a single eye. Force per-monitor software cursors while stereo is active, with the
@@ -2943,12 +3037,12 @@ bool CMonitorState::updateSwapchain() {
     // longer match the no-op/resize predicates and must re-acquire every buffer with the new policy.
     const bool multigpuChanged = OPTIONS.multigpu != forceLinear && OPTIONS.length != 0 && OPTIONS.size != Vector2D{};
 
-    auto options     = OPTIONS;
-    options.format   = m_owner->m_drmFormat;
-    options.scanout  = true;
-    options.length   = 3;
-    options.size     = MODE->pixelSize;
-    options.multigpu = forceLinear;
+    auto       options = OPTIONS;
+    options.format     = m_owner->m_drmFormat;
+    options.scanout    = true;
+    options.length     = 3;
+    options.size       = MODE->pixelSize;
+    options.multigpu   = forceLinear;
 
     if (multigpuChanged) {
         auto clearOpts = options;
