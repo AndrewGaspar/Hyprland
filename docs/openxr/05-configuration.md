@@ -348,6 +348,72 @@ bind = SUPER SHIFT, Home, xrmonitor, sync
 
 ---
 
+### Cursor edge crossing (`cursor_crossing`)
+
+| Variable | Type | Default | Meaning | Applies |
+|---|---|---|---|---|
+| `cursor_crossing` | string | `raycast` | What decides where the cursor lands when it pushes past an XR monitor's edge: `raycast` (cast from your head through the exit point and land on the monitor you can actually **see** over there) or `layout` (the 2D-plane sync's grid adjacency alone, the historic behaviour). | hot |
+
+The 2D-plane sync above gives Hyprland a *topological* arrangement — which monitor is next to which
+— and that is the right input for `movefocus`, monitor adjacency and the box the pointer is clamped
+to. But topological adjacency and **visual** adjacency are different relations, and they come apart
+exactly where a headset is more expressive than a desk. Compaction projects each quad *centre* to an
+(azimuth, elevation) pair and then throws depth away, so a quad 0.8 m from your face and one 3 m
+away at the same bearing land in the same column. Push off an edge and the cursor can reappear on a
+monitor your eyes did not predict.
+
+`raycast` changes only that one decision, and only at the instant it is made. At the moment the
+cursor pushes past an edge, its overshoot is turned into a point on the source monitor's own
+(extended) plane in the room; a ray is cast from **where your head is right now** through that point;
+the nearest quad that ray meets wins, and the cursor is warped to the 2D coordinates of the **3D hit
+point** — so it reappears at the place in space the ray met, not at an edge midpoint. Depth,
+elevation and yaw are all respected for free, because they are all just geometry to a ray.
+
+**How far you push matters.** The overshoot is what sweeps the ray outward, so nudging an edge aims
+just past it while a deliberate shove reaches further around the room — that is how the cursor gets
+across a *gap* between two quads that are not mathematically edge-to-edge. The overshoot is capped at
+half a monitor width so a fast flick still aims at what is beside the monitor rather than across the
+whole room.
+
+**Forgiveness.** Hand-placed quads leave centimetre gaps, so a ray that had to hit a rectangle exactly
+would miss constantly. A ray that meets nothing squarely gets a second pass with **4° of angular
+slack** about your head — the same trick the grab cone and gaze hysteresis use, so the forgiveness
+looks the same for a small near monitor and a big far one (~14 cm at 2 m). A square hit *always*
+beats a tolerated one, so the margin can only rescue a crossing that would otherwise have found
+nothing; and a tolerated hit is clamped into the target's bounds, so the cursor lands on the
+monitor's near edge, never outside it.
+
+**When it falls back.** `raycast` never fails loudly — every case it cannot answer degenerates to
+exactly the `layout` behaviour, unchanged:
+
+- no XR session running, or the head pose is more than 200 ms old (a session that has stopped
+  rendering must not be casting rays from where your head *used to be*);
+- the monitor being left is not an XR quad — a physical output has no pose in the room, so crossing
+  *off* one is always a layout decision. Crossing *onto* a physical output likewise: only XR quads
+  are candidates;
+- an XR monitor with no solved pose yet, or a `device`-anchored quad (a hand-held palette is not a
+  place to send a cursor — the 2D sync excludes these too);
+- the ray meets nothing, even with the margin.
+
+**It does not touch the layout.** No monitor is moved, no offset is written; `hyprctl openxr status`,
+`sync-layout`, the warp verbs and `movefocus` all still read the 2D-plane sync's arrangement. Focus
+follows normally too — the redirect only edits the cursor's destination *before* the usual clamp, so
+the monitor-focus and surface-focus that follow a motion see the landing position and behave as they
+always do.
+
+```ini
+openxr {
+    # The default. Set to `layout` for pure 2D-grid adjacency.
+    cursor_crossing = raycast
+}
+
+# A/B the two feels without leaving the headset:
+bind = SUPER SHIFT, C, exec, hyprctl keyword openxr:cursor_crossing layout
+bind = SUPER SHIFT ALT, C, exec, hyprctl keyword openxr:cursor_crossing raycast
+```
+
+---
+
 ## 3. The `xrmonitor` keyword
 
 Declares that a virtual monitor should exist and where it lives in 3D space. Ordinary

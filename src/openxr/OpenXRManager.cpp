@@ -311,6 +311,7 @@ void COpenXRManager::start() {
     publishHandInputPolicy(); // research/16 Part A: seed the hand-input policy from openxr:hand_input
     publishGrabStringTuning(); // task #25: seed hand_grab / hand_grab_anywhere / grab_filter_scope enums
     publishBlackAlphaTuning(); // report 09: seed the luma key (re-published below once the blend mode is picked)
+    publishCursorCrossingMode(); // task #139: seed openxr:cursor_crossing (raycast | layout)
 
     // Concurrency guard for the off-main handshake below. A previously-in-flight OR abandoned handshake
     // worker may still be blocked in xrCreateInstance against a wedged runtime, or an abandoned bring-up
@@ -3344,6 +3345,8 @@ void COpenXRManager::onConfigReload() {
     // task #25: re-parse hand_grab / hand_grab_anywhere / grab_filter_scope so a hot re-tune applies
     // live AND the frame thread never derefs the backing strings (the corrupted-heap-at-teardown crash).
     publishGrabStringTuning();
+    // task #139: re-parse openxr:cursor_crossing so a live raycast<->layout A/B applies immediately.
+    publishCursorCrossingMode();
     // report 09: re-resolve the luma key (openxr:black_alpha / :black_alpha_knee) — clamped, gated on
     // the session blend mode, and damaging the XR monitors so a live re-tune shows up immediately.
     publishBlackAlphaTuning();
@@ -3764,6 +3767,14 @@ void COpenXRManager::publishGrabStringTuning() {
     m_handGrabAnyMode.store((uint8_t)OpenXR::xrParseHandGrabAnywhere(*PHANDGRABANY), std::memory_order_relaxed);
     // scope=all (default) filters controllers too; anything else (e.g. "hands") = hands only.
     m_grabFilterScopeAll.store(*PGRABFILTSC != "hands", std::memory_order_relaxed);
+}
+
+void COpenXRManager::publishCursorCrossingMode() {
+    // MAIN-THREAD. openxr:cursor_crossing -> m_cursorCrossMode. Unlike its neighbours this is not a
+    // frame-thread safety measure (the only reader is redirectCursorCrossing, main thread) — see the
+    // header. Called from start() + onConfigReload() + the parseKeyword special-case.
+    static auto PCROSS = CConfigValue<std::string>("openxr:cursor_crossing");
+    m_cursorCrossMode.store((uint8_t)OpenXR::xrParseCursorCrossing(*PCROSS), std::memory_order_relaxed);
 }
 
 // ---- conditional hand input (research/16 Part A) ---------------------------------------------
@@ -4689,6 +4700,138 @@ COpenXRManager::SXRLayout2DStatus COpenXRManager::layout2DStatus() {
     return s;
 }
 
+// ---- ray-cast cursor edge crossing (task #139, XRCursorCross.hpp) --------------------------------
+
+void COpenXRManager::refreshCrossQuads(int64_t nowMs) {
+    // MAIN THREAD. See the header for why only the 3D half is cached and why the TTL exists.
+    if (m_crossQuadsMs != 0 && nowMs - m_crossQuadsMs < OpenXR::XR_CROSS_GEOM_TTL_MS)
+        return;
+    m_crossQuadsMs = nowMs;
+    m_crossQuads.clear();
+
+    std::scoped_lock lock(m_layersMu);
+    for (auto& l : m_layers) {
+        if (l->m_pendingRemoval.load(std::memory_order_acquire))
+            continue;
+        const MONITORID id = l->m_monitorId.load(std::memory_order_acquire);
+        if (id < 0)
+            continue;
+        // No solved world pose = we do not know where this quad IS this session (never submitted, or
+        // the session has not produced a frame yet). Guessing from the persistent anchorPose would be
+        // wrong for every follow mode, where anchorPose is an OFFSET in a frame we would have to
+        // re-solve, so such a monitor simply is not a crossing candidate.
+        if (!l->m_anchor.hasLastWorld())
+            continue;
+        const auto& st = l->m_anchor.state();
+        // Same exclusion the 2D sync makes (syncLayout2D): a device-anchored quad is a hand-held
+        // palette that rides your controller, not a place in the room to send a cursor.
+        if (st.mode == OpenXR::XR_ANCHOR_DEVICE)
+            continue;
+        // Content (not chrome-expanded) metres, derived exactly as CXRAnchor::solve does, so the
+        // rectangle we intersect is the rectangle of desktop pixels the user sees.
+        const double pxW = l->m_contentSize.x > 0.0 ? l->m_contentSize.x : 1.0;
+        const double pxH = l->m_contentSize.y > 0.0 ? l->m_contentSize.y : 1.0;
+
+        OpenXR::SXRCrossQuad q;
+        q.id      = id;
+        q.pose    = l->m_anchor.lastWorld();
+        q.wMeters = st.widthMeters;
+        q.hMeters = st.widthMeters * (float)(pxH / pxW);
+        m_crossQuads.push_back(q);
+    }
+}
+
+std::optional<Vector2D> COpenXRManager::redirectCursorCrossing(const Vector2D& oldPos, const Vector2D& newPos) {
+    // MAIN THREAD (CPointerManager::move). Every early return means "leave it to the 2D layout".
+    if (m_cursorCrossMode.load(std::memory_order_relaxed) != OpenXR::XR_CURSORCROSS_RAYCAST)
+        return std::nullopt;
+    if (!m_running.load(std::memory_order_acquire))
+        return std::nullopt;
+    if (oldPos == newPos)
+        return std::nullopt;
+
+    // The exact predicate CPointerManager::onMonitorLayoutChange uses to build the boxes the cursor
+    // is clamped to. Anything it excludes is not part of the layout the crossing is happening in.
+    const auto& mons     = State::monitorState()->monitors();
+    const auto  inLayout = [](const PHLMONITOR& m) { return m && m->m_enabled && !m->isMirror() && m->m_output; };
+    const auto  byId     = [&](MONITORID id) -> PHLMONITOR {
+        for (auto const& m : mons) {
+            if (inLayout(m) && m->m_id == id)
+                return m;
+        }
+        return nullptr;
+    };
+
+    // 1. The monitor being LEFT. oldPos is a previously-clamped cursor position, so it is inside
+    //    some box; if this motion does not take it out of that box there is no crossing to decide.
+    PHLMONITOR src;
+    for (auto const& m : mons) {
+        if (!inLayout(m))
+            continue;
+        if (m->logicalBox().containsPoint(oldPos)) {
+            src = m;
+            break;
+        }
+    }
+    if (!src)
+        return std::nullopt;
+    const CBox srcBox = src->logicalBox();
+    if (srcBox.containsPoint(newPos))
+        return std::nullopt;
+
+    // 2. Where the head is NOW. A ray cast from a stale head is a ray cast from where the user is
+    //    not, which is worse than the layout answer — so staleness falls back rather than guesses.
+    OpenXR::SXRPoseSample head;
+    if (!newestPoseSample(head) || !head.viewValid)
+        return std::nullopt;
+    const int64_t nowMs = (int64_t)Time::millis(Time::steadyNow());
+    if (nowMs - head.timestampMs > OpenXR::XR_CROSS_POSE_MAX_AGE_MS)
+        return std::nullopt;
+
+    // 3. Is the monitor we are leaving an XR quad at all? Crossing OFF a physical output keeps the
+    //    2D behaviour: a physical output has no pose in the room, so there is no plane to exit from.
+    refreshCrossQuads(nowMs);
+    const OpenXR::SXRCrossQuad* srcQuad = nullptr;
+    for (auto const& q : m_crossQuads) {
+        if (q.id == src->m_id) {
+            srcQuad = &q;
+            break;
+        }
+    }
+    if (!srcQuad || !(srcQuad->wMeters > 0.F) || !(srcQuad->hMeters > 0.F))
+        return std::nullopt;
+
+    // 4. Candidates: every OTHER XR quad that is currently a real, enabled monitor in the layout.
+    //    (Physical outputs are never candidates — nothing to intersect. That asymmetry is by
+    //    construction and documented: crossing between XR and physical monitors stays 2D.)
+    std::vector<OpenXR::SXRCrossQuad> cands;
+    cands.reserve(m_crossQuads.size());
+    for (auto const& q : m_crossQuads) {
+        if (q.id == srcQuad->id || !byId(q.id))
+            continue;
+        cands.push_back(q);
+    }
+    if (cands.empty())
+        return std::nullopt;
+
+    // 5. The exit point on the source quad's EXTENDED plane, and the line of sight through it.
+    const Vector2D     exitUV  = OpenXR::xrCrossExitUV(srcBox, newPos, OpenXR::XR_CROSS_MAX_OVERSHOOT_UV);
+    const OpenXR::Vec3 through = OpenXR::quadPointFromUV(srcQuad->pose, srcQuad->wMeters, srcQuad->hMeters, (float)exitUV.x, (float)exitUV.y);
+    const auto         pick    = OpenXR::xrPickCrossTarget(head.headPos, through, cands, srcQuad->id, OpenXR::XR_CROSS_TOLERANCE_DEG);
+    if (!pick.ok)
+        return std::nullopt; // nothing over there — the layout's answer is as good as any
+
+    // 6. The hit point, in the target's layout pixels. Its box is read LIVE (never from the cached
+    //    snapshot) so a 2D-sync relayout between motion events cannot land us on stale coordinates.
+    auto tgt = byId(pick.id);
+    if (!tgt)
+        return std::nullopt;
+    const Vector2D land = OpenXR::xrCrossEntryPoint(tgt->logicalBox(), pick.u, pick.v, OpenXR::XR_CROSS_ENTRY_INSET_PX);
+    Log::logger->log(Log::TRACE, "[OPENXR] cursor ray-crossing {} -> {} at uv {:.3f},{:.3f} ({:.2f}m{})", src->m_name, tgt->m_name, pick.u, pick.v, pick.t,
+                     pick.tolerated ? ", tolerated" : "");
+    return land;
+}
+
 std::expected<void, std::string> COpenXRManager::cmdSyncLayout(const std::string& args) {
     // At most one token; trimmed here rather than through splitWs, which is defined further down
     // with the rest of the verb helpers.
@@ -5334,6 +5477,15 @@ void COpenXRManager::recordPoseSample(const OpenXR::SXRPose& view, bool viewVali
 
     std::scoped_lock lock(m_poseRingMu);
     m_poseRing.push(s);
+}
+
+bool COpenXRManager::newestPoseSample(OpenXR::SXRPoseSample& out) {
+    // MAIN THREAD, m_poseRingMu only — see the header for why this is not gazeSampleNow().
+    std::scoped_lock lock(m_poseRingMu);
+    if (m_poseRing.empty())
+        return false;
+    out = m_poseRing.newest();
+    return true;
 }
 
 // Shared body for the `gaze` / `gaze at <ms>` verbs: turn a ring sample into an SXRGazeSample,

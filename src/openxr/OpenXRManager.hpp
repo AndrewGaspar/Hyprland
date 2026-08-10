@@ -20,6 +20,7 @@
 #include "XRMonitorConfig.hpp"
 #include "XRRule.hpp"     // situational transparency: SXRRule / SXRRuleContext / SXREffects (unguarded)
 #include "XRLayout2D.hpp" // 2D-plane sync: the pure projection (report 12, unguarded)
+#include "XRCursorCross.hpp" // ray-cast cursor edge crossing: the pure math (task #139, unguarded)
 #include "XRInput.hpp" // SXRInputEvent / SXRStateEvent / XRQueueItem / CXRQueue / CXRInput
 
 struct wl_event_source;
@@ -300,6 +301,17 @@ class COpenXRManager {
         float       pxPerDegree = 35.f;
     };
     SXRLayout2DStatus layout2DStatus();
+
+    // ---- ray-cast cursor edge crossing (task #139, XRCursorCross.hpp) ----
+    // MAIN THREAD ONLY, called from CPointerManager::move with the PRE-CLAMP candidate position —
+    // the one moment the overshoot past a monitor edge still exists (closestValid() discards it a
+    // few lines later). Returns the position the cursor should land at instead, or nullopt to leave
+    // the motion completely alone, which is the answer for every case that is not "an XR monitor's
+    // edge was just crossed, by ray, successfully": openxr:cursor_crossing = layout, no session, a
+    // head pose staler than XR_CROSS_POSE_MAX_AGE_MS, a source monitor that is not an XR quad, a
+    // motion that never left its monitor, or a ray that met nothing. nullopt therefore means "the
+    // 2D-plane sync's layout adjacency decides", exactly as before this existed.
+    std::optional<Vector2D>          redirectCursorCrossing(const Vector2D& oldPos, const Vector2D& newPos);
 
     // WP-G5: per-hand active input device for `hyprctl openxr status`. Reads CXRInput's atomic
     // interaction-profile mirror (main-thread safe) + the openxr:hand_grab mode. `hands` is true
@@ -627,6 +639,18 @@ class COpenXRManager {
     std::atomic<uint8_t> m_handGrabAnyMode{OpenXR::XR_HANDGRAB_ANY_GRASP};    // openxr:hand_grab_anywhere (default "grasp")
     std::atomic<bool>    m_grabFilterScopeAll{true};                         // openxr:grab_filter_scope != "hands" (default "all")
 
+    // ---- openxr:cursor_crossing parsed to an atomic (task #139) ----
+    // Read ONLY on the main thread (redirectCursorCrossing, from CPointerManager::move), so a plain
+    // CConfigValue<std::string> read would be legal here — this is not the frame-thread hazard the
+    // publishers above exist for. It is an atomic anyway for two reasons: the read sits in the
+    // pointer hot path (up to 1 kHz while the cursor is pushed against an edge), and parsing once
+    // keeps the string->enum mapping in one testable pure function. The cost of the atomic is that
+    // a bare `hyprctl keyword openxr:cursor_crossing …` no longer takes effect by itself under the
+    // legacy parser, hence the special-case in ConfigManager::parseKeyword — which is what makes
+    // A/B-ing the two feels live (bind it to a key) possible at all.
+    void                 publishCursorCrossingMode();  // main thread only
+    std::atomic<uint8_t> m_cursorCrossMode{OpenXR::XR_CURSORCROSS_RAYCAST};
+
     // ---- luma-keyed transparency ("black-as-alpha", openxr:black_alpha — report 09) ----
     // openxr:black_alpha / :black_alpha_knee are NUMERIC configs, so the frame thread could read them
     // directly — but the EFFECTIVE value also depends on the session's environment blend mode (which
@@ -786,6 +810,21 @@ class COpenXRManager {
     // query can tell head-tracked frames from dropouts. Reads m_gazeHoveredId (its own atomic) and
     // the frame-thread-only m_gazeSel/m_gazeHitId (same thread) — no config, no refcount.
     void recordPoseSample(const OpenXR::SXRPose& view, bool viewValid);
+    // Main thread: the newest ring sample, raw. Deliberately NOT gazeSampleNow() — that resolves a
+    // MONITORID to a name and so takes m_layersMu on top of m_poseRingMu, which the cursor-crossing
+    // path (called per motion event) must not pay for. Returns false only when the ring is empty.
+    bool newestPoseSample(OpenXR::SXRPoseSample& out);
+
+    // ---- ray-cast cursor crossing: the quad-geometry snapshot (task #139) ----
+    // Main thread. The live CONTENT quad of every XR monitor that has one, refreshed from m_layers
+    // under m_layersMu at most once per XR_CROSS_GEOM_TTL_MS. The TTL is what keeps a cursor held
+    // against a non-crossing edge (which asks us on every motion event, up to 1 kHz) from hammering
+    // the mutex the frame thread solves under. Only the 3D geometry is cached: each monitor's 2D
+    // box is resolved live on every call, because the 2D-plane sync can move a monitor between two
+    // motion events and a cached box would warp the cursor to where the monitor no longer is.
+    void                              refreshCrossQuads(int64_t nowMs);
+    std::vector<OpenXR::SXRCrossQuad> m_crossQuads;
+    int64_t                           m_crossQuadsMs = 0; // 0 = never built
 
     // Copy of the most recent frame-thread solve inputs, so verbs (main thread) get a view/grip
     // context without blocking the frame thread. Written by the frame thread under m_layersMu.
