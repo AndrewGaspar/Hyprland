@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "XRGraphics.hpp"      // XR_GLuint / XR_EGLImageKHR aliases + CXRGraphics
+#include "XRStereoPair.hpp"    // OpenXR::Stereo::SPaneGeom / SPairDecl (pure, unguarded)
 #include "XRMonitorConfig.hpp" // SXRMonitorParams / OpenXR::SXRAnchorSpec (unguarded)
 #include "XRRule.hpp"          // SXREffects / SXRResolvedEffects / SXRFxEnv (unguarded)
 #include "../helpers/memory/Memory.hpp"
@@ -58,9 +59,11 @@ class CXRMonitorLayer {
     // Stop queueing new buffers/mode changes (removal barrier step 1).
     void stopMainListeners();
 
-    // MAIN THREAD ONLY. Resolve + publish m_stereoPairLayout for this monitor (WP X1). Called from
+    // MAIN THREAD ONLY. Resolve + publish m_stereoPairDecl for this monitor (WP X1/X3). Called from
     // the `presented` listener, and directly on a config change so the kill switch applies at once.
     void publishStereoPairLayout(const PHLMONITOR& mon);
+    // MAIN THREAD ONLY (WP X3, §5.4). The XR ray cursor's depth, as a fraction of one pane's width.
+    void publishCursorDisparity(const PHLMONITOR& mon, bool depthPaired);
 
     // ---- frame thread ----
     // Grab the latest presented buffer, if any (nulls m_haveNewFrame). Returns null when no
@@ -147,9 +150,14 @@ class CXRMonitorLayer {
     // blits into the inner content rect and the margin holds the move-bar / corner handles. These
     // are set alongside m_swapchainSize in createLayerSwapchain and read on the frame thread by the
     // blit (px insets) and the quad-submit/pointer path (m_chrome fractions). See XRMath.hpp §8.
-    Vector2D                 m_contentSize;    // inner content rect size, px (the monitor's pixel mode)
-    Vector2D                 m_contentOffsetPx;// top-left of the content rect within the swapchain, px
-    OpenXR::SXRChromeGeometry m_chrome;        // normalized full-quad layout (single source of truth)
+    Vector2D                 m_contentSize;    // the DESKTOP buffer we blit, px (the monitor's pixel mode — double-wide while depth-packed)
+    Vector2D                 m_contentOffsetPx;// top-left of the content rect within ONE PANE, px
+    OpenXR::SXRChromeGeometry m_chrome;        // normalized layout of ONE PANE (single source of truth)
+    // WP X4: how the swapchain is divided. `panes` is 1 for every ordinary monitor, in which case
+    // paneFull == m_swapchainSize, paneContent == m_contentSize and every pane-aware expression below
+    // is the identity. 2 while the monitor is depth-packed, and then the swapchain holds two
+    // independently-margined panes so each eye's quad carries its own chrome ring.
+    OpenXR::Stereo::SPaneGeom m_paneGeom;
     XR_GLuint             m_cpuTex = 0;           // CPU-fallback staging tex, sized to mode
     Vector2D              m_cpuTexSize;           // size m_cpuTex was allocated at
     XR_EGLImageKHR        m_lastEGLImg = nullptr; // last dmabuf EGLImage (destroyed on next blit)
@@ -254,20 +262,31 @@ class CXRMonitorLayer {
     // change means an animation-only frame must recompose even with no new desktop buffer.
     float              m_fxAlphaDrawn = 1.F;
 
-    // Stereo CONTENT declaration for this monitor (research/24 §5.1, WP X1), as one published byte:
-    // a Render::Stereo::eContentLayout, or CONTENT_OFF for "submit one ordinary quad".
+    // Stereo declaration for this monitor (research/24 §5.1 + §6, WP X1/X3), as ONE published word
+    // (OpenXR::Stereo::packDecl): which producer made the panes, how the image splits, whether to
+    // submit a pair, and the monitor pixel mode all that describes.
     //
-    // The MAIN thread resolves it — it takes a fullscreen-controller lookup and a window's rule
-    // fold, none of which the frame thread may touch — and stores it here from the `presented`
-    // listener, i.e. at the moment it hands over the very buffer this layout describes. The frame
-    // thread loads it once per frame and turns it into an imageRect + eyeVisibility per eye.
+    // The MAIN thread resolves it — it takes a fullscreen-controller lookup, a window's rule fold and
+    // the monitor's live packing state, none of which the frame thread may touch — and stores it here
+    // from the `presented` listener, i.e. at the moment it hands over the very buffer it describes.
+    // The frame thread loads it once per frame and turns it into imageRects + eyeVisibility per eye.
     //
-    // A byte rather than the enum because the frame thread must never read anything whose backing
-    // store the main thread can reallocate under it; the same reason m_handGrabMode is a uint8_t.
-    // On a transition the pairing can be one frame behind the buffer it describes (the layout is
-    // published with frame N while the frame thread may still be showing N-1) — the same tolerance
-    // the m_fx* envelopes already run under, and the worst case is one frame of a doubled image.
-    std::atomic<uint8_t> m_stereoPairLayout{0};
+    // A plain word rather than a struct because the frame thread must never read anything whose
+    // backing store the main thread can reallocate under it; the same reason m_handGrabMode is a
+    // uint8_t. ONE word rather than several atomics because the mode travels with the split: a
+    // monitor mid-mode-change would otherwise let the frame thread pair up an image the declaration
+    // is not talking about, and spend a frame showing each eye half of a mono desktop.
+    std::atomic<uint64_t> m_stereoPairDecl{0};
+
+    // The XR ray cursor's depth disparity (§5.4, WP X3): the eye-0 shift as a fraction of ONE PANE's
+    // width, for whatever the pointer is currently over. MAIN thread publishes the target (it needs
+    // the hovered view and the depth ladder, both main-thread-only); the FRAME thread eases toward it
+    // with OpenXR::Stereo::easeCursorDisparity so crossing a window edge does not snap the cursor
+    // between depths. Zero on every monitor that is not depth-paired, which makes the whole feature a
+    // multiply by zero for everyone else.
+    std::atomic<float>    m_cursorDisparityTarget{0.F};
+    float                 m_cursorDisparity      = 0.F; // frame thread only (the eased value)
+    float                 m_cursorDisparityDrawn = 0.F; // frame thread only (redraw diff)
 
     // How many composition layers this monitor submitted LAST FRAME: 0 (nothing — no content yet,
     // suspended by the layer cap, or a pair the budget refused), 1 (an ordinary quad) or 2 (a
@@ -276,6 +295,14 @@ class CXRMonitorLayer {
     // answer "is the pair actually being submitted" rather than only "was it declared" — the two
     // differ when the budget refuses a pair, which is the one failure mode with no visual tell.
     std::atomic<uint8_t> m_quadsSubmitted{1};
+
+    // Whether the chrome draw pass ran for this monitor LAST FRAME (WP X4). Frame thread → main
+    // thread (status only). It exists because chrome suppression is a frame-thread decision with no
+    // other outside view: X1 suppresses chrome on a CONTENT pair and X4 restores it on a DEPTH pair,
+    // and "my XR monitor stopped being grabbable" is otherwise a bug report with nothing to look at.
+    // False also for chrome_enabled = 0 / chrome_margin = 0, which is the honest answer to
+    // "is there chrome on this quad".
+    std::atomic<bool>    m_chromeLive{false};
 
     // Fade-envelope state (frame thread only; only the blit loop touches these). Alpha is advanced
     // every frame from predicted-display-time deltas via OpenXR::chromeFadeAdvance; the *Drawn*

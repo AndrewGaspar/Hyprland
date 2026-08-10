@@ -237,10 +237,19 @@ void CMonitor::onConnect(bool noRule) {
 
         auto rule = m_activeMonitorRule;
 
-        if (SIZE == rule.m_resolution)
+        // `event.size` is the mode the backend is SCANNING OUT, and rule.m_resolution is only that
+        // for an ordinary or physically-packed output. On a VIRTUAL pack (research/24 WP X3) the
+        // field means ONE PANE, so writing the packed mode in would double an already-doubled mode
+        // on the next apply — and again on the next event. Same hazard, same fix, as the
+        // wlr-output-management write-back (Monitor::Stereo::adoptExternalMode).
+        const auto ADOPTED = Monitor::Stereo::adoptExternalMode(SIZE, rule.m_stereo, rule.m_stereoVirtualMode);
+
+        if (ADOPTED.resolution == rule.m_resolution && ADOPTED.stereo == rule.m_stereo && ADOPTED.virtualPack == rule.m_stereoVirtualMode)
             return;
 
-        rule.m_resolution = SIZE;
+        rule.m_resolution        = ADOPTED.resolution;
+        rule.m_stereo            = ADOPTED.stereo;
+        rule.m_stereoVirtualMode = ADOPTED.virtualPack;
 
         applyMonitorRule(std::move(rule));
     });
@@ -739,8 +748,9 @@ bool CMonitor::applyMonitorRuleSoft(Config::CMonitorRule&& pMonitorRule) {
         }
     }
 
-    m_stereoMode = m_activeMonitorRule.m_stereo;
-    sanitizeStereoMode(m_activeMonitorRule.m_resolution);
+    m_stereoMode        = m_activeMonitorRule.m_stereo;
+    m_stereoVirtualMode = m_activeMonitorRule.m_stereoVirtualMode;
+    sanitizeStereoMode(stereoRequestedMode(m_activeMonitorRule));
 
     // research/24 §3.2: the logical size derives from ONE PANE, not the mode. The pack sits strictly
     // below m_transformedSize (like zoom/mirror, a final-blit stage), so every logical↔buffer
@@ -812,6 +822,13 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
     // unchanged mode still changes the pane and must reset the render resources below
     const auto OLDPANESIZE = paneSize();
 
+    // stereo: the MODE this rule asks the display for. Identical to RULE->m_resolution for every
+    // rule that is not a VIRTUAL pack (research/24 WP X3) — an output with no panel declares the
+    // size it wants to WORK at, per eye, and the scanout mode is derived by doubling it. Used by
+    // the whole mode search below and by sanitizeStereoMode, so the request and the check can
+    // never disagree.
+    const Vector2D REQUESTEDMODE = Monitor::Stereo::requestedMode(RULE->m_resolution, RULE->m_stereo, RULE->m_stereoVirtualMode);
+
     m_transform = RULE->m_transform;
 
     // accumulate requested modes in reverse order (cause inesrting at front is inefficient)
@@ -833,7 +850,7 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
     else
         requestedModes.push_back(m_output->preferredMode());
 
-    if (RULE->m_resolution == Vector2D()) {
+    if (REQUESTEDMODE == Vector2D()) {
         requestedStr = "preferred";
 
         // fallback to first 3 modes if preferred fails/doesn't exist
@@ -844,7 +861,7 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
 
         if (m_output->preferredMode())
             requestedModes.push_back(m_output->preferredMode());
-    } else if (RULE->m_resolution == Vector2D(-1, -1)) {
+    } else if (REQUESTEDMODE == Vector2D(-1, -1)) {
         requestedStr = "highrr";
 
         // sort prioritizing refresh rate 1st and resolution 2nd, then add best 3
@@ -855,7 +872,7 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
                 return true;
             return false;
         });
-    } else if (RULE->m_resolution == Vector2D(-1, -2)) {
+    } else if (REQUESTEDMODE == Vector2D(-1, -2)) {
         requestedStr = "highres";
 
         // sort prioritizing resolution 1st and refresh rate 2nd, then add best 3
@@ -867,7 +884,7 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
                 return true;
             return false;
         });
-    } else if (RULE->m_resolution == Vector2D(-1, -3)) {
+    } else if (REQUESTEDMODE == Vector2D(-1, -3)) {
         requestedStr = "maxwidth";
 
         // sort prioritizing widest resolution 1st and refresh rate 2nd, then add best 3
@@ -878,15 +895,15 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
                 return true;
             return false;
         });
-    } else if (RULE->m_resolution != Vector2D()) {
+    } else if (REQUESTEDMODE != Vector2D()) {
         // user requested mode
-        requestedStr = std::format("{:X0}@{:.2f}Hz", RULE->m_resolution, RULE->m_refreshRate);
+        requestedStr = std::format("{:X0}@{:.2f}Hz", REQUESTEDMODE, RULE->m_refreshRate);
 
         // sort by closeness to requested, then add best 3
         addBest3Modes([&](auto const& a, auto const& b) {
-            if (abs(a->pixelSize.x - RULE->m_resolution.x) < abs(b->pixelSize.x - RULE->m_resolution.x))
+            if (abs(a->pixelSize.x - REQUESTEDMODE.x) < abs(b->pixelSize.x - REQUESTEDMODE.x))
                 return true;
-            if (a->pixelSize.x == b->pixelSize.x && abs(a->pixelSize.y - RULE->m_resolution.y) < abs(b->pixelSize.y - RULE->m_resolution.y))
+            if (a->pixelSize.x == b->pixelSize.x && abs(a->pixelSize.y - REQUESTEDMODE.y) < abs(b->pixelSize.y - REQUESTEDMODE.y))
                 return true;
             if (a->pixelSize == b->pixelSize && abs((a->refreshRate / 1000.f) - RULE->m_refreshRate) < abs((b->refreshRate / 1000.f) - RULE->m_refreshRate))
                 return true;
@@ -896,10 +913,10 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
         // if the best mode isn't close to requested, then try requested as custom mode first
         if (!requestedModes.empty()) {
             auto bestMode = requestedModes.back();
-            if (!DELTALESSTHAN(bestMode->pixelSize.x, RULE->m_resolution.x, 1) || !DELTALESSTHAN(bestMode->pixelSize.y, RULE->m_resolution.y, 1) ||
+            if (!DELTALESSTHAN(bestMode->pixelSize.x, REQUESTEDMODE.x, 1) || !DELTALESSTHAN(bestMode->pixelSize.y, REQUESTEDMODE.y, 1) ||
                 !DELTALESSTHAN(bestMode->refreshRate / 1000.f, RULE->m_refreshRate, 1))
                 requestedModes.push_back(
-                    makeShared<Aquamarine::SOutputMode>(Aquamarine::SOutputMode{.pixelSize = RULE->m_resolution, .refreshRate = RULE->m_refreshRate * 1000.f}));
+                    makeShared<Aquamarine::SOutputMode>(Aquamarine::SOutputMode{.pixelSize = REQUESTEDMODE, .refreshRate = RULE->m_refreshRate * 1000.f}));
         }
 
         // then if requested is custom, try custom mode first
@@ -984,9 +1001,9 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
     }
 
     // try requested as custom mode jic it works
-    if (!success && RULE->m_resolution != Vector2D() && RULE->m_resolution != Vector2D(-1, -1) && RULE->m_resolution != Vector2D(-1, -2)) {
+    if (!success && REQUESTEDMODE != Vector2D() && REQUESTEDMODE != Vector2D(-1, -1) && REQUESTEDMODE != Vector2D(-1, -2)) {
         auto        refreshRate = m_output->getBackend()->type() == Aquamarine::eBackendType::AQ_BACKEND_DRM ? RULE->m_refreshRate * 1000 : 0;
-        auto        mode        = makeShared<Aquamarine::SOutputMode>(Aquamarine::SOutputMode{.pixelSize = RULE->m_resolution, .refreshRate = refreshRate});
+        auto        mode        = makeShared<Aquamarine::SOutputMode>(Aquamarine::SOutputMode{.pixelSize = REQUESTEDMODE, .refreshRate = refreshRate});
         std::string modeStr     = std::format("{:X0}@{:.2f}Hz", mode->pixelSize, mode->refreshRate / 1000.f);
 
         m_state.applyCustomModeWithSwapchain(mode);
@@ -1039,7 +1056,7 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
         // mode as not-what-was-asked-for, or a later soft apply would adopt its stereo mode against
         // the mode that failed (research/24 §3.4 item 15).
         m_modeSearchFellBack = true;
-        Log::logger->log(Log::ERR, "Monitor {} has NO FALLBACK MODES, and an INVALID one was requested: {:X0}@{:.2f}Hz", m_name, RULE->m_resolution, RULE->m_refreshRate);
+        Log::logger->log(Log::ERR, "Monitor {} has NO FALLBACK MODES, and an INVALID one was requested: {:X0}@{:.2f}Hz", m_name, REQUESTEDMODE, RULE->m_refreshRate);
         scheduleModeRetry();
         return true;
     }
@@ -1058,8 +1075,9 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
     // lock) is derived below this line, and the !success return above skips all of it. The pack
     // must then survive sanitizing: the committed mode has to divide cleanly into panes AND be the
     // mode the rule asked for (research/24 §3.4 items 1 and 15).
-    m_stereoMode = RULE->m_stereo;
-    sanitizeStereoMode(RULE->m_resolution);
+    m_stereoMode        = RULE->m_stereo;
+    m_stereoVirtualMode = RULE->m_stereoVirtualMode;
+    sanitizeStereoMode(REQUESTEDMODE);
 
     static constexpr auto formats10bit = std::to_array<uint32_t>({DRM_FORMAT_XRGB2101010, DRM_FORMAT_XBGR2101010});
     static constexpr auto formats8bit  = std::to_array<uint32_t>({DRM_FORMAT_XRGB8888, DRM_FORMAT_XBGR8888});
@@ -1082,7 +1100,7 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
     // when stereo is off. Also, per-eye pixel mapping wants scale 1.0 on a physically-split panel
     // (§3.8) — warn, but honor the config.
     const Vector2D SCALEBASE = paneSize();
-    if (isStereo() && m_scale != 1.F && !autoScale)
+    if (isStereo() && !RULE->m_stereoVirtualMode && m_scale != 1.F && !autoScale)
         Log::logger->log(Log::WARN, "Monitor {}: stereo output with scale {:.2f} != 1.0 — the physical per-eye split maps 1:1 only at scale 1.0", m_name, m_scale);
 
     Vector2D logicalSize = Monitor::Stereo::scaleValidationSize(m_pixelSize, m_stereoMode, m_scale);
@@ -1503,12 +1521,19 @@ float CMonitor::getDefaultScale() {
     // the horizontal pixel density by the pack divisor and silently halve the logical desktop —
     // the scale validator below divides the pane and would happily accept 1920/2. An explicit
     // scale is still honored (with the warning in applyMonitorRule); only the guess is pinned.
-    if (isStereo())
+    // A VIRTUAL pack (research/24 WP X3) is exempt: an XR monitor has no per-eye pixel grid to map
+    // 1:1 onto, its "mode" is a swapchain it sized itself, and the pane is exactly the size the user
+    // declared. Pinning 1.0 there would shrink every XR desktop by openxr:default_monitor_scale the
+    // moment the depth producer engaged — a visible, unasked-for reflow of the whole session.
+    if (isStereo() && !m_stereoVirtualMode)
         return 1;
 
     static constexpr double MMPERINCH = 25.4;
 
-    const auto              DIAGONALPX = sqrt(pow(m_pixelSize.x, 2) + pow(m_pixelSize.y, 2));
+    // The PPI guess must be made of PANE pixels, not mode pixels: a virtual pack falls through to
+    // here (its scale is not pinned) and the doubled mode would inflate the diagonal by ~1.7x.
+    const auto              PANEPX     = paneSize();
+    const auto              DIAGONALPX = sqrt(pow(PANEPX.x, 2) + pow(PANEPX.y, 2));
     const auto              DIAGONALIN = sqrt(pow(m_output->physicalSize.x / MMPERINCH, 2) + pow(m_output->physicalSize.y / MMPERINCH, 2));
 
     const auto              PPI = DIAGONALPX / DIAGONALIN;
@@ -1899,6 +1924,10 @@ CBox CMonitor::stereoPaneDestBox(int idx) const {
     return Monitor::Stereo::paneDestBox(m_pixelSize, m_stereoMode, idx);
 }
 
+Vector2D CMonitor::stereoRequestedMode(const Config::CMonitorRule& rule) const {
+    return Monitor::Stereo::requestedMode(rule.m_resolution, rule.m_stereo, rule.m_stereoVirtualMode);
+}
+
 bool CMonitor::depthIsAnimating() const {
     // research/24 §6.3: the depth animations damage nothing by design, so the renderer has to ask.
     for (const auto& W : Desktop::windowState()->windows()) {
@@ -1939,6 +1968,21 @@ void CMonitor::sanitizeStereoMode(const Vector2D& requestedMode) {
     if (!isStereo())
         return;
 
+    // A VIRTUAL pack derives its mode from a per-pane resolution, so a rule that names no
+    // resolution has nothing to derive from (research/24 WP X3). `preferred` and the
+    // highrr/highres/maxwidth sentinels come through requestedMode() untouched, the mode search
+    // then lands on whatever the output prefers, and the pack would HALVE that into a desktop
+    // nobody asked for — the exact regression the virtual inversion exists to prevent. Drop it,
+    // loudly: a silently halved desktop is the failure mode that reads as "the compositor broke".
+    if (m_stereoVirtualMode && (requestedMode.x <= 0 || requestedMode.y <= 0)) {
+        const auto ERRSTR = std::format("Monitor {}: a per-eye pack needs an explicit per-eye resolution, but the rule asks for a mode by preference — disabling stereo", m_name);
+        Log::logger->log(Log::ERR, ERRSTR);
+        ErrorOverlay::overlay()->queueError(ERRSTR);
+        m_stereoMode        = Config::STEREO_OFF;
+        m_stereoVirtualMode = false;
+        return;
+    }
+
     // The pack is only valid on the mode it was CONFIGURED for: side-by-side content on a display
     // that is not in SBS mode is one eye's half stretched across the panel. The mode search has
     // three ways to land somewhere else (the custom-mode retry, the emergency any-available-mode
@@ -1973,7 +2017,11 @@ void CMonitor::updateStereoWatch() {
     // old mode forever, packing two panes into a scanout the panel has stopped splitting, which is
     // exactly the squished SBS frame this fixes. Poll instead, on the same shape as the mode-retry
     // timer above: cheap, off the render path, and safe to re-modeset from.
-    const bool WANT = m_enabled && m_output && (isStereo() || m_activeMonitorRule.m_stereo != Config::STEREO_OFF);
+    // A VIRTUAL pack has nothing to watch (research/24 WP X3): the "panel" is a headless output whose
+    // mode we invented, there is no EDID personality that can change under it, and its mode never
+    // appears in m_output->modes (watchAction would read that as a fall and re-modeset it forever).
+    const bool WANT = m_enabled && m_output && !m_stereoVirtualMode && !m_activeMonitorRule.m_stereoVirtualMode &&
+        (isStereo() || m_activeMonitorRule.m_stereo != Config::STEREO_OFF);
     if (!WANT) {
         clearStereoWatch();
         return;
@@ -2002,7 +2050,8 @@ void CMonitor::updateStereoWatch() {
                 advertised.emplace_back(m->pixelSize);
 
             const auto ACTION = Monitor::Stereo::watchAction(PMONITOR->m_stereoMode, PMONITOR->m_activeMonitorRule.m_stereo, PMONITOR->m_pixelSize,
-                                                             PMONITOR->m_activeMonitorRule.m_resolution, advertised, PMONITOR->m_customDrmMode.vdisplay > 0);
+                                                             PMONITOR->stereoRequestedMode(PMONITOR->m_activeMonitorRule), advertised,
+                                                             PMONITOR->m_customDrmMode.vdisplay > 0);
 
             // Act once per hardware state. A re-apply whose modeset cannot commit leaves the monitor
             // exactly as the watch found it, and re-modesetting every second forever is worse than

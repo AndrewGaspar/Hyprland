@@ -45,11 +45,64 @@ namespace Monitor::Stereo {
         return {COL * PANE.x, ROW * PANE.y, PANE.x, PANE.y};
     }
 
+    // THE MODE A STEREO RULE ASKS THE DISPLAY FOR — and the one place the two kinds of stereo
+    // output differ (research/24 §6.2's "this needs no change to the monitor's mode", WP X3).
+    //
+    // A PHYSICAL stereo output (the `monitor = …, stereo:sbs` token, WP F1) names a mode the panel
+    // really has: 3840x1080 on an XREAL in 3D mode. The rule's resolution IS the packed mode and
+    // the logical desktop is derived by halving it — the panel's mode is the fixed quantity.
+    //
+    // A VIRTUAL pack has no panel. A headless/XR output invents its own scanout, so the fixed
+    // quantity is the other one: the user declares the size they want to WORK at (an `xrmonitor`
+    // at 2560x1440 stays 2560x1440 per eye) and the packed mode is derived by doubling it. Halving
+    // a declared XR size instead would silently shrink every XR desktop the moment the depth
+    // producer engaged, which is the wrong semantics for an output that has no panel to respect.
+    //
+    // Everything downstream (deriveGeometry, sanitizeStereoMode, backComputeMode) is identical for
+    // both — only the request differs, and it differs here, once.
+    inline Vector2D requestedMode(const Vector2D& ruleResolution, Config::eMonitorStereoMode mode, bool virtualPack) {
+        if (!virtualPack || mode == Config::STEREO_OFF)
+            return ruleResolution;
+        // `preferred` (0,0) and the highrr/highres/maxwidth sentinels (-1,-N) are mode REQUESTS, not
+        // resolutions — there is nothing to double, and doubling a sentinel would invent a mode.
+        if (ruleResolution.x <= 0 || ruleResolution.y <= 0)
+            return ruleResolution;
+        return ruleResolution * packDivisor(mode);
+    }
+
     // sanitize predicate: the committed mode must divide cleanly into >= 1x1 panes, or the
     // packing is dropped loudly rather than deriving fractional pane sizes (§3.4 item 1).
     inline bool modeDivides(const Vector2D& pixelSize, Config::eMonitorStereoMode mode) {
         const Vector2D PANE = paneSize(pixelSize, mode);
         return PANE == PANE.floor() && PANE.x >= 1 && PANE.y >= 1;
+    }
+
+    // ADOPTING AN EXTERNAL MODE INTO A RULE WHOSE RESOLUTION MAY MEAN ONE PANE.
+    //
+    // Two writers hand a monitor rule the mode the output is SCANNING OUT: a display GUI through
+    // wlr-output-management (the head advertises the current mode, so that is what a read-modify-
+    // write commits back) and the backend's own state event (CMonitor's m_forceSize path). For a
+    // physical pack that is exactly what the field means and there is nothing to do. For a VIRTUAL
+    // pack the field means ONE PANE and they are handing us TWO — and left alone that is not a
+    // one-off error but a RUNAWAY, because the next apply doubles the already-doubled mode and the
+    // next commit reports that: 5120 → 10240 → 20480, until a modeset finally fails.
+    //
+    // So convert back to a pane when the mode divides cleanly, and drop the pack when it does not —
+    // a GUI that has genuinely picked another mode outranks a packing we invented.
+    struct SAdoptedMode {
+        Vector2D                   resolution;
+        Config::eMonitorStereoMode stereo      = Config::STEREO_OFF;
+        bool                       virtualPack = false;
+
+        bool                       operator==(const SAdoptedMode&) const = default;
+    };
+
+    inline SAdoptedMode adoptExternalMode(const Vector2D& mode, Config::eMonitorStereoMode stereo, bool virtualPack) {
+        if (!virtualPack || stereo == Config::STEREO_OFF)
+            return {.resolution = mode, .stereo = stereo, .virtualPack = virtualPack};
+        if (!modeDivides(mode, stereo))
+            return {.resolution = mode, .stereo = Config::STEREO_OFF, .virtualPack = false};
+        return {.resolution = paneSize(mode, stereo), .stereo = stereo, .virtualPack = true};
     }
 
     // sanitize predicate 2 (§3.4 item 15): the pack is only valid on the mode it was CONFIGURED

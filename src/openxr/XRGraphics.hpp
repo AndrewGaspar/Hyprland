@@ -89,7 +89,10 @@ class CXRGraphics {
     // (OpenXR::eXRQuadRegion) highlights the hovered element; `grabbed` overrides all elements to
     // the grab color. Colors come from openxr:chrome_col_* and are written PREMULTIPLIED (the quad
     // composites TEXTURE_SOURCE_ALPHA). Only touches margin pixels — never the content rect.
-    void drawChrome(CXRMonitorLayer& layer, XR_GLuint dstTex, float alpha, uint8_t hoverRegion, bool grabbed);
+    // `pane` (WP X4) selects which pane of the swapchain to draw into — 0 for every ordinary
+    // monitor, 0 and 1 for a depth-packed one, whose swapchain holds two independently margined
+    // panes so each eye's quad carries its own chrome ring.
+    void drawChrome(CXRMonitorLayer& layer, XR_GLuint dstTex, float alpha, uint8_t hoverRegion, bool grabbed, int pane = 0);
 
     // ---- report 14 Stage A1: endpoint cursor draw (frame thread, in a CScopedGLContext) ----
     // Draw each hand's endpoint cursor (a small opaque dot) into dstTex at its packed ray-hit uv.
@@ -102,7 +105,11 @@ class CXRGraphics {
     // packedGaze (research/16 §3.3) is the gaze cursor word for the CARRIED monitor — drawn in a
     // single distinct color (openxr:gaze_cursor_col) regardless of state, so the gaze point is
     // visible while carrying. 0 = no gaze cursor. Draw AFTER the hand cursors.
-    void drawCursor(CXRMonitorLayer& layer, XR_GLuint dstTex, uint32_t packedL, uint32_t packedR, uint32_t packedGaze = 0);
+    // `pane` (WP X4) as for drawChrome. `disparityContentFrac` (WP X3, §5.4) is this pane's signed
+    // depth shift for the cursor, as a fraction of ONE PANE's content width — the dot is drawn at the
+    // depth of whatever it is over, so it never sits behind a raised window it is pointing at. 0 on
+    // every non-depth monitor, which makes this an add of zero.
+    void drawCursor(CXRMonitorLayer& layer, XR_GLuint dstTex, uint32_t packedL, uint32_t packedR, uint32_t packedGaze = 0, int pane = 0, float disparityContentFrac = 0.F);
 
     // RAII guard for an XR GL burst. ctor makes the XR context current; dtor RESTORES whatever
     // EGL binding was current before the burst (WP-L1, research doc 17 §5) instead of blindly
