@@ -46,6 +46,7 @@
 #include "XRGpuProbe.hpp"
 #include "XRMonitorLayer.hpp"
 #include "XRDmabufImport.hpp" // OpenXR::xrContentPathName (status contentPath)
+#include "XRStereoPair.hpp" // WP X1: the stereo quad-pair policy + pane rect math (pure)
 #include "XRInput.hpp"
 #include "XRPointerDevice.hpp"
 #include "../Compositor.hpp"
@@ -1501,12 +1502,22 @@ void COpenXRManager::frameThread() {
             else if (gazeSel && hoverReg == OpenXR::XR_REGION_NONE)
                 hoverReg = OpenXR::XR_REGION_BAR;
             const bool    activeNow  = grabbedNow || hoverReg != OpenXR::XR_REGION_NONE;
-            const bool    chromeOn   = l->m_chrome.hasChrome();
+            // WP X1 (research/24 §5.1 option 2): while this monitor is submitted as a stereo PAIR,
+            // the eye quads cover the CONTENT rect only — the chrome margins are outside both, and
+            // the ray cursor is drawn at a full-quad uv into a swapchain whose full quad is no longer
+            // what anyone sees. Drawing either would put pixels where no eye looks (chrome) or in one
+            // eye at the wrong place (cursor), so both are suppressed for the duration.
+            //
+            // This is the honest v1 trade and it is a small one: a monitor showing a fullscreen 3D
+            // film or game is not one you reposition mid-frame. X4 gives the chrome two margined
+            // panes and X3 gives the cursor per-pane disparity; both remove this suppression.
+            const bool    stereoPaired = OpenXR::Stereo::pairActive((Render::Stereo::eContentLayout)l->m_stereoPairLayout.load(std::memory_order_acquire));
+            const bool    chromeOn   = l->m_chrome.hasChrome() && !stereoPaired;
             // report 14 Stage A1: per-hand endpoint cursor. Drawn (like chrome) into the swapchain
             // over content; its packed word was published last frame by processPointer's plumbing.
             static auto    PGAZECUR      = CConfigValue<Hyprlang::INT>("openxr:gaze_cursor");
-            const bool     cursorEnabled = *PCURSOREN != 0;
-            const bool     gazeCurEnabled = *PGAZECUR != 0;
+            const bool     cursorEnabled = *PCURSOREN != 0 && !stereoPaired;
+            const bool     gazeCurEnabled = *PGAZECUR != 0 && !stereoPaired;
             const uint32_t curL          = l->m_cursorPacked[0].load(std::memory_order_acquire);
             const uint32_t curR          = l->m_cursorPacked[1].load(std::memory_order_acquire);
             // research/16 §3.3: distinct gaze cursor on the carried monitor (packed by gazeSelectPass).
@@ -1631,6 +1642,15 @@ void COpenXRManager::frameThread() {
                     l->m_cursorDrawn[0]   = cursorEnabled ? curL : 0;
                     l->m_cursorDrawn[1]   = cursorEnabled ? curR : 0;
                     l->m_gazeCursorDrawn  = curGaze;
+                } else if (stereoPaired) {
+                    // WP X1: while paired we drew neither chrome nor cursor, and the content blit
+                    // above erased whatever was there. Clear the redraw-diff trackers to match, or
+                    // leaving the pair would compare against pixels that no longer exist and skip the
+                    // redraw that puts the chrome and the cursor back until the next time they move.
+                    l->m_chromeDrawnAlpha = 0.f;
+                    l->m_cursorDrawn[0]   = 0;
+                    l->m_cursorDrawn[1]   = 0;
+                    l->m_gazeCursorDrawn  = 0;
                 }
 
                 // Uniform monitor alpha (doc 05 §xrrule) — LAST, over content + chrome + cursors, so
@@ -1767,8 +1787,16 @@ void COpenXRManager::frameThread() {
                     // Aspect from the CONTENT pixel mode (not the chrome-expanded swapchain) so
                     // widthMeters/heightMeters stay CONTENT geometry — `size:` and layout
                     // serialization keep meaning content meters (WP-G1).
-                    in.pxW       = (uint32_t)std::max(1.0, l->m_contentSize.x);
-                    in.pxH       = (uint32_t)std::max(1.0, l->m_contentSize.y);
+                    //
+                    // WP X1 (research/24 §5.2): when this monitor is submitting a quad PAIR, the
+                    // pixels each eye actually sees are one un-squeezed pane, not the whole mode, and
+                    // the quad's height is derived from that aspect. This is the entire reason `sbs`
+                    // and `hsbs` must be DECLARED rather than measured: they are the same pixels and
+                    // ask for different shapes. `hsbs`/`htab` come back as the mode itself, so the
+                    // common case (a half-packed 3D video on a 16:9 monitor) leaves geometry alone.
+                    const auto PANEPX = Render::Stereo::presentedPaneSize(l->m_contentSize, (Render::Stereo::eContentLayout)l->m_stereoPairLayout.load(std::memory_order_acquire));
+                    in.pxW       = (uint32_t)std::max(1.0, PANEPX.x);
+                    in.pxH       = (uint32_t)std::max(1.0, PANEPX.y);
                     results[i]   = l->m_anchor.solve(in, tune);
                     solved[i]    = true;
 
@@ -1793,7 +1821,10 @@ void COpenXRManager::frameThread() {
                     results[i].pose         = l->m_anchor.lastWorld();
                     results[i].worldPose    = results[i].pose;
                     results[i].widthMeters  = l->m_anchor.state().widthMeters;
-                    results[i].heightMeters = results[i].widthMeters * (float)l->m_contentSize.y / (float)std::max(1.0, l->m_contentSize.x);
+                    // Same pane-aspect rule as the solve path above (WP X1) — a tracking dropout
+                    // must not silently un-pair the geometry and pop the quad's height.
+                    results[i].heightMeters =
+                        results[i].widthMeters * Render::Stereo::presentedAspect(l->m_contentSize, (Render::Stereo::eContentLayout)l->m_stereoPairLayout.load(std::memory_order_acquire));
                     solved[i]               = true;
                 }
             }
@@ -1804,8 +1835,11 @@ void COpenXRManager::frameThread() {
 
         std::vector<XrCompositionLayerQuad>              quads;
         std::vector<const XrCompositionLayerBaseHeader*> layerPtrs;
-        quads.reserve(active.size());
-        layerPtrs.reserve(active.size());
+        // WP X1: a stereo monitor submits a PAIR (one quad per eye), so the worst case is two per
+        // layer. Over-reserving is free; under-reserving would only cost a realloc, but layerPtrs is
+        // filled in a second pass precisely because these vectors may move, so keep both honest.
+        quads.reserve(active.size() * 2);
+        layerPtrs.reserve(active.size() * 2);
 
         // Composition order: OpenXR composites the layer array in SUBMISSION order (later
         // entries draw on top) — a quad's 3D position plays no part, so ordering must be
@@ -1834,8 +1868,20 @@ void COpenXRManager::frameThread() {
 
         for (size_t i : order) {
             auto& l = active[i];
-            if (quads.size() >= m_session->m_maxLayerCount)
-                break;
+            // WP X1: what the MAIN thread declared for this monitor (research/24 §5.1). CONTENT_OFF
+            // is the ordinary one-quad path and is what every monitor in a session that has never
+            // configured stereo reads, every frame, forever.
+            const auto STEREOLAYOUT = (Render::Stereo::eContentLayout)l->m_stereoPairLayout.load(std::memory_order_acquire);
+            const bool STEREOPAIR   = OpenXR::Stereo::pairActive(STEREOLAYOUT);
+            // The budget is checked for the WHOLE pair, never a quad at a time (§F2's cost note).
+            // A pair that only half-fits is submitted left-eye-only — one eye sees the desktop and
+            // the other sees nothing, which is not a degraded picture but a nauseating one. `continue`
+            // rather than `break` so a cheaper monitor behind it can still take the last slot.
+            if (!OpenXR::Stereo::submissionFits(quads.size(), m_session->m_maxLayerCount, STEREOLAYOUT)) {
+                if (quads.size() >= m_session->m_maxLayerCount)
+                    break;
+                continue;
+            }
             if (!l->m_quadActive || !l->m_hasContent || !solved[i])
                 continue;
 
@@ -1877,7 +1923,15 @@ void COpenXRManager::frameThread() {
             // (contentMeters / contentFrac) and shift the submit pose from the content center to the
             // quad geometric center so the content stays exactly where the anchor placed it — the
             // asymmetric bottom margin (which holds the move-bar) would otherwise drift layouts.
-            const OpenXR::SXRChromeGeometry& chrome = l->m_chrome;
+            // WP X1: a paired monitor shows ONLY its content rect — each eye's imageRect selects a
+            // half of it, and the chrome margins are outside both. So the pair is submitted at
+            // CONTENT meters on the CONTENT pose, which is simply what the anchor already solved;
+            // the margin grow/shift below exists to keep content where the anchor put it, and with
+            // no margins on screen there is nothing to correct for. Chrome is suppressed to match
+            // (§5.1 option 2) — drawing a move-bar into pixels no eye can see would leave a monitor
+            // that looks grabbable and is not.
+            const OpenXR::SXRChromeGeometry  EMPTYCHROME{};
+            const OpenXR::SXRChromeGeometry& chrome = STEREOPAIR ? EMPTYCHROME : l->m_chrome;
             const float                      quadW  = res.widthMeters / (chrome.contentFracW() > 0.f ? chrome.contentFracW() : 1.f);
             const float                      quadH  = res.heightMeters / (chrome.contentFracH() > 0.f ? chrome.contentFracH() : 1.f);
             const OpenXR::SXRPose            quadCenterPose = OpenXR::contentPoseToQuadCenter(quadPose, chrome, quadW, quadH);
@@ -1885,16 +1939,38 @@ void COpenXRManager::frameThread() {
             l->m_quadWMeters = quadW;
             l->m_quadHMeters = quadH;
 
+            // The content rect inside the swapchain, in imageRect's coordinate space: bottom-left,
+            // the same flip blitBuffer computes as `contentGL`. For a mono layer this is the whole
+            // image, exactly as before — paneImageRect is the identity on CONTENT_OFF.
+            const int32_t                 contentW = (int32_t)std::max(0.0, l->m_contentSize.x);
+            const int32_t                 contentH = (int32_t)std::max(0.0, l->m_contentSize.y);
+            const OpenXR::Stereo::SImageRect CONTENTRECT = STEREOPAIR && contentW > 0 && contentH > 0 ?
+                OpenXR::Stereo::SImageRect{(int32_t)l->m_contentOffsetPx.x, h - (int32_t)l->m_contentOffsetPx.y - contentH, contentW, contentH} :
+                OpenXR::Stereo::SImageRect{0, 0, w, h};
+
             XrCompositionLayerQuad quad   = {XR_TYPE_COMPOSITION_LAYER_QUAD};
             quad.layerFlags               = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
             quad.space                    = quadSpace;
-            quad.eyeVisibility            = XR_EYE_VISIBILITY_BOTH;
             quad.subImage.swapchain       = l->m_swapchain;
-            quad.subImage.imageRect       = {{0, 0}, {w, h}};
             quad.subImage.imageArrayIndex = 0;
             quad.pose                     = xrFromPose(quadCenterPose);
             quad.size                     = {quadW, quadH};
-            quads.push_back(quad);
+
+            // THE PAIR (research/24 §5.1a, F2). Two quads at one pose, one image, no GL work at all:
+            // the runtime's own sampler crops each eye to its half, which it was going to sample
+            // anyway. Both members are pushed here, back to back, so the depth sort above — which
+            // orders LAYERS, not quads — cannot separate a pair that shares a pose.
+            //
+            // Monado converts eyeVisibility for quads in its state tracker and consults it in BOTH
+            // render backends; WiVRn's own squasher carries the same helper. If a runtime ever gets
+            // this wrong, openxr:stereo_quad_pair flattens back to the single quad below.
+            for (int eye = 0; eye < (STEREOPAIR ? 2 : 1); ++eye) {
+                const auto RECT = OpenXR::Stereo::paneImageRect(CONTENTRECT, STEREOLAYOUT, eye);
+                quad.eyeVisibility = !STEREOPAIR ? XR_EYE_VISIBILITY_BOTH : (eye == 0 ? XR_EYE_VISIBILITY_LEFT : XR_EYE_VISIBILITY_RIGHT);
+                quad.subImage.imageRect = {{RECT.x, RECT.y}, {RECT.w, RECT.h}};
+                quads.push_back(quad);
+            }
+            l->m_quadsSubmitted.store((uint8_t)(STEREOPAIR ? 2 : 1), std::memory_order_relaxed);
 
             // Ray-pointer target: hit-test against the FULL quad (content + margins) so chrome hits
             // (bar / corners) are classifiable — worldPose is the quad-center world pose in the aim
@@ -1917,6 +1993,11 @@ void COpenXRManager::frameThread() {
                 pt.name      = l->m_monitorName;
                 pt.anchor    = &l->m_anchor;
                 pt.chrome    = chrome;
+                // WP X1 §5.6: tell the hit tester this quad is showing one PANE, so the content uv it
+                // hands the absolute-pointer path is un-mapped back into the whole packed image.
+                // Without it, pointing at the middle of the quad drives the cursor to the seam
+                // between the two eyes — half a screen away from where the user is pointing.
+                pt.stereo    = STEREOLAYOUT;
                 pointerTargets.push_back(std::move(pt));
             }
         }

@@ -269,6 +269,12 @@ class CXRMonitorLayer {
     // the m_fx* envelopes already run under, and the worst case is one frame of a doubled image.
     std::atomic<uint8_t> m_stereoPairLayout{0};
 
+    // How many composition layers this monitor's LAST submitted frame cost: 1 for an ordinary quad,
+    // 2 for a stereo pair. Frame thread → main thread (status only), so `hyprctl openxr` can answer
+    // "is the pair actually being submitted" rather than only "was it declared" — the two differ
+    // when the layer budget refuses a pair, which is the one failure mode with no visual tell.
+    std::atomic<uint8_t> m_quadsSubmitted{1};
+
     // Fade-envelope state (frame thread only; only the blit loop touches these). Alpha is advanced
     // every frame from predicted-display-time deltas via OpenXR::chromeFadeAdvance; the *Drawn*
     // trackers record what was last rendered so a static (no-new-buffer) frame can decide whether a
