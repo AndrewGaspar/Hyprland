@@ -148,7 +148,8 @@ you walk away, and re-docks when you return — see the anchoring doc. All hot-l
 
 | Variable | Type | Default | Meaning | Applies |
 |---|---|---|---|---|
-| `stereo_quad_pair` | bool | `true` | Present a stereo-declared window (`windowrule = stereo <layout>`, §8.6) that is **fullscreen and covering an XR monitor** as a **pair** of quad layers — one per eye, each cropped to that eye's half of the packed frame — so the headset shows real stereo instead of a doubled image. Set to `0` to fall back to the single flattened quad if a runtime mishandles `eyeVisibility` or `subImage.imageRect`. | hot |
+| `stereo_quad_pair` | bool | `true` | Submit a paired XR monitor as **two** quad layers, one per eye, instead of one flattened quad. The kill switch for both producers: with it off a stereo-content monitor (§8.8) falls back to the doubled image, and a depth monitor (§8.9) shows the left eye's pane to both eyes. Reach for it if a runtime mishandles `eyeVisibility` or `subImage.imageRect`. | hot |
+| `depth_desktop` | bool | `true` | **The depth desktop (§8.9).** Composite every XR monitor once per eye, so §8.7's depth rules read as real 3D depth in the headset. The monitor's declared size is unchanged and stays **per eye** — an `xrmonitor` at 2560x1440 is still a 2560x1440 desktop, now scanned out as 5120x1440. Costs one extra composite per XR monitor per frame, and only while something on it actually has depth. | hot |
 
 ### Luma-keyed transparency ("black-as-alpha")
 
@@ -1776,9 +1777,12 @@ error.
   day of wear: the numbers in the table above are a starting point pending a live tuning session on
   the glasses. If a rung feels wrong to you, it probably is — `depth_scale` first, then the ladder.
 - **Depth is disparity, not geometry.** Each window stays internally flat and there is no
-  head-motion parallax; on an XR monitor (a quad in the session) depth does nothing yet. The rules
-  are forward-compatible on purpose: the same `windowrule = depth 0.6` is what a future per-window
-  quad tier would read to place the window 0.6 · `depth_scale` metres nearer, with no re-authoring.
+  head-motion parallax. The rules are forward-compatible on purpose: the same
+  `windowrule = depth 0.6` is what a future per-window quad tier would read to place the window
+  0.6 · `depth_scale` metres nearer, with no re-authoring.
+- **In the headset this is §8.9**, and it is on by default. Everything above applies verbatim to an
+  XR monitor — same rules, same ladder, same `depth_scale`, same clamps — because an XR monitor
+  under `openxr:depth_desktop` is a stereo output whose mode it derives itself.
 
 ---
 
@@ -1852,12 +1856,25 @@ respects display aspect will letterbox a 3840×1080 SBS video into a 1920×1080 
 result is still `sbs` — the packed frame kept its own proportions on the way in. Declare `hsbs` when
 something squeezes both eyes into the native width instead (many game mods do).
 
-### What it does not do yet
+### This tier is for a monitor that is NOT producing panes of its own
+
+With the depth desktop on (§8.9, the default), an XR monitor already composites once per eye — so
+its pair belongs to the **depth** producer and a stereo window on it is un-packed *inside* the
+composite, per surface. That is strictly better: it works while the window is merely windowed, it
+keeps the chrome and the ray cursor, and the panel never changes shape. The tier described here is
+what an XR monitor does when it is **not** packed — `openxr:depth_desktop = 0` — where the whole
+frame is the client's, so no second composite is needed at all.
+
+`hyprctl -j openxr` says which producer owns a pair: `"stereoProducer": "content"` is this tier,
+`"depth"` is §8.9.
+
+### What this tier does not do
 
 - **The chrome is hidden while a monitor is paired.** The move-bar and corner resize handles live in
   the transparent margins around the content, and the eye quads cover the content only — so they
   would be drawn where no eye can look. A monitor showing a fullscreen 3D film is not one you
   reposition mid-scene; move it before you go fullscreen, or drop out of fullscreen to grab it.
+  (§8.9's pair keeps its chrome — it gives each eye its own margined pane.)
 - **The XR ray cursor is hidden too**, for the same reason plus a worse one: drawn once, it would
   land in one eye at the wrong place. **Pointing still works** — ray clicks land exactly where you
   aim, because the pane coordinate is mapped back through the pack before it reaches the pointer.
@@ -1865,8 +1882,6 @@ something squeezes both eyes into the native width instead (many game mods do).
   so it ends up in whichever half it happens to sit in. Fullscreen video and games generally hide
   it; there is no fix in this tier.
 - **Only whole-monitor content.** See "when it engages" above.
-- **Depth (§8.7) does nothing on an XR monitor yet.** Depth and this feature are the same primitive
-  with different producers, but the depth producer needs a genuinely two-paned swapchain.
 
 ### If a runtime gets it wrong
 
@@ -1883,6 +1898,110 @@ is "the headset is showing me something wrong right now".
 
 ---
 
+## 8.9 The depth desktop **in the headset** — `openxr:depth_desktop`
+
+§8.7 built the depth desktop and §8.5 gave it a physical screen to appear on. This is the presenter
+for the screens you actually spend the day in: **every XR monitor, composited once per eye**, so a
+focused window floats in front of the wallpaper and your bar sits above both — in the Quest, in the
+XREAL, on the monitors a keybind minted thirty seconds ago.
+
+It is **on by default**. There is nothing to declare and no rule to write:
+
+```bash
+hyprctl keyword openxr:depth_desktop 0   # off, for the cheapest possible XR presentation
+hyprctl keyword openxr:depth_desktop 1   # back
+```
+
+### The one thing to understand: your declared size does not change
+
+An XR monitor has no panel, so it invents its own scanout. When depth engages, Hyprland **doubles
+the mode** and keeps the desktop the size you declared:
+
+```
+xrmonitor = XR-1, 2560x1440@90     ->  2560x1440 desktop, per eye, scanned out as 5120x1440
+```
+
+`hyprctl monitors` shows both numbers, and the logical one is the one your windows live in:
+
+```
+width: 2560, height: 1440          # your desktop — unchanged, whether depth is on or off
+scanoutWidth: 5120                 # the two panes
+stereo: sbs
+stereoComposites: 2
+```
+
+This is the opposite of what the `monitor = …, stereo:sbs` token (§8.5) does, and deliberately so.
+That token describes a **panel** whose mode is fixed at 3840x1080, so the logical desktop is halved
+out of it. An XR monitor's mode is ours to choose, so the declared size is the fixed quantity and
+the mode is derived. Turning depth on and off never resizes a desktop or reflows a window — and
+your `openxr:default_monitor_scale` keeps applying, because there is no physical per-eye pixel grid
+to map 1:1 onto.
+
+### What it costs
+
+One extra composite per XR monitor per frame — **and only while something on that monitor would
+actually move**. A monitor with nothing raised composites once and shows the same pane to both eyes;
+`stereoComposites` in `hyprctl monitors` tells you which happened. Since `depth_unfocused` is 0.2,
+in practice any window on an XR monitor puts it at two composites, which is the feature working.
+
+The swapchain is double-wide for the whole session either way, because sizing it per frame would
+mean a modeset every time you focused a window. So the honest accounting is: **a fixed doubling of
+the blit and of swapchain memory, plus a second composite whenever the panes differ.** Two
+2560x1440 XR monitors cost about 120 MB more of swapchain images. If you are chasing frame time on
+a small iGPU, `openxr:depth_desktop = 0` is the switch, and `decoration:depth_scale = 0` is the
+cheaper half-measure (same ladder, no rise, one composite, still a pair).
+
+### What you get that §8.8 does not
+
+- **Every monitor, not one fullscreen window.** No coverage gate, no rule.
+- **The chrome stays.** Each eye's quad is its own margined pane, so the move-bar and the corner
+  handles are drawn once per pane and land in both eyes. Grabbing a monitor works exactly as it
+  does in mono — which matters, because chrome is the primary grab affordance and a depth desktop
+  that hid it everywhere would be a regression, not a feature.
+- **The ray cursor stays, and it has depth.** It is drawn once per pane at the disparity of whatever
+  it is pointing at, easing over ~80 ms so crossing a window edge does not snap it. A cursor at zero
+  disparity over a raised window sits *behind* the thing it is pointing at — stereo cinema's
+  "subtitle behind the object" — which is unpleasant in a way that is hard to name while you are
+  looking at it.
+- **Stereo content still works, windowed.** A `windowrule = stereo` window (§8.6) inside a depth
+  desktop is un-packed per surface, per pane. It does not have to own the screen, and the rest of
+  the desktop stays 2D around it. `hyprctl monitors` reports `stereoContent: true` when the crop
+  reached a drawn surface.
+
+### What you can inspect
+
+```json
+"stereo": "sbs",              // how the image splits
+"stereoProducer": "depth",    // WHO made the panes — "depth" | "content" | "off"
+"chrome": true,               // did the chrome pass run (false while a §8.8 content pair is up)
+"quads": 2                    // what the frame thread actually submitted
+```
+
+The three are separate because they fail separately. `"stereoProducer"` decides how a ray hit is
+mapped back to a desktop coordinate, so it is the field to check if the cursor lands somewhere
+unexpected. `"quads": 1` on a `"depth"` monitor means either the kill switch is off or the runtime's
+layer budget refused the pair — the budget is checked for the **whole** pair, so a monitor that
+does not fit is dropped rather than submitted left-eye-only, and the next (cheaper) monitor still
+gets the slot.
+
+### The kill switch, on a packed monitor
+
+`openxr:stereo_quad_pair 0` does **not** unpack the monitor — the mode cannot change without a
+modeset. It submits ONE quad showing **pane 0**: a mono desktop, at the right shape, immediately.
+That is the useful degradation; submitting the whole image would put a side-by-side picture in both
+eyes. To actually unpack, use `openxr:depth_desktop 0`.
+
+### Caveats
+
+- **Screenshots and screen recordings show one eye** (§8.7's caveat, unchanged).
+- **`hsbs`/`tab`/`htab` packings** are not available for the pack itself — the panes are always
+  full side-by-side. The window-content layouts of §8.6 are all four.
+- **An `xrmonitor`-adopted real output is never packed.** It has a panel and a user who chose its
+  mode; doubling it is not ours to do. Use `monitor = …, stereo:sbs` (§8.5) for that.
+- **The defaults are provisional** — see §8.7. `depth_scale` first, then the ladder.
+
+---
+
 ## 9. Known limitations
 
 - **Classic-config only.** `openxr { }` and `xrmonitor =` have no Lua config binding.
@@ -1891,9 +2010,10 @@ is "the headset is showing me something wrong right now".
 - **Roll is not representable** in `xrmonitor=` / `hyprctl openxr layout` serialization
   (yaw + pitch only) — a monitor that picked up roll during a grab loses it when
   re-serialized.
-- **No stereo/3D content on XR monitors.** Every *XR* monitor is a flat quad; there is no per-eye
-  rendering in the XR session. Per-window stereo content (§8.6) needs an output that is presenting
-  a pane pair, which today means a physical `stereo:` output (§8.5), not an XR monitor.
+- **XR monitors are per-eye QUADS, not a rendered eye buffer.** Each is still one image submitted
+  twice with an `eyeVisibility` and an `imageRect` — there is no view-projection rendering in the XR
+  session, so a window has no head-motion parallax and stays internally flat. Depth (§8.9) and
+  stereo content (§8.8) are both disparity between two panes, which is all the quad tier can be.
 - **Stereo outputs: `sbs` only** (no `hsbs`/`tab`/`htab` *packings* — the window-content layouts of
   §8.6 are all four), no direct scanout, software cursor only, and a display GUI can silently
   un-stereo the monitor (§8.5).
