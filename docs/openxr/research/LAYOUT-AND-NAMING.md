@@ -105,6 +105,32 @@ a name generator, or a projection — all pure, testable, and built on that tran
   headset-only session; physical monitors **untouched** (they have no room pose); the arc-slot
   fast path (§7) waits on research/08 landing — until then every monitor takes the angular path.
 
+#### Follow-up: ray-cast edge crossing (task #139) — **SHIPPED**
+Live validation of WP-S2 (2026-08-09) landed on "roughly correct, though it feels slightly hinky …
+I almost feel like if we treated the mouse movement as logically a ray casting through 3d space
+*when pushing past the boundary of the monitor* would feel closer to expected behavior." The gap is
+real and structural, not a tuning miss: the unwrap gives **topological** adjacency, the eye wants
+**visual** adjacency, and compaction discards depth (§2.4 projects centres by angle alone), so two
+quads at the same bearing and wildly different distances become the same column. Elevation and yaw
+diverge the same way.
+
+So the crossing DECISION — and only that decision — is now taken from the room instead of the grid.
+At the instant the cursor pushes past an edge, the overshoot becomes a point on the source quad's
+extended plane, a ray is cast from the live head pose (the WP-V1 pose ring) through it, and the
+nearest quad it meets wins; the cursor is warped to the 2D coordinates of the 3D hit point.
+Implemented in `src/openxr/XRCursorCross.hpp` (pure, unconditional, `tests/xr/cursor_cross.cpp`,
+29 cases) + `COpenXRManager::redirectCursorCrossing()`, hooked at `CPointerManager::move()` — the
+one place the pre-clamp overshoot still exists before `closestValid()` discards it. Config
+`openxr:cursor_crossing = raycast | layout` (default `raycast`, hot via a `parseKeyword`
+special-case so the two feels can be A/B'd from inside the headset).
+
+**The 2D sync is unchanged and remains authoritative** for everything else: it still owns the layout
+for `movefocus`, adjacency, the warp verbs, `hyprctl openxr status`, and the pointer's clamp union —
+and it is the FALLBACK for every case the ray cannot answer (no session, head pose older than
+200 ms, a non-XR or `device`-anchored source, a ray that meets nothing). Nothing writes a monitor
+offset, so there is no path by which the two can fight. Open taste question after living with it:
+is 4° of angular forgiveness (the second, tolerated pass) the right amount for a real desk gap?
+
 ### Shared threading & config contract
 Planner, reflow, projection, and name-minting all run **main-thread** under `m_layersMu`; the
 two-phase solve runs **frame-thread** over a snapshot. Slot ids, cell geometry, grid origins
@@ -150,6 +176,7 @@ parallel.
 |----|------|--------|
 | ~~S1~~ | ~~Pure projection + normalization math (viewer-centric unwrap, `PX_PER_DEG`, compaction), gtests, no deps~~ **shipped** — `XRLayout2D.{hpp,cpp}`, `tests/xr/layout2d.cpp` (24 cases incl. a randomized structural sweep) | M |
 | ~~S2~~ | ~~Reference-frame capture, debounced recompute funnel, offset injection into the monitor layout, `hyprctl openxr` verb~~ **shipped** — `syncLayout2D()`, `openxr:layout2d:*`, `sync-layout`/`xrmonitor sync`, `xrlayout2dsync`, `hyprtester/src/tests/xr/layout2d.cpp` | M · dep S1 |
+| ~~S4~~ | ~~Ray-cast edge crossing: cast from the head through the exit point instead of trusting grid adjacency, so depth/elevation/yaw are respected at the crossing moment (task #139, from WP-S2 live validation)~~ **shipped** — `XRCursorCross.hpp`, `redirectCursorCrossing()`, `openxr:cursor_crossing`, `tests/xr/cursor_cross.cpp` | S · dep S2 |
 | S3 | *(follow-up)* slot fast path — when research/08 places monitors into arc/grid slots, mirror `(col,row)` straight to 2D and skip the angular path for those monitors (report 12 §7) | S · dep 08 |
 
 ### Seams between the four

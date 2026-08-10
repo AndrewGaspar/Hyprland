@@ -1199,6 +1199,13 @@ std::string CConfigManager::parseKeyword(const std::string& COMMAND, const std::
     // is what makes `hyprctl keyword openxr:black_alpha 0.2` a live, in-headset tuning knob.
     if (COMMAND.starts_with("openxr:black_alpha") && g_pOpenXRManager)
         g_pOpenXRManager->onConfigReload();
+
+    // openxr:cursor_crossing (task #139) is a STRING parsed to an atomic enum in
+    // onConfigReload()->publishCursorCrossingMode() and read by the pointer path. Same legacy-keyword
+    // gap as the vars above — and this one exists precisely so the two crossing FEELS can be A/B'd
+    // live from inside the headset (`bind = …, hyprctl keyword openxr:cursor_crossing layout`).
+    if (COMMAND == "openxr:cursor_crossing" && g_pOpenXRManager)
+        g_pOpenXRManager->onConfigReload();
 #endif
 
     // Update window border colors
