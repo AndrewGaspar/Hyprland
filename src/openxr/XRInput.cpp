@@ -602,7 +602,13 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                     float cu = 0.f, cv = 0.f;
                     if (OpenXR::remapToContentUV(bestHit.u, bestHit.v, bestTgt->chrome, cu, cv)) {
                         newBodyMon = bestTgt->id;
-                        newBodyUV  = Vector2D{cu, cv};
+                        // WP X1 (research/24 §5.6). On a monitor submitted as a stereo PAIR the quad
+                        // shows one PANE, so the uv we just resolved is a pane coordinate — while
+                        // everything downstream (absolute pointer injection, keyed by monitor name
+                        // plus a 0..1 uv) wants a coordinate in the whole PACKED image. Un-map it
+                        // through the eye-0 crop, which is the same definition of "where the halves
+                        // are" the renderer's own crop uses. Identity on a mono monitor.
+                        newBodyUV = Render::Stereo::paneUVToContentUV({cu, cv}, bestTgt->stereo, 0);
                     }
                 }
             }
