@@ -106,7 +106,7 @@ namespace Monitor {
         // resources, matrices, capture — works at PANE size. m_pixelSize stays the true mode. When
         // STEREO_OFF, paneSize() == m_pixelSize and every pane-aware call site is bit-identical to
         // stock. Set from the active monitor rule in applyMonitorRule/Soft (before the size derivation).
-        Config::eMonitorStereoMode  m_stereoMode = Config::STEREO_OFF;
+        Config::eMonitorStereoMode m_stereoMode = Config::STEREO_OFF;
 
         // stereo CONTENT (research/24 §5.3, WP S1): the last frame actually cropped a stereo-declared
         // window into a pane — the declaration survived the fullscreen gate, the window was on this
@@ -117,53 +117,53 @@ namespace Monitor {
         // Distinct from m_stereoComposites below, which counts what the frame COST: the pane loop is
         // entered from a predicate over the scene, so a declared-but-invisible window is 2 composites
         // with this false.
-        bool                        m_stereoContentPanes = false;
+        bool m_stereoContentPanes = false;
 
         // stereo (§3.4 item 15): the last mode search did not land on a mode the rule asked for —
         // the emergency any-available-mode fallback, or a total failure that kept the old mode.
         // The pack cannot be trusted on such a mode, so sanitizeStereoMode() drops it.
-        bool                        m_modeSearchFellBack = false;
+        bool m_modeSearchFellBack = false;
 
         // Force this output's render swapchain to allocate LINEAR (multi-GPU-shareable) buffers.
         // Set by the OpenXR integration on a headless XR output when the XR runtime's GPU differs
         // from the buffer allocator's GPU (cross-GPU import needs linear). Honored in
         // CMonitorState::updateSwapchain via SSwapchainOptions::multigpu. Default false = native tiling.
-        bool                        m_forceLinearSwapchain = false;
+        bool                   m_forceLinearSwapchain = false;
 
-        CMonitorZoomController      m_zoomController;
+        CMonitorZoomController m_zoomController;
 
-        bool                        m_dpmsStatus       = true;
-        bool                        m_vrrActive        = false; // this can be TRUE even if VRR is not active in the case that this display does not support it.
-        bool                        m_enabled10bit     = false; // as above, this can be TRUE even if 10 bit failed.
-        NCMType::eCMType            m_cmType           = NCMType::CM_SRGB;
-        NTransferFunction::eTF      m_sdrEotf          = NTransferFunction::TF_DEFAULT;
-        float                       m_sdrSaturation    = 1.0f;
-        float                       m_sdrBrightness    = 1.0f;
-        float                       m_sdrMinLuminance  = 0.2f;
-        int                         m_sdrMaxLuminance  = 80;
-        bool                        m_createdByUser    = false;
-        bool                        m_isUnsafeFallback = false;
+        bool                   m_dpmsStatus       = true;
+        bool                   m_vrrActive        = false; // this can be TRUE even if VRR is not active in the case that this display does not support it.
+        bool                   m_enabled10bit     = false; // as above, this can be TRUE even if 10 bit failed.
+        NCMType::eCMType       m_cmType           = NCMType::CM_SRGB;
+        NTransferFunction::eTF m_sdrEotf          = NTransferFunction::TF_DEFAULT;
+        float                  m_sdrSaturation    = 1.0f;
+        float                  m_sdrBrightness    = 1.0f;
+        float                  m_sdrMinLuminance  = 0.2f;
+        int                    m_sdrMaxLuminance  = 80;
+        bool                   m_createdByUser    = false;
+        bool                   m_isUnsafeFallback = false;
         // OpenXR (report-20 issue A): true for a headless output whose plugged/enabled state is owned
         // by COpenXRManager (an XR virtual monitor that unplugs when the headset is doffed). The
         // monitor-rule manager must NOT re-enable such an output while it is intentionally held
         // disabled — its config rule says "enabled" (no `monitor=NAME,disable` line), so the ordinary
         // ensureMonitorStatus refresh would otherwise onConnect() it right back (the phantom-plug leak).
-        bool                        m_xrManagedPlug    = false;
+        bool                 m_xrManagedPlug = false;
 
-        SP<CEventLoopTimer>         m_dpmsRetryTimer;
+        SP<CEventLoopTimer>  m_dpmsRetryTimer;
 
-        bool                        m_pendingFrame    = false; // if we schedule a frame during rendering, reschedule it after
-        bool                        m_renderingActive = false;
+        bool                 m_pendingFrame    = false; // if we schedule a frame during rendering, reschedule it after
+        bool                 m_renderingActive = false;
 
-        bool                        m_ratsScheduled = false;
-        CTimer                      m_lastPresentationTimer;
+        bool                 m_ratsScheduled = false;
+        CTimer               m_lastPresentationTimer;
 
-        bool                        m_isBeingLeased = false;
+        bool                 m_isBeingLeased = false;
 
-        Config::CMonitorRule        m_activeMonitorRule;
+        Config::CMonitorRule m_activeMonitorRule;
 
-        SP<Render::ITexture>        m_splash;
-        SP<Render::ITexture>        m_background;
+        SP<Render::ITexture> m_splash;
+        SP<Render::ITexture> m_background;
 
         // explicit sync
         Hyprutils::OS::CFileDescriptor m_inFence; // TODO: remove when aq uses CFileDescriptor
@@ -330,11 +330,11 @@ namespace Monitor {
         bool         shouldUseSoftwareCursors();
 
         // stereo output (research/24 §3) — all return the trivial identity when m_stereoMode is off
-        bool         isStereo() const;
-        Vector2D     stereoPackDivisor() const; // {2,1} for sbs, {1,1} for off; F5 layouts are new divisors
-        Vector2D     paneSize() const;          // m_pixelSize / divisor, scanout orientation; == m_pixelSize when off
-        int          stereoPaneCount() const;
-        CBox         stereoPaneDestBox(int idx) const; // pane idx's destination box inside the mode-sized scanout buffer
+        bool     isStereo() const;
+        Vector2D stereoPackDivisor() const; // {2,1} for sbs, {1,1} for off; F5 layouts are new divisors
+        Vector2D paneSize() const;          // m_pixelSize / divisor, scanout orientation; == m_pixelSize when off
+        int      stereoPaneCount() const;
+        CBox     stereoPaneDestBox(int idx) const; // pane idx's destination box inside the mode-sized scanout buffer
 
         // the stereo per-eye producer (research/24 §5.3 WP S1 + §6 WP D2)
         //
@@ -442,16 +442,31 @@ namespace Monitor {
         WP<Monitor::CMonitorResources>      resources();
 
       private:
-        void                    updateMatrix();
-        Mat3x3                  m_projMatrix;
-        Mat3x3                  m_projOutputMatrix;
+        void   updateMatrix();
+        Mat3x3 m_projMatrix;
+        Mat3x3 m_projOutputMatrix;
 
         // stereo output (research/24 §3.7/§3.4): sanitizing (the committed mode must divide into
         // panes AND be the mode `requestedMode` asked for) + the per-monitor software-cursor lock
         // (a hardware cursor plane would be visible to one eye only)
-        void                    sanitizeStereoMode(const Vector2D& requestedMode);
-        void                    updateStereoCursorLock();
-        bool                    m_stereoSWCursorLocked = false;
+        void sanitizeStereoMode(const Vector2D& requestedMode);
+        void updateStereoCursorLock();
+        bool m_stereoSWCursorLocked = false;
+
+        // stereo output (research/24 §3.4 item 15b): the pack is a rule-apply-time decision, but a
+        // display can leave the mode it was packed for without any event this compositor can see
+        // (the XREAL 3D→2D personality fall re-enumerates under the same connector). This watch
+        // re-asks the connector's mode list once a second and re-applies the rule when the answer
+        // changed. Armed ONLY while the monitor is packed or its rule wants it to be, so a
+        // stereo:off monitor never allocates the timer and stays bit-identical to stock.
+        void                updateStereoWatch();
+        void                clearStereoWatch();
+        SP<CEventLoopTimer> m_stereoWatchTimer;
+        // the advertised mode list the watch last acted on. A re-apply that cannot commit leaves the
+        // monitor in the same state the watch fired for, so without this the watch would re-modeset
+        // every second forever; scheduleModeRetry() owns retrying a failed modeset, the watch owns
+        // reacting to the panel CHANGING. Cleared with the timer.
+        std::vector<Vector2D>   m_stereoWatchActedOn;
 
         void                    setupDefaultWS(const Config::CMonitorRule&);
         WORKSPACEID             findAvailableDefaultWS();
