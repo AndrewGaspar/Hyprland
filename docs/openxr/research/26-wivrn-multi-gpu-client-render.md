@@ -78,11 +78,31 @@ Report 19 established that the blit into the runtime-owned OpenXR swapchain imag
 eliminated ("The copy that always remains"). Cross-GPU only changes that blit's *destination* from
 local VRAM to a buffer the compositor GPU owns. Measured at 2064×2208 per eye, in the recommended
 topology (compositor + encode on AMD, game on NVIDIA): the NVIDIA client's write into the shared
-image costs **1.43 ms/eye** and the AMD compositor's read of it costs **0.49 ms/eye** — about
-**3.9 ms of an 11.1 ms 90 Hz frame for both eyes**. Forcing the compositor's swapchains LINEAR costs
-the AMD compositor only **+0.045 ms/eye (+10%)**, which is the single most encouraging number in
-this report. Caveats on the NVIDIA-side absolute numbers in §4.6 — they look clock-limited and the
-ratios, not the absolutes, are what should be trusted.
+image costs **1.313 ms/eye** and the AMD compositor's read of it costs **0.498 ms/eye**. But the
+compositor's read happens in *every* topology, so **the marginal cost of going cross-GPU is a single
+term: +1.22 ms/eye = 2.44 ms both eyes, ~22% of an 11.1 ms frame** (§4.6a). Forcing the compositor's
+swapchains LINEAR costs the AMD compositor only **+0.039 ms/eye (+9%)**.
+
+> **These figures were re-measured on 2026-08-10 with the box idle and exclusive, and they replace
+> an earlier set that was wrong by up to 21×.** Two defects: the benchmark serialized every copy
+> behind a pipeline barrier, and — more insidiously — a failed cross-vendor `OPAQUE_FD` semaphore
+> import had **poisoned the NVIDIA device against VRAM image allocations**, silently pushing every
+> NVIDIA allocation into system memory (§4.8). Both run logs are committed so the delta is
+> auditable. The lesson generalises beyond this report: an allocator with a sysmem fallback turns
+> that driver bug into a silent 20× performance loss with no error anywhere.
+
+**Can the overhead be optimised away when the game is exclusive? Partly — and the part that can be
+is already shipped** (§10). WiVRn 26.6.2 *already* skips the layer squash whenever a session
+submits exactly one projection layer (`W/server/compositor/compositor.cpp:326-345`), automatically,
+per frame, with no configuration. But the squash was never the cost. The cost is the PCIe write,
+and it cannot be removed per-frame because *which GPU owns the swapchain* is fixed for the session.
+The two tiers that would remove it are both architecturally blocked: **nvenc cannot run on the dGPU
+while the compositor is on the iGPU** (it imports into CUDA with `OPAQUE_FD`, which requires
+matching device UUIDs — `W/server/encoder/video_encoder_nvenc.cpp:389-411`), and full dGPU
+residency needs the Android-only client-allocates path *plus* an NVIDIA→AMD import that fails on
+both pitch and residency. **Good news for policy: because the shipped bypass is a pure per-frame
+`if` with no setup or teardown, no hysteresis is needed at all** — a notification costs exactly one
+frame of squash, and debouncing would only make it worse.
 
 **Recommendation: Shape A (full split), but do Shape B first as a same-week unblock.** Shape B —
 move the WiVRn compositor to NVIDIA and offload encode to the AMD iGPU via the documented vaapi
@@ -621,64 +641,126 @@ exactly the one that does **not** work cross-vendor, and its fallback (`SYNC_FD`
 the one that does — but the fallback is unreachable because the timeline failure aborts
 client-compositor creation (§2.6).
 
-### 4.6 Cost — and an honest caveat about the absolute numbers
+### 4.6 Cost — **re-measured 2026-08-10 on an idle, exclusive box**
+
+> **The first version of this section was wrong, and wrong by more than an order of magnitude on
+> the NVIDIA side.** Two independent defects, both now fixed; both run outputs are committed so the
+> delta is auditable (`sample-run-2026-08-10.txt` = flawed, `sample-run-2026-08-10-remeasured.txt`
+> = clean).
+>
+> 1. **Barrier serialization.** The benchmark placed a full pipeline barrier between iterations,
+>    so it measured per-copy latency including a pipeline drain rather than sustained throughput.
+> 2. **Silent sysmem fallback (§4.8).** Every NVIDIA allocation was landing in system memory
+>    because a failed cross-vendor `OPAQUE_FD` semaphore import — run *earlier in the same
+>    process* — had poisoned the device against VRAM image allocations.
+>
+> Fixed: no inter-copy barriers, GPU-side timestamp queries, a discarded warm-up pass and best-of-3
+> timed passes, and the sync probes moved to run **last**. NVIDIA's local copy went from a reported
+> 1.614 ms to **0.076 ms — a 21× correction.** AMD's numbers barely moved (0.488 → 0.475 ms),
+> because RADV was never poisoned and the iGPU is genuinely bandwidth-bound.
 
 At 2064×2208 RGBA8 (17.4 MiB/eye), 90 Hz = 11.1 ms frame budget:
 
-| measurement | per eye | both eyes | % of frame |
-|---|---|---|---|
-| local `OPTIMAL→OPTIMAL` copy on NVIDIA (baseline) | 1.614 ms | — | — |
-| local `OPTIMAL→OPTIMAL` copy on AMD (baseline) | 0.488 ms | — | — |
-| **compositor reads its own OPTIMAL swapchain image, AMD** | 0.444 ms | 0.9 ms | 8% |
-| **compositor reads its own LINEAR swapchain image, AMD** | **0.489 ms** | 1.0 ms | 9% |
-| compositor reads own OPTIMAL, NVIDIA | 1.599 ms | 3.2 ms | 29% |
-| compositor reads own LINEAR, NVIDIA | 2.298 ms | 4.6 ms | 41% |
+| measurement | per eye | vs old figure |
+|---|---|---|
+| local `OPTIMAL→OPTIMAL` copy, NVIDIA (VRAM) | **0.076 ms** (479 GB/s) | was 1.614 ms |
+| local `OPTIMAL→OPTIMAL` copy, AMD (VRAM) | **0.475 ms** (77 GB/s) | was 0.488 ms |
+| compositor reads its own **OPTIMAL** swapchain image, AMD | **0.438 ms** | was 0.444 ms |
+| compositor reads its own **LINEAR** swapchain image, AMD | **0.477 ms** | was 0.489 ms |
+| compositor reads own OPTIMAL, NVIDIA | 0.071 ms | was 1.599 ms |
+| compositor reads own LINEAR, NVIDIA | 0.110 ms | was 2.298 ms |
+
+**Forcing LINEAR costs the AMD compositor +0.039 ms/eye (+9%)** — the conclusion is unchanged and
+if anything slightly better than the first pass claimed.
 
 **The recommended topology (server/compositor = AMD, client/game = NVIDIA):**
 
 | stage | per eye | both eyes | % of frame |
 |---|---|---|---|
-| **NVIDIA client writes into the AMD-allocated shared image** | 1.431 ms | 2.9 ms | 26% |
-| **AMD compositor reads the shared image** | 0.492 ms | 1.0 ms | 9% |
-| | | **3.9 ms** | **35%** |
+| NVIDIA client writes into the AMD-allocated shared image | **1.313 ms** | 2.6 ms | 24% |
+| AMD compositor reads the shared image | **0.498 ms** | 1.0 ms | 9% |
+| | | **3.6 ms** | **33%** |
 
-The reverse topology (server = NVIDIA, client = AMD) is worse where it hurts — the compositor's
-read is the per-frame-critical one:
+**But 3.6 ms is not the marginal cost of going cross-GPU, and quoting it as such (as §0 originally
+did) overstates the bill.** The compositor reads the swapchain image in *every* topology — that
+0.498 ms/eye is work it does today, same-GPU, and it is within noise of its own local LINEAR read
+(0.477 ms). The only line that is genuinely *caused* by the split is the client's write, and §4.6a
+decomposes it.
 
-| stage | per eye | both eyes | % of frame |
-|---|---|---|---|
-| AMD client writes into the NVIDIA-allocated shared image | 0.542 ms | 1.1 ms | 10% |
-| NVIDIA compositor reads the shared image | 2.329 ms | 4.7 ms | 42% |
+### 4.6a Decomposition — where the client's 1.313 ms actually goes
 
-**Two things to take from this table:**
+Three writes on the same GPU, same size, same format, differing only in destination:
 
-1. **Forcing LINEAR costs the AMD compositor almost nothing — +0.045 ms/eye, +10%.** This is the
-   number that makes Shape A viable, and it is a pleasant surprise given how much pain LINEAR caused
-   in the `4460d2c8a` era (that pain was import *failure*, not throughput).
-2. **The recommended topology is also the cheaper one**, which happily aligns with the user's
-   existing AMD-only pin and with keeping the latency-critical composite on the GPU that owns the
-   buffer.
+| NVIDIA writes a full eye into… | per eye | memory |
+|---|---|---|
+| (a) its own `OPTIMAL` image | 0.071 ms | VRAM |
+| (b) its own `LINEAR` image | **0.091 ms** | VRAM |
+| (c) its own **exportable** `LINEAR` image | 0.078 ms | VRAM |
+| (d) the **AMD-allocated** shared `LINEAR` image | **1.313 ms** | AMD-side |
 
-> **Caveat — do not over-trust the NVIDIA absolute numbers.** The benchmark inserts a full pipeline
-> barrier between iterations, so it measures *serialized per-copy latency including pipeline drain*,
-> not streaming bandwidth. The NVIDIA local copy measuring 22.6 GB/s effective on a card capable of
-> several hundred is the tell; the dGPU may also have been clock- or power-limited, and another
-> session was using it during the run. Two consequences: (a) the NVIDIA-side absolutes are a
-> conservative **upper bound**, and (b) the anomaly where the remote write (1.431 ms) came out
-> *faster* than the local copy (1.614 ms) is a measurement artifact, not a real result. The AMD-side
-> ratios (0.444 vs 0.489) are internally consistent and are the ones to trust. **WP-XG0 should
-> re-measure with timestamp queries and a pipelined submission before anyone sizes a frame budget on
-> these figures.**
+- **(b)−(a) = +0.020 ms/eye** — the cost of LINEAR tiling alone. Negligible.
+- **(c)−(b) ≈ 0** — **making a buffer exportable costs nothing.** Contrary to the first pass's
+  hypothesis, NVIDIA happily places an exportable dma-buf in VRAM; the earlier "exportable buffers
+  land in sysmem" reading was an artifact of §4.8's poisoning.
+- **(d)−(b) = +1.22 ms/eye = 2.44 ms both eyes.** **This is the entire cross-GPU bill**: the PCIe
+  write into memory the other GPU owns. Everything else is noise.
+
+> **The marginal cost of Shape A is ~2.4 ms of an 11.1 ms frame (22%), not 3.9 ms** — and it is
+> one single, irreducible term: a PCIe write of 17.4 MiB per eye per frame. This number is the
+> spine of the exclusive-mode analysis in §10.
 
 ### 4.7 Where the shared buffer physically lives
 
-Worth recording, because it drives the PCIe story: when **AMD** exports, the allocation lands in
-AMD's `DEVICE_LOCAL` heap — which on an iGPU is carved system RAM — and NVIDIA imports it as a
-sysmem-heap allocation. When **NVIDIA** exports, the allocation lands in NVIDIA's **sysmem** heap
-(`heap[1]`, no `DEVICE_LOCAL`), not VRAM. **Neither driver ever placed a shareable dma-buf in dGPU
-VRAM**, which is expected: cross-vendor P2P over PCIe would require PCI P2PDMA and is not in play
-here. So in every working configuration the shared surface is in system memory, and the dGPU's
-access to it is a PCIe transfer. That is the true source of the 1.43 ms/eye write cost.
+**Corrected in the re-measure.** The first pass reported that "neither driver ever placed a
+shareable dma-buf in dGPU VRAM". That was an artifact of §4.8. On a healthy device:
+
+- **AMD exports** → the allocation is in AMD's `DEVICE_LOCAL` heap (carved system RAM on an iGPU),
+  and NVIDIA imports it as a sysmem-heap allocation. This is the recommended direction, it works,
+  and the NVIDIA client's writes to it cross PCIe — the 1.22 ms/eye of §4.6a.
+- **NVIDIA exports** → the allocation **is** placed in NVIDIA VRAM (`type1 heap0 DEVICE_LOCAL`).
+  Exportability does not force it to system memory.
+
+That second correction has a sharp consequence, and it is the one place the re-measure made the
+picture *worse* rather than better — see §4.8.
+
+### 4.8 Two driver behaviours found by the re-measure, both worth knowing
+
+**(1) A failed cross-vendor `OPAQUE_FD` semaphore import poisons the NVIDIA device against VRAM
+image allocations.** After `vkImportSemaphoreFdKHR(OPAQUE_FD)` returns `VK_ERROR_UNKNOWN`, every
+subsequent `vkAllocateMemory` for an **image** in a `DEVICE_LOCAL` VRAM type returns
+`VK_ERROR_OUT_OF_DEVICE_MEMORY` — on an idle 8 GB card with nothing else running. **Bare
+(non-image) allocations in the same memory type keep succeeding**, which is what makes it so easy
+to miss: a naive "is VRAM available?" probe says yes. An allocator with a sysmem fallback (like the
+first version of this PoC, like VMA, like most engines) silently relocates everything to system
+memory and reports success. The PoC now demonstrates this deterministically: with `--no-sync` there
+are **zero** allocation failures; with the sync probes enabled there are failures, and *only after*
+the probe runs. This is a plausible upstream NVIDIA bug report, and it is a live hazard for
+WP-XG3 — Monado tries `OPAQUE_FD` semaphores **first** on every client (§2.6), so a cross-GPU
+client would trip this on every session before falling back.
+
+**(2) NVIDIA→AMD import now fails at *submission*, not just at image creation.** With NVIDIA
+exporting from VRAM, the padded-width workaround of §4.4 gets further than before — RADV accepts
+the explicit-modifier image *and* the memory import (binding it to a `HOST_VISIBLE|HOST_COHERENT`
+sysmem type) — and then dies on the first `vkQueueSubmit` with:
+
+```
+radv/amdgpu: Not enough memory for command submission.
+VK_ERROR_DEVICE_LOST
+```
+
+**So §4.4's "padded NVIDIA→AMD share: OK (pixel-exact)" result only held because NVIDIA had been
+poisoned into system memory by (1).** When the exported buffer genuinely lives in dGPU VRAM, RADV
+cannot make it resident — consistent with there being no PCI P2PDMA path between these two devices.
+The reverse direction is therefore usable *only* if the exporter can be made to place the buffer in
+system memory, which NVIDIA's Vulkan offers no direct way to request. I did not root-cause the RADV
+side further; the failure is reproducible and the recommended direction is unaffected. The PoC now
+gates the reverse-direction tests behind `--reverse` because the `DEVICE_LOST` takes the whole
+process with it.
+
+**Net effect on the report's conclusions:** the recommended direction (AMD exports → NVIDIA
+imports) is unaffected and still pixel-exact for all four formats. The *fallback* direction is
+weaker than first reported, which matters only for the "client allocates" variant discussed in
+§10.4.
 
 ---
 
@@ -728,7 +810,7 @@ universally importable, not by making the suggestion per-client.** That is a muc
 it is the design this report recommends.
 
 The residual cost: the AMD desktop client's swapchains also become LINEAR, costing it the +10%
-measured in §4.6 — 0.045 ms/eye. Acceptable. If it ever isn't, per-client policy is the escape
+measured in §4.6 — 0.039 ms/eye. Acceptable. If it ever isn't, per-client policy is the escape
 hatch, and it is not foreclosed.
 
 ### 5.2 What may a runtime legally return, and is xrizer's assert its own invention?
@@ -948,7 +1030,7 @@ necessary here: a dma-buf import is a direct device read, no host bounce.
 | "NVIDIA can't import foreign dma-bufs" | **Stale since driver 525.** | NVIDIA's `cubanismo`, 2024-10-22: *"we've supported importing 'foreign' dma-bufs for several releases now via EGL and Vulkan"* ([open-gpu-kernel-modules#243](https://github.com/NVIDIA/open-gpu-kernel-modules/discussions/243)) |
 | "Cross-vendor semaphore sharing doesn't work" | **True for `OPAQUE_FD`, false for `SYNC_FD`.** | NVIDIA added `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT` in **545.23.06** (2023-10-17), gated on `nvidia-drm modeset=1`; broadly usable from 555.58; needs kernel ≥ 6.8. We run 610.43.03. **§4.5 confirms it works and orders.** |
 | "Only LINEAR is shareable NVIDIA↔RADV" | **True, and independently confirmed.** | KWin [MR !4177](https://invent.kde.org/plasma/kwin/-/merge_requests/4177): *"to import a buffer from a non-NVidia GPU to a NVidia GPU, **only the linear modifier is valid**."* Mesa's `ac_get_supported_modifiers()` emits only `AMD_FMT_MOD` + LINEAR. Matches §4.2 exactly. |
-| "NVIDIA ignores the explicit stride on LINEAR dma-buf import" | **Not reproduced here — we tested it.** | [forum 364360](https://forums.developer.nvidia.com/t/egl-import-via-egl-ext-image-dma-buf-import-modifiers-ignores-explicit-stride-causes-image-distortion-in-virtio-gpu-venus/364360) reports this for **EGL/virtio-gpu Venus**. §4.3 imported an AMD buffer with `rowPitch=8448` at width 2064 (tight would be 8256) into NVIDIA's **Vulkan** and got pixel-exact results. Treat as EGL/Venus-specific; **re-verify in WP-XG0 anyway**, because a silent stride bug would be a nightmare to diagnose. |
+| "NVIDIA ignores the explicit stride on LINEAR dma-buf import" | **Not reproduced here — we tested it.** | [forum 364360](https://forums.developer.nvidia.com/t/egl-import-via-egl-ext-image-dma-buf-import-modifiers-ignores-explicit-stride-causes-image-distortion-in-virtio-gpu-venus/364360) reports this for **EGL/virtio-gpu Venus**. §4.3 imported an AMD buffer with `rowPitch=8448` at width 2064 (tight would be 8256) into NVIDIA's **Vulkan** and got pixel-exact results. Treat as EGL/Venus-specific. Re-confirmed in the 2026-08-10 re-measure: still pixel-exact with NVIDIA exporting from VRAM. |
 | "The shared buffer lives in dGPU VRAM" | **False.** | §4.7 — neither driver ever placed a shareable dma-buf in VRAM. Xaver Hugl, 2026-07-31: *"the driver will not share the buffers on the GPU with the compositor, but actually create a copy in system memory."* |
 
 **Everyone who solved a version of this converged on LINEAR + a copy.** `linux-dmabuf-v1` is
@@ -960,8 +1042,8 @@ layout for multi-GPU buffers"*; KWin went CPU-copy (2021) → EGL import + a `gl
 
 For a latency sanity check, NVIDIA's own [`nvpro-samples/xr_multi_gpu`](https://github.com/nvpro-samples/xr_multi_gpu)
 measures device→device image transfer at **0.7–2.2 ms over PCIe 5.0** (same-vendor, Windows,
-SLI-gated). Our measured 1.43 ms/eye sits inside that band, which is mild independent corroboration
-that §4.6's numbers are the right order of magnitude even if the absolutes need redoing.
+SLI-gated). Our re-measured 1.313 ms/eye sits inside that band — mild independent corroboration
+that the cross-device transfer figure is the right order of magnitude.
 
 ---
 
@@ -998,13 +1080,13 @@ Move the WiVRn compositor to the dGPU and keep encode on the iGPU's VCN via the 
 ### Shape A — full split: client on NVIDIA, compositor + encode on AMD **(the recommendation)**
 
 **11 agent-tasks (§8).** Import boundary is AMD-exports → NVIDIA-imports, the permissive direction
-(§4.3). LINEAR swapchains, `sync_fd` sync, ~3.9 ms/frame of an 11.1 ms budget.
+(§4.3). LINEAR swapchains, `sync_fd` sync, **~2.4 ms/frame marginal** of an 11.1 ms budget (§4.6a).
 
 - **What it buys:** exactly the user's stated future — HypXRland desktop and encode stay on the
   efficient iGPU where they already work, and only the game's rendering is on the dGPU. The dGPU can
   be idle when no game is running. It also fixes the heterogeneous multi-client case (§5.1) as a
   side effect, because the buffers become universally importable.
-- **What it costs:** ~3.9 ms/frame (to be re-measured, §4.6 caveat), +10% on the AMD compositor's
+- **What it costs:** ~2.4 ms/frame marginal, +9% on the AMD compositor's
   swapchain reads, and four carried Monado patches that must be rebased at each WiVRn bump.
 - **Risk:** medium. The two real unknowns are (i) whether NVIDIA's Vulkan is as happy *rendering
   into* a LINEAR imported image as it was *copying* into one in the PoC, and (ii) rebase burden.
@@ -1065,7 +1147,7 @@ Sized in agent-tasks. **A** = required for Shape A. **B** = the Shape B unblock.
 | WP | Scope | Tasks | Variant |
 |---|---|---|---|
 | **WP-XG-B1** | **Shape B unblock.** Pass `.device` through `prober::check_vaapi` and the 10-bit probe (`W/server/encoder/encoder_settings.cpp:136-146`, `:362-372`) so vaapi capability is probed on the *configured* encode device, not the compositor's. Then flip the live config (drop the `VK_DRIVER_FILES` pin, `openxr:gpu = renderD128`, keep `device: renderD129`) and confirm the game runs. **Headset-in-the-loop; needs the user.** Upstream this as a WiVRn PR. | 1 | **B** |
-| **WP-XG0** | **Re-measure properly, and prove the no-regression baseline.** Rework the PoC benchmark to use timestamp queries and pipelined submission (kill the per-iteration barrier, §4.6 caveat) and re-run; add a `VK_IMAGE_USAGE_COLOR_ATTACHMENT` *render-into-imported-LINEAR* case, which the current PoC does not cover and which is unknown (i) in §7. Also re-verify the NVIDIA explicit-stride behaviour under Vulkan (§6.6 row 4) — we got pixel-exact results, but a silent stride bug would be brutal to diagnose later. Separately: build WiVRn 26.6.2 unmodified and confirm a same-GPU session is healthy, as the regression baseline every later WP is judged against. | 1 | A |
+| ~~WP-XG0~~ | ~~Re-measure properly.~~ **DONE 2026-08-10** — folded into the research pass. Benchmark reworked to GPU timestamp queries with pipelined submission and a discarded warm-up; sync probes moved last after discovering the §4.8 poisoning; re-run on an idle exclusive box. Results in §4.6/§4.6a, both run logs committed. **The one piece not covered and still open: a `VK_IMAGE_USAGE_COLOR_ATTACHMENT` render-into-imported-LINEAR case** (the PoC copies into it rather than rendering into it) — folded into WP-XG9. | — | — |
 | **WP-XG1** | **Monado patch 0009 — dma-buf export with explicit modifiers.** `xrt_swapchain_create_info` gains a modifier/cross-GPU field (`xrt_compositor.h:894-912`). `vk_image_allocator.c` `:63`/`:256` become `DMA_BUF` + `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` with a LINEAR modifier list when the flag is set, keeping the existing `OPAQUE_FD`/`OPTIMAL` path byte-identical when it is not. Plumb `vkGetImageDrmFormatModifierPropertiesEXT` + per-plane `vkGetImageSubresourceLayout` so the layouts can travel. | 2 | A |
 | **WP-XG2** | **Monado patch 0010 — client import via dma-buf.** `vk_create_image_from_native` (`vk_helpers.c:1115,1172,1189-1196`): `DMA_BUF` handle type, explicit-modifier image create, and **memory type from `vkGetMemoryFdPropertiesKHR`** — closing the tree's own TODO. Model it on the working import at `W/server/encoder/ffmpeg/video_encoder_va.cpp:363-467`. Carry the plane layouts over IPC (new fields in the swapchain-create reply). Also relax the `requirements.size` abort at `:1253-1259` for the cross-device case. | 2 | A |
 | **WP-XG3** | **Monado patch 0011 — force the `SYNC_FD` fence path when cross-GPU.** Suppress the `OPAQUE_FD` timeline-semaphore negotiation (`comp_vk_client.c:149-201`, gate at `:891-893`) so `submit_fence` (`:203-237`) is chosen, and make `setup_semaphore` failure **degrade** instead of `goto err_pool`. §4.5 says the fence path is correct cross-vendor; this WP is what makes it reachable. | 1 | A |
@@ -1073,15 +1155,17 @@ Sized in agent-tasks. **A** = required for Shape A. **B** = the Shape B unblock.
 | **WP-XG5** | **WiVRn — split the two UUIDs.** `W/server/compositor/compositor.cpp:797-798` stops copying one UUID into both; add a config key (e.g. `"client-gpu"`) resolved to a `VkPhysicalDevice`/UUID, defaulting to the compositor's device so existing setups are bit-identical. Wire it to the WP-XG1 swapchain flag. | 1 | A |
 | **WP-XG6** | **Format-list intersection.** `W/server/compositor/compositor.cpp:739-744` / `M/.../comp_vulkan.c:382-428` / `vk_compositor_flags.c:344+` currently evaluate formats against the server GPU with `OPTIMAL` tiling and `OPAQUE_FD`. Advertise the intersection of both devices, evaluated for `DRM_FORMAT_MODIFIER` tiling + `DMA_BUF`. §4.2 says all four common formats survive, so this should narrow nothing today — it is correctness insurance. | 1 | A |
 | **WP-XG7** | **Queue-family ownership across the boundary.** Add the missing `VK_QUEUE_FAMILY_FOREIGN_EXT` acquire in `W/server/compositor/layer_squasher.cpp:443-445` and match the client's release (`comp_vk_client.c:748-757`, currently `VK_QUEUE_FAMILY_EXTERNAL` and unmatched). Neither tree uses `FOREIGN_EXT` today; the PoC does and it works on both drivers. | 1 | A |
-| **WP-XG8** | **Live bring-up.** xrizer + The Big Walk with the game on NVIDIA and the compositor on AMD; confirm no `assert_eq!(pd, info.physical_device)`, measure real frame times against WP-XG0's baseline, and check the HypXRland desktop client still composites correctly in the same session (the §5.1 heterogeneous case). **Headset-in-the-loop; needs the user.** | 1 | A |
+| **WP-XG8** | **Live bring-up.** xrizer + The Big Walk with the game on NVIDIA and the compositor on AMD; confirm no `assert_eq!(pd, info.physical_device)`, measure real frame times against a same-GPU baseline, and check the HypXRland desktop client still composites correctly in the same session (the §5.1 heterogeneous case). **Headset-in-the-loop; needs the user.** | 1 | A |
+| **WP-XG9** | **Exclusive-mode verification (§10).** Three cheap things, one task: (a) confirm WiVRn's shipped one-projection-layer fast path (`compositor.cpp:326-345`) actually engages for a real xrizer/DXVK title — it may submit a HUD quad and never hit `layer_count == 1`; (b) decide whether the four things that path silently drops (colour scale/bias, chroma key, FOV-union viewport shrink, source-smaller-than-stream edge smear — §10.2) matter in practice, and log a warning if a layer needing them takes the fast path; (c) close out the last WP-XG0 gap by benchmarking *rendering into* an imported LINEAR image (`COLOR_ATTACHMENT`), not just copying into it. **No new mechanism — this is verification of behaviour that already ships.** | 1 | A |
 
 **Shape B (the unblock): WP-XG-B1 — 1 agent-task**, and it may be zero code if the probe happens to
 succeed anyway.
-**Shape A (the full split): WP-XG0, XG1, XG2, XG3, XG4, XG5, XG6, XG7, XG8 — 11 agent-tasks.**
+**Shape A (the full split): WP-XG1, XG2, XG3, XG4, XG5, XG6, XG7, XG8, XG9 — 11 agent-tasks**
+(XG0 is done; XG9 replaces it in the count).
 
-**Ordering:** XG-B1 → XG0 → XG1 → XG2 → XG3 → (XG4 ∥ XG5) → XG6 → XG7 → XG8. XG1+XG2 are the
-irreducible core; if they land and a same-GPU session still passes XG0's baseline, the rest is
-mechanical.
+**Ordering:** XG-B1 → XG1 → XG2 → XG3 → (XG4 ∥ XG5) → XG6 → XG7 → XG8 → XG9. XG1+XG2 are the
+irreducible core; if they land and a same-GPU session is still healthy, the rest is mechanical.
+XG9 can run any time after XG8, or independently against a same-GPU session today.
 
 **Not an agent task:** deciding whether to run the dGPU at all (§9 Q2), and any change to the live
 `wivrn.service` — the user does that.
@@ -1100,15 +1184,195 @@ mechanical.
    research/25's finding that the dGPU never actually sleeps today, the power argument for AMD-only
    is already weaker than when it was adopted — but that is your call, not mine, and it interacts
    with the Strix-Point-no-dGPU candidacy question.
-3. **Is ~3.9 ms/frame of an 11.1 ms budget acceptable** for the cross-GPU game path, before
-   optimisation? That is the honest current estimate (with §4.6's caveat that the NVIDIA half is a
-   conservative upper bound). If your bar is "no measurable difference from a native dGPU session",
-   Shape A may not clear it and Shape B is the answer permanently.
+3. **~~Is ~3.9 ms/frame acceptable?~~ ANSWERED — the number is ~2.4 ms, and you accepted it.**
+   The re-measure (§4.6) cut it, and §10 establishes that it cannot be reduced further by any
+   exclusive-mode trick: tier 1 is already shipped and free, tiers 2 and 3 are architecturally
+   blocked. The residual question is narrower: **if 2.4 ms ever proves too much, the only lever left
+   is Shape B** (compositor on the dGPU), which removes the transfer by construction. Do you want
+   that treated as the fallback plan, or is 2.4 ms simply fine?
 4. **How much carried-patch burden are you willing to take?** Shape A adds four Monado patches to
    `W/patches/monado/`, rebased at every WiVRn bump. Upstreaming them (they fix Monado's own TODO
    and complete a feature it half-shipped) would remove that burden but on upstream's timeline, not
    yours. Do you want the patches written upstream-first (cleaner, slower) or fork-first (faster,
    carried)?
-5. **Should the AMD desktop client also pay the LINEAR cost** (+0.045 ms/eye) so one global
+5. **Should the AMD desktop client also pay the LINEAR cost** (+0.039 ms/eye) so one global
    suggestion serves both clients (§5.1), or do you want per-client device policy built from the
    start? I recommend the former — it is much smaller and the escape hatch stays open.
+
+---
+
+## 10. Addendum — can the overhead be optimised out when the game is exclusive?
+
+The user's question, verbatim:
+
+> "Is it possible to seamlessly optimize out this overhead when the NVidia app is exclusive
+> (don't need to composite with anything else)?"
+
+**One-line answer: partly — and the part that is possible is already implemented and already fires
+automatically.** WiVRn 26.6.2 *already* has a one-projection-layer fast path that skips the layer
+squash. But the squash was never the expensive part. The expensive part is the **PCIe write into
+the compositor-owned buffer (§4.6a: 2.44 ms of the ~2.4 ms total)**, and that cannot be removed by
+any per-frame decision, because *which GPU owns the swapchain* is fixed for the life of the session.
+Removing it means moving the compositor to the dGPU — i.e. Shape B — which is a whole-session
+property, not something that can flip when a notification appears.
+
+### 10.1 Decomposing the per-frame cost by stage
+
+Using the re-measured §4.6/§4.6a numbers, per frame, both eyes, against an 11.1 ms budget:
+
+| stage | both eyes | removable when exclusive? |
+|---|---|---|
+| **PCIe write** — game blits into the AMD-owned swapchain image | **2.44 ms** | **No** (see §10.4) |
+| LINEAR-vs-OPTIMAL tiling penalty on that write | 0.04 ms | No, and negligible |
+| **Layer squash** — 2 compute dispatches + a full-eye RGBA intermediate | *(not measured)* | **Yes — already skipped, automatically** |
+| **Foveation + RGB→BT.709 4:2:0 convert** — 1 compute dispatch | *(not measured)* | **No — mandatory, see §10.3** |
+| Compositor reads the swapchain image | 1.0 ms | No — but not a cross-GPU cost; it happens in every topology |
+| Encoder input handoff — `vkCmdCopyImage` into the VA-imported dmabuf | *(not measured)* | No — AMD-side, already in WiVRn's existing budget |
+
+**Caveat, stated plainly:** the squash, foveation and encoder-handoff rows are *not* measured by the
+PoC — it benchmarks image copies, not WiVRn's compute shaders. Their absolute costs would need
+instrumenting inside a running WiVRn. What the PoC *does* establish is the one row that dominates
+and the one row the user asked about.
+
+### 10.2 Composite bypass — **already shipped**, and gated on exactly the right predicate
+
+`W/server/compositor/compositor.cpp:326-345`:
+
+```cpp
+// Check if we can pass a layer directly to foveation
+if (layer_accum.layer_count == 1 and
+    (layer_accum.layers[0].data.type == XRT_LAYER_PROJECTION or
+     layer_accum.layers[0].data.type == XRT_LAYER_PROJECTION_DEPTH))
+```
+
+…with the `else` branch commented `// no fast-path, squash layers` (`:348`). In the fast path the
+client's swapchain image views go straight to the foveation pass (`:335-338`); in the slow path they
+go via `squasher.get_views()` (`:360`). The squash itself is `wivrn::layer_squasher::do_layers`
+(`W/server/compositor/layer_squasher.cpp:388-642`), one compute dispatch **per view** (`:633-634`)
+running Monado's `layer.comp`, writing a single 2-array-layer RGBA intermediate allocated once at
+`layer_squasher.cpp:344-365`.
+
+So "exactly one full-view projection layer" already means **2 compute dispatches and one full-eye
+RGBA intermediate skipped per frame**, with no configuration and no work from us. The predicate is a
+pure `layer_count == 1` plus a type check — no FOV-coverage test, no opacity test.
+
+**What the existing fast path silently drops** (product risk; read from the two branches, not
+observed at runtime):
+
+- **Colour scale/bias** — `layer_squasher.cpp:554-557` → `layer.comp:498`. Identity by default; a
+  silent visual difference for apps setting `XRT_LAYER_COMPOSITION_COLOR_BIAS_SCALE`.
+- **Chroma key** — `layer_squasher.cpp:696-708` → `layer.comp:118-153`. No-op unless enabled.
+- **FOV-union viewport shrink** — `layer_squasher.cpp:542-577`. The squash intersects layer FOV with
+  HMD FOV and shrinks the encoded viewport; the fast path forgoes that resolution win.
+- **Source-smaller-than-stream edge smear** — the squash clamps source ≥ encoder extent via
+  `min_size` (`:575-576`); the fast path has no clamp, and `fill_ubo`'s tail
+  `std::ranges::fill(ubo, ubo[0])` (`W/server/compositor/foveation.cpp:470-471`) repeats the final
+  source column rather than rescaling. Reasoned from code, not measured.
+
+### 10.3 Why full bypass (encoder eats the client's image) is impossible
+
+The blocker is **not** dmabuf import and **not** encoder-side image binding — both are flexible
+enough. `video_encoder::present_image` takes the image as a **per-frame argument**
+(`W/server/encoder/video_encoder.h:127-129`, called at `compositor.cpp:504-512`), and the Vulkan
+Video backend already re-points per frame via a `VkImage`-keyed view cache
+(`W/server/encoder/video_encoder_vulkan.cpp:778-785`).
+
+The blocker is that **foveated resampling and RGB→BT.709 4:2:0 conversion are fused into one
+mandatory compute pass**, `W/server/compositor/shaders/foveation.comp:46-55,118`:
+
+```glsl
+const mat3 color_space = mat3(
+/* Y */ 0.2126,  0.7152,  0.0722,
+/* Cb*/-0.1146, -0.3854,  0.5,
+/* Cr*/ 0.5   , -0.4542, -0.0458);
+...
+colour.xyz = rgb_to_ycbcr(from_linear_to_srgb(colour.rgb));
+```
+
+…and **every encoder backend addresses `ePlane0`/`ePlane1` of a 2-plane YCbCr image** (vaapi
+`video_encoder_va.cpp:515-555`, nvenc `video_encoder_nvenc.cpp:446-476`, Vulkan Video
+`video_encoder_vulkan.cpp:688-728`, x264 `video_encoder_x264.cpp:242,258`). A client's RGBA
+swapchain image has no plane aspects. There is no RGB input path anywhere.
+
+**Good news hiding in this:** foveation is *not* lost by the existing bypass — it is a separate pass
+that consumes whatever views it is given (`compositor.cpp:429-438`), so the fast path keeps full
+foveation *and* gets correct cropping free, because the sub-rect and Y-flip are baked into its
+integer coordinate table on the CPU (`foveation.cpp:520-562`). Foveation also self-disables to a 1:1
+mapping when there is nothing to shrink (`foveation.cpp:351-360`).
+
+Removing the colour conversion would mean relocating it into the encoder — for vaapi, a
+VA-API/ffmpeg RGB→NV12 filter stage. **That trades one compute pass for another and saves nothing.**
+
+### 10.4 The encoder hop — seamless in principle, architecturally blocked in Shape A
+
+**The protocol would allow it.** The stream descriptor is five fields
+(`W/common/wivrn_packets.h:693-704`): `width`, `height`, `codec[3]`, `frame_rate`, `refresh_rate`.
+Encoder *implementation*, bitrate and bit depth are **not** in it.
+`send_video_stream_description` (`W/server/compositor/compositor.cpp:660-672`) derives it only from
+image extent, `settings[0].fps` and `settings[*].codec` — so swapping vaapi↔nvenc at matched
+codec/resolution/fps yields a **byte-identical descriptor**, and the client early-returns without
+touching the decoder (`W/client/scenes/stream.cpp:1152-1161`,
+`if (video_stream_description == description) return;`).
+
+Parameter sets are in-band by construction (MediaCodec is configured with no `csd-0`/`csd-1`,
+`W/client/decoder/android/android_decoder.cpp:137-172`), and mid-stream IDR + resync is a routine
+self-healing path that already fires on every packet loss (`W/server/encoder/idr_handler.cpp:49-55`)
+and every bitrate change (`W/server/encoder/ffmpeg/video_encoder_ffmpeg.cpp:71-82`). The client never
+blacks out during it, because `latest_frames` is a 3-deep rolling buffer only ever swapped, never
+cleared (`stream.cpp:566,582-590`). **Cost of a swap ≈ 1 network RTT of reprojected-only frames —
+1-2 frames at 90 Hz.** There is even an existing mid-session descriptor re-send:
+`compositor::resume()` (`compositor.cpp:829-834`), fired on every doff/don.
+
+**But it cannot be reached in Shape A.** nvenc feeds CUDA by exporting a device-local `VkBuffer`
+with **`vk::ExternalMemoryHandleTypeFlagBitsKHR::eOpaqueFd`** and importing via
+`cuImportExternalMemory` (`W/server/encoder/video_encoder_nvenc.cpp:389-411`). Per §6.1, `OPAQUE_FD`
+requires matching `deviceUUID`/`driverUUID` — so **nvenc only works when the compositor's Vulkan
+device *is* the NVIDIA GPU.** With the compositor on AMD, nvenc is unreachable **by construction,
+not merely unimplemented**. VAAPI is the only cross-GPU-capable backend, and it is already in use.
+
+Two further constraints if revisited: a resident shadow encoder set costs roughly **130-165 MB**
+(vaapi preallocates `initial_pool_size = 10` full-size surfaces per encoder,
+`video_encoder_va.cpp:88`) and would hold a **VCN session** open while idle — the exact resource
+`hypxrva` exists to arbitrate. And **bit depth must be held constant**: it is absent from the
+descriptor, so a 10→8-bit swap would change the H.265 profile mid-stream with no protocol signal,
+the one case the sources cannot promise is seamless.
+
+### 10.5 Hysteresis — the happy answer is that none is needed
+
+The concern was that exclusivity flips whenever a notification or HUD overlay appears, and our own
+compositor deliberately avoids riding transient overlays (the `coversOutput` gate,
+`src/openxr/XRStereoPair.hpp:43-49`, whose comment notes that a gate keyed on the wrong thing
+produces "the compositor broke" failure modes).
+
+**That concern does not apply to tier 1, because the transition is free.** The fast path is a
+per-frame `if` on `layer_count` with no setup, no teardown, no reallocation and no state: the
+foveation pass consumes either the client's views or the squasher's, and nothing else differs. A HUD
+quad appearing costs exactly one frame of squash; it disappearing returns to the fast path the next
+frame. **There is nothing to debounce, and adding hysteresis would make it worse** by keeping the
+squash alive for frames that no longer need it.
+
+Hysteresis *would* be needed for anything switching encoders or buffer residency (tiers 2-3), where
+a transition costs 1-2 frames of reprojection plus encoder re-init. Suggested policy **if those ever
+become reachable**: ~2 s of continuous exclusivity before switching in, ~5 s before switching back,
+so a notification cannot induce a switch. But since tier 2 and tier 3 are both blocked, **this policy
+has nothing to govern today** and should not be built speculatively.
+
+### 10.6 Ranking the tiers
+
+| tier | what it does | recovers | status |
+|---|---|---|---|
+| **1 — composite bypass** | skip the squash when one projection layer | 2 dispatches + 1 RGBA intermediate/frame | ✅ **already shipped and automatic** — zero work |
+| **2 — encoder hop** (vaapi/AMD ↔ nvenc/NVIDIA) | keep pixels on the dGPU through encode | most of the 2.44 ms | ❌ **blocked**: nvenc's `OPAQUE_FD` CUDA import pins it to the compositor's GPU (§10.4) |
+| **3 — full dGPU residency** (swapchain allocated on NVIDIA) | eliminates the PCIe write | the whole 2.44 ms | ❌ **blocked**: needs the client-allocates path (Android-only, §2.1) *and* NVIDIA→AMD import, which fails on both pitch (§4.4) and residency (§4.8) |
+
+**Recommendation: option (c) from the user's framing — "the estimate was pessimistic".** The
+re-measure already did most of the optimising: the marginal cross-GPU cost is **~2.4 ms, not
+3.9 ms**, tier 1 is already free and already on, and the remaining 2.4 ms is a single irreducible
+PCIe write no per-frame exclusivity decision can remove. **If that 2.4 ms ever proves unacceptable,
+the answer is not a clever exclusive-mode path — it is Shape B** (compositor on the dGPU), which
+removes the transfer by construction and is a config change.
+
+**One genuinely cheap follow-up falls out**, the only new work this addendum proposes: verify the
+shipped fast path actually engages for a real xrizer/DXVK game (it may submit a HUD quad and never
+hit `layer_count == 1`), and decide whether the four things it silently drops (§10.2) matter. That
+is **WP-XG9**.

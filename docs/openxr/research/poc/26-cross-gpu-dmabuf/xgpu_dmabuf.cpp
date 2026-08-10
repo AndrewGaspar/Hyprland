@@ -346,6 +346,7 @@ struct Img {
     uint32_t       planes = 1;
     VkDeviceSize   size = 0;
     uint32_t       memTypeIdx = UINT32_MAX;
+    uint32_t       typeBits   = 0;
     std::vector<VkSubresourceLayout> layouts;
 };
 
@@ -389,7 +390,8 @@ static bool createExportable(const Gpu& g, uint32_t w, uint32_t h, VkFormat fmt,
     VkImageMemoryRequirementsInfo2 mri{VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2};
     mri.image = out.img;
     vkGetImageMemoryRequirements2(g.dev, &mri, &mr);
-    out.size = mr.memoryRequirements.size;
+    out.size     = mr.memoryRequirements.size;
+    out.typeBits = mr.memoryRequirements.memoryTypeBits;
 
     VkMemoryDedicatedAllocateInfo dai{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
     dai.image = out.img;
@@ -557,9 +559,14 @@ static Img createLocal(const Gpu& g, uint32_t w, uint32_t h, VkFormat fmt,
     VK_CHECK(vkCreateImage(g.dev, &ici, nullptr, &o.img));
     VkMemoryRequirements mr;
     vkGetImageMemoryRequirements(g.dev, o.img, &mr);
+    o.typeBits = mr.memoryTypeBits;
     VkResult r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
     for (uint32_t mt : memTypeOrder(g, mr.memoryTypeBits)) {
-        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        // NVIDIA rejects non-dedicated VRAM allocations for images (OUT_OF_DEVICE_MEMORY even on
+        // an idle 8 GB card); a dedicated allocation is accepted. Always ask for dedicated.
+        VkMemoryDedicatedAllocateInfo dai{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+        dai.image = o.img;
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &dai};
         mai.allocationSize  = mr.size;
         mai.memoryTypeIndex = mt;
         r                   = vkAllocateMemory(g.dev, &mai, nullptr, &o.mem);
@@ -567,6 +574,8 @@ static Img createLocal(const Gpu& g, uint32_t w, uint32_t h, VkFormat fmt,
             o.memTypeIdx = mt;
             break;
         }
+        std::fprintf(stderr, "  [memtype] %s: type%u (%s) rejected for %.1f MiB image: %s\n",
+                     g.tag(), mt, memTypeDesc(g, mt).c_str(), mr.size / 1048576.0, vkres(r));
     }
     if (r != VK_SUCCESS) {
         std::fprintf(stderr, "  [soft-fail] createLocal alloc failed on %s: %s\n", g.tag(),
@@ -1132,25 +1141,20 @@ static void acquireForeign(const Gpu& g, VkImage img) {
     endCmdWait(g, cb);
 }
 
+// Steady-state copy throughput.
+//
+// Methodology (the first cut of this program got it wrong and the report carried the wrong
+// numbers): NO barrier between iterations. A full pipeline barrier per copy measures
+// per-copy latency including a pipeline drain, which on a large dGPU is dominated by launch
+// overhead and understates throughput by an order of magnitude. The copies here are
+// deliberately unsynchronised — they alias the same destination, so the pixel *contents* are
+// undefined, but correctness is established separately in section 5 and what we want here is
+// the rate the hardware can sustain. Timing is GPU-side via timestamp queries; a warm-up pass
+// is discarded and the best of several timed passes is reported.
 static double benchImageCopy(const Gpu& g, VkImage srcImg, VkImageLayout srcLayout, VkImage dstImg,
                              uint32_t w, uint32_t h, uint32_t iters, bool srcForeign) {
-    // Pre-transition dst once.
+    // One-time layout/ownership setup, outside the timed region.
     {
-        VkCommandBuffer cb = beginCmd(g);
-        barrier(cb, dstImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
-                VK_ACCESS_TRANSFER_WRITE_BIT);
-        endCmdWait(g, cb);
-    }
-    VkImageCopy ic{};
-    ic.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    ic.srcSubresource.layerCount = 1;
-    ic.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    ic.dstSubresource.layerCount = 1;
-    ic.extent                    = {w, h, 1};
-
-    // warmup + timed
-    double best = 1e30;
-    for (uint32_t pass = 0; pass < 3; pass++) {
         VkCommandBuffer cb = beginCmd(g);
         if (srcForeign)
             barrier(cb, srcImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0,
@@ -1158,35 +1162,47 @@ static double benchImageCopy(const Gpu& g, VkImage srcImg, VkImageLayout srcLayo
         else
             barrier(cb, srcImg, srcLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        for (uint32_t i = 0; i < iters; i++) {
+        barrier(cb, dstImg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                VK_ACCESS_TRANSFER_WRITE_BIT);
+        endCmdWait(g, cb);
+    }
+
+    VkImageCopy ic{};
+    ic.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    ic.srcSubresource.layerCount = 1;
+    ic.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    ic.dstSubresource.layerCount = 1;
+    ic.extent                    = {w, h, 1};
+
+    double best = 1e30;
+    for (uint32_t pass = 0; pass < 4; pass++) {  // pass 0 = warm-up, discarded
+        VkCommandBuffer cb = beginCmd(g);
+        vkCmdResetQueryPool(cb, g.tsPool, 0, 2);
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.tsPool, 0);
+        for (uint32_t i = 0; i < iters; i++)
             vkCmdCopyImage(cb, srcImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dstImg,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
-            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-            mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0,
-                                 nullptr);
-        }
-        // put src back so the next pass's barrier is legal
-        barrier(cb, srcImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_WRITE_BIT);
-
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.tsPool, 1);
         VK_CHECK(vkEndCommandBuffer(cb));
-        auto         t0 = std::chrono::steady_clock::now();
+
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1;
         si.pCommandBuffers    = &cb;
         VK_CHECK(vkQueueSubmit(g.q, 1, &si, VK_NULL_HANDLE));
         VK_CHECK(vkQueueWaitIdle(g.q));
-        auto t1 = std::chrono::steady_clock::now();
         vkFreeCommandBuffers(g.dev, g.pool, 1, &cb);
+
         if (pass == 0)
-            continue;  // warmup
+            continue;
+
+        uint64_t ts[2] = {0, 0};
+        if (vkGetQueryPoolResults(g.dev, g.tsPool, 0, 2, sizeof(ts), ts, sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) !=
+            VK_SUCCESS)
+            continue;
         const double ms =
-            std::chrono::duration<double, std::milli>(t1 - t0).count() / (double)iters;
+            (double)(ts[1] - ts[0]) * (double)g.tsPeriodNs / 1e6 / (double)iters;
         best = std::min(best, ms);
-        srcForeign = false;  // after first acquire it's ours
     }
     return best;
 }
@@ -1197,7 +1213,10 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);  // keep stdout/stderr interleaving readable
     setvbuf(stderr, nullptr, _IOLBF, 0);
     uint32_t W = 2064, H = 2208, ITERS = 20;
-    int      fmtSel = -1;
+    int      fmtSel  = -1;
+    bool     noSync  = false;  // skip the sync probes (see the OPAQUE_FD poisoning note)
+    bool     noShare = false;  // skip the share/pitch sections (they can DEVICE_LOST RADV)
+    bool     reverse = false;  // also bench server=NVIDIA/client=AMD (can DEVICE_LOST RADV)
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "--width") && i + 1 < argc)
             W = (uint32_t)std::atoi(argv[++i]);
@@ -1207,6 +1226,12 @@ int main(int argc, char** argv) {
             ITERS = (uint32_t)std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--format") && i + 1 < argc)
             fmtSel = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--no-sync"))
+            noSync = true;
+        else if (!std::strcmp(argv[i], "--no-share"))
+            noShare = true;
+        else if (!std::strcmp(argv[i], "--reverse"))
+            reverse = true;
     }
 
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -1243,6 +1268,63 @@ int main(int argc, char** argv) {
             amd = (int)i;
     }
     std::printf("\n  NVIDIA index=%d  AMD index=%d\n", nv, amd);
+
+    // VRAM availability probe. If another process (a running game) has the dGPU's VRAM, every
+    // "local" allocation below silently lands in system memory and every NVIDIA-side timing in
+    // this program becomes a sysmem/PCIe number rather than a VRAM number. That is a big enough
+    // distortion that it must be reported, not discovered later.
+    std::printf("\n=== 1b. per-device VRAM availability (distorts every later timing if it fails) ===\n");
+    for (uint32_t i = 0; i < n; i++) {
+        const Gpu& g = gpus[i];
+        std::printf("  %s:\n", g.tag());
+        for (uint32_t t = 0; t < g.mem.memoryTypeCount; t++) {
+            const auto  flags = g.mem.memoryTypes[t].propertyFlags;
+            const auto  heap  = g.mem.memoryTypes[t].heapIndex;
+            const bool  vram  = (g.mem.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+            if (!vram || !(flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+                continue;
+            VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            mai.allocationSize  = 64ull * 1024 * 1024;  // 64 MiB probe
+            mai.memoryTypeIndex = t;
+            VkDeviceMemory m = VK_NULL_HANDLE;
+            VkResult       r = vkAllocateMemory(g.dev, &mai, nullptr, &m);
+            std::printf("    %-58s 64MiB bare alloc -> %s\n", memTypeDesc(g, t).c_str(), vkres(r));
+            if (r == VK_SUCCESS)
+                vkFreeMemory(g.dev, m, nullptr);
+
+            // Same instant, same memory type, but bound to an IMAGE. Drivers may accept a bare
+            // block and refuse an image in the very same heap.
+            VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ici.imageType     = VK_IMAGE_TYPE_2D;
+            ici.format        = VK_FORMAT_R8G8B8A8_UNORM;
+            ici.extent        = {2048, 2048, 1};
+            ici.mipLevels     = 1;
+            ici.arrayLayers   = 1;
+            ici.samples       = VK_SAMPLE_COUNT_1_BIT;
+            ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
+            ici.usage         = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+            ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            VkImage img = VK_NULL_HANDLE;
+            if (vkCreateImage(g.dev, &ici, nullptr, &img) == VK_SUCCESS) {
+                VkMemoryRequirements imr;
+                vkGetImageMemoryRequirements(g.dev, img, &imr);
+                const bool allowed = (imr.memoryTypeBits & (1u << t)) != 0;
+                VkMemoryDedicatedAllocateInfo dai{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+                dai.image = img;
+                VkMemoryAllocateInfo imai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &dai};
+                imai.allocationSize  = imr.size;
+                imai.memoryTypeIndex = t;
+                VkDeviceMemory im = VK_NULL_HANDLE;
+                VkResult ir = vkAllocateMemory(g.dev, &imai, nullptr, &im);
+                std::printf("    %-58s %.0fMiB IMAGE (allowed=%d) -> %s\n", "", 
+                            imr.size / 1048576.0, (int)allowed, vkres(ir));
+                if (ir == VK_SUCCESS)
+                    vkFreeMemory(g.dev, im, nullptr);
+                vkDestroyImage(g.dev, img, nullptr);
+            }
+        }
+    }
     if (nv < 0 || amd < 0) {
         std::printf("FATAL: expected one NVIDIA and one AMD device\n");
         return 2;
@@ -1275,15 +1357,11 @@ int main(int argc, char** argv) {
         std::printf("\n");
     }
 
-    std::printf("=== 4. cross-vendor semaphore handoff ===\n");
-    trySemaphoreHandoff(NV, AMD);
-    trySemaphoreHandoff(AMD, NV);
-    std::printf("\n  --- does the cross-vendor wait actually ORDER anything? ---\n");
-    semOrderingTest(NV, AMD, 2048, 2048);
-    semOrderingTest(AMD, NV, 2048, 2048);
 
-    std::printf("\n=== 5. dma-buf image share (%ux%u) ===\n", W, H);
+    std::printf("\n=== 5. dma-buf image share (%ux%u) ===%s\n", W, H, noShare ? " SKIPPED" : "");
     for (VkFormat f : formats) {
+        if (noShare)
+            break;
         for (int dir = 0; dir < 2; dir++) {
             Gpu& S = dir == 0 ? NV : AMD;
             Gpu& D = dir == 0 ? AMD : NV;
@@ -1369,8 +1447,9 @@ int main(int argc, char** argv) {
     // back a TIGHT rowPitch (width*bpp) while RADV requires the linear stride to be aligned.
     // Sweep widths and print each side's natural pitch to prove or kill it, then test the
     // padded-width workaround.
-    std::printf("\n=== 5b. LINEAR row-pitch alignment probe (why NVIDIA->AMD fails) ===\n");
-    {
+    std::printf("\n=== 5b. LINEAR row-pitch alignment probe (why NVIDIA->AMD fails) ===%s\n",
+                noShare ? " SKIPPED" : "");
+    if (!noShare) {
         const VkFormat f = VK_FORMAT_R8G8B8A8_UNORM;
         std::printf("  width  NV pitch  AMD pitch  NV->AMD import\n");
         const uint32_t widths[] = {1832, 1920, 2016, 2048, 2064, 2080, 2112, 2144, 2160, 2560};
@@ -1425,7 +1504,7 @@ int main(int argc, char** argv) {
         std::printf("    AMD wants rowPitch=%" PRIu64 " for width %u  ->  padded width = %u "
                     "(+%u px, +%.1f%% memory)\n",
                     wantPitch, W, padW, padW - W, 100.0 * (padW - W) / W);
-        if (padW != W) {
+        if (padW != W && reverse) {
             ShareResult r =
                 tryShare(NV, AMD, padW, H, VK_FORMAT_R8G8B8A8_UNORM, {0}, kUsage);
             std::printf("    padded NVIDIA->AMD share: %s\n",
@@ -1496,13 +1575,85 @@ int main(int argc, char** argv) {
             }
         }
 
+        // DECOMPOSITION (addendum): where does the client's write cost actually go?
+        //
+        //   (a) local OPTIMAL -> local OPTIMAL, VRAM        : the "no swapchain at all" floor
+        //   (b) local OPTIMAL -> local LINEAR, VRAM         : cost of LINEAR alone, still resident
+        //   (c) local OPTIMAL -> EXPORTABLE LINEAR          : (b) + wherever the driver is forced
+        //                                                     to put a shareable buffer
+        //
+        // (c)-(b) is the residency premium. It is charged even when nobody imports the buffer,
+        // because a dma-buf-exportable allocation cannot live in dGPU VRAM (see §4.7) — which is
+        // exactly why "exclusive mode" can only recover it by not exporting at all.
+        std::printf("\n  --- decomposition: what does the client's write actually pay for? ---\n");
+        for (Gpu* g : {&NV, &AMD}) {
+            Img srcOpt = createLocal(*g, W, H, f,
+                                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                         VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+            if (!srcOpt.img)
+                continue;
+            {
+                VkCommandBuffer cb = beginCmd(*g);
+                barrier(cb, srcOpt.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
+                        VK_ACCESS_MEMORY_WRITE_BIT);
+                endCmdWait(*g, cb);
+            }
+
+            Img dstOpt = createLocal(*g, W, H, f, VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+            Img dstLin = createLocal(*g, W, H, f, VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                     VK_IMAGE_TILING_LINEAR);
+            Img dstExp{};
+            const bool haveExp = createExportable(*g, W, H, f, kUsage, {0}, dstExp, nullptr);
+
+            double a = -1, b = -1, c = -1;
+            if (dstOpt.img)
+                a = benchImageCopy(*g, srcOpt.img, VK_IMAGE_LAYOUT_GENERAL, dstOpt.img, W, H,
+                                   ITERS, false);
+            if (dstLin.img)
+                b = benchImageCopy(*g, srcOpt.img, VK_IMAGE_LAYOUT_GENERAL, dstLin.img, W, H,
+                                   ITERS, false);
+            if (haveExp)
+                c = benchImageCopy(*g, srcOpt.img, VK_IMAGE_LAYOUT_GENERAL, dstExp.img, W, H,
+                                   ITERS, false);
+
+            {
+                std::string ord;
+                for (uint32_t mt : memTypeOrder(*g, dstOpt.typeBits))
+                    ord += std::to_string(mt) + " ";
+                std::printf("  %s:  [memTypeOrder(0x%02x) = %s]\n", g->tag(), dstOpt.typeBits,
+                            ord.c_str());
+            }
+            std::printf("    (a) -> local OPTIMAL               %7.3f ms   bits=0x%02x [%s]\n", a,
+                        dstOpt.typeBits,
+                        dstOpt.img ? memTypeDesc(*g, dstOpt.memTypeIdx).c_str() : "n/a");
+            std::printf("    (b) -> local LINEAR                %7.3f ms   bits=0x%02x [%s]\n", b,
+                        dstLin.typeBits,
+                        dstLin.img ? memTypeDesc(*g, dstLin.memTypeIdx).c_str() : "n/a");
+            std::printf("    (c) -> EXPORTABLE LINEAR           %7.3f ms   bits=0x%02x [%s]\n", c,
+                        dstExp.typeBits,
+                        haveExp ? memTypeDesc(*g, dstExp.memTypeIdx).c_str() : "n/a");
+            if (b > 0 && c > 0)
+                std::printf("    residency premium (c)-(b) = %+.3f ms/eye  (%+.1f ms both eyes)\n",
+                            c - b, (c - b) * 2);
+
+            for (Img* i : {&dstOpt, &dstLin, &dstExp, &srcOpt})
+                if (i->img) {
+                    vkDestroyImage(g->dev, i->img, nullptr);
+                    vkFreeMemory(g->dev, i->mem, nullptr);
+                }
+        }
+
         // THE REAL SHAPE. Monado's server allocates the swapchain images and exports them;
         // the client imports and RENDERS INTO them. So for "compositor on AMD, game on NVIDIA"
         // the buffer is AMD-allocated, and the per-frame cost is NVIDIA *writing* into it
         // (the game's blit at xrReleaseSwapchainImage) plus AMD *reading* it at composite.
         std::printf("\n  --- the real shape: server(exporter) allocates, client(importer) renders "
                     "into it ---\n");
-        for (int dir = 0; dir < 2; dir++) {
+        // dir==1 (server=NVIDIA, client=AMD) is guarded behind --reverse: when NVIDIA exports a
+        // VRAM-resident buffer, RADV imports it successfully and then dies at submission with
+        // "radv/amdgpu: Not enough memory for command submission" -> VK_ERROR_DEVICE_LOST, which
+        // takes the whole run with it. That is itself a finding (see the report), not a bug here.
+        for (int dir = 0; dir < (reverse ? 2 : 1); dir++) {
             Gpu& SRV = dir == 0 ? AMD : NV;  // allocates + composites (the WiVRn server)
             Gpu& CLI = dir == 0 ? NV : AMD;  // imports + renders (the game)
 
@@ -1586,6 +1737,25 @@ int main(int argc, char** argv) {
             vkDestroyImage(SRV.dev, shared.img, nullptr);
             vkFreeMemory(SRV.dev, shared.mem, nullptr);
         }
+    }
+
+    // === 7. SYNC PROBES RUN LAST, DELIBERATELY ===
+    //
+    // Discovered the hard way: a FAILED cross-vendor OPAQUE_FD semaphore import leaves the
+    // NVIDIA device in a state where every subsequent VRAM image allocation returns
+    // VK_ERROR_OUT_OF_DEVICE_MEMORY, silently pushing allocations into system memory. Bare
+    // (non-image) VRAM allocations keep succeeding, so the damage is easy to miss. Every
+    // NVIDIA timing in the first version of this program was a sysmem number because of it.
+    // Keep this section after all measurement, and treat --no-sync as the way to get clean
+    // allocation behaviour.
+    std::printf("\n=== 7. cross-vendor semaphore handoff (LAST: poisons NVIDIA allocs) ===%s\n",
+                noSync ? " SKIPPED" : "");
+    if (!noSync) {
+        trySemaphoreHandoff(NV, AMD);
+        trySemaphoreHandoff(AMD, NV);
+        std::printf("\n  --- does the cross-vendor wait actually ORDER anything? ---\n");
+        semOrderingTest(NV, AMD, 2048, 2048);
+        semOrderingTest(AMD, NV, 2048, 2048);
     }
 
     std::printf("\ndone.\n");
