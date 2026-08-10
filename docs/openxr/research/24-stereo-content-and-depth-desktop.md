@@ -2270,11 +2270,12 @@ optional; it is now Phase F.
 >    rewrites the normalized rect to `(x, y+h, w, -h)`, so `layer_quad.vert` samples the quad's top
 >    row at `offset.y + extent.h`. This decides only which half an over-under pack gives the left
 >    eye — a mistake swaps the eyes, which is uncomfortable without ever looking broken.
-> 4. **Declared ≠ submitted, so status reports both.** A pair the layer budget refuses is submitted
->    as a single mono quad and looks exactly like a mono monitor. `hyprctl -j openxr` carries
->    `stereo` (what the main thread declared) *and* `quads` (what the frame thread submitted); the
->    budget check is per-PAIR and `continue`s rather than breaking, so a refused pair leaves the slot
->    to a cheaper monitor instead of half-submitting a left-eye-only frame.
+> 4. **Declared ≠ submitted, so status reports both.** A pair the layer budget refuses is dropped
+>    from the frame, which looks exactly like a monitor that simply is not there. `hyprctl -j openxr`
+>    carries `stereo` (what the main thread declared) *and* `quads` (what the frame thread actually
+>    submitted: 0, 1 or 2, zeroed per frame so it can never read stale). The budget check is
+>    per-PAIR and `continue`s rather than breaking, so a refused pair leaves the slot to a cheaper
+>    monitor instead of half-submitting a left-eye-only frame.
 >
 > Deviations from the line item: the **depth sort needed no change** — pairs are pushed back to back
 > inside one loop iteration and the sort orders layers, not quads, so adjacency is structural. And

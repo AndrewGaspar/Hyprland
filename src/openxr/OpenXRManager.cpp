@@ -1866,6 +1866,15 @@ void COpenXRManager::frameThread() {
         std::vector<SXRPointerTarget> pointerTargets;
         pointerTargets.reserve(active.size());
 
+        // WP X1: "how many quads did this monitor cost" is reported in status, so it must mean THIS
+        // frame. Zero every layer first and let the successful submissions below write 1 or 2 — a
+        // layer that is skipped (no content yet, suspended by the layer cap, or a pair the budget
+        // refused) then reads 0, "submitted nothing", instead of whatever it cost last time. The
+        // budget-refusal case is the one that matters: it is invisible in the headset, and a stale
+        // count would make it invisible in status too.
+        for (auto& l : active)
+            l->m_quadsSubmitted.store(0, std::memory_order_relaxed);
+
         for (size_t i : order) {
             auto& l = active[i];
             // WP X1: what the MAIN thread declared for this monitor (research/24 §5.1). CONTENT_OFF

@@ -1684,12 +1684,13 @@ mechanism (a real second composite) and is not in this tier.
 "quads": 2
 ```
 
-`stereo` is the declaration that reached the monitor; `quads` is how many composition layers its
-last submitted frame actually cost. They differ in exactly one case, and it is the one failure with
-no visual tell: if the runtime's layer budget could not fit the pair, the monitor is submitted as a
-single mono quad and reads `"stereo": "sbs", "quads": 1`. (The budget is at least 16 and a session
-uses a handful, so this needs a lot of monitors.) The text form says
-`stereo: sbs (2 quads)` and says nothing at all on a mono monitor.
+`stereo` is the declaration that reached the monitor; `quads` is how many composition layers it
+actually submitted last frame — `1` mono, `2` paired, and **`0` for a monitor that submitted nothing
+at all**. They differ in exactly one case, and it is the one failure with no visual tell: if the
+runtime's layer budget could not fit the pair, the monitor is dropped from the frame rather than
+submitted left-eye-only, and reads `"stereo": "sbs", "quads": 0`. (The budget is at least 16 and a
+session uses a handful, so this takes a lot of monitors.) The text form says `stereo: sbs (2 quads)`
+and says nothing at all on a mono monitor.
 
 ### `sbs` vs `hsbs` decides the panel's shape, and this is the one thing to get right
 
