@@ -237,10 +237,19 @@ void CMonitor::onConnect(bool noRule) {
 
         auto rule = m_activeMonitorRule;
 
-        if (SIZE == rule.m_resolution)
+        // `event.size` is the mode the backend is SCANNING OUT, and rule.m_resolution is only that
+        // for an ordinary or physically-packed output. On a VIRTUAL pack (research/24 WP X3) the
+        // field means ONE PANE, so writing the packed mode in would double an already-doubled mode
+        // on the next apply — and again on the next event. Same hazard, same fix, as the
+        // wlr-output-management write-back (Monitor::Stereo::adoptExternalMode).
+        const auto ADOPTED = Monitor::Stereo::adoptExternalMode(SIZE, rule.m_stereo, rule.m_stereoVirtualMode);
+
+        if (ADOPTED.resolution == rule.m_resolution && ADOPTED.stereo == rule.m_stereo && ADOPTED.virtualPack == rule.m_stereoVirtualMode)
             return;
 
-        rule.m_resolution = SIZE;
+        rule.m_resolution        = ADOPTED.resolution;
+        rule.m_stereo            = ADOPTED.stereo;
+        rule.m_stereoVirtualMode = ADOPTED.virtualPack;
 
         applyMonitorRule(std::move(rule));
     });
@@ -1521,7 +1530,10 @@ float CMonitor::getDefaultScale() {
 
     static constexpr double MMPERINCH = 25.4;
 
-    const auto              DIAGONALPX = sqrt(pow(m_pixelSize.x, 2) + pow(m_pixelSize.y, 2));
+    // The PPI guess must be made of PANE pixels, not mode pixels: a virtual pack falls through to
+    // here (its scale is not pinned) and the doubled mode would inflate the diagonal by ~1.7x.
+    const auto              PANEPX     = paneSize();
+    const auto              DIAGONALPX = sqrt(pow(PANEPX.x, 2) + pow(PANEPX.y, 2));
     const auto              DIAGONALIN = sqrt(pow(m_output->physicalSize.x / MMPERINCH, 2) + pow(m_output->physicalSize.y / MMPERINCH, 2));
 
     const auto              PPI = DIAGONALPX / DIAGONALIN;
@@ -1956,6 +1968,21 @@ void CMonitor::sanitizeStereoMode(const Vector2D& requestedMode) {
     if (!isStereo())
         return;
 
+    // A VIRTUAL pack derives its mode from a per-pane resolution, so a rule that names no
+    // resolution has nothing to derive from (research/24 WP X3). `preferred` and the
+    // highrr/highres/maxwidth sentinels come through requestedMode() untouched, the mode search
+    // then lands on whatever the output prefers, and the pack would HALVE that into a desktop
+    // nobody asked for — the exact regression the virtual inversion exists to prevent. Drop it,
+    // loudly: a silently halved desktop is the failure mode that reads as "the compositor broke".
+    if (m_stereoVirtualMode && (requestedMode.x <= 0 || requestedMode.y <= 0)) {
+        const auto ERRSTR = std::format("Monitor {}: a per-eye pack needs an explicit per-eye resolution, but the rule asks for a mode by preference — disabling stereo", m_name);
+        Log::logger->log(Log::ERR, ERRSTR);
+        ErrorOverlay::overlay()->queueError(ERRSTR);
+        m_stereoMode        = Config::STEREO_OFF;
+        m_stereoVirtualMode = false;
+        return;
+    }
+
     // The pack is only valid on the mode it was CONFIGURED for: side-by-side content on a display
     // that is not in SBS mode is one eye's half stretched across the panel. The mode search has
     // three ways to land somewhere else (the custom-mode retry, the emergency any-available-mode
@@ -2023,7 +2050,8 @@ void CMonitor::updateStereoWatch() {
                 advertised.emplace_back(m->pixelSize);
 
             const auto ACTION = Monitor::Stereo::watchAction(PMONITOR->m_stereoMode, PMONITOR->m_activeMonitorRule.m_stereo, PMONITOR->m_pixelSize,
-                                                             PMONITOR->m_activeMonitorRule.m_resolution, advertised, PMONITOR->m_customDrmMode.vdisplay > 0);
+                                                             PMONITOR->stereoRequestedMode(PMONITOR->m_activeMonitorRule), advertised,
+                                                             PMONITOR->m_customDrmMode.vdisplay > 0);
 
             // Act once per hardware state. A re-apply whose modeset cannot commit leaves the monitor
             // exactly as the watch found it, and re-modesetting every second forever is worse than
