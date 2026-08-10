@@ -9,6 +9,10 @@
 #include "../output/Monitor.hpp"
 #include "../debug/log/Logger.hpp"
 #include "XRDmabufImport.hpp" // OpenXR::shouldStashPresentedBuffer (cross-GPU stale-buffer guard)
+#include "XRStereoPair.hpp"   // WP X1: the stereo quad-pair policy (pure)
+#include "../config/ConfigValue.hpp"
+#include "../desktop/view/Window.hpp"
+#include "../managers/fullscreen/FullscreenController.hpp"
 #include <aquamarine/buffer/Buffer.hpp>
 
 CXRMonitorLayer::CXRMonitorLayer(const std::string& name, uint64_t seq, float sizeMeters) : m_monitorName(name), m_sizeMeters(sizeMeters), m_seq(seq) {
@@ -33,6 +37,10 @@ void CXRMonitorLayer::bindToMonitor(PHLMONITOR mon, std::function<void()> onGone
         const auto pmon = m_monitor.lock();
         if (!pmon || !pmon->m_output || !pmon->m_output->state)
             return;
+        // WP X1: resolve the stereo declaration for the frame we are about to hand over, BEFORE the
+        // buffer checks below — a frame the cross-GPU guard drops must not leave the frame thread
+        // splitting the previous (differently-declared) image.
+        publishStereoPairLayout(pmon);
         auto buf = pmon->m_output->state->state().buffer;
         if (!buf)
             return;
@@ -75,6 +83,35 @@ void CXRMonitorLayer::bindToMonitor(PHLMONITOR mon, std::function<void()> onGone
         if (onGone)
             onGone();
     });
+}
+
+// MAIN THREAD ONLY (research/24 §5.1, WP X1). Resolve whether this monitor's next frame should be
+// submitted as a pair of eye-cropped quads, and publish the answer as one byte for the frame thread.
+//
+// Everything expensive or thread-hostile happens here: the fullscreen-controller lookup, the
+// window's rule/tag fold, the string-backed config. The frame thread gets an integer.
+//
+// The COVERAGE test is what makes the pair safe, and it is asked of the window's live geometry
+// rather than of the declaration: CWindow::stereoLayout() already applied §4.3's fullscreen gate,
+// but `always` and a client's own tag both legitimately SKIP that gate, and a floating declared
+// window must not split the desktop. This is the same size/position comparison the solitary check
+// uses (Monitor.cpp's SC_TRANSFORM) — deliberately not m_solitaryClient itself, which additionally
+// drops out for notifications, drag-and-drop, fadeouts and overlay layers. Those are transient, and
+// since engaging the pair can change the quad's ASPECT (§5.2), letting a toast flatten the panel
+// would make it visibly change shape and back.
+void CXRMonitorLayer::publishStereoPairLayout(const PHLMONITOR& mon) {
+    static auto                    PPAIR = CConfigValue<Hyprlang::INT>("openxr:stereo_quad_pair");
+
+    OpenXR::Stereo::SPairQuery     query;
+    query.enabled = *PPAIR != 0;
+
+    if (const auto FSWINDOW = Fullscreen::controller()->getFullscreenWindow(mon)) {
+        query.declared     = FSWINDOW->stereoLayout();
+        query.coversOutput = FSWINDOW->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT) == mon->m_size &&
+            FSWINDOW->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT) == mon->m_position;
+    }
+
+    m_stereoPairLayout.store((uint8_t)OpenXR::Stereo::resolvePairLayout(query), std::memory_order_release);
 }
 
 void CXRMonitorLayer::stopMainListeners() {

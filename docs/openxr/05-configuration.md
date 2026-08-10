@@ -144,6 +144,12 @@ you walk away, and re-docks when you return — see the anchoring doc. All hot-l
 | `chrome_col_hover` | color | `0xcc66aaff` | Chrome color for the element (bar or corner) the ray points at. |
 | `chrome_col_grab` | color | `0xff66aaff` | Chrome color while the quad is grabbed. |
 
+### Stereo content — the quad pair (§8.8)
+
+| Variable | Type | Default | Meaning | Applies |
+|---|---|---|---|---|
+| `stereo_quad_pair` | bool | `true` | Present a stereo-declared window (`windowrule = stereo <layout>`, §8.6) that is **fullscreen and covering an XR monitor** as a **pair** of quad layers — one per eye, each cropped to that eye's half of the packed frame — so the headset shows real stereo instead of a doubled image. Set to `0` to fall back to the single flattened quad if a runtime mishandles `eyeVisibility` or `subImage.imageRect`. | hot |
+
 ### Luma-keyed transparency ("black-as-alpha")
 
 Turns the dark parts of your desktop see-through, so a monitor reads as an **AR overlay** on your
@@ -1701,6 +1707,107 @@ error.
   head-motion parallax; on an XR monitor (a quad in the session) depth does nothing yet. The rules
   are forward-compatible on purpose: the same `windowrule = depth 0.6` is what a future per-window
   quad tier would read to place the window 0.6 · `depth_scale` metres nearer, with no re-authoring.
+
+---
+
+## 8.8 Stereo content **in the headset** — the OpenXR quad pair
+
+§8.6 makes a window's content differ between two panes. §8.5 shows those panes on a physical
+side-by-side screen. This is the other presenter: on an **XR monitor** there is no scanout buffer
+to pack — there is a quad — and OpenXR already knows how to show one image to one eye.
+
+So instead of packing anything, Hyprland submits the monitor's swapchain image **twice**: one quad
+with `eyeVisibility = LEFT`, one with `RIGHT`, each with an `imageRect` selecting that eye's half of
+the frame the client already packed. Your headset's runtime does the crop it was going to do anyway.
+
+```ini
+# in your XR session: mpv gets true stereo when it owns an XR monitor
+windowrule = stereo auto, match:xdg_tag ^stereo:.*
+windowrule = stereo sbs, match:class ^(mpv)$
+```
+
+There is **nothing to enable** beyond the rule — `openxr:stereo_quad_pair` is on by default.
+
+### When it engages
+
+Two conditions, both required:
+
+1. A window on the XR monitor resolves to a packed layout (`sbs`/`hsbs`/`tab`/`htab`) — the §8.6
+   rule fold, tag and fullscreen gate decide this, and `hyprctl clients` shows it as `stereo`.
+2. **That window covers the whole monitor.** Fullscreen, at the output's exact size and position.
+
+The second condition is the one that surprises people, and it is not the same as §8.6's fullscreen
+gate. The pair splits the monitor's **entire** image, not one window's texture — so a stereo window
+that is merely floating (or declared `always`) would send the left half of your *desktop*, bars and
+wallpaper included, to your left eye. So the XR tier asks for coverage again even when the window
+rule waived its own gate. Per-window stereo on an otherwise-mono XR monitor is a different
+mechanism (a real second composite) and is not in this tier.
+
+`hyprctl -j openxr` reports both halves of the answer per monitor:
+
+```json
+"stereo": "sbs",
+"quads": 2
+```
+
+`stereo` is the declaration that reached the monitor; `quads` is how many composition layers it
+actually submitted last frame — `1` mono, `2` paired, and **`0` for a monitor that submitted nothing
+at all**. They differ in exactly one case, and it is the one failure with no visual tell: if the
+runtime's layer budget could not fit the pair, the monitor is dropped from the frame rather than
+submitted left-eye-only, and reads `"stereo": "sbs", "quads": 0`. (The budget is at least 16 and a
+session uses a handful, so this takes a lot of monitors.) The text form says `stereo: sbs (2 quads)`
+and says nothing at all on a mono monitor.
+
+### `sbs` vs `hsbs` decides the panel's shape, and this is the one thing to get right
+
+On the flat presenter the two layouts are the same geometric operation. **Here they are not**, and
+this is the entire reason the distinction has to be declared rather than measured.
+
+The quad's height is derived from the pixels one eye sees:
+
+| Declared | One eye gets | The panel |
+|---|---|---|
+| `hsbs` / `htab` | half the samples, stretched back to the mode's shape | **unchanged** |
+| `sbs` / `tab` | a genuinely half-width (or half-height) picture | **changes shape** to match |
+
+A half-packed 3D film on a 16:9 XR monitor — which is what almost all SBS video is — leaves your
+panel exactly where and how it was. A `sbs` declaration on that same monitor tells Hyprland each
+eye's picture is only half as wide as the mode, so the quad becomes twice as tall to keep the pixels
+square. That is correct, and it is also a strong hint you wanted `hsbs`.
+
+Note this is a property of what the **client** put in its buffer, not of the file: a player that
+respects display aspect will letterbox a 3840×1080 SBS video into a 1920×1080 window, and the
+result is still `sbs` — the packed frame kept its own proportions on the way in. Declare `hsbs` when
+something squeezes both eyes into the native width instead (many game mods do).
+
+### What it does not do yet
+
+- **The chrome is hidden while a monitor is paired.** The move-bar and corner resize handles live in
+  the transparent margins around the content, and the eye quads cover the content only — so they
+  would be drawn where no eye can look. A monitor showing a fullscreen 3D film is not one you
+  reposition mid-scene; move it before you go fullscreen, or drop out of fullscreen to grab it.
+- **The XR ray cursor is hidden too**, for the same reason plus a worse one: drawn once, it would
+  land in one eye at the wrong place. **Pointing still works** — ray clicks land exactly where you
+  aim, because the pane coordinate is mapped back through the pack before it reaches the pointer.
+- **The desktop cursor is in one eye.** On an XR monitor the pointer is composited into the frame,
+  so it ends up in whichever half it happens to sit in. Fullscreen video and games generally hide
+  it; there is no fix in this tier.
+- **Only whole-monitor content.** See "when it engages" above.
+- **Depth (§8.7) does nothing on an XR monitor yet.** Depth and this feature are the same primitive
+  with different producers, but the depth producer needs a genuinely two-paned swapchain.
+
+### If a runtime gets it wrong
+
+`eyeVisibility` and `imageRect` on quad layers are honored by both runtimes this was built against —
+Monado (including the XREAL path) and WiVRn. If some other runtime mishandles either, one keyword
+takes the whole thing back without touching your windows:
+
+```ini
+hyprctl keyword openxr:stereo_quad_pair 0    # back to a single flattened quad, immediately
+```
+
+It applies on the next frame rather than the next repaint, because the situation you reach for it in
+is "the headset is showing me something wrong right now".
 
 ---
 

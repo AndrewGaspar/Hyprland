@@ -233,6 +233,20 @@ namespace Render::Stereo {
         return bufferSize;
     }
 
+    // ONE eye's pixels AFTER the squeeze is undone — the pane size scaled by `k` on the packed axis,
+    // which is the shape the eye is supposed to perceive. This is the size a presenter that DERIVES
+    // its destination from content pixels must feed its aspect math (WP X1's quad: the anchor solves
+    // heightMeters from a pixel aspect, so handing it the pane's RAW pixels would leave a half pack
+    // squeezed and a full pack correct, which is exactly backwards for `hsbs`).
+    //
+    // Worth reading next to contentPaneSize(): that one answers "which pixels are this eye's", this
+    // one answers "what shape do they mean". They differ only on the half layouts.
+    inline Vector2D presentedPaneSize(const Vector2D& bufferSize, eContentLayout layout) {
+        const auto PANE = contentPaneSize(bufferSize, layout);
+        const auto K    = static_cast<double>(aspectFactor(layout));
+        return splitsVertically(layout) ? Vector2D{PANE.x, PANE.y * K} : Vector2D{PANE.x * K, PANE.y};
+    }
+
     // §5.2's rule applied end to end: the presented HEIGHT/WIDTH of one eye, given the packed buffer
     // it came out of. The squeezed axis is un-squeezed by `k` — for a side-by-side pack that is the
     // pane's width, for an over-under pack its height ("axes swapped for TAB").
@@ -246,11 +260,8 @@ namespace Render::Stereo {
     // Consumer: the XR quad pair (WP X1), whose height is derived from content pixels. The flat
     // presenter never calls it, for the reason aspectFactor above spells out.
     inline float presentedAspect(const Vector2D& bufferSize, eContentLayout layout) {
-        const auto PANE = contentPaneSize(bufferSize, layout);
-        const auto K    = static_cast<double>(aspectFactor(layout));
-        const auto W    = splitsVertically(layout) ? PANE.x : PANE.x * K;
-        const auto H    = splitsVertically(layout) ? PANE.y * K : PANE.y;
-        return static_cast<float>(H / std::max(1.0, W));
+        const auto PRESENTED = presentedPaneSize(bufferSize, layout);
+        return static_cast<float>(PRESENTED.y / std::max(1.0, PRESENTED.x));
     }
 
     struct SUVRange {

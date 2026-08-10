@@ -1206,6 +1206,14 @@ std::string CConfigManager::parseKeyword(const std::string& COMMAND, const std::
     // live from inside the headset (`bind = …, hyprctl keyword openxr:cursor_crossing layout`).
     if (COMMAND == "openxr:cursor_crossing" && g_pOpenXRManager)
         g_pOpenXRManager->onConfigReload();
+
+    // openxr:stereo_quad_pair (research/24 WP X1) is the stereo kill switch, folded into each XR
+    // monitor's published declaration on the main thread by onConfigReload()->publishStereoPairTuning(),
+    // which also damages the monitors so the flatten happens on the next frame rather than the next
+    // repaint. Same legacy-keyword gap as the vars above, and it matters more here: the whole reason
+    // to reach for this keyword is that a runtime is showing something wrong right now.
+    if (COMMAND == "openxr:stereo_quad_pair" && g_pOpenXRManager)
+        g_pOpenXRManager->onConfigReload();
 #endif
 
     // Update window border colors
