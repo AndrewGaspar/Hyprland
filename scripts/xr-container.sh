@@ -904,7 +904,8 @@ cmd_session() {
     podman exec -it "$ctr" machinectl shell dev@.host /usr/bin/bash -lc \
         "env $envstr bash /src/containers/session/session-launch.sh" || true
 
-    cleanup_session; trap - EXIT INT TERM
+    podman rm -f "$ctr" >/dev/null 2>&1 || true
+    trap - EXIT INT TERM
     log "Session exited; container '$ctr' removed (whole session tree reaped)."
 }
 
