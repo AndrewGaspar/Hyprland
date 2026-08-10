@@ -1,0 +1,284 @@
+=== 1. physical devices (2) ===
+  NVIDIA GeForce RTX 5070 Laptop GPU             vendor=0x10de driver=NVIDIA                  
+      deviceUUID=0fec34e97f02f760a848bc113180d8ec driverUUID=08d21a137e9852738a860d4c7ef8f6ea
+      renderD128 card1  tsPeriod=1.0ns  modifier=1 dmabuf=1 foreign=1 semfd=1 fencefd=1
+      memory heaps:
+        heap[0]   8151 MiB flags=0x1 (VRAM)
+        heap[1]  23523 MiB flags=0x0 (sysmem)
+      memory types:
+        type0 heap1  (sysmem heap)
+        type1 heap0 DEVICE_LOCAL (VRAM heap)
+        type2 heap1 HOST_VISIBLE|HOST_COHERENT (sysmem heap)
+        type3 heap1 HOST_VISIBLE|HOST_COHERENT|HOST_CACHED (sysmem heap)
+        type4 heap0 DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT (VRAM heap)
+  AMD Radeon 890M Graphics (RADV STRIX1)         vendor=0x1002 driver=radv                    
+      deviceUUID=00000000c20000000000000000000000 driverUUID=414d442d4d4553412d44525600000000
+      renderD129 card2  tsPeriod=10.0ns  modifier=1 dmabuf=1 foreign=1 semfd=1 fencefd=1
+      memory heaps:
+        heap[0]   5398 MiB flags=0x0 (sysmem)
+        heap[1]  10796 MiB flags=0x1 (VRAM)
+      memory types:
+        type0 heap1 DEVICE_LOCAL (VRAM heap)
+        type1 heap1 DEVICE_LOCAL (VRAM heap)
+        type2 heap0 HOST_VISIBLE|HOST_COHERENT (sysmem heap)
+        type3 heap1 DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT (VRAM heap)
+        type4 heap1 DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT (VRAM heap)
+        type5 heap0 HOST_VISIBLE|HOST_COHERENT|HOST_CACHED (sysmem heap)
+        type6 heap0 HOST_VISIBLE|HOST_COHERENT|HOST_CACHED (sysmem heap)
+        type7 heap1 DEVICE_LOCAL (VRAM heap)
+        type8 heap0 HOST_VISIBLE|HOST_COHERENT (sysmem heap)
+        type9 heap1 DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT (VRAM heap)
+        type10 heap0 HOST_VISIBLE|HOST_COHERENT|HOST_CACHED (sysmem heap)
+
+  NVIDIA index=0  AMD index=1
+
+=== 1b. per-device VRAM availability (distorts every later timing if it fails) ===
+  NVIDIA GeForce RTX 5070 Laptop GPU:
+    type1 heap0 DEVICE_LOCAL (VRAM heap)                       64MiB bare alloc -> VK_SUCCESS
+                                                               16MiB IMAGE (allowed=1) -> VK_SUCCESS
+    type4 heap0 DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT (VRAM heap) 64MiB bare alloc -> VK_SUCCESS
+                                                               16MiB IMAGE (allowed=0) -> VK_SUCCESS
+  AMD Radeon 890M Graphics (RADV STRIX1):
+    type0 heap1 DEVICE_LOCAL (VRAM heap)                       64MiB bare alloc -> VK_SUCCESS
+                                                               16MiB IMAGE (allowed=1) -> VK_SUCCESS
+    type1 heap1 DEVICE_LOCAL (VRAM heap)                       64MiB bare alloc -> VK_SUCCESS
+                                                               16MiB IMAGE (allowed=0) -> VK_SUCCESS
+    type3 heap1 DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT (VRAM heap) 64MiB bare alloc -> VK_SUCCESS
+                                                               16MiB IMAGE (allowed=1) -> VK_SUCCESS
+    type4 heap1 DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT (VRAM heap) 64MiB bare alloc -> VK_SUCCESS
+                                                               16MiB IMAGE (allowed=0) -> VK_SUCCESS
+    type7 heap1 DEVICE_LOCAL (VRAM heap)                       64MiB bare alloc -> VK_SUCCESS
+                                                               16MiB IMAGE (allowed=1) -> VK_SUCCESS
+    type9 heap1 DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT (VRAM heap) 64MiB bare alloc -> VK_SUCCESS
+                                                               16MiB IMAGE (allowed=1) -> VK_SUCCESS
+
+=== 2. external sync capabilities ===
+  NVIDIA GeForce RTX 5070 Laptop GPU:
+      SEMAPHORE OPAQUE_FD  binary   exportable=1 importable=1 (export=0x1 compat=0x1)
+      SEMAPHORE OPAQUE_FD  timeline exportable=1 importable=1 (export=0x1 compat=0x1)
+      SEMAPHORE SYNC_FD    binary   exportable=1 importable=1 (export=0x10 compat=0x10)
+      FENCE OPAQUE_FD               exportable=1 importable=1 (export=0x1 compat=0x1)
+      FENCE SYNC_FD                 exportable=1 importable=1 (export=0x8 compat=0x8)
+  AMD Radeon 890M Graphics (RADV STRIX1):
+      SEMAPHORE OPAQUE_FD  binary   exportable=1 importable=1 (export=0x11 compat=0x11)
+      SEMAPHORE OPAQUE_FD  timeline exportable=1 importable=1 (export=0x1 compat=0x1)
+      SEMAPHORE SYNC_FD    binary   exportable=1 importable=1 (export=0x11 compat=0x11)
+      FENCE OPAQUE_FD               exportable=1 importable=1 (export=0x9 compat=0x9)
+      FENCE SYNC_FD                 exportable=1 importable=1 (export=0x9 compat=0x9)
+
+=== 3. DRM format modifier lists (usage = TRANSFER_SRC|DST|SAMPLED|COLOR_ATT) ===
+  NVIDIA GeForce RTX 5070 Laptop GPU             R8G8B8A8_UNORM : 7 modifiers
+      DRM_FORMAT_MOD_LINEAR                                      planes=1 exp=1 imp=1 ded=0 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=0 gob) [0x0300000000606010]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=1 gob) [0x0300000000606011]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=2 gob) [0x0300000000606012]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=3 gob) [0x0300000000606013]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=4 gob) [0x0300000000606014]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=5 gob) [0x0300000000606015]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+  AMD Radeon 890M Graphics (RADV STRIX1)         R8G8B8A8_UNORM : 8 modifiers
+      DRM_FORMAT_MOD_LINEAR                                      planes=1 exp=1 imp=1 ded=0 max=16384x16384
+      AMD(ver=? tile=4) [0x0200000000000a04]                     planes=1 exp=1 imp=1 ded=0 max=16384x16384
+      AMD(ver=? tile=4) [0x0200000010401604]                     planes=1 exp=1 imp=1 ded=0 max=16384x16384
+      AMD(ver=? tile=4) [0x0200000010401b04]                     planes=1 exp=1 imp=1 ded=0 max=16384x16384
+      AMD(ver=? tile=4) [0x0200000010437b04]                     planes=3 exp=1 imp=1 ded=0 max=16384x16384
+      AMD(ver=? tile=4) [0x0200000010467b04]                     planes=3 exp=1 imp=1 ded=0 max=2560x2560
+      AMD(ver=? tile=4) [0x020000001046bb04]                     planes=2 exp=1 imp=1 ded=0 max=2560x2560
+      AMD(ver=? tile=4) [0x02000000104abb04]                     planes=2 exp=1 imp=1 ded=0 max=2560x2560
+
+  NVIDIA GeForce RTX 5070 Laptop GPU             R8G8B8A8_SRGB : 7 modifiers
+      DRM_FORMAT_MOD_LINEAR                                      planes=1 exp=1 imp=1 ded=0 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=0 gob) [0x0300000000606010]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=1 gob) [0x0300000000606011]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=2 gob) [0x0300000000606012]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=3 gob) [0x0300000000606013]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=4 gob) [0x0300000000606014]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=5 gob) [0x0300000000606015]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+  AMD Radeon 890M Graphics (RADV STRIX1)         R8G8B8A8_SRGB : 8 modifiers
+      DRM_FORMAT_MOD_LINEAR                                      planes=1 exp=1 imp=1 ded=0 max=16384x16384
+      AMD(ver=? tile=4) [0x0200000000000a04]                     planes=1 exp=1 imp=1 ded=0 max=16384x16384
+      AMD(ver=? tile=4) [0x0200000010401604]                     planes=1 exp=1 imp=1 ded=0 max=16384x16384
+      AMD(ver=? tile=4) [0x0200000010401b04]                     planes=1 exp=1 imp=1 ded=0 max=16384x16384
+      AMD(ver=? tile=4) [0x0200000010437b04]                     planes=3 exp=1 imp=1 ded=0 max=16384x16384
+      AMD(ver=? tile=4) [0x0200000010467b04]                     planes=3 exp=1 imp=1 ded=0 max=2560x2560
+      AMD(ver=? tile=4) [0x020000001046bb04]                     planes=2 exp=1 imp=1 ded=0 max=2560x2560
+      AMD(ver=? tile=4) [0x02000000104abb04]                     planes=2 exp=1 imp=1 ded=0 max=2560x2560
+
+  NVIDIA GeForce RTX 5070 Laptop GPU             B8G8R8A8_UNORM : 7 modifiers
+      DRM_FORMAT_MOD_LINEAR                                      planes=1 exp=1 imp=1 ded=0 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=0 gob) [0x0300000000606010]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=1 gob) [0x0300000000606011]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=2 gob) [0x0300000000606012]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=3 gob) [0x0300000000606013]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=4 gob) [0x0300000000606014]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=5 gob) [0x0300000000606015]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+  AMD Radeon 890M Graphics (RADV STRIX1)         B8G8R8A8_UNORM : 8 modifiers
+      DRM_FORMAT_MOD_LINEAR                                      planes=1 exp=1 imp=1 ded=0 max=16384x16384
+      AMD(ver=? tile=4) [0x0200000000000a04]                     planes=1 exp=1 imp=1 ded=0 max=16384x16384
+      AMD(ver=? tile=4) [0x0200000010401604]                     planes=1 exp=1 imp=1 ded=0 max=16384x16384
+      AMD(ver=? tile=4) [0x0200000010401b04]                     planes=1 exp=1 imp=1 ded=0 max=16384x16384
+      AMD(ver=? tile=4) [0x0200000010437b04]                     planes=3 exp=1 imp=1 ded=0 max=16384x16384
+      AMD(ver=? tile=4) [0x0200000010467b04]                     planes=3 exp=1 imp=1 ded=0 max=2560x2560
+      AMD(ver=? tile=4) [0x020000001046bb04]                     planes=2 exp=1 imp=1 ded=0 max=2560x2560
+      AMD(ver=? tile=4) [0x02000000104abb04]                     planes=2 exp=1 imp=1 ded=0 max=2560x2560
+
+  NVIDIA GeForce RTX 5070 Laptop GPU             A2B10G10R10_UNORM_PACK32 : 7 modifiers
+      DRM_FORMAT_MOD_LINEAR                                      planes=1 exp=1 imp=1 ded=0 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=0 gob) [0x0300000000606010]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=1 gob) [0x0300000000606011]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=2 gob) [0x0300000000606012]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=3 gob) [0x0300000000606013]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=4 gob) [0x0300000000606014]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+      NVIDIA_BLOCK_LINEAR_2D(h=5 gob) [0x0300000000606015]       planes=1 exp=1 imp=1 ded=1 max=32768x32768
+  AMD Radeon 890M Graphics (RADV STRIX1)         A2B10G10R10_UNORM_PACK32 : 8 modifiers
+      DRM_FORMAT_MOD_LINEAR                                      planes=1 exp=1 imp=1 ded=0 max=16384x16384
+      AMD(ver=? tile=4) [0x0200000000000a04]                     planes=1 exp=1 imp=1 ded=0 max=16384x16384
+      AMD(ver=? tile=4) [0x0200000010401604]                     planes=1 exp=1 imp=1 ded=0 max=16384x16384
+      AMD(ver=? tile=4) [0x0200000010401b04]                     planes=1 exp=1 imp=1 ded=0 max=16384x16384
+      AMD(ver=? tile=4) [0x0200000010437b04]                     planes=3 exp=1 imp=1 ded=0 max=16384x16384
+      AMD(ver=? tile=4) [0x0200000010467b04]                     planes=3 exp=1 imp=1 ded=0 max=2560x2560
+      AMD(ver=? tile=4) [0x020000001046bb04]                     planes=2 exp=1 imp=1 ded=0 max=2560x2560
+      AMD(ver=? tile=4) [0x02000000104abb04]                     planes=2 exp=1 imp=1 ded=0 max=2560x2560
+
+
+=== 5. dma-buf image share (2064x2208) ===
+
+  --- R8G8B8A8_UNORM: NVIDIA GeForce RTX 5070 Laptop GPU --> AMD Radeon 890M Graphics (RADV STRIX1) ---
+      modifier intersection (src-exportable AND dst-importable): 1
+        DRM_FORMAT_MOD_LINEAR
+      TRY modifier DRM_FORMAT_MOD_LINEAR ... 
+        export ok: mod=DRM_FORMAT_MOD_LINEAR size=17.38 MiB src-mem=type1 heap0 DEVICE_LOCAL (VRAM heap) fd=32
+        plane[0] offset=0 rowPitch=8256 size=18229248
+  [soft-fail] vkCreateImage(g.dev, &ici, nullptr, &out.img) -> VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT
+FAIL (import into dst failed)
+
+  --- R8G8B8A8_UNORM: AMD Radeon 890M Graphics (RADV STRIX1) --> NVIDIA GeForce RTX 5070 Laptop GPU ---
+      modifier intersection (src-exportable AND dst-importable): 1
+        DRM_FORMAT_MOD_LINEAR
+      TRY modifier DRM_FORMAT_MOD_LINEAR ... 
+        export ok: mod=DRM_FORMAT_MOD_LINEAR size=17.79 MiB src-mem=type0 heap1 DEVICE_LOCAL (VRAM heap) fd=32
+        plane[0] offset=0 rowPitch=8448 size=18653184
+        import ok: dst-mem=type0 heap1  (sysmem heap)
+        result: OK  (all 4557312 px match)
+
+  --- R8G8B8A8_SRGB: NVIDIA GeForce RTX 5070 Laptop GPU --> AMD Radeon 890M Graphics (RADV STRIX1) ---
+      modifier intersection (src-exportable AND dst-importable): 1
+        DRM_FORMAT_MOD_LINEAR
+      TRY modifier DRM_FORMAT_MOD_LINEAR ... 
+        export ok: mod=DRM_FORMAT_MOD_LINEAR size=17.38 MiB src-mem=type1 heap0 DEVICE_LOCAL (VRAM heap) fd=32
+        plane[0] offset=0 rowPitch=8256 size=18229248
+  [soft-fail] vkCreateImage(g.dev, &ici, nullptr, &out.img) -> VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT
+FAIL (import into dst failed)
+
+  --- R8G8B8A8_SRGB: AMD Radeon 890M Graphics (RADV STRIX1) --> NVIDIA GeForce RTX 5070 Laptop GPU ---
+      modifier intersection (src-exportable AND dst-importable): 1
+        DRM_FORMAT_MOD_LINEAR
+      TRY modifier DRM_FORMAT_MOD_LINEAR ... 
+        export ok: mod=DRM_FORMAT_MOD_LINEAR size=17.79 MiB src-mem=type0 heap1 DEVICE_LOCAL (VRAM heap) fd=32
+        plane[0] offset=0 rowPitch=8448 size=18653184
+        import ok: dst-mem=type0 heap1  (sysmem heap)
+        result: OK  (all 4557312 px match)
+
+  --- B8G8R8A8_UNORM: NVIDIA GeForce RTX 5070 Laptop GPU --> AMD Radeon 890M Graphics (RADV STRIX1) ---
+      modifier intersection (src-exportable AND dst-importable): 1
+        DRM_FORMAT_MOD_LINEAR
+      TRY modifier DRM_FORMAT_MOD_LINEAR ... 
+        export ok: mod=DRM_FORMAT_MOD_LINEAR size=17.38 MiB src-mem=type1 heap0 DEVICE_LOCAL (VRAM heap) fd=32
+        plane[0] offset=0 rowPitch=8256 size=18229248
+  [soft-fail] vkCreateImage(g.dev, &ici, nullptr, &out.img) -> VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT
+FAIL (import into dst failed)
+
+  --- B8G8R8A8_UNORM: AMD Radeon 890M Graphics (RADV STRIX1) --> NVIDIA GeForce RTX 5070 Laptop GPU ---
+      modifier intersection (src-exportable AND dst-importable): 1
+        DRM_FORMAT_MOD_LINEAR
+      TRY modifier DRM_FORMAT_MOD_LINEAR ... 
+        export ok: mod=DRM_FORMAT_MOD_LINEAR size=17.79 MiB src-mem=type0 heap1 DEVICE_LOCAL (VRAM heap) fd=32
+        plane[0] offset=0 rowPitch=8448 size=18653184
+        import ok: dst-mem=type0 heap1  (sysmem heap)
+        result: OK  (all 4557312 px match)
+
+  --- A2B10G10R10_UNORM_PACK32: NVIDIA GeForce RTX 5070 Laptop GPU --> AMD Radeon 890M Graphics (RADV STRIX1) ---
+      modifier intersection (src-exportable AND dst-importable): 1
+        DRM_FORMAT_MOD_LINEAR
+      TRY modifier DRM_FORMAT_MOD_LINEAR ... 
+        export ok: mod=DRM_FORMAT_MOD_LINEAR size=17.38 MiB src-mem=type1 heap0 DEVICE_LOCAL (VRAM heap) fd=32
+        plane[0] offset=0 rowPitch=8256 size=18229248
+  [soft-fail] vkCreateImage(g.dev, &ici, nullptr, &out.img) -> VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT
+FAIL (import into dst failed)
+
+  --- A2B10G10R10_UNORM_PACK32: AMD Radeon 890M Graphics (RADV STRIX1) --> NVIDIA GeForce RTX 5070 Laptop GPU ---
+      modifier intersection (src-exportable AND dst-importable): 1
+        DRM_FORMAT_MOD_LINEAR
+      TRY modifier DRM_FORMAT_MOD_LINEAR ... 
+        export ok: mod=DRM_FORMAT_MOD_LINEAR size=17.79 MiB src-mem=type0 heap1 DEVICE_LOCAL (VRAM heap) fd=32
+        plane[0] offset=0 rowPitch=8448 size=18653184
+        import ok: dst-mem=type0 heap1  (sysmem heap)
+        result: OK  (all 4557312 px match)
+
+=== 5b. LINEAR row-pitch alignment probe (why NVIDIA->AMD fails) ===
+  width  NV pitch  AMD pitch  NV->AMD import
+  [soft-fail] vkCreateImage(g.dev, &ici, nullptr, &out.img) -> VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT
+  1832   7328      7424       REJECTED
+  1920   7680      7680       OK   (pitches match)
+  [soft-fail] vkCreateImage(g.dev, &ici, nullptr, &out.img) -> VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT
+  2016   8064      8192       REJECTED
+  2048   8192      8192       OK   (pitches match)
+  [soft-fail] vkCreateImage(g.dev, &ici, nullptr, &out.img) -> VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT
+  2064   8256      8448       REJECTED
+  [soft-fail] vkCreateImage(g.dev, &ici, nullptr, &out.img) -> VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT
+  2080   8320      8448       REJECTED
+  2112   8448      8448       OK   (pitches match)
+  [soft-fail] vkCreateImage(g.dev, &ici, nullptr, &out.img) -> VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT
+  2144   8576      8704       REJECTED
+  [soft-fail] vkCreateImage(g.dev, &ici, nullptr, &out.img) -> VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT
+  2160   8640      8704       REJECTED
+  2560   10240     10240      OK   (pitches match)
+
+  padded-width workaround for 2064x2208:
+    AMD wants rowPitch=8448 for width 2064  ->  padded width = 2112 (+48 px, +2.3% memory)
+
+=== 6. cost of the shapes at 2064x2208 (per-eye; VR needs 2 of these @90Hz) ===
+  local OPTIMAL->OPTIMAL copy on NVIDIA GeForce RTX 5070 Laptop GPU         0.076 ms (478.6 GB/s eff)
+  local OPTIMAL->OPTIMAL copy on AMD Radeon 890M Graphics (RADV STRIX1)     0.475 ms (76.8 GB/s eff)
+  compositor reads own OPTIMAL swapchain image on AMD Radeon 890M Graphics (RADV STRIX1)     0.438 ms
+  compositor reads own LINEAR  swapchain image on AMD Radeon 890M Graphics (RADV STRIX1)     0.477 ms
+  compositor reads own OPTIMAL swapchain image on NVIDIA GeForce RTX 5070 Laptop GPU         0.071 ms
+  compositor reads own LINEAR  swapchain image on NVIDIA GeForce RTX 5070 Laptop GPU         0.110 ms
+
+  --- decomposition: what does the client's write actually pay for? ---
+  NVIDIA GeForce RTX 5070 Laptop GPU:  [memTypeOrder(0x03) = 1 0 ]
+    (a) -> local OPTIMAL                 0.071 ms   bits=0x03 [type1 heap0 DEVICE_LOCAL (VRAM heap)]
+    (b) -> local LINEAR                  0.091 ms   bits=0x1f [type1 heap0 DEVICE_LOCAL (VRAM heap)]
+    (c) -> EXPORTABLE LINEAR             0.078 ms   bits=0x0f [type1 heap0 DEVICE_LOCAL (VRAM heap)]
+    residency premium (c)-(b) = -0.014 ms/eye  (-0.0 ms both eyes)
+  AMD Radeon 890M Graphics (RADV STRIX1):  [memTypeOrder(0x7ad) = 0 3 7 9 2 5 8 10 ]
+    (a) -> local OPTIMAL                 0.472 ms   bits=0x7ad [type0 heap1 DEVICE_LOCAL (VRAM heap)]
+    (b) -> local LINEAR                  0.493 ms   bits=0x7ad [type0 heap1 DEVICE_LOCAL (VRAM heap)]
+    (c) -> EXPORTABLE LINEAR             0.493 ms   bits=0x7ad [type0 heap1 DEVICE_LOCAL (VRAM heap)]
+    residency premium (c)-(b) = -0.001 ms/eye  (-0.0 ms both eyes)
+
+  --- the real shape: server(exporter) allocates, client(importer) renders into it ---
+  server=AMD Radeon 890M Graphics (RADV STRIX1) client=NVIDIA GeForce RTX 5070 Laptop GPU (w=2112, buffer in type0 heap1 DEVICE_LOCAL (VRAM heap))
+    CLIENT writes into shared image     1.313 ms/eye  (2.6 ms both eyes = 24% of an 11.1 ms frame)
+    SERVER reads shared image           0.498 ms/eye  (1.0 ms both eyes = 9% of an 11.1 ms frame)
+
+=== 7. cross-vendor semaphore handoff (LAST: poisons NVIDIA allocs) ===
+  cross-vendor semaphore handoff NVIDIA GeForce RTX 5070 Laptop GPU -> AMD Radeon 890M Graphics (RADV STRIX1):
+      SYNC_FD    IMPORT OK, cross-device wait -> VK_SUCCESS
+  [soft-fail] dst.ImportSemaphoreFdKHR(dst.dev, &ii) -> VK_ERROR_UNKNOWN
+      OPAQUE_FD  IMPORT INTO DST FAILED (VK_ERROR_UNKNOWN)  <-- cross-vendor sync blocked
+  cross-vendor semaphore handoff AMD Radeon 890M Graphics (RADV STRIX1) -> NVIDIA GeForce RTX 5070 Laptop GPU:
+      SYNC_FD    IMPORT OK, cross-device wait -> VK_SUCCESS
+  [soft-fail] dst.ImportSemaphoreFdKHR(dst.dev, &ii) -> VK_ERROR_INITIALIZATION_FAILED
+      OPAQUE_FD  IMPORT INTO DST FAILED (VK_ERROR_INITIALIZATION_FAILED)  <-- cross-vendor sync blocked
+
+  --- does the cross-vendor wait actually ORDER anything? ---
+  ordering test NVIDIA GeForce RTX 5070 Laptop GPU -> AMD Radeon 890M Graphics (RADV STRIX1) (sync_fd):
+  [memtype] NVIDIA GeForce RTX 5070 Laptop GPU: type1 (type1 heap0 DEVICE_LOCAL (VRAM heap)) rejected for 16.0 MiB image: VK_ERROR_OUT_OF_DEVICE_MEMORY
+  [memtype] NVIDIA GeForce RTX 5070 Laptop GPU: type1 (type1 heap0 DEVICE_LOCAL (VRAM heap)) rejected for 16.0 MiB image: VK_ERROR_OUT_OF_DEVICE_MEMORY
+      src job (400 full-frame copies) took 590.5 ms; dst wait returned at 590.5 ms (VK_SUCCESS)
+      import cost 0.03 ms; ORDERING HONOURED (waiter held for the signaller's work)
+  ordering test AMD Radeon 890M Graphics (RADV STRIX1) -> NVIDIA GeForce RTX 5070 Laptop GPU (sync_fd):
+      src job (400 full-frame copies) took 175.1 ms; dst wait returned at 175.0 ms (VK_SUCCESS)
+      import cost 0.03 ms; ORDERING HONOURED (waiter held for the signaller's work)
+
+done.
