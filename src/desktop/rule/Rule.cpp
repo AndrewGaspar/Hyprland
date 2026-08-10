@@ -42,6 +42,8 @@ constexpr auto MATCH_PROP_STRINGS =
         {RULE_PROP_CONTENT, "content"},                                    //
         {RULE_PROP_XDG_TAG, "xdg_tag"},                                    //
         {RULE_PROP_NAMESPACE, "namespace"},                                //
+        {RULE_PROP_EXE, "exe"},                                            //
+        {RULE_PROP_CMDLINE, "cmdline"},                                    //
     }));
 
 constexpr auto RULE_ENGINES =
@@ -69,6 +71,8 @@ constexpr auto RULE_ENGINES =
         {RULE_PROP_NAMESPACE, RULE_MATCH_ENGINE_REGEX},              //
         {RULE_PROP_EXEC_TOKEN, RULE_MATCH_ENGINE_REGEX},             //
         {RULE_PROP_EXEC_PID, RULE_MATCH_ENGINE_INT},                 //
+        {RULE_PROP_EXE, RULE_MATCH_ENGINE_REGEX},                    //
+        {RULE_PROP_CMDLINE, RULE_MATCH_ENGINE_REGEX},                //
     }));
 
 std::span<const std::string_view> Rule::allMatchPropStrings() {

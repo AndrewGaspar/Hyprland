@@ -478,6 +478,17 @@ bool CWindowRule::matches(PHLWINDOW w, bool allowEnvLookup) {
                     return false;
                 break;
 
+            // task #143. procIdentity() reads /proc once and caches; both strings are
+            // client-controlled, so these carry the same trust level as class and title.
+            case RULE_PROP_EXE:
+                if (!engine->match(w->procIdentity().exe))
+                    return false;
+                break;
+            case RULE_PROP_CMDLINE:
+                if (!engine->match(w->procIdentity().cmdline))
+                    return false;
+                break;
+
             case RULE_PROP_EXEC_TOKEN:
                 if (!allowEnvLookup)
                     break;
