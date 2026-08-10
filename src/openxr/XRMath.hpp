@@ -612,6 +612,16 @@ namespace OpenXR {
         return out;
     }
 
+    // The exact inverse of rayQuadIntersect's UV map: the world point at (u,v) on a quad of pose
+    // `Q` and size w x h metres. Same convention — u = 0 left / 1 right, v = 0 top / 1 bottom — and
+    // deliberately NOT clamped, so a UV outside [0,1] gives the corresponding point on the quad's
+    // EXTENDED plane. Ray-cast cursor crossing (XRCursorCross.hpp) depends on that: the cursor's
+    // overshoot past a monitor edge is exactly a UV past [0,1], and turning it back into a world
+    // point is what aims the ray. Round-trips with rayQuadIntersect for any in-bounds (u,v).
+    inline Vec3 quadPointFromUV(const SXRPose& Q, float w, float h, float u, float v) {
+        return Q.pos + qRotate(Q.rot, Vec3{(u - 0.5F) * w, (0.5F - v) * h, 0.F});
+    }
+
     // ---- chrome margin geometry + hit-region classification (docs/openxr/research/04-grabbable-borders.md §8, WP-G1) ----
     //
     // Per §8 the submitted XrCompositionLayerQuad is expanded with a TRANSPARENT alpha margin
