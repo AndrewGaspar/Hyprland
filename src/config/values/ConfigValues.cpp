@@ -862,6 +862,12 @@ std::vector<SP<IValue>> Values::getConfigValues() {
         MS<Color>("openxr:chrome_col_idle", "XR monitor chrome color at rest (visible while hovering the quad; premultiplied over passthrough)", 0x66aaaaaa),
         MS<Color>("openxr:chrome_col_hover", "XR monitor chrome color for the element (bar or corner) the ray is pointing at", 0xcc66aaff),
         MS<Color>("openxr:chrome_col_grab", "XR monitor chrome color while the quad is grabbed", 0xff66aaff),
+        // ---- stereo CONTENT on an XR monitor: the quad pair (research/24 §5.1, WP X1) ----
+        MS<Bool>("openxr:stereo_quad_pair",
+                 "present a stereo-declared window (windowrule = stereo <layout>) that is fullscreen on an XR monitor as a PAIR of quad layers — one per eye, each cropped to "
+                 "that eye's half of the packed frame — so the headset shows real stereo instead of a doubled image. Needs a runtime that honors eyeVisibility and "
+                 "subImage.imageRect (Monado and WiVRn do). Turn it off to fall back to the single flattened quad if a runtime mishandles either",
+                 true),
         // ---- luma-keyed transparency, "black-as-alpha" (docs/openxr/research/archive/09-monitor-transparency.md) ----
         MS<Float>("openxr:black_alpha",
                   "luma-keyed transparency: the alpha given to PURE BLACK content pixels, so a dark desktop turns into an AR-style overlay you can see the room through. 1.0 "
