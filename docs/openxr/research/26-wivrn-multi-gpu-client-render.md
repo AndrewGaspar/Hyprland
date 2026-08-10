@@ -1154,10 +1154,10 @@ Sized in agent-tasks. **A** = required for Shape A. **B** = the Shape B unblock.
 | **WP-XG1** | **Monado patch 0009 — dma-buf export with explicit modifiers.** `xrt_swapchain_create_info` gains a modifier/cross-GPU field (`xrt_compositor.h:894-912`). `vk_image_allocator.c` `:63`/`:256` become `DMA_BUF` + `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` with a LINEAR modifier list when the flag is set, keeping the existing `OPAQUE_FD`/`OPTIMAL` path byte-identical when it is not. Plumb `vkGetImageDrmFormatModifierPropertiesEXT` + per-plane `vkGetImageSubresourceLayout` so the layouts can travel. **STATUS: DONE 2026-08-10** — `patches/monado/0009-vk-allocate-swapchain-images-as-dma-bufs-with-an-exp.patch` in `wivrn-xg` (`cc91de4a`). Field is `xrt_swapchain_create_info::cross_device`; it reaches the server for free because the whole struct is already an `in` argument of the `swapchain_create` IPC call. The modifier list is exactly `{DRM_FORMAT_MOD_LINEAR}` (§4.2), and the queried modifier plus per-plane layout land on `struct vk_image` and are copied into `xrt_image_native` by `comp_swapchain_create_init`. **Two deviations, both forced:** (i) `vk_init_from_given` had to gain a `dma_buf_modifier_enabled` argument — a bundle built that way cannot read back which extensions were enabled, so `has_EXT_external_memory_dma_buf`/`has_EXT_image_drm_format_modifier` are false on **both** the client bundle and WiVRn's server bundle (`W/server/compositor/compositor.cpp:714-728`), and the feature could never have engaged; (ii) a mutable-format cross-device image is seeded with its own format so it satisfies `VUID-VkImageCreateInfo-tiling-02353`. | 2 | A |
 | **WP-XG2** | **Monado patch 0010 — client import via dma-buf.** `vk_create_image_from_native` (`vk_helpers.c:1115,1172,1189-1196`): `DMA_BUF` handle type, explicit-modifier image create, and **memory type from `vkGetMemoryFdPropertiesKHR`** — closing the tree's own TODO. Model it on the working import at `W/server/encoder/ffmpeg/video_encoder_va.cpp:363-467`. Carry the plane layouts over IPC (new fields in the swapchain-create reply). Also relax the `requirements.size` abort at `:1253-1259` for the cross-device case. **STATUS: DONE 2026-08-10** — `patches/monado/0010-vk-import-swapchain-images-as-dma-bufs-with-the-memo.patch` (`wivrn-xg` `cc91de4a`, amended in `fe4d4bc5`). The tree's own TODO at `vk_helpers.c:1196` is closed. Layouts travel in a new `struct ipc_arg_swapchain_layout` on the `swapchain_create` **reply** — one per swapchain, not per image, matching how the single `size` and `use_dedicated_allocation` in that same reply already collapse, with an added assert that the images agree; the IPC generator needed no change because a struct in `out` is an established shape. The size abort becomes a debug line for the cross-device case only. **Three additions the row did not anticipate:** (i) importability is checked against the modifier with `VkPhysicalDeviceImageDrmFormatModifierInfoEXT`, because the existing helper asks about `OPTIMAL` tiling — a layout the fd does not have; (ii) `vkGetMemoryFdPropertiesKHR` had to be added to `vk_generate_inc_files.py`, it was not loaded; (iii) `VK_EXT_external_memory_dma_buf` and `VK_EXT_image_drm_format_modifier` were added to the **optional** device extensions the runtime enables for `XR_KHR_vulkan_enable2` — deliberately *not* to the required `xrt_gfx_vk_device_extensions` string, which is handed to applications verbatim, where a name some driver lacks would fail `vkCreateDevice` for a client that never wanted cross-GPU swapchains (a review caught this; the first draft had it in both). | 2 | A |
 | **WP-XG3** | **Monado patch 0011 — force the `SYNC_FD` fence path when cross-GPU.** Suppress the `OPAQUE_FD` timeline-semaphore negotiation (`comp_vk_client.c:149-201`, gate at `:891-893`) so `submit_fence` (`:203-237`) is chosen, and make `setup_semaphore` failure **degrade** instead of `goto err_pool`. §4.5 says the fence path is correct cross-vendor; this WP is what makes it reachable. **STATUS: DONE 2026-08-10** — `patches/monado/0011-c-client-never-negotiate-an-OPAQUE_FD-timeline-semap.patch` (`wivrn-xg` `cc91de4a`). Per §4.8 the suppression is by **device identity established first**, not try-and-fall-back: `client_vk_compositor_create` compares its own `VkPhysicalDeviceIDProperties::deviceUUID` against the compositor's (now passed down from `xrt_system_compositor_info`) and skips `setup_semaphore` outright. A cross-device client that also cannot export `sync_fd` fences now gets a warning that sync will fall back to `vkQueueWaitIdle`. **One deliberate change that is not gated on cross-device:** `setup_semaphore` failure no longer does `goto err_pool`. Failing a whole session over the loss of one of four sync paths was wrong for a same-device client too, and the function leaves `c->sync.xcsem` NULL on failure so `submit_semaphore` declines and `submit_fence` takes over. | 1 | A |
-| **WP-XG4** | **Monado patch 0012 — let the client legally use a different device.** Relax the two identity checks (`oxr_session.c:1285-1292`, `oxr_api_system.c:448-452`) when cross-GPU mode is on, and make the silent `phys[0]` fallback at `oxr_vulkan.c:647-650` **loud** (it currently converts a config error into an inscrutable `vkAllocateMemory` failure). Precedent for this shape of change: existing patch `0007-don-t-verify-GL-stuff.patch`. | 1 | A |
-| **WP-XG5** | **WiVRn — split the two UUIDs.** `W/server/compositor/compositor.cpp:797-798` stops copying one UUID into both; add a config key (e.g. `"client-gpu"`) resolved to a `VkPhysicalDevice`/UUID, defaulting to the compositor's device so existing setups are bit-identical. Wire it to the WP-XG1 swapchain flag. | 1 | A |
-| **WP-XG6** | **Format-list intersection.** `W/server/compositor/compositor.cpp:739-744` / `M/.../comp_vulkan.c:382-428` / `vk_compositor_flags.c:344+` currently evaluate formats against the server GPU with `OPTIMAL` tiling and `OPAQUE_FD`. Advertise the intersection of both devices, evaluated for `DRM_FORMAT_MODIFIER` tiling + `DMA_BUF`. §4.2 says all four common formats survive, so this should narrow nothing today — it is correctness insurance. | 1 | A |
-| **WP-XG7** | **Queue-family ownership across the boundary.** Add the missing `VK_QUEUE_FAMILY_FOREIGN_EXT` acquire in `W/server/compositor/layer_squasher.cpp:443-445` and match the client's release (`comp_vk_client.c:748-757`, currently `VK_QUEUE_FAMILY_EXTERNAL` and unmatched). Neither tree uses `FOREIGN_EXT` today; the PoC does and it works on both drivers. | 1 | A |
+| **WP-XG4** | **Monado patch 0012 — let the client legally use a different device.** Relax the two identity checks (`oxr_session.c:1285-1292`, `oxr_api_system.c:448-452`) when cross-GPU mode is on, and make the silent `phys[0]` fallback at `oxr_vulkan.c:647-650` **loud** (it currently converts a config error into an inscrutable `vkAllocateMemory` failure). Precedent for this shape of change: existing patch `0007-don-t-verify-GL-stuff.patch`. **STATUS: DONE 2026-08-10** — `patches/monado/0012-st-oxr-let-a-client-legally-render-on-a-different-de.patch` (`wivrn-xg2` `e16cdf98`). Both checks now consult one predicate, `oxr_vk_suggests_cross_device_client(sys)`, which is true only when the compositor reports **both** UUIDs and they differ — the same "not reported means not cross-device" rule round 1 had to add to the client gate. The fallback is louder in both directions: it now names every device the client's `VkInstance` enumerated (name + UUID), and in cross-GPU mode it is an **`XR_ERROR_RUNTIME_FAILURE` rather than a fallback**, because silently rendering on the wrong GPU is the exact outcome the configuration exists to prevent — the message points at `VK_DRIVER_FILES`/`VK_ICD_FILENAMES`, the usual cause. **One deviation from the row:** relaxing turned out to be safe rather than merely permitted, and that is worth stating — nothing downstream needs the two devices to be equal, because `determine_cross_device` measures the device the application *actually* bound. An app that ignores the suggestion and picks the compositor's own device simply gets the same-device path. | 1 | A |
+| **WP-XG5** | **WiVRn — split the two UUIDs.** `W/server/compositor/compositor.cpp:797-798` stops copying one UUID into both; add a config key (e.g. `"client-gpu"`) resolved to a `VkPhysicalDevice`/UUID, defaulting to the compositor's device so existing setups are bit-identical. Wire it to the WP-XG1 swapchain flag. **STATUS: DONE 2026-08-10** (`wivrn-xg2` `a52ebc49`). The key is `"client-gpu"`, top-level, kebab-case like every other WiVRn key, `std::optional<std::string>`, `null` spelled out as "use the compositor's". Grammar and resolution live in the new `server/utils/cross_gpu.cpp`; the resolved `VkPhysicalDevice`, both UUIDs and the derived `cross_device` bool live on `wivrn::vk_bundle`, resolved once at bundle construction, so `sys_info()` publishes two independently-correct UUIDs on **every** path including the default one. **`XRT_COMPOSITOR_FORCE_CROSS_DEVICE` is deleted** — not in a new patch but by amending 0009, since it was always labelled "temporary, for XG5 to delete" and a series that adds then removes its own debug knob is noise to carry. An unresolvable `client-gpu` **throws at startup** with every candidate device listed (name, UUID, render node, primary node). | 1 | A |
+| **WP-XG6** | **Format-list intersection.** `W/server/compositor/compositor.cpp:739-744` / `M/.../comp_vulkan.c:382-428` / `vk_compositor_flags.c:344+` currently evaluate formats against the server GPU with `OPTIMAL` tiling and `OPAQUE_FD`. Advertise the intersection of both devices, evaluated for `DRM_FORMAT_MODIFIER` tiling + `DMA_BUF`. ~~§4.2 says all four common formats survive, so this should narrow nothing today — it is correctness insurance.~~ **That premise was wrong; see the STATUS.** **STATUS: DONE 2026-08-10**, in two halves. Server half (`wivrn-xg2` `a52ebc49`): `compositor::narrow_formats_to_cross_device` re-evaluates every format Monado advertised against **both** physical devices with `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT`, `DRM_FORMAT_MOD_LINEAR` and `DMA_BUF` export-on-server/import-on-client, and drops what does not survive; it runs only when the two devices differ, so the same-device list is untouched. Client half, the array-size term (`patches/monado/0013-...`): `client_vk_swapchain_create` runs the *existing* import check — patch 0010's `vk_check_dma_buf_import_support`, made public rather than duplicated — against its own device **before** the IPC round trip, and returns `XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED` → `XR_ERROR_FEATURE_UNSUPPORTED` from the `xrCreateSwapchain` the application called. **The design choice the hazard demanded: refuse loudly, never degrade.** Falling back single-device is not available — the allocation shape is chosen once for a whole swapchain by the device that does *not* have the limit, and an opaque same-device image is unimportable on the client for every layer count including one. **The row's "this should narrow nothing" did not survive measurement: it narrows 8 formats to 6** (§8.2). | 1 | A |
+| **WP-XG7** | **Queue-family ownership across the boundary.** Add the missing `VK_QUEUE_FAMILY_FOREIGN_EXT` acquire in `W/server/compositor/layer_squasher.cpp:443-445` and match the client's release (`comp_vk_client.c:748-757`, currently `VK_QUEUE_FAMILY_EXTERNAL` and unmatched). Neither tree uses `FOREIGN_EXT` today; the PoC does and it works on both drivers. **STATUS: DONE 2026-08-10** — client release in `patches/monado/0014-...`, server acquire in `wivrn-xg2` `b29e1eda`. The client's `dstQueueFamilyIndex` becomes `FOREIGN_EXT` when and only when `cross_device`; `layer_squasher::do_layers` gains a per-frame pre-pass that acquires, from `FOREIGN_EXT`, every image the frame's layers reference whose swapchain has `vkic.info.cross_device` set (deduplicated, since one image can back several layers). **The layout-matching problem and its answer:** a queue-family transfer that also changes layout requires both halves to name the same `oldLayout`/`newLayout`, and the server does not know the client's `barrier_optimal_layout` — except that it does, because that layout is a pure function of the swapchain format, so the server recomputes it with the same `vk_csci_get_barrier_optimal_layout` the client used. `VK_EXT_queue_family_foreign` is added to WiVRn's optional device extensions and to Monado's `enable2` optional list; **its absence on the compositor is logged as an error, not skipped quietly**, because the client releases to `FOREIGN` regardless and an unmatched release is corruption rather than a lost optimisation. | 1 | A |
 | **WP-XG8** | **Live bring-up.** xrizer + The Big Walk with the game on NVIDIA and the compositor on AMD; confirm no `assert_eq!(pd, info.physical_device)`, measure real frame times against a same-GPU baseline, and check the HypXRland desktop client still composites correctly in the same session (the §5.1 heterogeneous case). **Headset-in-the-loop; needs the user.** | 1 | A |
 | **WP-XG9** | **Exclusive-mode verification (§10).** Three cheap things, one task: (a) confirm WiVRn's shipped one-projection-layer fast path (`compositor.cpp:326-345`) actually engages for a real xrizer/DXVK title — it may submit a HUD quad and never hit `layer_count == 1`; (b) decide whether the four things that path silently drops (colour scale/bias, chroma key, FOV-union viewport shrink, source-smaller-than-stream edge smear — §10.2) matter in practice, and log a warning if a layer needing them takes the fast path; (c) close out the last WP-XG0 gap by benchmarking *rendering into* an imported LINEAR image (`COLOR_ATTACHMENT`), not just copying into it. **No new mechanism — this is verification of behaviour that already ships.** | 1 | A |
 
@@ -1237,7 +1237,8 @@ computed by comparing the client's `deviceUUID` against `xrt_system_compositor_i
 Once XG5 splits those two UUIDs the comparison starts answering true on its own and the env var
 should be removed.
 
-**What XG8 must still prove** (none of it was attempted, and none of it is inferable from the above):
+**What XG8 must still prove** (none of it was attempted, and none of it is inferable from the above).
+**Round 2 closed items 3, 4 and 5 of this list; §8.2 carries the current version of it:**
 
 1. **That a real client's `VkDevice` has the two extensions enabled.** The runtime enables
    `VK_EXT_external_memory_dma_buf` and `VK_EXT_image_drm_format_modifier` itself under `enable2`,
@@ -1296,6 +1297,131 @@ surfaced in front of the user.
 device supports them, and a `setup_semaphore` failure that is *not* an IPC failure no longer kills
 the session. Both are judged improvements; neither is "unchanged".
 
+### 8.2 Round 2 (XG4 + XG5 + XG6 + XG7) — the trigger is real, and the format list was not insurance
+
+Landed 2026-08-10 on branch `xg-round-2`, cut from `xg-round-1` at `a9fbbb2a`: `e16cdf98` (the three
+new Monado patches plus the deletion of the temporary lever), `a52ebc49` (client-GPU selection and
+the format intersection), `b29e1eda` (the queue-family acquire), `7cea6954` (the harness). Nothing
+pushed; `~/code/wivrn-xg` and `~/code/wivrn-26.6.2` were not touched.
+
+Patch series, now fourteen: `0012-st-oxr-let-a-client-legally-render-on-a-different-de.patch`
+(`27e5653b`), `0013-c-client-refuse-a-cross-device-swapchain-the-client-.patch` (`d46fd7b8`),
+`0014-c-client-release-a-cross-device-swapchain-image-to-V.patch` (`71c8736d`), and `0009` re-cut as
+`e3361712` with `XRT_COMPOSITOR_FORCE_CROSS_DEVICE` removed.
+
+**A from-scratch configure `git am`s all fourteen and builds.** `wivrn-server` links with
+`-DGIT_DESC=v26.6.2` (`--version` prints `WiVRn version 26.6.2`) and `WIVRN_WERROR=OFF`, the only
+warning being the pre-existing GCC 16 `-Wpedantic` complaint in `wrap_lambda.h`. **And the hazard-2
+lesson was applied:** a standalone Monado configured `-DBUILD_TESTING=ON` builds and passes
+**23/23** `ctest`, including `tests_comp_client_vulkan` — which is excluded from the `all` target, so
+it has to be named explicitly or ctest reports it "Not Run" rather than failing. That target and
+`st_oxr` are what compile this round's `oxr` and client-compositor changes outside WiVRn.
+
+**The one measured result that contradicts the workplan: XG6 narrows the format list.** The row said
+"§4.2 says all four common formats survive, so this should narrow nothing today — it is correctness
+insurance". §4.2 measured four formats; Monado advertises nineteen. Evaluated properly, the AMD
+compositor → NVIDIA client list is **six formats where the same-device list is eight**:
+
+| format | same-device | cross-device | who declines |
+|---|---|---|---|
+| `R16G16B16A16_UNORM` | KEPT | **dropped** | the client, cannot import |
+| `R16G16B16A16_SFLOAT` | KEPT | KEPT | — |
+| `R8G8B8A8_SRGB` | KEPT | KEPT | — |
+| `B8G8R8A8_SRGB` | KEPT | KEPT | — |
+| `R8G8B8A8_UNORM` | KEPT | KEPT | — |
+| `B8G8R8A8_UNORM` | KEPT | KEPT | — |
+| `R5G6B5_UNORM_PACK16` | KEPT | KEPT | — |
+| `R32_SFLOAT` | KEPT | **dropped** | the client, cannot import |
+| the six depth/stencil formats | dropped | dropped | the compositor, cannot export |
+
+So the insurance paid out immediately: two formats would have been advertised and then failed inside
+`vkCreateImage` in a client that had every reason to trust the list. The four formats §4.2 measured
+all survive, as promised — note that `A2B10G10R10_UNORM_PACK32`, one of those four, **is not in
+Monado's `VK_CSCI_FORMATS` list at all**, so it is never advertised by either path and the
+10-bit-swapchain question is Monado's, not this work's.
+
+**The depth row is the other new limitation, and it is not a cross-vendor one.** RADV declines to
+*export* any depth or stencil format as a LINEAR explicit-modifier dma-buf, so no depth format can
+back a cross-device swapchain. Same-device sessions are unaffected (they still use `OPTIMAL` +
+`OPAQUE_FD`, where depth is fine); a cross-GPU session simply will not advertise a depth format, and
+an application wanting `XR_KHR_composition_layer_depth` gets none. See §9 Q6.
+
+**The harness now drives the new pieces, and links the server's own code to do it.** The client-GPU
+resolver and the format-agreement query live in `server/utils/cross_gpu.cpp` — plain C over
+`VkPhysicalDevice` handles and a `PFN_vkGetInstanceProcAddr`, needing no `VkDevice` and no
+compositor — and that file is compiled straight into `tools/xg-cross-gpu-harness`. Results:
+
+- **`--client-gpu`**: every accepted spelling resolves to the device it names, on both GPUs — lower-case
+  UUID (`0fec34e97f02f760a848bc113180d8ec`), dashed upper-case UUID, `/dev/dri/renderD128`, and bare
+  `renderD128`. Unset resolves to the compositor's own device. `renderD999` is refused with the full
+  candidate listing. The UUIDs it prints match §4.1 digit for digit.
+- **`--formats`**: the table above, printed for both configurations, with the four §4.2 formats asserted.
+- **`--import-gate`**: on the client device, `array_size = 1` is accepted and `array_size = 2` is refused
+  with `VK_ERROR_FEATURE_NOT_PRESENT` and the message naming `maxArrayLayers`, *before* the compositor
+  allocates anything. This is the same function `client_vk_swapchain_create` now calls.
+- **The three round-1 swapchain configurations still pass, pixel-exact over all 54,687,744 bytes**, with
+  the legacy path still opaque/no-modifier at 19.12 MiB and the cross-device path still modifier `0x0`
+  at 17.79 MiB, `rowPitch = 8448`. The marginal cost of the shared destination re-measures at
+  **+1.192 ms/eye** against round 1's +1.214 and §4.6a's +1.22. No regression from any of this round.
+
+**The default path is unchanged, and this time the claim is narrow enough to be true.** Every new
+behaviour is gated: `narrow_formats_to_cross_device` behind `vk.cross_device`, the acquire pre-pass
+behind `vkic.info.cross_device` per swapchain, the `FOREIGN_EXT` release behind `c->cross_device`,
+the import gate behind `xinfo.cross_device`, both `oxr` relaxations behind
+`oxr_vk_suggests_cross_device_client`. With no `client-gpu` key the resolver returns the compositor's
+own device (asserted by the harness), the two UUIDs are equal by construction, `cross_device` is
+false, and the legacy allocator path is what the harness exercises and finds byte-identical.
+**What does change with the flag off, and should be understood as such:** `VK_EXT_queue_family_foreign`
+is now enabled on the compositor's device and on `enable2` clients' devices — enabled but unused —
+and the unmatched-GPU warning in `oxr_vk_get_physical_device` is considerably more verbose.
+
+> **`wivrn-server` was deliberately not run.** A live `wivrn-server` from `~/code/wivrn-26.6.2` was
+> serving the headset throughout this work. Starting a second one risks the D-Bus name and, worse,
+> `active_runtime.cpp` rewriting `~/.config/openxr/1/active_runtime.json` out from under the live
+> session. Only `--version` was invoked. Everything else was proved through the harness, which takes
+> no DRM master, opens no compositor and touches no session.
+
+**Two new hazards for XG8.**
+
+1. **`VK_EXT_queue_family_foreign` cannot be verified on a client device the application created.**
+   The extension defines no entry points, so the `vkGetDeviceProcAddr`-returns-NULL trick round 1
+   used for the two dma-buf extensions does not apply — there is nothing to ask for. The runtime adds
+   it to the `enable2` optional list, but under xrizer the device is DXVK's and consults neither list.
+   The client releases to `FOREIGN_EXT` whenever it is cross-device, because a release the compositor
+   cannot match is worse than a technically-unenabled constant, and every driver accepts the value.
+   **This joins the same XG8 bucket as `VK_EXT_external_memory_dma_buf` and
+   `VK_EXT_image_drm_format_modifier`: three extensions DXVK must happen to enable.**
+2. **The ownership transfer is one-directional and unbalanced by design.** The client releases every
+   frame; the compositor acquires only for images the frame's layers actually reference. A released
+   image that no layer uses is never acquired, and the client's next acquire is the pre-existing
+   `UNDEFINED` → optimal barrier with `VK_QUEUE_FAMILY_IGNORED` — a discard, which is what a client
+   re-rendering the whole image wants and what the PoC and harness both validated. It is not a
+   symmetric protocol and validation layers do not track ownership across devices, so nothing will
+   complain either way; it is recorded here so that a future corruption report starts in the right
+   place.
+
+**The precise XG8 checklist, superseding §8.1's list.** Items 3, 4 and 5 of that list are now done
+(the identity checks, the ownership transfer, the format list). What remains:
+
+1. **Three extensions on DXVK's device.** `VK_EXT_external_memory_dma_buf`,
+   `VK_EXT_image_drm_format_modifier`, `VK_EXT_queue_family_foreign`. The first two fail loudly by
+   name at swapchain creation; the third fails silently, because there is no way to detect it. **Still
+   the single most likely thing to go wrong, and the fix would be in DXVK, not here.**
+2. **`COLOR_ATTACHMENT` into an imported LINEAR image on NVIDIA.** Unchanged from round 1: the harness
+   copies, a game renders. This is WP-XG9 (c).
+3. **A session end to end.** Set `client-gpu` to the dGPU's render node, drop the `VK_DRIVER_FILES`
+   pin so the server's `VkInstance` can enumerate it (**the resolver throws at startup if it cannot** —
+   which is the intended, legible failure, but it is a config change that must accompany the key),
+   confirm no `assert_eq!(pd, info.physical_device)` from xrizer, and measure frame times against a
+   same-GPU baseline.
+4. **That a real title asks for a swapchain the narrowed list still contains.** Six formats remain;
+   xrizer/DXVK titles overwhelmingly want `R8G8B8A8_SRGB` or `B8G8R8A8_SRGB`, which do. A title
+   wanting a depth layer will not get one.
+5. **That the HypXRland desktop client still composites in the same session** — the §5.1
+   heterogeneous case, now genuinely reachable: it stays on AMD, computes `cross_device = false`
+   against the compositor's UUID, and should take the untouched path while the game does not.
+6. **The encoder and the live config** — XG-B1's runtime half, unchanged and still unexercised.
+
 ---
 
 ## 9. Open questions for the user
@@ -1324,6 +1450,21 @@ the session. Both are judged improvements; neither is "unchanged".
 5. **Should the AMD desktop client also pay the LINEAR cost** (+0.039 ms/eye) so one global
    suggestion serves both clients (§5.1), or do you want per-client device policy built from the
    start? I recommend the former — it is much smaller and the escape hatch stays open.
+   **Partly answered by what XG5 shipped, and not in the direction the question assumed.** `client-gpu`
+   is one global suggestion, as recommended — but the LINEAR cost is *not* global, because the
+   decision is made per client from the device it actually bound. The AMD desktop client compares its
+   own UUID against the compositor's, finds them equal, and takes the untouched same-device path;
+   only the client that really is elsewhere pays. The +0.039 ms/eye the question worried about is
+   therefore not charged to anyone. **What is still global is the advertised format list** — narrowed
+   for every client once the two devices differ (§8.2) — which is the remaining reason to want
+   per-client policy, and a much weaker one. Confirm you are happy with that before XG8.
+6. **Is losing depth swapchains cross-GPU acceptable?** New, from §8.2: RADV will not export any
+   depth or stencil format as a LINEAR explicit-modifier dma-buf, so a cross-GPU session advertises
+   no depth format and `XR_KHR_composition_layer_depth` is unavailable to *every* client in that
+   session, including the same-device desktop one. Same-GPU sessions are untouched. I do not know of
+   an xrizer title that submits depth layers, and WiVRn's squasher treats depth as an optional
+   refinement rather than a requirement, so I expect this to cost nothing in practice — but it is a
+   capability the session silently stops advertising and you should know before it surprises you.
 
 ---
 
