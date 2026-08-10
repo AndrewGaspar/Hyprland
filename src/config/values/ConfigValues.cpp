@@ -868,6 +868,14 @@ std::vector<SP<IValue>> Values::getConfigValues() {
                  "that eye's half of the packed frame — so the headset shows real stereo instead of a doubled image. Needs a runtime that honors eyeVisibility and "
                  "subImage.imageRect (Monado and WiVRn do). Turn it off to fall back to the single flattened quad if a runtime mishandles either",
                  true),
+        // ---- the DEPTH DESKTOP on XR monitors (research/24 §6, WP X3/X4) ----
+        MS<Bool>("openxr:depth_desktop",
+                 "composite every XR monitor ONCE PER EYE so the shipped depth rules (decoration:depth_focused / depth_unfocused / depth_layers, windowrule = depth, layerrule "
+                 "= depth) read as real 3D depth in the headset: a focused window floats in front of the wallpaper, bars sit above both. The monitor's declared size is "
+                 "unchanged and stays PER EYE — an xrmonitor at 2560x1440 still gives you a 2560x1440 desktop, now scanned out as a 5120x1440 pair. Costs one extra composite "
+                 "per XR monitor per frame, and only while something on it actually has depth (a flat desktop composites once and shows the same pane to both eyes). Turn it "
+                 "off for the cheapest possible XR presentation, or while measuring",
+                 true),
         // ---- luma-keyed transparency, "black-as-alpha" (docs/openxr/research/archive/09-monitor-transparency.md) ----
         MS<Float>("openxr:black_alpha",
                   "luma-keyed transparency: the alpha given to PURE BLACK content pixels, so a dark desktop turns into an AR-style overlay you can see the room through. 1.0 "

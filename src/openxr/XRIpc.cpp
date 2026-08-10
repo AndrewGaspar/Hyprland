@@ -98,6 +98,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
             "contentPath": "{}",
             "linear": {},
             "stereo": "{}",
+            "stereoProducer": "{}",
             "quads": {},
             "adaptive": {{
                 "enabled": {},
@@ -129,7 +130,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
             }}
         }})#",
                                 m.name, m.id, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.quatX, m.quatY, m.quatZ, m.quatW, m.grabbed ? "true" : "false",
-                                m.grabKind, m.hovered ? "true" : "false", m.region, m.plugged ? "true" : "false", m.contentPath, m.linear ? "true" : "false", m.stereo, m.quads, m.adaptiveEnabled ? "true" : "false", m.adaptivePhase,
+                                m.grabKind, m.hovered ? "true" : "false", m.region, m.plugged ? "true" : "false", m.contentPath, m.linear ? "true" : "false", m.stereo, m.producer, m.quads, m.adaptiveEnabled ? "true" : "false", m.adaptivePhase,
                                 m.adaptiveRoamMode, m.adaptiveSeatDist, m.adaptiveT, m.anchorState, m.l2dSource, m.l2dCol, m.l2dRow, m.l2dX, m.l2dY, m.l2dAzDeg, m.l2dElDeg, m.fxAlpha, m.fxAlphaTarget, m.fxAlphaSrc, m.fxBlackAlpha, m.fxBlackAlphaTarget,
                                 m.fxBlackAlphaSrc, m.fxKnee, m.fxKneeSrc, m.fxTransitioning ? "true" : "false");
             if (i + 1 < MONS.size())
@@ -216,7 +217,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
         // WP X1: only mentioned when a monitor is actually in stereo, so a mono session's status is
         // byte-identical to before. `quads` alongside it is the tell for a pair the budget refused.
         if (m.stereo != "off")
-            out += std::format(" stereo: {} ({} quad{})", m.stereo, m.quads, m.quads == 1 ? "" : "s");
+            out += std::format(" stereo: {}/{} ({} quad{})", m.stereo, m.producer, m.quads, m.quads == 1 ? "" : "s");
         out += "\n";
         // Situational transparency (doc 05 §xrrule): the effective values + WHERE each came from, so
         // "why is this monitor ghosted" is answerable in one command. `-> x` shows a live transition.
