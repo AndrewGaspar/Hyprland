@@ -314,6 +314,7 @@ void COpenXRManager::start() {
     publishBlackAlphaTuning(); // report 09: seed the luma key (re-published below once the blend mode is picked)
     publishCursorCrossingMode(); // task #139: seed openxr:cursor_crossing (raycast | layout)
     publishStereoPairTuning(); // WP X1: seed the stereo kill switch before any layer publishes a declaration
+    publishDepthDesktopTuning(); // WP X3: seed the depth desktop (packs each XR monitor's mode)
 
     // Concurrency guard for the off-main handshake below. A previously-in-flight OR abandoned handshake
     // worker may still be blocked in xrCreateInstance against a wedged runtime, or an abandoned bring-up
@@ -1449,29 +1450,32 @@ void COpenXRManager::frameThread() {
         // Per-layer: ensure a swapchain, then blit the latest presented buffer into it.
         bool lostInFrame = false; // set if a per-layer xr call reveals a dead/wedged runtime
         for (auto& l : active) {
-            // Mode change: recreate the swapchain at the new pixel size (doc 02).
-            if (l->m_swapchainDirty.exchange(false, std::memory_order_acq_rel)) {
+            // The main thread's declaration for this monitor (research/24 §5.1 + §6, WP X1/X3): the
+            // producer, the split, whether to submit a pair, and the pixel mode all of that describes.
+            // Read ONCE here and used for the whole iteration — a re-read mid-frame could see a
+            // different declaration for the same image.
+            const auto DECL = OpenXR::Stereo::unpackDecl(l->m_stereoPairDecl.load(std::memory_order_acquire));
+            // WP X4: a depth-packed monitor's swapchain is TWO independently-margined panes, so the
+            // pane count is part of the swapchain's shape, not just of the submission. It only ever
+            // changes together with the mode (the pack IS the doubled mode), but deriving it here and
+            // comparing keeps the swapchain self-healing if the two ever arrive out of order — the
+            // cost of getting it wrong is a frame showing each eye half a mono desktop.
+            const int WANTPANES = DECL.producer == OpenXR::Stereo::PRODUCER_DEPTH ? 2 : 1;
+
+            // Mode change (doc 02), pane-count change (WP X4), or first bind: (re)create the
+            // swapchain at the monitor's pixel mode, as cached by the main thread at bind/modeChanged
+            // (m_pendingSize under m_bufMu). The frame thread must NOT lock() m_monitor — hyprutils
+            // refcounts are not atomic and racing the main thread's copies corrupts them (see
+            // XRMonitorLayer.hpp).
+            const bool DIRTY = l->m_swapchainDirty.exchange(false, std::memory_order_acq_rel);
+            if (DIRTY || l->m_swapchain == XR_NULL_HANDLE || l->m_paneGeom.panes != WANTPANES) {
                 Vector2D newSize;
                 {
                     std::lock_guard<std::mutex> lk(l->m_bufMu);
                     newSize = l->m_pendingSize;
                 }
                 if (newSize.x >= 1 && newSize.y >= 1)
-                    createLayerSwapchain(*l, newSize);
-            }
-
-            // First bind: create a swapchain sized to the monitor's pixel mode, as cached by
-            // the main thread at bind/modeChanged (m_pendingSize under m_bufMu). The frame
-            // thread must NOT lock() m_monitor — hyprutils refcounts are not atomic and racing
-            // the main thread's copies corrupts them (see XRMonitorLayer.hpp).
-            if (l->m_swapchain == XR_NULL_HANDLE) {
-                Vector2D size;
-                {
-                    std::lock_guard<std::mutex> lk(l->m_bufMu);
-                    size = l->m_pendingSize;
-                }
-                if (size.x >= 1 && size.y >= 1)
-                    createLayerSwapchain(*l, size);
+                    createLayerSwapchain(*l, newSize, WANTPANES);
             }
 
             if (l->m_swapchain == XR_NULL_HANDLE)
@@ -1503,22 +1507,26 @@ void COpenXRManager::frameThread() {
             else if (gazeSel && hoverReg == OpenXR::XR_REGION_NONE)
                 hoverReg = OpenXR::XR_REGION_BAR;
             const bool    activeNow  = grabbedNow || hoverReg != OpenXR::XR_REGION_NONE;
-            // WP X1 (research/24 §5.1 option 2): while this monitor is submitted as a stereo PAIR,
-            // the eye quads cover the CONTENT rect only — the chrome margins are outside both, and
-            // the ray cursor is drawn at a full-quad uv into a swapchain whose full quad is no longer
-            // what anyone sees. Drawing either would put pixels where no eye looks (chrome) or in one
-            // eye at the wrong place (cursor), so both are suppressed for the duration.
+            // WP X1 (research/24 §5.1 option 2): while a CONTENT pair is submitted, the eye quads
+            // cover the content rect only — the chrome margins are outside both, and the ray cursor
+            // would be drawn at a full-quad uv into a swapchain whose full quad is no longer what
+            // anyone sees. Drawing either would put pixels where no eye looks (chrome) or in one eye
+            // at the wrong place (cursor), so both stay suppressed for the pure-content case: a
+            // monitor showing a fullscreen 3D film is not one you reposition mid-frame.
             //
-            // This is the honest v1 trade and it is a small one: a monitor showing a fullscreen 3D
-            // film or game is not one you reposition mid-frame. X4 gives the chrome two margined
-            // panes and X3 gives the cursor per-pane disparity; both remove this suppression.
-            const bool    stereoPaired = OpenXR::Stereo::pairActive((Render::Stereo::eContentLayout)l->m_stereoPairLayout.load(std::memory_order_acquire));
-            const bool    chromeOn   = l->m_chrome.hasChrome() && !stereoPaired;
+            // WP X4 removes that suppression for the DEPTH producer, and it had to: chrome is the
+            // primary grab affordance, so a depth desktop that hides it on EVERY monitor is not a
+            // trade, it is a regression. The depth pack gives each eye its own margined pane
+            // (createLayerSwapchain above), so chrome and cursor are drawn once PER PANE and land
+            // inside both eyes' quads.
+            const bool    contentPaired = DECL.producer == OpenXR::Stereo::PRODUCER_CONTENT && DECL.submit;
+            const int     drawPanes   = std::max(1, l->m_paneGeom.panes);
+            const bool    chromeOn   = l->m_chrome.hasChrome() && !contentPaired;
             // report 14 Stage A1: per-hand endpoint cursor. Drawn (like chrome) into the swapchain
             // over content; its packed word was published last frame by processPointer's plumbing.
             static auto    PGAZECUR      = CConfigValue<Hyprlang::INT>("openxr:gaze_cursor");
-            const bool     cursorEnabled = *PCURSOREN != 0 && !stereoPaired;
-            const bool     gazeCurEnabled = *PGAZECUR != 0 && !stereoPaired;
+            const bool     cursorEnabled = *PCURSOREN != 0 && !contentPaired;
+            const bool     gazeCurEnabled = *PGAZECUR != 0 && !contentPaired;
             const uint32_t curL          = l->m_cursorPacked[0].load(std::memory_order_acquire);
             const uint32_t curR          = l->m_cursorPacked[1].load(std::memory_order_acquire);
             // research/16 §3.3: distinct gaze cursor on the carried monitor (packed by gazeSelectPass).
@@ -1560,6 +1568,17 @@ void COpenXRManager::frameThread() {
                 chromeOn ? OpenXR::chromeFadeAdvance(l->m_chromeAlpha, activeNow, dtSec, sinceActiveSec, (float)*PFADEMS / 1000.f, (float)*PHIDEMS / 1000.f) : 0.f;
             l->m_chromeAlpha = newAlpha;
 
+            // WP X3 (§5.4): ease the ray cursor's depth toward whatever it is over. The main thread
+            // publishes the target (it needs the hovered view); the ease runs here because this is
+            // where a real frame delta exists. A window edge is a STEP in this quantity and a cursor
+            // that teleports between depths reads as a glitch — 3τ ≈ 80 ms, inside §5.4's window.
+            const float dispTarget = l->m_cursorDisparityTarget.load(std::memory_order_acquire);
+            l->m_cursorDisparity   = OpenXR::Stereo::easeCursorDisparity(l->m_cursorDisparity, dispTarget, dtSec, OpenXR::Stereo::CURSOR_DISPARITY_EASE_TAU_SEC);
+            // While the ease is running the cursor moves with no new desktop buffer and no pointer
+            // motion, so it is its own animation source — exactly like the chrome fade above. The
+            // epsilon is a pane-width fraction; below it the shift rounds to the same pixel anyway.
+            const bool  dispChanged = std::fabs(l->m_cursorDisparity - l->m_cursorDisparityDrawn) > 1e-4f;
+
             // A chrome-only (no new desktop buffer) redraw is needed ONLY when the on-screen chrome
             // would actually differ (alpha/region/grab changed) and something is or was visible.
             // This is what keeps a static desktop with hidden chrome at zero GPU cost — the quad
@@ -1570,7 +1589,8 @@ void COpenXRManager::frameThread() {
             // comparison is exact and this costs nothing.
             const bool fadeVisualChanged   = fxAlpha != l->m_fxAlphaDrawn;
             const bool wantAnimTick        = l->m_hasContent &&
-                ((chromeOn && chromeVisualChanged && (newAlpha > 0.f || l->m_chromeDrawnAlpha > 0.f)) || ((cursorEnabled || gazeCurEnabled) && cursorChanged) || fadeVisualChanged);
+                ((chromeOn && chromeVisualChanged && (newAlpha > 0.f || l->m_chromeDrawnAlpha > 0.f)) || ((cursorEnabled || gazeCurEnabled) && (cursorChanged || dispChanged)) ||
+                 fadeVisualChanged);
 
             if (!buf && !wantAnimTick && l->m_hasContent)
                 continue;
@@ -1629,7 +1649,11 @@ void COpenXRManager::frameThread() {
                 // margin over the content. No-op when disabled or fully faded out; drawChrome never
                 // touches the content rect.
                 if (chromeOn && l->m_hasContent) {
-                    m_graphics->drawChrome(*l, dst, newAlpha, hoverReg, grabbedNow);
+                    // WP X4: once per pane. On a mono monitor drawPanes == 1 and this is the shipped
+                    // single call; on a depth-packed one each eye gets its own bar and handles, at
+                    // the same place in its own picture, so the quad still reads as grabbable.
+                    for (int pane = 0; pane < drawPanes; ++pane)
+                        m_graphics->drawChrome(*l, dst, newAlpha, hoverReg, grabbedNow, pane);
                     l->m_chromeDrawnAlpha  = newAlpha;
                     l->m_chromeDrawnRegion = hoverReg;
                     l->m_chromeDrawnGrab   = grabbedNow;
@@ -1639,11 +1663,18 @@ void COpenXRManager::frameThread() {
                 // uv, over content + chrome. Plus the gaze cursor (research/16 §3.3) on the carried
                 // monitor. No-op when disabled or no cursor present.
                 if ((cursorEnabled || gazeCurEnabled) && l->m_hasContent) {
-                    m_graphics->drawCursor(*l, dst, cursorEnabled ? curL : 0, cursorEnabled ? curR : 0, curGaze);
+                    // WP X3: once per pane, each with that pane's share of the disparity, so the dot
+                    // floats at the depth of what it is pointing at instead of behind it (§5.4's
+                    // "subtitle behind the object"). A mono monitor draws one dot at disparity 0 —
+                    // the shipped call, reached through a loop of length one.
+                    for (int pane = 0; pane < drawPanes; ++pane)
+                        m_graphics->drawCursor(*l, dst, cursorEnabled ? curL : 0, cursorEnabled ? curR : 0, curGaze, pane,
+                                               drawPanes > 1 ? OpenXR::Stereo::cursorDisparityForPane(l->m_cursorDisparity, pane) : 0.f);
                     l->m_cursorDrawn[0]   = cursorEnabled ? curL : 0;
                     l->m_cursorDrawn[1]   = cursorEnabled ? curR : 0;
                     l->m_gazeCursorDrawn  = curGaze;
-                } else if (stereoPaired) {
+                    l->m_cursorDisparityDrawn = l->m_cursorDisparity;
+                } else if (contentPaired) {
                     // WP X1: while paired we drew neither chrome nor cursor, and the content blit
                     // above erased whatever was there. Clear the redraw-diff trackers to match, or
                     // leaving the pair would compare against pixels that no longer exist and skip the
@@ -1652,6 +1683,7 @@ void COpenXRManager::frameThread() {
                     l->m_cursorDrawn[0]   = 0;
                     l->m_cursorDrawn[1]   = 0;
                     l->m_gazeCursorDrawn  = 0;
+                    l->m_cursorDisparityDrawn = l->m_cursorDisparity;
                 }
 
                 // Uniform monitor alpha (doc 05 §xrrule) — LAST, over content + chrome + cursors, so
@@ -1795,7 +1827,7 @@ void COpenXRManager::frameThread() {
                     // and `hsbs` must be DECLARED rather than measured: they are the same pixels and
                     // ask for different shapes. `hsbs`/`htab` come back as the mode itself, so the
                     // common case (a half-packed 3D video on a 16:9 monitor) leaves geometry alone.
-                    const auto PANEPX = Render::Stereo::presentedPaneSize(l->m_contentSize, (Render::Stereo::eContentLayout)l->m_stereoPairLayout.load(std::memory_order_acquire));
+                    const auto PANEPX = Render::Stereo::presentedPaneSize(l->m_contentSize, OpenXR::Stereo::unpackDecl(l->m_stereoPairDecl.load(std::memory_order_acquire)).layout);
                     in.pxW       = (uint32_t)std::max(1.0, PANEPX.x);
                     in.pxH       = (uint32_t)std::max(1.0, PANEPX.y);
                     results[i]   = l->m_anchor.solve(in, tune);
@@ -1825,7 +1857,8 @@ void COpenXRManager::frameThread() {
                     // Same pane-aspect rule as the solve path above (WP X1) — a tracking dropout
                     // must not silently un-pair the geometry and pop the quad's height.
                     results[i].heightMeters =
-                        results[i].widthMeters * Render::Stereo::presentedAspect(l->m_contentSize, (Render::Stereo::eContentLayout)l->m_stereoPairLayout.load(std::memory_order_acquire));
+                        results[i].widthMeters *
+                        Render::Stereo::presentedAspect(l->m_contentSize, OpenXR::Stereo::unpackDecl(l->m_stereoPairDecl.load(std::memory_order_acquire)).layout);
                     solved[i]               = true;
                 }
             }
@@ -1881,13 +1914,22 @@ void COpenXRManager::frameThread() {
             // WP X1: what the MAIN thread declared for this monitor (research/24 §5.1). CONTENT_OFF
             // is the ordinary one-quad path and is what every monitor in a session that has never
             // configured stereo reads, every frame, forever.
-            const auto STEREOLAYOUT = (Render::Stereo::eContentLayout)l->m_stereoPairLayout.load(std::memory_order_acquire);
-            const bool STEREOPAIR   = OpenXR::Stereo::pairActive(STEREOLAYOUT);
+            auto       DECL         = OpenXR::Stereo::unpackDecl(l->m_stereoPairDecl.load(std::memory_order_acquire));
+            // WP X3: does that declaration describe the image we are actually holding? A monitor
+            // mid-mode-change (depth engaging, a mode retry) briefly has a swapchain from before the
+            // change and a declaration from after it, and splitting on that mismatch shows each eye
+            // half of a mono desktop. Fall back to one honest quad until the two agree — at most one
+            // frame, and it is invisible instead of wrong.
+            if (!OpenXR::Stereo::describes(DECL, (int32_t)l->m_contentSize.x, (int32_t)l->m_contentSize.y))
+                DECL = {};
+            const auto STEREOLAYOUT = DECL.layout;
+            const bool STEREOPAIR   = DECL.submit && OpenXR::Stereo::pairActive(STEREOLAYOUT);
+            const bool DEPTHPACKED  = DECL.producer == OpenXR::Stereo::PRODUCER_DEPTH && l->m_paneGeom.panes >= 2;
             // The budget is checked for the WHOLE pair, never a quad at a time (§F2's cost note).
             // A pair that only half-fits is submitted left-eye-only — one eye sees the desktop and
             // the other sees nothing, which is not a degraded picture but a nauseating one. `continue`
             // rather than `break` so a cheaper monitor behind it can still take the last slot.
-            if (!OpenXR::Stereo::submissionFits(quads.size(), m_session->m_maxLayerCount, STEREOLAYOUT)) {
+            if (!OpenXR::Stereo::submissionFits(quads.size(), m_session->m_maxLayerCount, DECL)) {
                 if (quads.size() >= m_session->m_maxLayerCount)
                     break;
                 continue;
@@ -1940,8 +1982,14 @@ void COpenXRManager::frameThread() {
             // no margins on screen there is nothing to correct for. Chrome is suppressed to match
             // (§5.1 option 2) — drawing a move-bar into pixels no eye can see would leave a monitor
             // that looks grabbable and is not.
+            //
+            // WP X4: a DEPTH-packed monitor keeps its chrome. Its swapchain holds two independently
+            // margined panes, each eye's quad IS one of them, and the margin grow/shift below is the
+            // same correction it always was — computed from per-pane meters, which is what the anchor
+            // solved. Only the pure CONTENT pair (a client's packed frame, no margins inside the eye
+            // rects) still flattens to an empty chrome.
             const OpenXR::SXRChromeGeometry  EMPTYCHROME{};
-            const OpenXR::SXRChromeGeometry& chrome = STEREOPAIR ? EMPTYCHROME : l->m_chrome;
+            const OpenXR::SXRChromeGeometry& chrome = (STEREOPAIR && !DEPTHPACKED) ? EMPTYCHROME : l->m_chrome;
             const float                      quadW  = res.widthMeters / (chrome.contentFracW() > 0.f ? chrome.contentFracW() : 1.f);
             const float                      quadH  = res.heightMeters / (chrome.contentFracH() > 0.f ? chrome.contentFracH() : 1.f);
             const OpenXR::SXRPose            quadCenterPose = OpenXR::contentPoseToQuadCenter(quadPose, chrome, quadW, quadH);
@@ -1954,7 +2002,7 @@ void COpenXRManager::frameThread() {
             // image, exactly as before — paneImageRect is the identity on CONTENT_OFF.
             const int32_t                 contentW = (int32_t)std::max(0.0, l->m_contentSize.x);
             const int32_t                 contentH = (int32_t)std::max(0.0, l->m_contentSize.y);
-            const OpenXR::Stereo::SImageRect CONTENTRECT = STEREOPAIR && contentW > 0 && contentH > 0 ?
+            const OpenXR::Stereo::SImageRect CONTENTRECT = STEREOPAIR && !DEPTHPACKED && contentW > 0 && contentH > 0 ?
                 OpenXR::Stereo::SImageRect{(int32_t)l->m_contentOffsetPx.x, h - (int32_t)l->m_contentOffsetPx.y - contentH, contentW, contentH} :
                 OpenXR::Stereo::SImageRect{0, 0, w, h};
 
@@ -1974,8 +2022,15 @@ void COpenXRManager::frameThread() {
             // Monado converts eyeVisibility for quads in its state tracker and consults it in BOTH
             // render backends; WiVRn's own squasher carries the same helper. If a runtime ever gets
             // this wrong, openxr:stereo_quad_pair flattens back to the single quad below.
+            //
+            // WP X3/X4: the DEPTH producer's rects are the swapchain's two HALVES (each a whole
+            // margined pane), not two halves of a content rect — that is the only geometric
+            // difference between the producers at submission time. And when the kill switch is off on
+            // a packed monitor, ONE quad is submitted showing PANE 0 only: a mono desktop at the
+            // right shape. Submitting the whole image instead would show a doubled side-by-side
+            // picture, which is not a degradation anyone can work in.
             for (int eye = 0; eye < (STEREOPAIR ? 2 : 1); ++eye) {
-                const auto RECT = OpenXR::Stereo::paneImageRect(CONTENTRECT, STEREOLAYOUT, eye);
+                const auto RECT = DEPTHPACKED ? OpenXR::Stereo::paneFullRect(l->m_paneGeom, eye) : OpenXR::Stereo::paneImageRect(CONTENTRECT, STEREOLAYOUT, eye);
                 quad.eyeVisibility = !STEREOPAIR ? XR_EYE_VISIBILITY_BOTH : (eye == 0 ? XR_EYE_VISIBILITY_LEFT : XR_EYE_VISIBILITY_RIGHT);
                 quad.subImage.imageRect = {{RECT.x, RECT.y}, {RECT.w, RECT.h}};
                 quads.push_back(quad);
@@ -2007,7 +2062,7 @@ void COpenXRManager::frameThread() {
                 // hands the absolute-pointer path is un-mapped back into the whole packed image.
                 // Without it, pointing at the middle of the quad drives the cursor to the seam
                 // between the two eyes — half a screen away from where the user is pointing.
-                pt.stereo    = STEREOLAYOUT;
+                pt.stereo    = DECL;
                 pointerTargets.push_back(std::move(pt));
             }
         }
@@ -2095,10 +2150,18 @@ void COpenXRManager::frameThread() {
     }
 }
 
-bool COpenXRManager::createLayerSwapchain(CXRMonitorLayer& layer, const Vector2D& size) {
+bool COpenXRManager::createLayerSwapchain(CXRMonitorLayer& layer, const Vector2D& size, int panes) {
     // Frame thread. Destroy any existing swapchain first (context NOT current — interop rule).
     if (layer.m_swapchain != XR_NULL_HANDLE)
         layer.destroySwapchain();
+
+    // WP X4: `size` is the monitor's whole pixel mode. On a depth-packed monitor that mode holds TWO
+    // panes side by side, and each of them needs its OWN chrome ring — one ring around the pair would
+    // put the left eye's right-hand margin inside the right eye's picture. So the chrome geometry
+    // below is computed for ONE pane and the swapchain is two of those. panes == 1 for every ordinary
+    // monitor, and then every expression here is exactly what shipped.
+    const int      PANES = std::clamp(panes, 1, 2);
+    const Vector2D PANECONTENT{std::max(1.0, size.x / PANES), std::max(1.0, size.y)};
 
     // Chrome margins (WP-G1): expand the swapchain by a transparent margin around the content so
     // chrome (bottom move-bar + corner handles) has a place that never covers a desktop pixel.
@@ -2119,14 +2182,21 @@ bool COpenXRManager::createLayerSwapchain(CXRMonitorLayer& layer, const Vector2D
     const float                     margin   = chromeOn ? (float)*PMARGIN : 0.f;
     const float                     barH     = chromeOn ? (float)*PBARH : 0.f;
     const float                     cW     = std::max(0.001f, layer.m_anchor.state().widthMeters);
-    const float                     cH     = cW * (float)std::max(1.0, size.y) / (float)std::max(1.0, size.x);
+    const float                     cH     = cW * (float)PANECONTENT.y / (float)PANECONTENT.x;
     const OpenXR::SXRChromeGeometry chrome = OpenXR::makeChromeGeometry(cW, cH, margin, barH, (float)*PBARWF, (float)*PCORNER);
 
-    // Full swapchain px = content px expanded by the same fractions (px/fraction stay consistent).
-    const double   fw = chrome.contentFracW() > 0.0 ? (double)chrome.contentFracW() : 1.0;
-    const double   fh = chrome.contentFracH() > 0.0 ? (double)chrome.contentFracH() : 1.0;
-    const Vector2D fullSize{std::max(size.x, std::round(size.x / fw)), std::max(size.y, std::round(size.y / fh))};
-    const Vector2D contentOffset{std::round(chrome.contentU0 * fullSize.x), std::round(chrome.contentV0 * fullSize.y)};
+    // One pane's full px = its content px expanded by the same fractions (px/fraction stay
+    // consistent); the swapchain is `panes` of those laid out horizontally.
+    const double            fw = chrome.contentFracW() > 0.0 ? (double)chrome.contentFracW() : 1.0;
+    const double            fh = chrome.contentFracH() > 0.0 ? (double)chrome.contentFracH() : 1.0;
+    OpenXR::Stereo::SPaneGeom paneGeom;
+    paneGeom.panes       = PANES;
+    paneGeom.paneContent = PANECONTENT;
+    paneGeom.paneFull    = {std::max(PANECONTENT.x, std::round(PANECONTENT.x / fw)), std::max(PANECONTENT.y, std::round(PANECONTENT.y / fh))};
+    paneGeom.contentOffsetPx = {std::round(chrome.contentU0 * paneGeom.paneFull.x), std::round(chrome.contentV0 * paneGeom.paneFull.y)};
+
+    const Vector2D fullSize      = OpenXR::Stereo::swapchainSizeFor(paneGeom);
+    const Vector2D contentOffset = paneGeom.contentOffsetPx;
 
     XrSwapchainCreateInfo info = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     info.usageFlags            = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
@@ -2162,6 +2232,7 @@ bool COpenXRManager::createLayerSwapchain(CXRMonitorLayer& layer, const Vector2D
     layer.m_contentSize     = size;
     layer.m_contentOffsetPx = contentOffset;
     layer.m_chrome          = chrome;
+    layer.m_paneGeom        = paneGeom;
     layer.m_hasContent      = false;
 
     // Reset the per-layer CPU staging tex + chrome snapshot so they realloc to the new mode.
@@ -2538,6 +2609,25 @@ void COpenXRManager::registerDeclaredMonitorRule(const PHLMONITOR& mon, const PX
     static auto PDEFAULTSCALE = CConfigValue<Hyprlang::FLOAT>("openxr:default_monitor_scale");
     static auto PNOSCALECHECK = CConfigValue<Hyprlang::INT>("debug:disable_scale_checks");
     const float PINNEDSCALE   = OpenXR::xrPinnedRuleScale(Config::monitorRuleMgr()->all(), [&mon](const std::string& sel) { return mon->matchesStaticSelector(sel); });
+
+    // THE DEPTH DESKTOP (research/24 §6, WP X3). An XR monitor that composites once per eye scans out
+    // a PAIR of panes, so its pixel mode is its declared size doubled — and the declared size keeps
+    // meaning exactly what it meant, which is the per-eye desktop the user asked for. That inversion
+    // is `m_stereoVirtualMode`: the rule's resolution is ONE PANE and Monitor::Stereo::requestedMode
+    // derives the mode from it. (The `monitor = …, stereo:` token means the opposite — a panel names
+    // its mode and the logical size is halved out of it — which is why this deliberately does not go
+    // through that token. Halving a declared XR size would shrink every XR desktop the moment depth
+    // engaged.)
+    //
+    // Only monitors WE created. An `xrmonitor`-adopted real output has a panel, a mode list and a
+    // user who chose them; doubling its mode is not ours to do — the same line xrDefaultMonitorScale
+    // draws, for the same reason.
+    static auto PDEPTHDESKTOP = CConfigValue<Hyprlang::INT>("openxr:depth_desktop");
+    const bool  WANTDEPTH     = *PDEPTHDESKTOP != 0 && layer->m_createdByXR;
+    const auto  WANTSTEREO    = WANTDEPTH ? Config::STEREO_SBS : Config::STEREO_OFF;
+    // A user who wrote an explicit `stereo:` token on this output keeps it when depth is off; depth
+    // on takes over, because a virtual pack and a physical one are not composable.
+    const bool  STEREOCHANGED = WANTDEPTH ? (rule.m_stereo != WANTSTEREO || !rule.m_stereoVirtualMode) : rule.m_stereoVirtualMode;
     // The mode the output will run once this rule lands — the divisor gate needs it. What we are
     // about to ask for, else what the rule asks for, else what it is scanning out now: `preferred` /
     // `highres` / `maxwidth` leave m_resolution zeroed or at a negative sentinel, and the mode those
@@ -2546,12 +2636,24 @@ void COpenXRManager::registerDeclaredMonitorRule(const PHLMONITOR& mon, const PX
     Vector2D effectiveMode = wantMode ? *layer->m_reqResolution : rule.m_resolution;
     if (effectiveMode.x <= 0 || effectiveMode.y <= 0)
         effectiveMode = mon->m_pixelSize;
-    const auto WANTSCALE = OpenXR::xrDefaultMonitorScale(layer->m_createdByXR, OpenXR::xrRuleScaleIsExplicit(PINNEDSCALE), rule.m_stereo != Config::STEREO_OFF, effectiveMode,
-                                                         *PNOSCALECHECK, (float)*PDEFAULTSCALE);
+    // `stereoOutput` asks "is this a PHYSICAL per-eye panel", because that is the only case whose
+    // scale must be pinned to 1.0. A virtual pack has no physical pixel grid, its pane IS the
+    // declared size, and openxr:default_monitor_scale still divides that pane cleanly — so the XR
+    // scale default keeps applying and turning depth on does not reflow the session.
+    const auto WANTSCALE = OpenXR::xrDefaultMonitorScale(layer->m_createdByXR, OpenXR::xrRuleScaleIsExplicit(PINNEDSCALE),
+                                                         WANTSTEREO != Config::STEREO_OFF && !WANTDEPTH, effectiveMode, *PNOSCALECHECK, (float)*PDEFAULTSCALE);
 
-    if (!wantMode && !wantOffset && !WANTSCALE)
+    if (!wantMode && !wantOffset && !WANTSCALE && !STEREOCHANGED)
         return;
     rule.m_name = mon->m_name;
+    if (WANTDEPTH) {
+        rule.m_stereo            = WANTSTEREO;
+        rule.m_stereoVirtualMode = true;
+    } else if (rule.m_stereoVirtualMode) {
+        // Ours to clear, and only ours: a physical `stereo:` token never sets the virtual flag.
+        rule.m_stereo            = Config::STEREO_OFF;
+        rule.m_stereoVirtualMode = false;
+    }
     if (wantMode) {
         rule.m_resolution = *layer->m_reqResolution;
         if (layer->m_reqRefresh)
@@ -3443,7 +3545,12 @@ void COpenXRManager::onConfigReload() {
     publishBlackAlphaTuning();
     // WP X1: re-resolve each monitor's stereo declaration (a windowrule change moves it) and apply
     // openxr:stereo_quad_pair immediately rather than at the next repaint.
-    publishStereoPairTuning();
+publishStereoPairTuning();
+
+    // research/24 WP X3: openxr:depth_desktop decides whether each XR monitor scans out a per-eye
+    // PAIR of panes. Unlike its neighbours this changes the output's MODE, so it re-registers the
+    // monitor rules rather than poking an atomic — and only on the edge (see m_lastDepthDesktop).
+    publishDepthDesktopTuning();
     // doc 05 §xrrule: re-snapshot the declared transparency rules and re-resolve every monitor. Must
     // run AFTER publishBlackAlphaTuning — the black_alpha globals are the DEFAULT layer it folds on.
     reloadXRRules();
@@ -3628,6 +3735,37 @@ void COpenXRManager::publishStereoPairTuning() {
 
     for (auto& mon : mons)
         g_pHyprRenderer->damageMonitor(mon);
+}
+
+// MAIN THREAD (research/24 §6, WP X3). openxr:depth_desktop is the depth desktop's master switch,
+// and it is the only openxr:* value that changes an output's MODE: a depth-producing monitor scans
+// out two panes, so its pixel mode is its declared (per-eye) size doubled. That cannot be published
+// as an atomic — it has to travel through the monitor rule, the mode search and applyMonitorRule,
+// which is exactly what registerDeclaredMonitorRule already owns.
+//
+// So this is an EDGE trigger, not a refresh: a `hyprctl reload` with the value unchanged must not
+// re-modeset every XR output. On the edge, re-registering the rules is the whole action — the rule
+// manager's ensureMonitorStatus compares before applying, applyMonitorRule re-derives the pane
+// geometry and the render resources, modeChanged reaches the layer, and the frame thread rebuilds
+// the swapchain at the new pane count on its next pass.
+void COpenXRManager::publishDepthDesktopTuning() {
+    static auto PDEPTH = CConfigValue<Hyprlang::INT>("openxr:depth_desktop");
+
+    const bool  want    = *PDEPTH != 0;
+    const bool  changed = !m_lastDepthDesktop.has_value() || *m_lastDepthDesktop != want;
+    m_lastDepthDesktop  = want;
+
+    if (!changed)
+        return;
+
+    Log::logger->log(Log::DEBUG, "[OPENXR] depth desktop {} — re-deriving XR monitor modes", want ? "ON (per-eye composite, packed mode)" : "OFF (single composite)");
+    reassertMonitorModeRules();
+
+    // The declaration the frame thread reads is derived from the monitor's live packing state, which
+    // the rules above have only SCHEDULED. Re-publishing here costs one fullscreen lookup per monitor
+    // and makes the OFF direction take effect on the very next frame instead of the next repaint —
+    // the same reason publishStereoPairTuning exists.
+    publishStereoPairTuning();
 }
 
 COpenXRManager::SXRBlackAlpha COpenXRManager::blackAlphaStatus() const {
@@ -4411,10 +4549,16 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
         }
         if (l->m_reqRefresh)
             info.refresh = *l->m_reqRefresh;
-        // WP X1: the declared layout (main thread wrote it) and what the frame thread last actually
+        // WP X1/X3: the declaration (main thread wrote it) and what the frame thread last actually
         // submitted. Both are plain atomics — no refcount, no string crosses a thread here.
-        info.stereo = Render::Stereo::layoutToString((Render::Stereo::eContentLayout)l->m_stereoPairLayout.load(std::memory_order_acquire));
-        info.quads  = (int)l->m_quadsSubmitted.load(std::memory_order_relaxed);
+        // `stereo` is the split, `producer` is WHO made the panes — the two are reported separately
+        // because they answer different questions: "sbs"/"depth" is the depth desktop doing its job,
+        // "sbs"/"content" is a client's packed frame, and "sbs"/"depth" with quads 1 is a pair the
+        // budget refused or the kill switch flattened.
+        const auto DECL = OpenXR::Stereo::unpackDecl(l->m_stereoPairDecl.load(std::memory_order_acquire));
+        info.stereo     = Render::Stereo::layoutToString(DECL.layout);
+        info.producer   = OpenXR::Stereo::producerToString(DECL.producer);
+        info.quads      = (int)l->m_quadsSubmitted.load(std::memory_order_relaxed);
         if (auto mon = l->m_monitor.lock()) {
             info.id      = mon->m_id;
             info.plugged = mon->m_enabled; // research/18: unplugged (disabled) while sessionless

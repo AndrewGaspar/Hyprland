@@ -274,6 +274,10 @@ class COpenXRManager {
         // reported separately on purpose: a declared pair that reads `quads: 1` is one the layer
         // budget refused, which is the only way this feature fails with no visual tell at all.
         std::string stereo = "off";
+        // WP X3: which producer made the panes — "off" | "content" (a client packed both eyes into
+        // one frame) | "depth" (the compositor composited the desktop once per eye). It decides the
+        // pointer un-map, so it is the field to check when the cursor lands somewhere unexpected.
+        std::string producer = "off";
         int         quads  = 1;
         std::string l2dSource = "off";
         int         l2dCol = 0, l2dRow = 0;
@@ -546,7 +550,7 @@ class COpenXRManager {
     // --- layer management ---
     // Frame thread: (re)create a layer's swapchain at the given pixel size. Returns false on
     // failure (leaves m_swapchain == XR_NULL_HANDLE).
-    bool createLayerSwapchain(CXRMonitorLayer& layer, const Vector2D& size);
+    bool createLayerSwapchain(CXRMonitorLayer& layer, const Vector2D& size, int panes = 1);
     // Main thread: bind still-existing layers on start() and drop those whose monitor
     // disappeared while disabled (doc 02 lazy binding).
     void bindExistingLayers();
@@ -673,6 +677,7 @@ class COpenXRManager {
     // freshly-picked mode before the session object is adopted). nullopt + no session = gate closed.
     void               publishBlackAlphaTuning(std::optional<OpenXR::eXRBlendMode> modeOverride = std::nullopt); // main thread only
     void               publishStereoPairTuning();                                                                 // main thread only (WP X1)
+    void               publishDepthDesktopTuning();                                                                // main thread only (WP X3)
     std::atomic<float> m_blackAlpha{1.F};         // EFFECTIVE alpha for pure black; 1.0 = feature off
     std::atomic<float> m_blackAlphaKnee{0.1F};    // luma at which content is fully opaque
     std::atomic<float> m_blackAlphaConfigured{1.F};
@@ -976,6 +981,10 @@ class COpenXRManager {
     // compared.
     std::optional<std::array<double, 5>> m_lastChromeGeom;
 
+    // WP X3: last seen openxr:depth_desktop. A change re-derives every XR monitor's scanout mode
+    // (the pack doubles it), which is a modeset — so it must happen on the EDGE, never on every
+    // reload, or a `hyprctl reload` would re-modeset every XR output for nothing.
+    std::optional<bool> m_lastDepthDesktop;
     // WP X1: last seen openxr:stereo_quad_pair, so a keyword toggle can be told apart from an
     // unrelated reload and only the real change pays for a forced re-composite of every XR monitor.
     std::optional<bool>                  m_lastStereoQuadPair;
