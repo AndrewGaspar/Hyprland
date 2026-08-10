@@ -296,6 +296,14 @@ class CXRMonitorLayer {
     // differ when the budget refuses a pair, which is the one failure mode with no visual tell.
     std::atomic<uint8_t> m_quadsSubmitted{1};
 
+    // Whether the chrome draw pass ran for this monitor LAST FRAME (WP X4). Frame thread → main
+    // thread (status only). It exists because chrome suppression is a frame-thread decision with no
+    // other outside view: X1 suppresses chrome on a CONTENT pair and X4 restores it on a DEPTH pair,
+    // and "my XR monitor stopped being grabbable" is otherwise a bug report with nothing to look at.
+    // False also for chrome_enabled = 0 / chrome_margin = 0, which is the honest answer to
+    // "is there chrome on this quad".
+    std::atomic<bool>    m_chromeLive{false};
+
     // Fade-envelope state (frame thread only; only the blit loop touches these). Alpha is advanced
     // every frame from predicted-display-time deltas via OpenXR::chromeFadeAdvance; the *Drawn*
     // trackers record what was last rendered so a static (no-new-buffer) frame can decide whether a

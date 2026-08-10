@@ -278,6 +278,10 @@ class COpenXRManager {
         // one frame) | "depth" (the compositor composited the desktop once per eye). It decides the
         // pointer un-map, so it is the field to check when the cursor lands somewhere unexpected.
         std::string producer = "off";
+        // WP X4: did the chrome draw pass run last frame? False while a CONTENT pair suppresses it,
+        // and false when chrome is configured off — a depth-paired monitor must read TRUE, because
+        // the chrome is the primary grab affordance and losing it on every monitor is a regression.
+        bool        chrome   = false;
         int         quads  = 1;
         std::string l2dSource = "off";
         int         l2dCol = 0, l2dRow = 0;
