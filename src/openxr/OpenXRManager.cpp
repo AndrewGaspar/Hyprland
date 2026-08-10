@@ -1522,6 +1522,7 @@ void COpenXRManager::frameThread() {
             const bool    contentPaired = DECL.producer == OpenXR::Stereo::PRODUCER_CONTENT && DECL.submit;
             const int     drawPanes   = std::max(1, l->m_paneGeom.panes);
             const bool    chromeOn   = l->m_chrome.hasChrome() && !contentPaired;
+            l->m_chromeLive.store(chromeOn, std::memory_order_relaxed);
             // report 14 Stage A1: per-hand endpoint cursor. Drawn (like chrome) into the swapchain
             // over content; its packed word was published last frame by processPointer's plumbing.
             static auto    PGAZECUR      = CConfigValue<Hyprlang::INT>("openxr:gaze_cursor");
@@ -4558,6 +4559,7 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
         const auto DECL = OpenXR::Stereo::unpackDecl(l->m_stereoPairDecl.load(std::memory_order_acquire));
         info.stereo     = Render::Stereo::layoutToString(DECL.layout);
         info.producer   = OpenXR::Stereo::producerToString(DECL.producer);
+        info.chrome     = l->m_chromeLive.load(std::memory_order_relaxed);
         info.quads      = (int)l->m_quadsSubmitted.load(std::memory_order_relaxed);
         if (auto mon = l->m_monitor.lock()) {
             info.id      = mon->m_id;
