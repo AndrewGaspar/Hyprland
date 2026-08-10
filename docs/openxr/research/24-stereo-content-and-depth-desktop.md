@@ -2237,10 +2237,55 @@ optional; it is now Phase F.
 
 | WP | Size | Device | What |
 |---|---|---|---|
-| **X1** | S | Quest + XREAL | **The quad pair.** The quad-assembly change (pair emission, `eyeVisibility`, `imageRect`, pair-aware budget check, pair-aware depth sort), aspect `k` (§5.2), the pane-pair declaration published to the frame thread as atomics, chrome suppressed while stereo ≠ off, `xrmonitor`/`xrrule` tokens as a *convenience* layer over the generic state. Under 100 lines because §3 and Phase S did the producer |
-| **X2** | S | flat | **Tests.** hyprtester (null runtime): a stereo monitor submits exactly 2 quads with the expected rects and eye bits; `stereo off` submits 1; the pair is never half-submitted |
+| **X1** ✅ | S | Quest + XREAL | **The quad pair.** The quad-assembly change (pair emission, `eyeVisibility`, `imageRect`, pair-aware budget check, pair-aware depth sort), aspect `k` (§5.2), the pane-pair declaration published to the frame thread as atomics, chrome suppressed while stereo ≠ off, `xrmonitor`/`xrrule` tokens as a *convenience* layer over the generic state. Under 100 lines because §3 and Phase S did the producer |
+| **X2** ✅ | S | flat | **Tests.** hyprtester (null runtime): a stereo monitor submits exactly 2 quads with the expected rects and eye bits; `stereo off` submits 1; the pair is never half-submitted |
 | **X3** | S | Quest + XREAL | **The XR presenter for depth panes.** Double-wide swapchain, two `blitBuffer` calls, pair submission (reuses X1); pointer un-mapping for the depth producer (§5.6); the XR ray cursor drawn per pane with content-depth disparity |
 | **X4** | M | Quest | **Chrome in stereo.** Double-wide swapchain with two margined panes, `drawChrome` per pane, per-pane grab geometry. Removes X1's chrome suppression |
+
+> **STATUS (WP X1 + X2): IMPLEMENTED.** The pair is emitted from the quad-assembly loop, and the
+> shape it took confirms §5.1(a)'s central claim — **there is no producer at all**. A fullscreen
+> stereo client's packed frame already IS the swapchain's content rect, so nothing is rendered
+> twice, no swapchain is reallocated when stereo engages or leaves, and the whole feature is an
+> `imageRect`, an `eyeVisibility` and an aspect. `Render::Stereo::presentedPaneSize` (factored out
+> of `presentedAspect`) feeds the anchor solve, so §5.2's `k` finally has the caller S2 reserved it
+> for. Chrome and the XR ray cursor are suppressed while paired, per option 2.
+>
+> **Four things this WP had to add that §13's line item did not name**, all of them found by
+> writing it:
+>
+> 1. **A coverage gate the XR tier has to ask for itself.** `CWindow::stereoLayout()` already
+>    applies §4.3's fullscreen gate — but `always` and a client's own tag both legitimately *skip*
+>    it, and the quad pair splits the monitor's WHOLE content rect rather than one window's texture.
+>    A floating `always`-declared window would therefore send half the desktop to each eye. The gate
+>    is a size/position match against the output (`SC_TRANSFORM`'s comparison), deliberately **not**
+>    `m_solitaryClient`: solitary also drops out for notifications, DND, fadeouts and overlay
+>    layers, and since pairing can change the quad's aspect, riding it would let a toast visibly
+>    reshape the panel and reshape it back.
+> 2. **The pointer un-map is mandatory, not X3 polish.** A paired quad shows one PANE, so a ray hit
+>    is a pane uv while absolute injection wants packed-image coordinates — §5.6's "off by half a
+>    screen", reached the moment the first pair is submitted. `paneUVToContentUV` (S2) is the fix and
+>    `SXRPointerTarget` grew a layout field to carry it.
+> 3. **`imageRect`'s origin is bottom-left for our swapchains, and it was worth proving.** A GL
+>    client submits through `comp_gl_client.c`, which sets `flip_y`; `set_post_transform_rect` then
+>    rewrites the normalized rect to `(x, y+h, w, -h)`, so `layer_quad.vert` samples the quad's top
+>    row at `offset.y + extent.h`. This decides only which half an over-under pack gives the left
+>    eye — a mistake swaps the eyes, which is uncomfortable without ever looking broken.
+> 4. **Declared ≠ submitted, so status reports both.** A pair the layer budget refuses is submitted
+>    as a single mono quad and looks exactly like a mono monitor. `hyprctl -j openxr` carries
+>    `stereo` (what the main thread declared) *and* `quads` (what the frame thread submitted); the
+>    budget check is per-PAIR and `continue`s rather than breaking, so a refused pair leaves the slot
+>    to a cheaper monitor instead of half-submitting a left-eye-only frame.
+>
+> Deviations from the line item: the **depth sort needed no change** — pairs are pushed back to back
+> inside one loop iteration and the sort orders layers, not quads, so adjacency is structural. And
+> the `xrmonitor`/`xrrule` convenience tokens were **not** built: the generic `windowrule = stereo`
+> already reaches XR monitors through Phase S, so an XR-only alias would be a second way to say the
+> same thing (and `xrrule`'s enum-valued effect fold is still the open F8/D7 work). X3 and X4 remain
+> as scoped.
+>
+> Not yet validated in a headset — the pair has never been looked at through a Quest or an XREAL.
+> §14's open question 1 (does the XREAL's scanline split interact with a half-covering quad) is
+> still open and this is what would answer it.
 
 **Suggested order:** F0 → **F1** → F2 → F3 → F4 → S0 → **S1** → S2 → S3 → S5 → **ship Q1, flat**
 → X1 → X2 → **ship Q1, XR** → D0 → D1 → **D2** → D4 → **ship Q2, flat** → X3 → D5 → F5 → X4 →
@@ -2257,7 +2302,8 @@ helper. Only S0 (a headset eyeball check) and the XR tier (X1) remain before "sh
 **Phase D core (D1–D2, D4) **Phase D core (D1–D2, D4)
 ≈ 700–900 lines**, dominated by the producer and the 14 `m_floatingOffset` call sites. **Phase X
 (X1–X3) ≈ 250–350 lines** — the cheapest phase, and now the last one, which is the whole point of
-the inversion.
+the inversion. **X1 + X2 are IMPLEMENTED** and came in at the low end of that: the submission change
+is ~90 lines in the frame loop, on top of a ~135-line pure header and its tests.
 
 ---
 
