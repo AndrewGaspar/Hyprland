@@ -602,13 +602,19 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                     float cu = 0.f, cv = 0.f;
                     if (OpenXR::remapToContentUV(bestHit.u, bestHit.v, bestTgt->chrome, cu, cv)) {
                         newBodyMon = bestTgt->id;
-                        // WP X1 (research/24 §5.6). On a monitor submitted as a stereo PAIR the quad
-                        // shows one PANE, so the uv we just resolved is a pane coordinate — while
-                        // everything downstream (absolute pointer injection, keyed by monitor name
-                        // plus a 0..1 uv) wants a coordinate in the whole PACKED image. Un-map it
-                        // through the eye-0 crop, which is the same definition of "where the halves
-                        // are" the renderer's own crop uses. Identity on a mono monitor.
-                        newBodyUV = Render::Stereo::paneUVToContentUV({cu, cv}, bestTgt->stereo, 0);
+                        // WP X1/X3 (research/24 §5.6). On a monitor submitted as a stereo PAIR the
+                        // quad shows one PANE, so the uv we just resolved is a pane coordinate —
+                        // while everything downstream (absolute pointer injection, keyed by monitor
+                        // name plus a 0..1 uv) wants a coordinate in the whole logical desktop.
+                        // Un-map it THROUGH THE PRODUCER: a client's packed frame needs the eye-0
+                        // crop (the same definition of "where the halves are" the renderer's own
+                        // crop uses), a depth-composited pane already IS the desktop and needs
+                        // nothing. Identity on a mono monitor, and on the wrong producer this is
+                        // §5.6's cursor-half-a-screen-out bug exactly.
+                        //
+                        // Eye 0 by convention: the two eye quads are coincident, so a ray crosses
+                        // both at one point and there is only one uv to un-map.
+                        newBodyUV = OpenXR::Stereo::paneUVToMonitorUV({cu, cv}, bestTgt->stereo, 0);
                     }
                 }
             }

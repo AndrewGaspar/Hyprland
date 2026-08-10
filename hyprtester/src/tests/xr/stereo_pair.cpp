@@ -31,6 +31,13 @@ using Hyprutils::Utils::CScopeGuard;
 // purpose: with the window-level gate out of the way, what remains under test is the XR-side
 // COVERAGE gate, the one this WP added, and the one that stops a floating stereo window from
 // sending half the desktop to each eye.
+//
+// WP X3 note: this whole case runs with `openxr:depth_desktop = 0`. That is not a workaround, it is
+// the CONTENT producer's actual domain — a depth-packed monitor already composites once per eye, so
+// its pair belongs to the depth producer and the packed buffer must not be split a second time
+// (tests/xr/depth_desktop.cpp covers that side, including a stereo window living inside it). X1's
+// route is what an XR monitor does when it is NOT producing panes of its own, and turning the depth
+// desktop off is how you ask for it.
 
 namespace {
     // Same session gate the rest of the XR group uses: focused, with a short visible fallback so a
@@ -96,11 +103,15 @@ TEST_CASE(xr_stereo_quad_pair) {
     // The rule goes in BEFORE the client maps, so the declaration is there the first time the fold
     // runs and the test is not racing a re-evaluation.
     ASSERT(getFromSocket("/keyword windowrule stereo sbs always, match:class ^(xr_stereo_pair)$"), std::string("ok"));
+    // The CONTENT producer's domain is an XR monitor that is NOT producing panes of its own — see
+    // the header note. Set this BEFORE the monitor is created so it is never packed at all.
+    ASSERT(getFromSocket("/keyword openxr:depth_desktop 0"), std::string("ok"));
 
     CScopeGuard ruleGuard = {[&]() {
         // `off` is the one layout that wins outright — leave nothing behind for later cases.
         getFromSocket("/keyword windowrule stereo off, match:class ^(xr_stereo_pair)$");
         getFromSocket("/keyword openxr:stereo_quad_pair 1");
+        getFromSocket("/keyword openxr:depth_desktop 1");
         Tests::killAllWindows();
     }};
 
@@ -140,6 +151,10 @@ TEST_CASE(xr_stereo_quad_pair) {
     ASSERT(getFromSocket("/dispatch focuswindow class:xr_stereo_pair"), std::string("ok"));
     ASSERT(getFromSocket("/dispatch fullscreen 0"), std::string("ok"));
     ASSERT(waitForPair(MON, "sbs", 2), true);
+    // ...and this pair belongs to the CONTENT producer, which is what decides the pointer un-map.
+    // Reading `depth` here would mean the cursor is about to be un-mapped with the identity on an
+    // image where each pane is half a packed frame — §5.6's half-a-screen bug.
+    EXPECT_CONTAINS(blockOf(getFromSocket("j/openxr"), MON), "\"stereoProducer\": \"content\"");
 
     // THE KILL SWITCH, which is the whole reason it exists: a runtime is showing something wrong
     // and one keyword must take it back — without moving the window, without a reload, and without

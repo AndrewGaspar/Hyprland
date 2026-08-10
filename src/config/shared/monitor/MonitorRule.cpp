@@ -17,7 +17,9 @@ eMonitorRuleComparisonResult CMonitorRule::compare(const CMonitorRule& other) co
     const auto SAME_LEASE        = other.m_lease == m_lease;
     // Stereo changes the logical/pane size derivation, the render-resource sizes and the matrices —
     // it needs the full applyMonitorRule path, so it is a hard prop.
-    const auto SAME_STEREO       = other.m_stereo == m_stereo;
+    // The virtual flag rides with it: it changes what m_resolution MEANS (pane vs mode), so two
+    // rules that agree on every number and disagree here ask for different scanout modes.
+    const auto SAME_STEREO       = other.m_stereo == m_stereo && other.m_stereoVirtualMode == m_stereoVirtualMode;
 
     if (!SAME_ENABLED || !SAME_LEASE || !SAME_STEREO || !SAME_RES || !SAME_REFRESH || !SAME_SCALE || !SAME_BITNESS || !SAME_DRM_MODELINE)
         return COMPARISON_NO_MATCH;
