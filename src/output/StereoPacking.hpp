@@ -11,6 +11,9 @@
 #include "../config/shared/monitor/MonitorRule.hpp"
 #include "../helpers/math/Math.hpp"
 
+#include <algorithm>
+#include <span>
+
 namespace Monitor::Stereo {
 
     // {columns, rows} of identical panes packed into the scanout mode. {1,1} when off;
@@ -62,6 +65,47 @@ namespace Monitor::Stereo {
         if (requestedMode.x > 0 && requestedMode.y > 0)
             return committedMode == requestedMode;
         return !searchFellBack;
+    }
+
+    // §3.4 item 15b — the pack is validated when a rule is applied, but the hazard is CONTINUOUS.
+    // A display can swap its mode list under a connector that never disconnects: the XREAL falls
+    // from its 3D personality (3840x1080-only EDID) to its 2D one (1920x1080-only) on a USB
+    // re-enumeration and keeps the same connector. Nothing in the tree signals that — aquamarine's
+    // IOutput has no modes-changed event, `m_output->modes` is read only inside applyMonitorRule,
+    // and CMonitorRuleManager::ensureMonitorStatus skips a monitor whose RULE did not change. So
+    // m_pixelSize and m_stereoMode freeze at the last good apply while the panel stops splitting,
+    // and the compositor packs two panes into a mode the display no longer presents side by side.
+    //
+    // A packed monitor therefore has to re-ask. This is the whole decision, as arithmetic over the
+    // connector's advertised mode list, so it is one gtest away from the code that runs.
+    enum eStereoWatchAction : uint8_t {
+        STEREO_WATCH_NOTHING = 0,
+        STEREO_WATCH_DROP,   // the pack is live on a mode the panel no longer offers
+        STEREO_WATCH_READOPT // the pack is off, the rule still wants it, and its mode came back
+    };
+
+    inline bool modeAdvertised(const Vector2D& mode, const std::span<const Vector2D> advertised) {
+        return std::ranges::find(advertised, mode) != advertised.end();
+    }
+
+    // `packMode` is what the monitor is packing RIGHT NOW (CMonitor::m_stereoMode, already
+    // sanitized); `ruleMode`/`requestedMode` are what the active rule asks for. `onCustomMode` is
+    // the one legitimate way a committed mode is absent from the advertised list (a user modeline),
+    // and it must never be read as a fall.
+    //
+    // READOPT is deliberately narrower than DROP. Dropping is a safety action and applies to every
+    // request form. Re-adopting re-modesets the panel, so it only fires when the rule NAMES a
+    // resolution and that exact resolution is back — `preferred`/`highrr`/`highres`/`maxwidth` ask
+    // for "whatever the search picks", which is not a thing a timer may decide to chase.
+    inline eStereoWatchAction watchAction(Config::eMonitorStereoMode packMode, Config::eMonitorStereoMode ruleMode, const Vector2D& committedMode, const Vector2D& requestedMode,
+                                          const std::span<const Vector2D> advertised, bool onCustomMode = false) {
+        if (packMode != Config::STEREO_OFF)
+            return !onCustomMode && !modeAdvertised(committedMode, advertised) ? STEREO_WATCH_DROP : STEREO_WATCH_NOTHING;
+
+        if (ruleMode == Config::STEREO_OFF || requestedMode.x <= 0 || requestedMode.y <= 0)
+            return STEREO_WATCH_NOTHING;
+
+        return modeAdvertised(requestedMode, advertised) && committedMode != requestedMode ? STEREO_WATCH_READOPT : STEREO_WATCH_NOTHING;
     }
 
     // the size the fractional-scale check must validate — the PANE over the scale, never the mode

@@ -1286,6 +1286,37 @@ accept — then the display is not in side-by-side mode, and packing it would pu
 across the whole panel. The pack is dropped with the same log line and toast; fix the mode and it
 comes back on the next reload.
 
+### The display can leave side-by-side mode on its own
+
+Both checks above run when a monitor rule is *applied*. The hazard is continuous: a display can
+swap its mode list under a connector that never disconnects. An XREAL that falls from its 3D
+personality (a 3840×1080-only EDID) back to its 2D one (1920×1080-only) on a USB re-enumeration
+does exactly that — same connector, same name, same rule, different panel. There is no
+"mode list changed" event for Hyprland to listen to, so without help the pack would sit at the old
+mode forever, packing two panes into a scanout the display had stopped splitting. That looks like a
+squished side-by-side frame, and `hyprctl monitors` shows the contradiction directly: a live
+`availableModes` of `1920x1080` next to a frozen `stereo: sbs, scanoutWidth: 3840`.
+
+So a **stereo output watches its own mode list**, once a second, and re-applies its rule when the
+answer changes:
+
+- the packed mode stops being advertised → the rule is re-applied, the mode search lands wherever
+  the panel now is, and the sanitizer above drops the pack with its usual log line and toast;
+- the mode the rule asked for is advertised again → the rule is re-applied and the pack comes back
+  by itself. This is what makes a permanent `stereo:sbs` line in your config survive the glasses
+  power-cycling: the desktop follows the panel in both directions with nothing to reload.
+
+Three things it deliberately does not do. It never runs on a monitor that is neither packed nor
+configured for stereo, so `stereo:off` allocates nothing and behaves exactly as before. It never
+reads a **custom modeline** as a fall — a `modeline` mode is legitimately absent from the
+advertised list. And it only re-adopts for a rule that **names a resolution**: `preferred`,
+`highrr`, `highres` and `maxwidth` mean "whatever the mode search picks", which is not a thing a
+timer should chase, so those still come back on the next reload.
+
+It also acts once per hardware state. If the re-apply cannot commit a mode at all, the watch does
+not retry every second — the existing mode retry owns that — it waits for the panel to change
+again.
+
 Live toggling needs no new command — monitor rules already re-apply:
 
 ```bash
@@ -1382,6 +1413,47 @@ and from a Lua config, with the same grammar in the value:
 ```lua
 hl.window_rule({ match = { xdg_tag = "^stereo:" }, stereo = "auto" })
 ```
+
+### Matching a specific program — `match:exe` and `match:cmdline`
+
+`match:class` and `match:title` identify a *surface*. Sometimes you want the *process*, and these
+two matchers are the whole of that grammar. Both take a regex, both work on every `windowrule` (not
+just `stereo`), and both are read from `/proc` once per window and cached for its life.
+
+| Matcher | Matches against | Typical use |
+|---|---|---|
+| `match:exe <regex>` | the resolved target of `/proc/<pid>/exe` — an absolute path to the running image | native programs, when several share a class |
+| `match:cmdline <regex>` | `/proc/<pid>/cmdline`, the process's own argv, with the NUL separators folded to single spaces | **Wine/Proton games**, and anything launched by a wrapper |
+
+**Wine is why this exists.** A Proton game has none of the identities you would reach for first: its
+class belongs to the wrapper, its title is whatever the game draws, and its `exe` is
+`wine-preloader` — the same path for every Wine app on the machine. Its argv is the only string that
+names it. Measured on a live Proton install:
+
+```
+exe     = …/Proton - Experimental/files/bin/wine-preloader
+cmdline = Z:\home\ajg\Games\Ishimura\game\Dead Space.exe
+```
+
+so the rule that engages half-SBS 3D for that one game, windowed or not, is:
+
+```ini
+windowrule = stereo hsbs always, match:cmdline .*Ishimura.game.Dead Space.exe
+```
+
+Three things to know, in the order people trip over them:
+
+- **`windowrule` conditions are full-match regexes.** A cmdline is a long absolute path, so a bare
+  `match:cmdline Dead Space.exe` matches *nothing* — lead with `.*` as above. (This is the same
+  rule as `match:title`; `xrrule` is the one that searches.) The `.` between the path components is
+  deliberate: it matches the literal `\` that Wine reports without you having to reason about how
+  many layers of backslash escaping a config line survives.
+- **These are read once, at first rule evaluation, and never refreshed.** A process that `exec`s
+  something else later keeps the identity it had when its window mapped, exactly like
+  `match:initial_class`. A window whose process is already gone caches an empty string, and an empty
+  string never matches — so a matcher on a dead process quietly does not fire rather than erroring.
+- **Both are client-controlled**, the same trust level as `class` and `title`. A process picks its
+  own argv and can be exec'd from any path. Use them to *identify*, never to *authorize*.
 
 ### The layouts
 

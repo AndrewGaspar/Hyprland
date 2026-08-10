@@ -455,6 +455,21 @@ namespace Monitor {
         void                updateStereoCursorLock();
         bool                m_stereoSWCursorLocked = false;
 
+        // stereo output (research/24 §3.4 item 15b): the pack is a rule-apply-time decision, but a
+        // display can leave the mode it was packed for without any event this compositor can see
+        // (the XREAL 3D→2D personality fall re-enumerates under the same connector). This watch
+        // re-asks the connector's mode list once a second and re-applies the rule when the answer
+        // changed. Armed ONLY while the monitor is packed or its rule wants it to be, so a
+        // stereo:off monitor never allocates the timer and stays bit-identical to stock.
+        void                  updateStereoWatch();
+        void                  clearStereoWatch();
+        SP<CEventLoopTimer>   m_stereoWatchTimer;
+        // the advertised mode list the watch last acted on. A re-apply that cannot commit leaves the
+        // monitor in the same state the watch fired for, so without this the watch would re-modeset
+        // every second forever; scheduleModeRetry() owns retrying a failed modeset, the watch owns
+        // reacting to the panel CHANGING. Cleared with the timer.
+        std::vector<Vector2D> m_stereoWatchActedOn;
+
         void                setSpecialWorkspaceVisualState(bool active);
         void                commitDPMSState(bool state);
         void                scheduleModeRetry();
