@@ -267,6 +267,13 @@ class COpenXRManager {
         // `hyprctl openxr status` explains where the mouse will cross. source is
         // "auto" (the projection placed it) | "pinned" (an explicit user monitor= offset owns it) |
         // "off" (2D-plane sync disabled, or nothing placed yet — the historic append-right).
+        // Stereo CONTENT, the OpenXR quad pair (research/24 §5.1, WP X1). `stereo` is the layout
+        // the MAIN thread declared for this monitor — "off" | "sbs" | "hsbs" | "tab" | "htab" — and
+        // `quads` is how many composition layers its LAST submitted frame actually cost. They are
+        // reported separately on purpose: a declared pair that reads `quads: 1` is one the layer
+        // budget refused, which is the only way this feature fails with no visual tell at all.
+        std::string stereo = "off";
+        int         quads  = 1;
         std::string l2dSource = "off";
         int         l2dCol = 0, l2dRow = 0;
         double      l2dX = 0.0, l2dY = 0.0;
