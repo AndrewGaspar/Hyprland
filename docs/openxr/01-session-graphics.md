@@ -127,19 +127,34 @@ the one the XR EGL context landed on — and the runtime imports the compositor'
 mismatched EGL binding at `xrCreateSession` without complaint, so session bring-up is the last
 point at which the compositor can refuse while the desktop is still intact.
 
-When the runtime advertises `XR_KHR_vulkan_enable2`, `start()` probes the runtime's DRM render
-node via Vulkan device enumeration and compares it to the XR context's node:
+`start()` resolves the runtime's DRM render node and compares it to the XR context's node:
 
 - **Mismatch** → `start()` aborts to UNAVAILABLE with an error telling the user to point
   `openxr:gpu` at the runtime's GPU. The desktop session is untouched.
 - **Match** → proceed.
-- **Undeterminable** (runtime lacks the extension, or the probe times out) → proceed with a
-  warning, since a setup that would actually work should not be blocked.
+- **Undeterminable** (runtime advertises neither probe extension, or the probe times out) →
+  proceed with a warning, since a setup that would actually work should not be blocked.
 
-The probe runs on a throwaway thread with a bounded (3s) wait: `vkCreateInstance` can deadlock
-against the runtime's own in-process Vulkan use, and the check must never freeze the
-compositor — on timeout the thread is abandoned (it bails before touching any XR handle) and
-bring-up continues unverified. The resolved runtime GPU is surfaced as `runtimeGpu` in
+The question is "which GPU does the runtime **composite** on", and it is asked of
+`XR_MND_query_egl_device`: `xrGetSystemEGLDeviceMND` names the `EGLDeviceEXT` an EGL client is
+meant to build its context on, which is the compositor's device by construction — an EGL binding
+renders through the runtime's GL client compositor, which imports the compositor's swapchain
+images by an opaque fd, valid only on the device that exported them. It is answered in-process
+(the runtime enumerates our EGL devices through the `getProcAddress` we hand it and matches by
+UUID), so it needs no thread and no timeout, and its `EGLDeviceEXT` maps to a DRM node with
+`eglQueryDeviceStringEXT` — the same render-node-then-primary order `selectDisplay()` used to
+choose the context's device.
+
+`XR_KHR_vulkan_enable2` remains as the **fallback** for a runtime without the EGL query.
+`xrGetVulkanGraphicsDevice2KHR` answers a different question — which GPU a *Vulkan application*
+should render on — which coincides with the compositor's on every runtime that does not
+deliberately split the two, and does not on a WiVRn configured for cross-GPU rendering (game on
+the dGPU, composite and encode on the iGPU). It runs on a throwaway thread with a bounded (3s)
+wait: `vkCreateInstance` can deadlock against the runtime's own in-process Vulkan use, and the
+check must never freeze the compositor — on timeout the thread is abandoned (it bails before
+touching any XR handle) and bring-up continues unverified.
+
+The resolved runtime GPU, and which of the two queries answered, are surfaced as `runtimeGpu` in
 `hyprctl openxr status`.
 
 ## EGL context ownership — the critical invariant
