@@ -1158,7 +1158,7 @@ Sized in agent-tasks. **A** = required for Shape A. **B** = the Shape B unblock.
 | **WP-XG5** | **WiVRn — split the two UUIDs.** `W/server/compositor/compositor.cpp:797-798` stops copying one UUID into both; add a config key (e.g. `"client-gpu"`) resolved to a `VkPhysicalDevice`/UUID, defaulting to the compositor's device so existing setups are bit-identical. Wire it to the WP-XG1 swapchain flag. **STATUS: DONE 2026-08-10** (`wivrn-xg2` `a52ebc49`). The key is `"client-gpu"`, top-level, kebab-case like every other WiVRn key, `std::optional<std::string>`, `null` spelled out as "use the compositor's". Grammar and resolution live in the new `server/utils/cross_gpu.cpp`; the resolved `VkPhysicalDevice`, both UUIDs and the derived `cross_device` bool live on `wivrn::vk_bundle`, resolved once at bundle construction, so `sys_info()` publishes two independently-correct UUIDs on **every** path including the default one. **`XRT_COMPOSITOR_FORCE_CROSS_DEVICE` is deleted** — not in a new patch but by amending 0009, since it was always labelled "temporary, for XG5 to delete" and a series that adds then removes its own debug knob is noise to carry. An unresolvable `client-gpu` **throws at startup** with every candidate device listed (name, UUID, render node, primary node). | 1 | A |
 | **WP-XG6** | **Format-list intersection.** `W/server/compositor/compositor.cpp:739-744` / `M/.../comp_vulkan.c:382-428` / `vk_compositor_flags.c:344+` currently evaluate formats against the server GPU with `OPTIMAL` tiling and `OPAQUE_FD`. Advertise the intersection of both devices, evaluated for `DRM_FORMAT_MODIFIER` tiling + `DMA_BUF`. ~~§4.2 says all four common formats survive, so this should narrow nothing today — it is correctness insurance.~~ **That premise was wrong; see the STATUS.** **STATUS: DONE 2026-08-10**, in two halves. Server half (`wivrn-xg2` `a52ebc49`): `compositor::narrow_formats_to_cross_device` re-evaluates every format Monado advertised against **both** physical devices with `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT`, `DRM_FORMAT_MOD_LINEAR` and `DMA_BUF` export-on-server/import-on-client, and drops what does not survive; it runs only when the two devices differ, so the same-device list is untouched. Client half, the array-size term (`patches/monado/0013-...`): `client_vk_swapchain_create` runs the *existing* import check — patch 0010's `vk_check_dma_buf_import_support`, made public rather than duplicated — against its own device **before** the IPC round trip, and returns `XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED` → `XR_ERROR_FEATURE_UNSUPPORTED` from the `xrCreateSwapchain` the application called. **The design choice the hazard demanded: refuse loudly, never degrade.** Falling back single-device is not available — the allocation shape is chosen once for a whole swapchain by the device that does *not* have the limit, and an opaque same-device image is unimportable on the client for every layer count including one. **The row's "this should narrow nothing" did not survive measurement: it narrows 8 formats to 6** (§8.2). | 1 | A |
 | **WP-XG7** | **Queue-family ownership across the boundary.** Add the missing `VK_QUEUE_FAMILY_FOREIGN_EXT` acquire in `W/server/compositor/layer_squasher.cpp:443-445` and match the client's release (`comp_vk_client.c:748-757`, currently `VK_QUEUE_FAMILY_EXTERNAL` and unmatched). Neither tree uses `FOREIGN_EXT` today; the PoC does and it works on both drivers. **STATUS: DONE 2026-08-10** — client release in `patches/monado/0014-...`, server acquire in `wivrn-xg2` `b29e1eda`. The client's `dstQueueFamilyIndex` becomes `FOREIGN_EXT` when and only when `cross_device`; `layer_squasher::do_layers` gains a per-frame pre-pass that acquires, from `FOREIGN_EXT`, every image the frame's layers reference whose swapchain has `vkic.info.cross_device` set (deduplicated, since one image can back several layers). **The layout-matching problem and its answer:** a queue-family transfer that also changes layout requires both halves to name the same `oldLayout`/`newLayout`, and the server does not know the client's `barrier_optimal_layout` — except that it does, because that layout is a pure function of the swapchain format, so the server recomputes it with the same `vk_csci_get_barrier_optimal_layout` the client used. `VK_EXT_queue_family_foreign` is added to WiVRn's optional device extensions and to Monado's `enable2` optional list; **its absence on the compositor is logged as an error, not skipped quietly**, because the client releases to `FOREIGN` regardless and an unmatched release is corruption rather than a lost optimisation. | 1 | A |
-| **WP-XG8** | **Live bring-up.** xrizer + The Big Walk with the game on NVIDIA and the compositor on AMD; confirm no `assert_eq!(pd, info.physical_device)`, measure real frame times against a same-GPU baseline, and check the HypXRland desktop client still composites correctly in the same session (the §5.1 heterogeneous case). **Headset-in-the-loop; needs the user.** | 1 | A |
+| **WP-XG8** | **Live bring-up.** xrizer + The Big Walk with the game on NVIDIA and the compositor on AMD; confirm no `assert_eq!(pd, info.physical_device)`, measure real frame times against a same-GPU baseline, and check the HypXRland desktop client still composites correctly in the same session (the §5.1 heterogeneous case). **Headset-in-the-loop; needs the user.** **STATUS: ATTEMPT 1 FAILED 2026-08-10, and the cause is fixed** (`wivrn-xg` `xg-round-3`, patch `0015`). The server stack behaved — format narrowing matched the harness at runtime, the compositor stayed on AMD, encode worked, hypxrhud streamed — but the HypXRland desktop client refused every session in a connect/disconnect loop, because its wrong-GPU guard asks `xrGetVulkanGraphicsDevice2KHR` which GPU the runtime uses and was handed the **client** suggestion. The row's own item, "check the desktop client still composites", was the one that failed, and it failed on policy rather than on any of the cross-GPU mechanism. The device suggestion is now answered per graphics API. **The live half is still owed and now has a two-sided pass condition: the desktop client comes up *and* xrizer still gets NVIDIA.** See §8.3. | 1 | A |
 | **WP-XG9** | **Exclusive-mode verification (§10).** Three cheap things, one task: (a) confirm WiVRn's shipped one-projection-layer fast path (`compositor.cpp:326-345`) actually engages for a real xrizer/DXVK title — it may submit a HUD quad and never hit `layer_count == 1`; (b) decide whether the four things that path silently drops (colour scale/bias, chroma key, FOV-union viewport shrink, source-smaller-than-stream edge smear — §10.2) matter in practice, and log a warning if a layer needing them takes the fast path; (c) close out the last WP-XG0 gap by benchmarking *rendering into* an imported LINEAR image (`COLOR_ATTACHMENT`), not just copying into it. **No new mechanism — this is verification of behaviour that already ships.** | 1 | A |
 
 **Shape B (the unblock): WP-XG-B1 — 1 agent-task**, and it may be zero code if the probe happens to
@@ -1421,6 +1421,155 @@ and the unmatched-GPU warning in `oxr_vk_get_physical_device` is considerably mo
    heterogeneous case, now genuinely reachable: it stays on AMD, computes `cross_device = false`
    against the compositor's UUID, and should take the untouched path while the game does not.
 6. **The encoder and the live config** — XG-B1's runtime half, unchanged and still unexercised.
+
+### 8.3 Round 3 (XG8 attempt 1) — the suggestion was handed to a client that cannot use it
+
+**The stack worked. The desktop did not, and the reason was one line of policy.** With
+`client-gpu = /dev/dri/renderD128` live for the first time on 2026-08-10, the Quest connected and
+everything §8.1/§8.2 built behaved: the format narrowing ran at runtime and matched the harness digit
+for digit (depth formats "rejected by the compositor's GPU, which cannot export it"), the compositor
+stayed on AMD, vaapi encode worked, and hypxrhud — an EGL/GL ES client — connected and streamed.
+**Hyprland went into a connect/disconnect loop instead**, which the server's journal records as
+`client_connected` → `describe_client` → `client_disconnected` cycles from one pid — **71 of them
+between 18:19:08 and 18:42:47**, every ~2 s at first and every ~32 s once its retry backoff settled,
+and still going as this was written. The same journal shows the earlier same-GPU session that day
+(13:47) with Hyprland connecting **once** and staying, alongside `steam`, `wineopenxr test instance`
+and `Big Walk` — so the loop is specific to the cross-GPU configuration, not to the day's build.
+
+**What refused, and why it was wrong.** `COpenXRManager::start()` carries a wrong-GPU guard
+(`src/openxr/OpenXRManager.cpp:623-682`, added after coredumps 8986/39318) which asks *"which GPU
+does the runtime composite on"* through `XR_KHR_vulkan_enable2` — `xrGetVulkanGraphicsDevice2KHR`,
+`src/openxr/XRGpuProbe.cpp:41` — and refuses to start XR when the answer differs from the DRM node
+`openxr:gpu` selected. That query answers with `client_vk_deviceUUID`. **Until XG5 those two were the
+same value by definition; after XG5 they are not, and the guard was reading the wrong one.** It
+compared the dGPU against its own AMD EGL context, concluded the runtime had moved underneath it, and
+did exactly what it was written to do. Hyprland enables `XR_MNDX_egl_enable` + `XR_KHR_opengl_es_enable`
+to bind with and `XR_KHR_vulkan_enable2` *only* to run that probe (`src/openxr/XRSession.cpp:82`, and
+the comment at `:97`), so it is the exact case where the two answers must differ.
+
+**Item 1 — how the GL/EGL client path picks its internal Vulkan device: it has none.** This was the
+question the round was gated on, and the answer removes a whole branch of the workplan.
+`oxr_session_populate_egl` (`oxr_session_gfx_egl.c:63-72`) calls `xrt_gfx_provider_create_gl_egl`
+(`comp_egl_client.c:654-789`), which builds a `client_gl_compositor` that wraps the
+`xrt_compositor_native` **directly** — `comp_gl_client.c:622`, `c->xcn = xcn;`. There is no
+`client_vk_compositor` underneath it. Grepping every GL/EGL client file for `VkInstance|VkDevice|VkPhysicalDevice|vkCreate|vkEnumerate|vk_bundle` returns **zero matches**; the only Vulkan-shaped text
+is two integer format tables (`comp_gl_client.c:63-108`). The device such a client renders on is
+whatever its own `EGLContext` was already created on — the context arrives fully formed in
+`XrGraphicsBindingEGLMNDX::context` and is only made current (`comp_egl_client.c:711`). Consequences:
+
+- **hypxrhud worked by design, not because NVIDIA was masked in its environment.** No EGL client
+  consults the suggestion on the binding path.
+- **Hyprland would not have crashed had its guard not fired.** Its EGL context is on the compositor's
+  own GPU, which is where the images come from; the guard was a false positive, full stop.
+- **Item 3 is moot as written.** There is no GL-client Vulkan device to re-derive from the EGL
+  context, so the defence-in-depth patch that item asked for has nothing to patch. See "what was
+  deliberately not built" below for the guard that *would* be the real version of it.
+- The GL client imports through `glImportMemoryFdEXT(memory, size, GL_HANDLE_TYPE_OPAQUE_FD_EXT, …)`
+  (`comp_gl_memobj_swapchain.c:79-82`, preferred) or `eglCreateImageKHR(… EGL_LINUX_DMA_BUF_EXT)`
+  (`comp_gl_eglimage_swapchain.c:274-291`, fallback chosen at `comp_egl_client.c:508-555`). **The
+  preferred path is an opaque fd, importable on the exporting device and nowhere else** — which is
+  why "the compositor's device" is not a preference for these clients but the only possible answer.
+  It also never sets `xrt_swapchain_create_info::cross_device` (the only writer in the tree is
+  `comp_vk_client.c:678`), so the server allocates it ordinary `OPAQUE_FD`/`OPTIMAL` images and the
+  entire XG1/XG2 machinery stays out of its way.
+
+**Where the per-API logic landed, and why not in the server.** In `st/oxr`, as
+`patches/monado/0015-…`. The workplan assumed the WiVRn compositor could answer per client, because
+`ipc_handle_instance_describe_client` logs each client's extensions — **it can't, and the log is what
+proves it.** The struct it prints is `struct xrt_application_info` (`xrt_instance.h:72-87`): twelve
+booleans for hand tracking, eye gaze, body and face tracking, and **no graphics-binding bit at all**
+(the journal lines from the incident are exactly those twelve). `ipc_handle_system_compositor_get_info`
+does have the per-client state in scope (`ipc_server_handler.c:402-411`, and describe_client provably
+precedes it — `ipc_client_connection.c:413-414` runs at `xrCreateInstance`, `get_system_info` at
+`xrGetSystem`), so the *ordering* supports a per-client answer; the *data* does not exist. Answering
+there would mean inventing new wire fields and then varying a struct every other reader treats as a
+constant of the system. In `st/oxr` the extension set is already authoritative and in scope, needs no
+IPC, needs no WiVRn change, and fixes in-process Monado targets for free. **WiVRn itself is unchanged
+this round.**
+
+**What the patch does.** One pure decision — `oxr_select_vk_client_device_uuid(extensions, info)` and
+`oxr_select_gl_client_device_uuid(info)` in `oxr_system.c` — consulted by the two entry points that
+answer "which device":
+
+| asked by | before | after |
+|---|---|---|
+| `xrGetVulkanGraphicsDevice(2)KHR`, Vulkan-only client | `client_vk_deviceUUID` | unchanged |
+| `xrGetVulkanGraphicsDevice(2)KHR`, client that also enabled EGL/GL/GLES | `client_vk_deviceUUID` | **`compositor_vk_deviceUUID`** |
+| `xrGetSystemEGLDeviceMND` (`XR_MND_query_egl_device`) | `client_vk_deviceUUID` | **`compositor_vk_deviceUUID`** |
+| either, on a single-device runtime | one UUID | the same UUID, both branches |
+
+The second row is the incident. **The third row was a second, independent instance of the same bug,
+found while reading rather than by the failure**: `oxr_egl.c:88` matched EGL devices against
+`client_vk_deviceUUID` under a comment and an error message that both said "the compositor's device".
+Any EGL client that used that extension to choose its device would have been pointed at the dGPU and
+then failed its first `glImportMemoryFdEXT`. Hyprland does not use it; something else would have.
+
+Two deliberate details. **The decision is taken from the enabled extension set, not from the graphics
+binding**, because both entry points are called *before* `xrCreateSession` when no binding exists —
+and an instance enabling both kinds counts as GL, because the binding is what has to work and the
+Vulkan use is a probe. **A compositor that reports no device of its own is not second-guessed**: with
+`compositor_vk_deviceUUID` unset the answer stays the suggestion, since handing a GL client a zeroed
+UUID would match no device at all. `oxr_vk_suggests_cross_device_client` now measures divergence
+against *what this client is told* rather than what the compositor published, so the identity-check
+relaxations XG4 added stay strict for a GL client, which has nothing to diverge.
+
+**The pure-Vulkan answer is unchanged byte for byte, and that is asserted, not asserted-to.** xrizer's
+`assert_eq!(pd, info.physical_device)` still sees the `client-gpu` device.
+
+**Validation.**
+
+- **All fifteen patches `git am` cleanly from a from-scratch configure** at the pinned Monado rev, and
+  `wivrn-server` builds with `-DGIT_DESC=v26.6.2` / `WIVRN_WERROR=OFF` — `--version` prints
+  `WiVRn version 26.6.2`, zero errors and, this round, zero warnings.
+- **Standalone Monado `-DBUILD_TESTING=ON`: 24/24 `ctest`**, including `tests_comp_client_vulkan` and
+  `st_oxr`'s `tests_input_transform`, both of which must be named explicitly since they are excluded
+  from `all`. The new `tests_oxr_client_device` (18 assertions) drives the selection directly:
+  Vulkan-only → client GPU; EGL-only → compositor; EGL **and** vulkan_enable2 → compositor; each of
+  the three GL extensions alone; **one device → the same answer whichever kind of client asks**; and
+  the unset-compositor-UUID fallback. That last-but-one case is the "default path is bit-identical"
+  claim, now a test rather than a reading.
+- **No harness regression.** `--client-gpu` resolves all four spellings on both GPUs and refuses
+  `renderD999` with the full listing; `--formats` still narrows nineteen advertised formats to the
+  same **six**, with the same four §4.2 formats surviving. Neither touches the changed code, so this
+  is a build check rather than a proof — stated as such.
+- **Caveat on `all`:** a standalone Monado `--target all` does *not* link, and did not before this
+  round either: WiVRn's patch 0008 moves `u_git_tag` into WiVRn's build, so `monado-ctl` and
+  `libmonado.so` fail with `undefined reference to u_git_tag`. §8.1's lesson ("`-DBUILD_TESTING=ON` is
+  the only thing that compiles Monado's own callers") holds, but it has to be run as
+  *build the test targets, then ctest* — not `all`.
+
+**What was deliberately not built, and should be considered later.** An EGL client on the wrong GPU
+today gets an opaque fd from another device handed to `glImportMemoryFdEXT` — undefined behaviour, and
+plausibly the very radeonsi crash Hyprland's guard exists to prevent. The runtime *could* refuse that
+loudly: query the bound `EGLContext`'s device (`EGL_EXT_device_query` → `EGL_DEVICE_UUID_EXT`, which
+`oxr_egl.c` already trusts to equal the Vulkan `deviceUUID`), compare against
+`compositor_vk_deviceUUID`, and fail `xrCreateSession` — which would make Hyprland's own guard
+redundant for every EGL client, not just this one. It is not in this round on purpose: **tonight's
+failure was a safety guard firing wrongly, and the wrong response to that is to add a second guard
+that can fire wrongly** on a session the user is about to trust. It wants its own round, with the
+desktop client already known-good.
+
+**Two things about the live box, recorded because they are not inferable later.** The `wivrn-server`
+still running as of this writing is the **`wivrn-xg` round-2 build**, and its compositor child holds
+fds on *both* render nodes (11 on AMD `renderD129`, 2 on NVIDIA `renderD128` plus the `nvidia*`
+nodes) — i.e. it is still the cross-GPU configuration, with a headset still connected, **and Hyprland
+is still retrying and being refused every ~32 s**. Meanwhile `~/.config/wivrn/config.json` **no longer
+contains the `client-gpu` key**: the config was reverted but the service has not been restarted, so
+the running process is the only remaining copy of the failing configuration. Everything in this round
+was proved through builds, `ctest` and the harness; no `wivrn-server` was started, nothing was
+restarted, and the GPUs were **not** exclusive — no timing was measured and none is claimed.
+
+**What XG8 attempt 2 must verify.** §8.2's checklist stands; these are added, and the first two are
+the pass/fail of this round:
+
+1. **The desktop client comes up.** With the same `client-gpu`, Hyprland's probe must now report the
+   *AMD* device, log `XR GPU verified against runtime`, and start a session — not
+   `XR is refusing to start`. Its log will also carry the new runtime line naming both UUIDs and
+   saying why the answer was overridden; if that line is absent, the running server is not the
+   patched one.
+2. **xrizer still gets NVIDIA.** No `assert_eq!(pd, info.physical_device)`. The two together are the
+   whole point: two clients, two answers, one session.
+3. That hypxrhud still connects — it should be untouched, and now for a reason rather than by luck.
 
 ---
 
