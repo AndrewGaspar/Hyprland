@@ -931,7 +931,7 @@ JSON (`hyprctl -j openxr`) — all keys always present:
     "state": "focused",
     "runtimeName": "Monado(XRT) by Collabora et al.",
     "systemName": "Simulated HMD",
-    "runtimeGpu": "AMD Radeon Graphics (drm 226:128)",
+    "runtimeGpu": "AMD Radeon Graphics (drm 226:128, via EGL device query (XR_MND_query_egl_device))",
     "runtimeJson": "",
     "blendMode": "opaque",
     "blackAlpha": { "configured": 1.000, "effective": 1.000, "knee": 0.100, "active": false, "gatedOff": false },
@@ -980,7 +980,9 @@ Field notes:
 - `state` — `disabled` | `unavailable` | `starting` | `idle` | `visible` | `focused` |
   `stopping`.
 - `runtimeName` / `systemName` — from the runtime; empty when there is no session.
-- `runtimeGpu` — the GPU the runtime composites on, resolved by the cross-GPU probe (see the
+- `runtimeGpu` — the GPU the runtime composites on, resolved by the cross-GPU probe, followed by
+  which query answered (`via EGL device query (XR_MND_query_egl_device)` normally, `via Vulkan
+  device query (XR_KHR_vulkan_enable2)` on a runtime without the EGL query — see the
   session/graphics doc); empty when undeterminable (text form shows `unknown`).
 - `blendMode` — the active environment blend mode (`opaque` when there is no session).
 - `blackAlpha` — the luma-keyed transparency state: `configured` is `openxr:black_alpha` as set,
