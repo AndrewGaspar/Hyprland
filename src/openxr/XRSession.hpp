@@ -89,8 +89,12 @@ class CXRSession {
     XrSpace    m_viewSpace       = XR_NULL_HANDLE; // VIEW
     bool       m_usingLocalFloor = false;
     bool       m_hasLocalFloor = false, m_hasHandInteraction = false, m_hasHandTracking = false;
-    // XR_KHR_vulkan_enable2 advertised AND enabled (probe-only, for the wrong-GPU guard in start()).
-    bool       m_hasVulkanEnable2 = false;
+    // The two probe-only extensions behind the wrong-GPU guard in start(), each advertised AND
+    // enabled. XR_MND_query_egl_device answers "which GPU does the runtime composite on" (the
+    // question the guard actually asks); XR_KHR_vulkan_enable2 answers "which GPU should a Vulkan
+    // application render on" and is only the fallback, correct on runtimes that do not split them.
+    bool       m_hasEglDeviceQuery = false;
+    bool       m_hasVulkanEnable2  = false;
 
     // XR_EXT_user_presence (report-19): the real donned/doffed signal. m_hasUserPresence = extension
     // advertised AND enabled; m_supportsUserPresence = the system property (a runtime may enable the
