@@ -1630,6 +1630,47 @@ DXVK missing `VK_EXT_image_drm_format_modifier` / `VK_EXT_external_memory_dma_bu
 `VK_EXT_queue_family_foreign` on the import path — a fix there lives in DXVK/xrizer territory, not
 in this tree.
 
+### 8.5 Rounds 5-7 — the last three walls, and the session that reached FOCUSED
+
+**2026-08-11 00:25:03.883: `OpenXR session state changed: FOCUSED`.** Big Walk, rendered by DXVK on
+the RTX 5070, its eye buffers imported by the AMD compositor as LINEAR dma-bufs, composited and
+encoded on the 890M, streamed to the Quest. The full §7 Shape A, live. Three more walls fell after
+§8.4, each exposed by the previous fix, each caught loudly by the guard rails this series built:
+
+1. **xrizer's stereo strategy** (round 5): one two-layer array swapchain (`compositor.rs:1489`) hits
+   the designed multi-layer refusal. Fix: fall back to one single-layer swapchain per eye on exactly
+   `XR_ERROR_FEATURE_UNSUPPORTED` with `array_size > 1` — first attempt byte-identical, so same-GPU
+   runtimes never see the new path. Carried on the xrizer fork (`xg-round-5`); upstream had nothing
+   to backport (all branches hardcode `array_size: 2`, no related PR or issue).
+2. **The game device lacked the import extensions** (round 6): the per-eye creation was refused too,
+   and `vk_check_dma_buf_import_support` said why in the game's own log. Patch 0016 advertises
+   `VK_KHR_external_memory_fd`, `VK_EXT_external_memory_dma_buf`, `VK_EXT_image_drm_format_modifier`
+   and `VK_EXT_queue_family_foreign` to cross-device clients (split- and support-gated, unsplit
+   byte-identical). The same round found that deploying this NAIVELY breaks every Proton title on
+   the box: Proton's `steam_helper` broadcasts the runtime's answer to ALL games via a volatile
+   registry key, DXVK forwards it to `vkCreateDevice` unchecked, and winevulkan's Windows-facing
+   allowlist fails the whole device on three of the four names.
+3. **Proton-safe delivery** (round 7): Proton's own escape hatch — a device that enables the magic
+   `VK_WINE_openvr_device_extensions` name makes win32u expand `VK_WINE_OPENVR_DEVICE_EXTS_PCIID_%04x_%04x`
+   from the environment against the names winevulkan knows, dropping unknown ones instead of failing.
+   The xrizer fork substitutes the three hostile names with the magic name (once, whole-token,
+   borrowed-input fast path pinned by test); `VK_EXT_queue_family_foreign` passes verbatim (it is
+   allowlisted). The env vars live in the session environment for both PCIIDs. Proton's app-facing
+   thunk already performs this exact substitution; the registry path not doing it is an upstream bug
+   candidate with this box as the repro.
+
+**The verification chain, from the successful run:** the registry answer carried the magic name and
+`queue_family_foreign` and none of the hostile names; the Proton log's "Enabling 56 host device
+extensions" included all three real names; xrizer logged the array refusal, the per-eye fallback,
+then `SYNCHRONIZED → VISIBLE → FOCUSED` with no panic. Operational rule learned on the way: the
+registry answer is cached per wineserver session — fully exit Steam between runtime-answer changes.
+
+**Still open:** the §8.2/XG9 performance round (does the shipped one-projection-layer fast path
+engage for a real title; frame times vs native; the per-eye path costs two `xrWaitSwapchainImage`
+calls per frame instead of one); in-headset visual QA (the validating session ran with the headset
+on a desk); and the upstream conversations this arc now justifies with data — WiVRn multi-GPU,
+the Proton substitution gap, and the xrizer per-eye fallback.
+
 ---
 
 ## 9. Open questions for the user
