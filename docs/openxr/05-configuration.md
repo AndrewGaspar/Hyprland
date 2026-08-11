@@ -745,6 +745,7 @@ transports, one implementation.
 | `gazerelease` | *(none)* | Explicit release of the gaze carry (no-op if none). For a `bindr` hold-to-carry pattern. |
 | `gazepush` | `<±m>` | Push/pull the gaze-carried monitor along the gaze ray (or, when not carrying, the gaze-selected monitor along the view ray). No arg = `openxr:gaze_dist_step`. Designed for `binde` repeats. |
 | `handinput` | `on\|off\|auto\|toggle` | Set the conditional hand-input policy (§2). `toggle` is the key-chord to flip hands on/off at the keyboard. |
+| `view` | `on\|off\|toggle` | Show or hide every HypXRland monitor quad while leaving the OpenXR session, headless outputs, workspaces, swapchains, and anchors intact. The latch is session-scoped and resets to `on` after a session restart. This also removes the hidden quads from ray-pointer hit testing. |
 | `alpha` | `<name\|active> <0..1\|auto>` | Manual uniform-transparency override (§3.5). Sticky — outranks every `xrrule` until cleared with `auto`. |
 | `blackalpha` | `<name\|active> <0..1\|off\|auto>` | Manual luma-key override (§3.5). `off` disables keying on that monitor; `auto` hands it back to the rules. |
 | `sync` | *(none)* \| `freeze` \| `thaw` | 2D-plane sync. Bare: re-latch the desk orientation and re-derive the 2D layout **now**. `freeze` pauses the automatic recompute (rearrange quads without your mouse mapping moving under you); `thaw` resumes it and catches up. Same implementation as `hyprctl openxr sync-layout`. |
@@ -764,6 +765,7 @@ binde = SUPER,       minus,        xrmonitor, distance +0.25
 bind  = SUPER,       H,            xrmonitor, anchor active head
 bind  = SUPER,       L,            xrmonitor, anchor active local
 bind  = SUPER,       A,            xrmonitor, adaptive toggle
+bind  = SUPER ALT,   M,            xrmonitor, view toggle
 bind  = SUPER SHIFT, Home,         xrmonitor, sync
 ```
 
@@ -904,6 +906,7 @@ runtime json: (loader default)
 blend mode: opaque
 black alpha: off
 overlay: no
+monitor view: shown
 selected: XR-code
 monitors follow session: visible
 visible: yes
@@ -936,6 +939,7 @@ JSON (`hyprctl -j openxr`) — all keys always present:
     "blendMode": "opaque",
     "blackAlpha": { "configured": 1.000, "effective": 1.000, "knee": 0.100, "active": false, "gatedOff": false },
     "overlay": false,
+    "monitorView": "shown",
     "selected": "XR-code",
     "monitorsFollowSession": "visible",
     "monitorUnplugPendingMs": -1,
@@ -1015,6 +1019,9 @@ Field notes:
 - `visible` — the raw session-visibility signal, the other half of the plug gate (which needs
   both): `yes` while VISIBLE/FOCUSED, `no` while a session exists but isn't visible
   (doffed/standby), `n/a` with no session.
+- `monitorView` — `shown` or `hidden`, the session-scoped `xrmonitor view` presentation gate.
+  Hidden monitors remain plugged with their workspaces and anchors intact, but submit no quads and
+  cannot receive ray-pointer hits.
 - `reprobeWaiting` / `reprobePendingMs` — while dormant in `unavailable`: what the reprobe is
   waiting for (`runtime` | `headset` | `""`) and ms until the next probe (`-1` when none
   armed). `headset` covers both xrGetSystem `FORM_FACTOR_UNAVAILABLE` (stock monado, HMD absent)

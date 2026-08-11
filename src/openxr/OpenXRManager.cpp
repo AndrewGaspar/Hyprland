@@ -297,6 +297,10 @@ void COpenXRManager::start() {
 
     setState(XR_STATE_STARTING);
 
+    // `xrmonitor view` is deliberately a session-scoped convenience latch. Always recover to a
+    // visible desktop after a user restart, runtime loss/re-probe, or compositor relog.
+    m_monitorViewVisible.store(true, std::memory_order_release);
+
     // report-20 issue B1: assume "waiting for the runtime" until we learn otherwise. A failure past
     // createInstance flips this to HEADSET (getSystem FORM_FACTOR_UNAVAILABLE) or keeps it at RUNTIME.
     m_probeWait = XR_WAIT_RUNTIME;
@@ -1425,6 +1429,14 @@ void COpenXRManager::frameThread() {
         toRemove.clear(); // drop refs BEFORE the acks — main may finalize (and erase) immediately
         for (auto& name : removedNames)
             reportLayerRemoved(name);
+
+        // A hidden view is still a fully live OpenXR session: keep pumping wait/begin/end frames and
+        // processing removal barriers, but make the presentation set empty. This avoids swapchain
+        // churn, output/workspace movement, and session recreation; xrEndFrame below legally submits
+        // zero layers. CXRInput still samples actions and processPointer receives no targets, which
+        // clears hover/releases without letting an invisible quad intercept the pointer.
+        if (!m_monitorViewVisible.load(std::memory_order_acquire))
+            active.clear();
 
         // DEVIATION from doc 01's frame-loop pseudocode (which gates the pump on the state
         // already being SYNCHRONIZED/VISIBLE/FOCUSED): the runtime only advances
@@ -5767,6 +5779,35 @@ std::expected<void, std::string> COpenXRManager::cmdHandInput(const std::string&
         m_handForce.store(wasOn ? HANDFORCE_OFF : HANDFORCE_ON, std::memory_order_relaxed);
     } else
         return std::unexpected<std::string>("handinput: expected on|off|auto|toggle");
+    return {};
+}
+
+std::expected<void, std::string> COpenXRManager::cmdView(const std::string& args) {
+    const auto tokens = splitWs(args);
+    if (tokens.size() != 1)
+        return std::unexpected<std::string>("view: expected on|off|toggle");
+    const std::string& arg = tokens[0];
+    if (arg != "on" && arg != "off" && arg != "toggle")
+        return std::unexpected<std::string>("view: expected on|off|toggle");
+    if (!sessionExists())
+        return std::unexpected<std::string>("view: no OpenXR session");
+
+    const bool wasVisible = m_monitorViewVisible.load(std::memory_order_acquire);
+    const bool visible    = arg == "toggle" ? !wasVisible : arg == "on";
+    m_monitorViewVisible.store(visible, std::memory_order_release);
+
+    if (!visible) {
+        // Status should reflect the gate immediately instead of retaining last frame's quad count or
+        // hover until the frame thread reaches its next zero-layer submission.
+        {
+            std::scoped_lock lock(m_layersMu);
+            for (auto& l : m_layers)
+                l->m_quadsSubmitted.store(0, std::memory_order_relaxed);
+        }
+        setHoveredMonitor("");
+    }
+
+    Log::logger->log(Log::DEBUG, "[OPENXR] monitor view {}", visible ? "shown" : "hidden");
     return {};
 }
 

@@ -85,6 +85,85 @@ TEST_CASE(xr_monitor_create_destroy) {
     NLog::green("xr_monitor_create_destroy: create+destroy round-trip verified in both j/monitors and j/openxr");
 }
 
+// `xrmonitor view` is the in-headset presentation switch: it must remove every monitor quad without
+// stopping the session or unplugging/recreating the backing outputs. Exercise the public IPC surface
+// here; the per-monitor `quads` count proves the frame-thread gate has reached xrEndFrame rather than
+// this being status-only bookkeeping.
+TEST_CASE(xr_monitor_view_toggle) {
+    XR_SKIP_IF_UNAVAILABLE();
+    SArtifactGuard guard{this->failed, name(), {}};
+    // `view` is a global session latch; never let an assertion hide the fixtures for tests that
+    // follow this one.
+    struct SViewGuard {
+        ~SViewGuard() {
+            getFromSocket("/openxr view on");
+        }
+    } viewGuard;
+
+    if (!gateUp()) {
+        XR::logSkip(name(), "session never reached focused/visible (known env instability)");
+        return;
+    }
+
+    const std::string mon        = XR::monitorName(18);
+    const std::string nameMarker = "\"name\": \"" + mon + "\"";
+    ASSERT(getFromSocket("/openxr create " + mon + " 1280x720"), std::string("ok"));
+    guard.monitorNames.push_back(mon);
+
+    ASSERT(XR::waitForJson("j/openxr", [&](const std::string& r) { return r.contains(nameMarker); }, std::chrono::milliseconds(10000)), true);
+    // A freshly-created monitor may still be inside the first-plug settle window even though the
+    // session itself is focused. Wait for the backing output before trying to focus it.
+    if (!XR::waitForJson("j/monitors", [&](const std::string& r) { return r.contains(nameMarker); }, std::chrono::milliseconds(15000))) {
+        XR::logSkip(name(), "XR monitor never got plugged (monitors_follow_session gate never satisfied in this environment)");
+        return;
+    }
+    ASSERT(getFromSocket("/dispatch focusmonitor " + mon), std::string("ok"));
+    auto kitty = Tests::spawnKitty("xr_monitor_view_toggle");
+    if (!kitty) {
+        XR::logSkip(name(), "kitty did not spawn (env limitation)");
+        return;
+    }
+    ASSERT(XR::waitForJson("j/clients", [&](const std::string& r) { return r.contains("\"xr_monitor_view_toggle\""); }, std::chrono::milliseconds(10000)), true);
+    ASSERT(XR::waitForJson(
+               "j/openxr",
+               [&](const std::string& r) {
+                   const auto p = XR::findAfter(r, nameMarker);
+                   return p != std::string::npos && XR::fieldAfter(r, p, "quads") != "0";
+               },
+               std::chrono::milliseconds(10000)),
+           true);
+    const std::string stateBefore = XR::fieldAfter(getFromSocket("j/openxr"), 0, "state");
+
+    ASSERT(getFromSocket("/openxr view off"), std::string("ok"));
+    ASSERT(XR::waitForJson(
+               "j/openxr",
+               [&](const std::string& r) {
+                   const auto p = XR::findAfter(r, nameMarker);
+                   return XR::fieldAfter(r, 0, "monitorView") == "hidden" && p != std::string::npos && XR::fieldAfter(r, p, "quads") == "0";
+               },
+               std::chrono::milliseconds(3000)),
+           true);
+
+    const std::string hidden = getFromSocket("j/openxr");
+    EXPECT(XR::fieldAfter(hidden, 0, "state"), stateBefore);
+    const auto hiddenMon = XR::findAfter(hidden, nameMarker);
+    EXPECT_NOT(hiddenMon, std::string::npos);
+    EXPECT(XR::fieldAfter(hidden, hiddenMon, "plugged"), std::string("true"));
+
+    ASSERT(getFromSocket("/openxr view toggle"), std::string("ok"));
+    ASSERT(XR::waitForJson(
+               "j/openxr",
+               [&](const std::string& r) {
+                   const auto p = XR::findAfter(r, nameMarker);
+                   return XR::fieldAfter(r, 0, "monitorView") == "shown" && p != std::string::npos && XR::fieldAfter(r, p, "quads") != "0";
+               },
+               std::chrono::milliseconds(3000)),
+           true);
+
+    EXPECT(getFromSocket("/openxr view invalid"), std::string("view: expected on|off|toggle"));
+    NLog::green("xr_monitor_view_toggle: zero-layer hide/show preserved session and backing output");
+}
+
 // xr_monitor_create_mode — live 2026-08-01: `hyprctl openxr create XR-2 2560x1440@60` produced a
 // monitor RUNNING 1920x1080. createXRMonitor does install a persistent monitor rule carrying the
 // requested mode (report-20 issue E), but a config reparse CLEARS the rule manager and only
