@@ -23,6 +23,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     const std::string RTJSON  = g_pOpenXRManager->runtimeJson();
     const std::string BLEND   = g_pOpenXRManager->blendModeName();
     const bool        OVERLAY = g_pOpenXRManager->isOverlay();
+    const bool        MONITOR_VIEW = g_pOpenXRManager->monitorViewVisible();
     // report 09: luma-keyed transparency ("black-as-alpha"). Reports the CONFIGURED value, the
     // EFFECTIVE one (forced off unless the blend mode composites over passthrough/additive) and the
     // knee, so "why is my desktop still opaque" is answerable in one command.
@@ -149,6 +150,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "blendMode": "{}",
     "blackAlpha": {{ "configured": {:.3f}, "effective": {:.3f}, "knee": {:.3f}, "active": {}, "gatedOff": {} }},
     "overlay": {},
+    "monitorView": "{}",
     "selected": "{}",
     "monitorsFollowSession": "{}",
     "monitorUnplugPendingMs": {},
@@ -174,10 +176,10 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
 }}
 )#",
                            STATE, RUNTIME, SYSTEM, RTGPU, RTJSON, BLEND, BLACK.configured, BLACK.effective, BLACK.knee, BLACK.active ? "true" : "false",
-                           BLACK.gatedOff ? "true" : "false", OVERLAY ? "true" : "false", SELECTED, FOLLOW, UNPLUG_PEND, PRESENCE, VISIBLE, REPROBE_WAIT, REPROBE_MS, REPROBE_WATCH ? "true" : "false", INHIBITING_IDLE ? "true" : "false", INHIBIT_MODE,
-                           HANDIN.mode, HANDIN.state, GAZE.source, GAZE.hoveredMonitor, GAZE.hoveredName, GAZE.carrying ? "true" : "false", GAZE.carryMonitor, GAZE.dist,
-                           HANDS[0].hands ? "hands" : "controllers", HANDS[0].gesture,
-                           HANDS[0].filtered ? "true" : "false", HANDS[1].hands ? "hands" : "controllers", HANDS[1].gesture, HANDS[1].filtered ? "true" : "false",
+                           BLACK.gatedOff ? "true" : "false", OVERLAY ? "true" : "false", MONITOR_VIEW ? "shown" : "hidden", SELECTED, FOLLOW, UNPLUG_PEND, PRESENCE, VISIBLE,
+                           REPROBE_WAIT, REPROBE_MS, REPROBE_WATCH ? "true" : "false", INHIBITING_IDLE ? "true" : "false", INHIBIT_MODE, HANDIN.mode, HANDIN.state, GAZE.source,
+                           GAZE.hoveredMonitor, GAZE.hoveredName, GAZE.carrying ? "true" : "false", GAZE.carryMonitor, GAZE.dist, HANDS[0].hands ? "hands" : "controllers",
+                           HANDS[0].gesture, HANDS[0].filtered ? "true" : "false", HANDS[1].hands ? "hands" : "controllers", HANDS[1].gesture, HANDS[1].filtered ? "true" : "false",
                            L2D.enabled ? "true" : "false", L2D.frozen ? "true" : "false", L2D.refValid ? "true" : "false", L2D.refYawDeg, L2D.placed, L2D.rows, L2D.width,
                            L2D.height, L2D.vertical, L2D.attach, L2D.pxPerDegree, MONS.empty() ? "" : "\n", mons);
     }
@@ -202,13 +204,15 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
         : !L2D.refValid        ? "on (waiting for tracking)"
                                : std::format("{}{} monitor(s) in {} row(s), block {}x{}, ref yaw {:.0f} deg, {} px/deg, vertical {}, attach {}", L2D.frozen ? "frozen — " : "",
                                              L2D.placed, L2D.rows, L2D.width, L2D.height, L2D.refYawDeg, L2D.pxPerDegree, L2D.vertical, L2D.attach);
-    std::string       out = std::format(
-        "state: {}\nruntime: {}\nsystem: {}\nruntime gpu: {}\nruntime json: {}\nblend mode: {}\nblack alpha: {}\noverlay: {}\nselected: {}\nmonitors follow session: {}\nvisible: "
-        "{}\npresence: {}\nidle "
-        "inhibited: {} (mode {})\nhand input: {} "
-        "({})\ngaze ({}): {}\ninput: left {}, right {}\n2d-plane sync: {}\n",
-        STATELINE, RUNTIME, SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, RTJSON.empty() ? "(loader default)" : RTJSON, BLEND, BLACKLINE, OVERLAY ? "yes" : "no", SELECTED.empty() ? "(none)" : SELECTED, FOLLOWLINE, VISIBLE, PRESENCE,
-        INHIBITING_IDLE ? "yes" : "no", INHIBIT_MODE, HANDIN.state, HANDIN.mode, GAZE.source, GAZELINE, handLabel(HANDS[0]), handLabel(HANDS[1]), L2DLINE);
+    std::string       out =
+        std::format("state: {}\nruntime: {}\nsystem: {}\nruntime gpu: {}\nruntime json: {}\nblend mode: {}\nblack alpha: {}\noverlay: {}\nmonitor view: {}\nselected: {}\nmonitors "
+                    "follow session: {}\nvisible: "
+                    "{}\npresence: {}\nidle "
+                    "inhibited: {} (mode {})\nhand input: {} "
+                    "({})\ngaze ({}): {}\ninput: left {}, right {}\n2d-plane sync: {}\n",
+                    STATELINE, RUNTIME, SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, RTJSON.empty() ? "(loader default)" : RTJSON, BLEND, BLACKLINE, OVERLAY ? "yes" : "no",
+                    MONITOR_VIEW ? "shown" : "hidden", SELECTED.empty() ? "(none)" : SELECTED, FOLLOWLINE, VISIBLE, PRESENCE, INHIBITING_IDLE ? "yes" : "no", INHIBIT_MODE,
+                    HANDIN.state, HANDIN.mode, GAZE.source, GAZELINE, handLabel(HANDS[0]), handLabel(HANDS[1]), L2DLINE);
     for (const auto& m : MONS) {
         out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} ({}) hovered: {} ({}) plugged: {} content: {}{}", m.name,
                            m.id, m.w, m.h, m.refresh, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.grabbed ? "yes" : "no", m.grabKind, m.hovered ? "yes" : "no", m.region,
@@ -442,6 +446,10 @@ static std::string openxrRequest(eHyprCtlOutputFormat format, std::string reques
         auto r = g_pOpenXRManager->cmdHandInput(ARGS);
         return r ? "ok" : r.error();
     }
+    if (SUBCOMMAND == "view") {
+        auto r = g_pOpenXRManager->cmdView(ARGS);
+        return r ? "ok" : r.error();
+    }
 
     // 2D-plane sync (report 12 WP-S2). Bare = re-latch the desk orientation and re-derive the plane
     // now; freeze/thaw pauses and resumes the automatic recompute while you rearrange quads.
@@ -455,7 +463,7 @@ static std::string openxrRequest(eHyprCtlOutputFormat format, std::string reques
         return openxrGaze(format, ARGS);
 
     return std::format("unknown openxr subcommand '{}'. Valid: status, enable, disable, create, destroy, select, anchor, move, rotate, scale, distance, center, place, alpha, "
-                       "blackalpha, adaptive, dock, undock, roam, gazegrab, gazerelease, gazepush, handinput, gaze, layout, sync-layout",
+                       "blackalpha, adaptive, dock, undock, roam, gazegrab, gazerelease, gazepush, handinput, view, gaze, layout, sync-layout",
                        SUBCOMMAND);
 }
 
