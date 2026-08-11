@@ -626,13 +626,33 @@ void COpenXRManager::continueBringup(CXRSession* sess) {
     // graphics driver (radeonsi driUnbindContext) — an uncatchable SEGV that takes the whole
     // compositor, and with it the user's desktop session, down. WiVRn/Monado accept a mismatched
     // EGL binding at xrCreateSession without complaint, so this is the last point we can refuse
-    // while the desktop is still intact. The runtime's GPU is probed via XR_KHR_vulkan_enable2
-    // (best-effort: an undeterminable result proceeds with a warning rather than blocking a setup
-    // that might be fine). Runs on the main thread, before the frame thread — no interop yet.
+    // while the desktop is still intact.
+    //
+    // WHICH QUESTION WE ASK MATTERS (research 26 §8.4). The guard needs the COMPOSITOR's GPU, and
+    // that is an EGL question: XR_MND_query_egl_device's xrGetSystemEGLDeviceMND names the device
+    // an EGL client must build its context on, which is the compositor's by construction (the GL
+    // client compositor imports its swapchain images by an OPAQUE_FD, valid only on the exporting
+    // device). xrGetVulkanGraphicsDevice2KHR answers a DIFFERENT question — "which GPU should a
+    // Vulkan application render on" — and a WiVRn configured for cross-GPU rendering answers it
+    // with the dGPU the game renders on, not the iGPU it composites and encodes on. So: EGL query
+    // first; the Vulkan probe only as a fallback for runtimes that lack it, where the two questions
+    // have the same answer anyway. Best-effort throughout — an undeterminable result proceeds with
+    // a warning rather than blocking a setup that might be fine. Runs on the main thread, before
+    // the frame thread — no interop yet.
     {
         const auto&         node = gfx->selectedRenderNode();
         OpenXR::SRuntimeGpu rt;
-        if (sess->m_hasVulkanEnable2) {
+
+        // The EGL device query is answered in-process (the runtime enumerates our EGL devices via
+        // the getProcAddress we hand it and matches by UUID) — no IPC, no Vulkan, nothing that can
+        // deadlock, so unlike the Vulkan probe it runs straight on this thread.
+        if (sess->m_hasEglDeviceQuery)
+            rt = OpenXR::probeRuntimeEglDevice(sess->m_instance, sess->m_systemId);
+        else
+            rt.note = "runtime does not advertise XR_MND_query_egl_device";
+
+        if (!rt.determined && sess->m_hasVulkanEnable2) {
+            const std::string eglNote = rt.note;
             // Run the probe on a THROWAWAY thread with a bounded wait. vkCreateInstance inside it
             // can deadlock indefinitely against the runtime's own in-process Vulkan usage (observed
             // hanging forever vs Monado's null compositor), and this must NEVER freeze the
@@ -660,21 +680,29 @@ void COpenXRManager::continueBringup(CXRSession* sess) {
                 rt = *result;
             else {
                 abandon->store(true, std::memory_order_release);
-                rt.note = "GPU probe timed out";
+                rt.probe = "Vulkan device query (XR_KHR_vulkan_enable2)";
+                rt.note  = "GPU probe timed out";
                 Log::logger->log(Log::WARN, "[OPENXR] runtime GPU probe did not respond within {}ms; proceeding without GPU verification", kProbeTimeoutMs);
             }
-        } else
-            rt.note = "runtime does not advertise XR_KHR_vulkan_enable2";
+
+            // Both questions went unanswered — carry both reasons into the "could not verify" WARN.
+            if (!rt.determined)
+                rt.note = std::format("{}; {}", eglNote, rt.note);
+            else
+                Log::logger->log(Log::DEBUG, "[OPENXR] EGL device query unavailable ({}), fell back to the Vulkan device query — correct unless this runtime renders clients on a separate GPU", eglNote);
+        } else if (!rt.determined)
+            rt.note = std::format("{}; no XR_KHR_vulkan_enable2 to fall back on", rt.note);
 
         // Publish the resolved runtime GPU for `hyprctl openxr status` (empty when undeterminable).
-        m_runtimeGpu = rt.determined ? std::format("{} (drm {}:{})", rt.deviceName.empty() ? "GPU" : rt.deviceName, rt.drmMajor, rt.drmMinor) : "";
+        m_runtimeGpu = rt.determined ? std::format("{} (drm {}:{}, via {})", rt.deviceName.empty() ? "GPU" : rt.deviceName, rt.drmMajor, rt.drmMinor, rt.probe) : "";
 
         if (rt.determined && node.valid && (rt.drmMajor != node.major || rt.drmMinor != node.minor)) {
             Log::logger->log(Log::ERR,
-                             "[OPENXR] openxr:gpu selects {} (drm {}:{}) but the runtime '{}' composites on {} (drm {}:{}). Cross-GPU buffer import "
-                             "crashes the graphics driver and would take the whole session down, so XR is refusing to start. Point openxr:gpu at the "
-                             "runtime's GPU (or unset it). Desktop session unaffected.",
-                             node.path, node.major, node.minor, m_runtimeName, rt.deviceName.empty() ? "another GPU" : rt.deviceName, rt.drmMajor, rt.drmMinor);
+                             "[OPENXR] openxr:gpu selects {} (drm {}:{}) but the runtime '{}' composites on {} (drm {}:{}), per its {}. Cross-GPU buffer "
+                             "import crashes the graphics driver and would take the whole session down, so XR is refusing to start. Point openxr:gpu at "
+                             "the runtime's GPU (or unset it). Desktop session unaffected.",
+                             node.path, node.major, node.minor, m_runtimeName, rt.deviceName.empty() ? "another GPU" : rt.deviceName, rt.drmMajor, rt.drmMinor,
+                             rt.probe);
             m_session  = UP<CXRSession>(sess); // adopt so abortStart() tears both down (synchronous refusal)
             m_graphics = UP<CXRGraphics>(gfx);
             abortStart();
@@ -682,7 +710,8 @@ void COpenXRManager::continueBringup(CXRSession* sess) {
         }
 
         if (rt.determined && node.valid)
-            Log::logger->log(Log::DEBUG, "[OPENXR] XR GPU verified against runtime: {} (drm {}:{})", rt.deviceName.empty() ? node.path : rt.deviceName, node.major, node.minor);
+            Log::logger->log(Log::DEBUG, "[OPENXR] XR GPU verified against runtime: {} (drm {}:{}), per its {}", rt.deviceName.empty() ? node.path : rt.deviceName, node.major,
+                             node.minor, rt.probe);
         else
             Log::logger->log(Log::WARN,
                              "[OPENXR] could not verify the XR GPU matches the runtime ({}); proceeding. If the session crashes at swapchain creation, "

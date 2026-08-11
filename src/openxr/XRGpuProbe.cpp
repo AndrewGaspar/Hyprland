@@ -3,24 +3,144 @@
 
 #include "../debug/log/Logger.hpp"
 
+// Include contract (doc 01): every XR_USE_* macro must be defined before openxr_platform.h, and
+// each one's own headers before that. This TU asks the runtime TWO different "which GPU" questions
+// and openxr_platform.h has an include guard, so both macros are set up front, once:
+//   * XR_USE_PLATFORM_EGL   — for PFN_xrEglGetProcAddressMNDX, which XR_MND_query_egl_device reuses.
+//   * XR_USE_GRAPHICS_API_VULKAN — for XrVulkanInstanceCreateInfoKHR etc., only where Vulkan headers
+//     were found at configure time (HAVE_XR_VULKAN_PROBE). This TU is the ONLY place Hyprland pulls
+//     in Vulkan; libvulkan is dlopen'd at runtime (no hard link dependency) so a box without a
+//     Vulkan ICD simply loses the fallback probe.
+#define XR_USE_PLATFORM_EGL
 #ifdef HAVE_XR_VULKAN_PROBE
-
-// The probe needs the Vulkan-flavoured OpenXR structs (XrVulkanInstanceCreateInfoKHR etc.), which
-// openxr_platform.h only declares under XR_USE_GRAPHICS_API_VULKAN — so Vulkan headers must come
-// first. This TU is the ONLY place Hyprland pulls in Vulkan; libvulkan is dlopen'd at runtime (no
-// hard link dependency) so a box without a Vulkan ICD simply falls back to "could not verify".
 #define XR_USE_GRAPHICS_API_VULKAN
+#endif
+
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#ifdef HAVE_XR_VULKAN_PROBE
 #include <vulkan/vulkan.h>
+#endif
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
 #include <dlfcn.h>
 #include <atomic>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+
+#ifndef EGL_DRM_RENDER_NODE_FILE_EXT
+#define EGL_DRM_RENDER_NODE_FILE_EXT 0x3377
+#endif
+#ifndef EGL_DRM_DEVICE_FILE_EXT
+#define EGL_DRM_DEVICE_FILE_EXT 0x3233
+#endif
+#ifndef EGL_RENDERER_EXT
+#define EGL_RENDERER_EXT 0x335F
+#endif
+
+namespace OpenXR {
+
+/*
+ * XR_MND_query_egl_device — a Monado vendor extension that is not in the OpenXR SDK headers we
+ * build against, so its two structs and its entry point are declared here, matching Monado's
+ * src/external/openxr_includes/openxr/XR_MND_query_egl_device.h field for field.
+ */
+static constexpr XrStructureType XR_TYPE_SYSTEM_EGL_DEVICE_GET_INFO_MND_ = (XrStructureType)1000445001;
+static constexpr XrStructureType XR_TYPE_SYSTEM_EGL_DEVICE_MND_          = (XrStructureType)1000445002;
+
+struct SXrSystemEGLDeviceGetInfoMND {
+    XrStructureType             type;
+    const void*                 next;
+    XrSystemId                  systemId;
+    PFN_xrEglGetProcAddressMNDX getProcAddress;
+};
+
+struct SXrSystemEGLDeviceMND {
+    XrStructureType type;
+    void*           next;
+    EGLDeviceEXT    eglDevice;
+};
+
+using PFN_xrGetSystemEGLDeviceMND_t = XrResult(XRAPI_PTR*)(XrInstance, const SXrSystemEGLDeviceGetInfoMND*, SXrSystemEGLDeviceMND*);
+using PFNEGLQUERYDEVICESTRINGEXTPROC_t = const char* (*)(EGLDeviceEXT, EGLint);
+
+SRuntimeGpu probeRuntimeEglDevice(XrInstance instance, XrSystemId systemId) {
+    SRuntimeGpu out;
+    out.probe = "EGL device query (XR_MND_query_egl_device)";
+
+    // The instance must have enabled XR_MND_query_egl_device; the loader/runtime otherwise answers
+    // XR_ERROR_FUNCTION_UNSUPPORTED and we fall back to the Vulkan probe.
+    PFN_xrGetSystemEGLDeviceMND_t pGetEglDevice = nullptr;
+    if (XR_FAILED(xrGetInstanceProcAddr(instance, "xrGetSystemEGLDeviceMND", reinterpret_cast<PFN_xrVoidFunction*>(&pGetEglDevice))) || !pGetEglDevice) {
+        out.note = "runtime does not expose xrGetSystemEGLDeviceMND (XR_MND_query_egl_device)";
+        return out;
+    }
+
+    // Answered in-process: the runtime calls back through `getProcAddress` to enumerate OUR EGL
+    // devices and hands back the one whose UUID matches its compositor's. No IPC, no Vulkan — safe
+    // to call straight from the main thread, unlike the Vulkan probe below.
+    SXrSystemEGLDeviceGetInfoMND info = {XR_TYPE_SYSTEM_EGL_DEVICE_GET_INFO_MND_, nullptr, systemId, eglGetProcAddress};
+    SXrSystemEGLDeviceMND       dev   = {XR_TYPE_SYSTEM_EGL_DEVICE_MND_, nullptr, EGL_NO_DEVICE_EXT};
+
+    const XrResult res = pGetEglDevice(instance, &info, &dev);
+    if (XR_FAILED(res) || dev.eglDevice == EGL_NO_DEVICE_EXT) {
+        out.note = std::string("xrGetSystemEGLDeviceMND failed (") + std::to_string((int)res) + ")";
+        return out;
+    }
+
+    auto eglQueryDeviceStringEXT_fn = (PFNEGLQUERYDEVICESTRINGEXTPROC_t)eglGetProcAddress("eglQueryDeviceStringEXT");
+    if (!eglQueryDeviceStringEXT_fn) {
+        out.note = "EGL_EXT_device_query unavailable (no eglQueryDeviceStringEXT)";
+        return out;
+    }
+
+    // Prefer the render node, fall back to the primary/card node — the same order (and the same
+    // DRM major:minor identity) CXRGraphics::selectDisplay used to pick the XR context's device,
+    // so the two are directly comparable. A failed query latches an EGL error on this thread;
+    // clear it so the main thread's own EGL bookkeeping is not left holding our EGL_BAD_ATTRIBUTE.
+    bool        primaryOnly = false;
+    const char* nodePath    = eglQueryDeviceStringEXT_fn(dev.eglDevice, EGL_DRM_RENDER_NODE_FILE_EXT);
+    if (!nodePath) {
+        eglGetError();
+        nodePath    = eglQueryDeviceStringEXT_fn(dev.eglDevice, EGL_DRM_DEVICE_FILE_EXT);
+        primaryOnly = nodePath != nullptr;
+    }
+    if (!nodePath) {
+        eglGetError();
+        out.note = "the runtime's EGL device reports no DRM node (EGL_EXT_device_drm unsupported)";
+        return out;
+    }
+
+    struct stat st = {};
+    if (stat(nodePath, &st) != 0) {
+        out.note = std::string("could not stat the runtime's DRM node ") + nodePath;
+        return out;
+    }
+
+    // EGL_EXT_device_query_name is optional; the node path is a perfectly good name without it.
+    const char* renderer = eglQueryDeviceStringEXT_fn(dev.eglDevice, EGL_RENDERER_EXT);
+    if (!renderer)
+        eglGetError();
+
+    out.determined = true;
+    out.drmMajor   = (int64_t)major(st.st_rdev);
+    out.drmMinor   = (int64_t)minor(st.st_rdev);
+    out.deviceName = renderer ? renderer : nodePath;
+    if (primaryOnly)
+        out.note = "runtime reported only a primary DRM node";
+    return out;
+}
+
+}
+
+#ifdef HAVE_XR_VULKAN_PROBE
 
 namespace OpenXR {
 
 SRuntimeGpu probeRuntimeRenderNode(XrInstance instance, XrSystemId systemId, const std::atomic<bool>* abandon) {
     SRuntimeGpu out;
+    out.probe = "Vulkan device query (XR_KHR_vulkan_enable2)";
     auto abandoned = [&] { return abandon && abandon->load(std::memory_order_acquire); };
 
     // Resolve the XR_KHR_vulkan_enable2 entry points. xrGetVulkanGraphicsDevice2KHR is the query we
@@ -198,12 +318,14 @@ SRuntimeGpu probeRuntimeRenderNode(XrInstance instance, XrSystemId systemId, con
 
 }
 
-#else // !HAVE_XR_VULKAN_PROBE — built without Vulkan headers; the probe is a no-op stub.
+#else // !HAVE_XR_VULKAN_PROBE — built without Vulkan headers; the FALLBACK probe is a no-op stub.
+      // The EGL device query above is unaffected and remains the guard's primary answer.
 
 namespace OpenXR {
 SRuntimeGpu probeRuntimeRenderNode(XrInstance, XrSystemId, const std::atomic<bool>*) {
     SRuntimeGpu out;
-    out.note = "built without Vulkan headers (XR GPU probe unavailable)";
+    out.probe = "Vulkan device query (XR_KHR_vulkan_enable2)";
+    out.note  = "built without Vulkan headers (XR GPU probe unavailable)";
     return out;
 }
 }
