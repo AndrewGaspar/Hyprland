@@ -220,6 +220,12 @@ class COpenXRManager {
     std::expected<void, std::string> cmdGazeRelease();                     // (none) — explicit release
     std::expected<void, std::string> cmdGazePush(const std::string& args); // <±m> (default gaze_dist_step)
     std::expected<void, std::string> cmdHandInput(const std::string& args); // on|off|auto|toggle
+    // Session-scoped presentation gate: stop/start submitting every monitor quad without destroying
+    // outputs, swapchains, anchors, or the OpenXR overlay session. Intended for an in-headset bind.
+    std::expected<void, std::string> cmdView(const std::string& args); // on|off|toggle
+    bool                             monitorViewVisible() const {
+        return m_monitorViewVisible.load(std::memory_order_acquire);
+    }
 
     // Snapshot of one XR monitor for `hyprctl openxr status` (doc 05 §4.3). Main thread.
     struct SXRMonitorInfo {
@@ -853,6 +859,11 @@ class COpenXRManager {
 
     eXRManagerState        m_state  = XR_STATE_DISABLED;
     bool                   m_active = false; // derived: state ∈ {visible, focused}
+
+    // Global monitor-quad presentation gate. Main-thread dispatcher writes; the frame thread reads
+    // once per frame before rendering/solving/submitting. Reset to visible on every session start so
+    // a runtime loss or compositor relog cannot strand the user in a persistently blank headset.
+    std::atomic<bool> m_monitorViewVisible{true};
 
     // Plugged-state bookkeeping (report-18 addendum). m_monitorsPlugged is the last plugged intent
     // setMonitorsPlugged() applied to the session-following XR monitors, so updateMonitorsPlugged()

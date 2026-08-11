@@ -867,6 +867,8 @@ static SDispatchResult xrmonitorDispatch(const std::string& args) {
         return wrapExp(g_pOpenXRManager->cmdGazePush(rest));
     if (verb == "handinput")
         return wrapExp(g_pOpenXRManager->cmdHandInput(rest));
+    if (verb == "view")
+        return wrapExp(g_pOpenXRManager->cmdView(rest));
 
     // 2D-plane sync (report 12 WP-S2): re-derive Hyprland's 2D monitor layout from where the quads
     // actually float, so mouse crossing and directional focus match what you see. Bindable, so
