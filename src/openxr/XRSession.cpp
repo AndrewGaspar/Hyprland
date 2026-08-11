@@ -94,11 +94,24 @@ bool CXRSession::createInstance() {
         exts.push_back("XR_EXT_hand_tracking");
     m_usingLocalFloor = m_hasLocalFloor;
 
-    // XR_KHR_vulkan_enable2 (probe-only): enabled purely so start() can learn which GPU the
-    // runtime composites on (OpenXR::probeRuntimeRenderNode) and fail closed on a wrong openxr:gpu
-    // BEFORE the frame thread hands the runtime a cross-GPU EGL context — which hard-crashes the
-    // graphics driver (radeonsi driUnbindContext, coredumps 8986/39318). The session itself still
-    // uses the EGL/GLES binding; the two graphics enable-extensions coexist on one instance.
+    // XR_MND_query_egl_device (probe-only): the PRIMARY answer to "which GPU does the runtime
+    // COMPOSITE on", which start() needs to fail closed on a wrong openxr:gpu BEFORE the frame
+    // thread hands the runtime a cross-GPU EGL context — that hard-crashes the graphics driver
+    // (radeonsi driUnbindContext, coredumps 8986/39318). xrGetSystemEGLDeviceMND names the
+    // EGLDeviceEXT an EGL client is meant to build its context on, which IS the compositor's
+    // device: an EGL binding renders through the runtime's GL client compositor and imports its
+    // swapchain images by an OPAQUE_FD, valid only on the device that exported them.
+    m_hasEglDeviceQuery = hasExt("XR_MND_query_egl_device");
+    if (m_hasEglDeviceQuery)
+        exts.push_back("XR_MND_query_egl_device");
+
+    // XR_KHR_vulkan_enable2 (probe-only): the FALLBACK for a runtime without the EGL device query.
+    // xrGetVulkanGraphicsDevice(2)KHR answers a different question — "which GPU should a VULKAN
+    // APPLICATION render on" — which coincides with the compositor's GPU on every runtime that does
+    // not deliberately split the two, and does NOT on a WiVRn configured for cross-GPU rendering
+    // (game on the dGPU, composite+encode on the iGPU). Hence: EGL query first, this second. The
+    // session itself still uses the EGL/GLES binding; the graphics enable-extensions coexist on one
+    // instance.
     m_hasVulkanEnable2 = hasExt("XR_KHR_vulkan_enable2");
     if (m_hasVulkanEnable2)
         exts.push_back("XR_KHR_vulkan_enable2");
