@@ -1571,6 +1571,65 @@ the pass/fail of this round:
    whole point: two clients, two answers, one session.
 3. That hypxrhud still connects — it should be untouched, and now for a reason rather than by luck.
 
+### 8.4 XG8 attempt 2 — one answer per *client* is not enough; it must be one answer per *question*
+
+**How the round-3 patch actually reached the live box, recorded because it should not happen again.**
+Patch 0015 went live twice on 2026-08-10, and the first time was an accident. The service that
+started at login was still running the attempt-1 configuration (round-2 image, `client-gpu` set),
+with Hyprland in its ~32 s refusal loop. The round-3 rebuild of `~/code/wivrn-xg/build-server`
+finished at 18:45:49 — replacing `libopenxr_wivrn.so` at the exact path the *running* server's
+`active_runtime.json` named — and Hyprland's 18:46:02 retry dlopened the new client library, got the
+compositor's GPU answered, and brought a full cross-GPU session up unattended, headset never
+connected. An in-place rebuild under a live retry loop **is** a deployment. (That evening the box
+later froze — display dead, input alive, no kernel/GPU errors — and needed a hard power-off; cause
+untraced, tracked as task #153. The freeze is the only open caution against leaving a cross-GPU
+session running unattended.)
+
+**Attempt 2 proper (same evening, user present): §8.3's checklist went one for two, plus the freebie.**
+Item 1 **passed** — twelve seconds after the round-3 server restart, Hyprland's probe
+accepted the AMD answer, the runtime logged both UUIDs ("answered: …c2…, suggested to Vulkan
+clients: 0fec34e9…"), the session came up, and the format narrowing in the server journal matched
+§8.2's harness output digit for digit. Item 3 passed. Item 2 **failed**: The Big Walk via xrizer
+died on the *same* assert (`src/openxr_data.rs:476`, `assert_eq!(pd, info.physical_device)`) as
+attempt 1 — but mismatched in the **opposite direction**, the two handles 0x50 apart, adjacent
+entries in one instance's device list.
+
+**Root cause: the extension set does not encode intent.** Round 3 keyed the answer on the enabled
+extensions — "a GL/EGL binding extension is present → this is a GL client → answer the compositor's
+device." xrizer enables `khr_vulkan_enable` **and** `khr_opengl_enable` unconditionally
+(`src/openxr_data.rs:126-127`) because an OpenVR shim cannot know the game's API until the first
+`Submit`. So the runtime told xrizer AMD while DXVK independently picked the NVIDIA dGPU. The
+instances are symmetric and the heuristic is undecidable: Hyprland enables
+`XR_MNDX_egl_enable` + `XR_KHR_opengl_es_enable` + `XR_KHR_vulkan_enable2` and binds EGL; xrizer
+enables GL + Vulkan and binds Vulkan. (They also happen to differ in *which* Vulkan query they call
+— Hyprland `xrGetVulkanGraphicsDevice2KHR`, xrizer the v1 `xrGetVulkanGraphicsDeviceKHR` — and that
+coincidence is explicitly **not** a discriminator worth building on.)
+
+**Round 4 (task #154): answer each question honestly, and move the one misaligned caller.**
+`xrGetVulkanGraphicsDevice(2)KHR` asks "which physical device should my VkDevice use" — the answer
+is the client suggestion, always, no sniffing (stock-identical when `client-gpu` is unset). The EGL
+device query that round 3 also fixed keeps answering the *compositor* — correct by construction,
+since GL clients wrap the native compositor and import same-device `OPAQUE_FD`. The one caller that
+asks the Vulkan question while binding EGL is **Hyprland's own wrong-GPU guard**, so the guard moves
+to the EGL device query (the instance already enables `XR_MNDX_egl_enable`,
+`src/openxr/XRSession.cpp:82`; `EGLDeviceEXT` → DRM node via `eglQueryDeviceStringEXT`), keeping
+the `vulkan_enable2` probe as a fallback for stock runtimes, where the Vulkan answer *is* the
+compositor's GPU.
+
+**The deployment order this creates is not optional.** New-guard Hyprland works against round-3,
+round-4 *and* stock servers (fallback). Old-guard Hyprland against a round-4 server re-creates
+attempt 1's refusal loop, because the Vulkan answer it misreads as "the compositor's GPU" is then
+*always* the dGPU. Fishfood Hyprland first, relog, then the server swap.
+
+**What attempt 3 must verify.** (1) Desktop up with the guard's log naming *which* probe answered
+(EGL query, not fallback). (2) xrizer: no assert — and note its temporary session
+(`src/graphics_backends/vulkan.rs:517-546`, v1 query) now lands on NVIDIA *before* the game submits,
+so the cross-device path is exercised by a session that may create no swapchains; watch it. (3) The
+game actually renders on the dGPU at playable frame times. (4) The remaining known failure class is
+DXVK missing `VK_EXT_image_drm_format_modifier` / `VK_EXT_external_memory_dma_buf` /
+`VK_EXT_queue_family_foreign` on the import path — a fix there lives in DXVK/xrizer territory, not
+in this tree.
+
 ---
 
 ## 9. Open questions for the user
