@@ -31,6 +31,8 @@ void CXRMonitorLayer::bindToMonitor(PHLMONITOR mon, std::function<void()> onGone
         std::lock_guard<std::mutex> lk(m_bufMu);
         m_pendingSize = mon->m_pixelSize;
     }
+    publishStereoMode(mon);
+    publishStereoPairLayout(mon);
     m_swapchainDirty.store(true, std::memory_order_release);
 
     // presented: fires on the main thread after each committed frame — stash the buffer for
@@ -70,14 +72,23 @@ void CXRMonitorLayer::bindToMonitor(PHLMONITOR mon, std::function<void()> onGone
         const auto pmon = m_monitor.lock();
         if (!pmon)
             return;
-        const Vector2D newSize = pmon->m_pixelSize;
+        const Vector2D newSize     = pmon->m_pixelSize;
+        bool           sizeChanged = false;
         {
             std::lock_guard<std::mutex> lk(m_bufMu);
-            if (m_pendingSize == newSize)
-                return;
+            sizeChanged   = m_pendingSize != newSize;
             m_pendingSize = newSize;
         }
-        m_swapchainDirty.store(true, std::memory_order_release);
+        if (sizeChanged)
+            m_swapchainDirty.store(true, std::memory_order_release);
+
+        // The depth pack is structural monitor state. Publish it on the mode edge even when the
+        // pixel dimensions happen to compare equal, then republish the frame declaration from it.
+        // In particular, do not make a subsequent presented callback rediscover this state while
+        // the OpenXR session is bouncing through hidden/visible. Publish AFTER m_pendingSize: once
+        // the frame thread sees this declaration, any pane-count rebuild must also see its mode.
+        publishStereoMode(pmon);
+        publishStereoPairLayout(pmon);
     });
 
     // destroy: external monitor teardown (hyprctl output destroy, backend teardown).
@@ -87,11 +98,26 @@ void CXRMonitorLayer::bindToMonitor(PHLMONITOR mon, std::function<void()> onGone
     });
 }
 
+// MAIN THREAD ONLY. Snapshot the producer which belongs to the monitor MODE. Unlike a fullscreen
+// content declaration this must not be inferred afresh on every presented event: the compositor may
+// stop presenting while an Android system activity takes OpenXR focus, but the output buffer remains
+// double-wide until a real modeChanged edge says otherwise.
+void CXRMonitorLayer::publishStereoMode(const PHLMONITOR& mon) {
+    OpenXR::Stereo::SPairDecl mode;
+    if (mon->isStereo() && mon->stereoPaneCount() >= 2) {
+        mode.producer = OpenXR::Stereo::PRODUCER_DEPTH;
+        mode.layout   = Render::Stereo::CONTENT_SBS;
+        mode.modeW    = (uint32_t)std::max(0.0, mon->m_pixelSize.x);
+        mode.modeH    = (uint32_t)std::max(0.0, mon->m_pixelSize.y);
+    }
+    m_stereoModeDecl.store(OpenXR::Stereo::packDecl(mode), std::memory_order_release);
+}
+
 // MAIN THREAD ONLY (research/24 §5.1, WP X1). Resolve whether this monitor's next frame should be
 // submitted as a pair of eye-cropped quads, and publish the answer as one byte for the frame thread.
 //
 // Everything expensive or thread-hostile happens here: the fullscreen-controller lookup, the
-// window's rule/tag fold, the string-backed config. The frame thread gets an integer.
+// window's rule/tag fold, the string-backed config. The frame thread gets one packed word.
 //
 // The COVERAGE test is what makes the pair safe, and it is asked of the window's live geometry
 // rather than of the declaration: CWindow::stereoLayout() already applied §4.3's fullscreen gate,
@@ -109,40 +135,21 @@ void CXRMonitorLayer::bindToMonitor(PHLMONITOR mon, std::function<void()> onGone
 // desktop. So when the pack is on, the DEPTH producer owns the pair and the CONTENT query is not
 // even asked; when it is off, X1's path below is untouched, byte for byte.
 void CXRMonitorLayer::publishStereoPairLayout(const PHLMONITOR& mon) {
-    static auto              PPAIR  = CConfigValue<Hyprlang::INT>("openxr:stereo_quad_pair");
-    const bool               ENABLED = *PPAIR != 0;
+    static auto                PPAIR   = CConfigValue<Hyprlang::INT>("openxr:stereo_quad_pair");
+    const bool                 ENABLED = *PPAIR != 0;
 
-    OpenXR::Stereo::SPairDecl decl;
-    decl.modeW = (uint32_t)std::max(0.0, mon->m_pixelSize.x);
-    decl.modeH = (uint32_t)std::max(0.0, mon->m_pixelSize.y);
+    const auto                 MODE = OpenXR::Stereo::unpackDecl(m_stereoModeDecl.load(std::memory_order_acquire));
 
-    if (mon->isStereo() && mon->stereoPaneCount() >= 2) {
-        // THE DEPTH DESKTOP (research/24 §6, WP X3). The layout is a property of the PACK, not of the
-        // kill switch: the buffer is laid out side-by-side whether or not we submit two quads, and the
-        // quad's aspect is derived from one pane either way. `submit` carries the switch, so turning
-        // it off degrades to ONE quad showing pane 0 — a mono desktop at the right shape — instead of
-        // one quad showing a doubled side-by-side image.
-        decl.producer = OpenXR::Stereo::PRODUCER_DEPTH;
-        decl.layout   = Render::Stereo::CONTENT_SBS;
-        decl.submit   = ENABLED;
-    } else {
-        OpenXR::Stereo::SPairQuery query;
-        query.enabled = ENABLED;
-
+    OpenXR::Stereo::SPairQuery query;
+    query.enabled = ENABLED;
+    if (MODE.producer != OpenXR::Stereo::PRODUCER_DEPTH)
         if (const auto FSWINDOW = Fullscreen::controller()->getFullscreenWindow(mon)) {
             query.declared     = FSWINDOW->stereoLayout();
             query.coversOutput = FSWINDOW->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT) == mon->m_size &&
                 FSWINDOW->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT) == mon->m_position;
         }
 
-        decl.layout   = OpenXR::Stereo::resolvePairLayout(query);
-        decl.producer = OpenXR::Stereo::pairActive(decl.layout) ? OpenXR::Stereo::PRODUCER_CONTENT : OpenXR::Stereo::PRODUCER_NONE;
-        decl.submit   = decl.producer == OpenXR::Stereo::PRODUCER_CONTENT;
-        // X1 never carried a mode and its swapchain never changes size when the pair engages, so the
-        // describes() guard has nothing to protect there. Leave it unarmed rather than inventing a
-        // constraint that could only ever mis-fire.
-        decl.modeW = decl.modeH = 0;
-    }
+    const auto decl = OpenXR::Stereo::resolvePublishedDecl(MODE, query);
 
     m_stereoPairDecl.store(OpenXR::Stereo::packDecl(decl), std::memory_order_release);
     publishCursorDisparity(mon, decl.producer == OpenXR::Stereo::PRODUCER_DEPTH);

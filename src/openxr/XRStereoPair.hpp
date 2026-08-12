@@ -233,6 +233,35 @@ namespace OpenXR::Stereo {
         return quadsSoFar + quadsFor(d) <= static_cast<size_t>(maxLayerCount);
     }
 
+    // Resolve the per-frame declaration from two kinds of main-thread state which have very
+    // different lifetimes:
+    //
+    //  * `mode` says how the OUTPUT buffer is physically laid out. A DEPTH pack is structural and
+    //    changes only on a monitor modeChanged edge.
+    //  * `content` describes the window currently covering an ordinary monitor. It may change on
+    //    every presentation.
+    //
+    // Keeping the structural declaration authoritative is load-bearing during an Android system
+    // activity / OpenXR visibility bounce. Such a bounce can stop presentation between two main-
+    // thread observations, but it cannot turn an already double-wide output buffer into a mono
+    // one. Publishing CONTENT_OFF for that buffer makes the frame thread rebuild a one-pane
+    // swapchain at the packed width and submit the raw SBS image, squeezed 2:1, in both eyes.
+    inline SPairDecl resolvePublishedDecl(const SPairDecl& mode, const SPairQuery& content) {
+        if (mode.producer == PRODUCER_DEPTH) {
+            SPairDecl out = mode;
+            out.layout    = Render::Stereo::CONTENT_SBS;
+            out.submit    = content.enabled;
+            return out;
+        }
+
+        const auto layout = resolvePairLayout(content);
+        return {
+            .producer = pairActive(layout) ? PRODUCER_CONTENT : PRODUCER_NONE,
+            .layout   = layout,
+            .submit   = pairActive(layout),
+        };
+    }
+
     // ---- pane geometry inside the swapchain (WP X4) ----
     //
     // X1 needed none of this: one image, and each eye's rect was a half of the content. X4's chrome

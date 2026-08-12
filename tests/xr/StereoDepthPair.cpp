@@ -161,6 +161,54 @@ TEST(XRDepthPair, DeclarationOnlyDescribesTheModeItWasMadeFor) {
     EXPECT_TRUE(describes(contentDecl(), 5120, 1440));
 }
 
+// MediaProjection consent/status used to launch WiVRn's immersive MainActivity again. Each launch
+// bounced the native OpenXR session out of VISIBLE/FOCUSED and could leave the main thread without a
+// fresh presentation while the frame thread resumed. The depth producer belongs to the MODE, so
+// arbitrary per-frame CONTENT_OFF observations throughout that churn must not flatten it.
+TEST(XRDepthPair, FocusAndVisibilityChurnCannotFlattenAPackedMode) {
+    const SPairDecl MODE = depthDecl();
+
+    for (const auto SESSION_VISIBLE : {true, false, true, false, true}) {
+        // Session visibility deliberately is not an input. It controls whether frames are submitted,
+        // not what the already-created monitor buffer means when submission resumes.
+        (void)SESSION_VISIBLE;
+        const auto DECL = resolvePublishedDecl(MODE, SPairQuery{.enabled = true});
+
+        EXPECT_EQ(DECL.producer, PRODUCER_DEPTH);
+        EXPECT_EQ(DECL.layout, CONTENT_SBS);
+        EXPECT_TRUE(DECL.submit);
+        EXPECT_EQ(quadsFor(DECL), 2u);
+        EXPECT_EQ(paneFullRect(packed(), 0), (SImageRect{0, 0, 2688, 1536}));
+        EXPECT_EQ(paneFullRect(packed(), 1), (SImageRect{2688, 0, 2688, 1536}));
+    }
+}
+
+TEST(XRDepthPair, ARealModeEdgeStillDropsTheDepthProducer) {
+    // Once modeChanged publishes an ordinary one-pane mode, the same CONTENT_OFF observation must
+    // become one ordinary quad. The latch delays nothing and cannot make depth_desktop one-way.
+    const auto DECL = resolvePublishedDecl(SPairDecl{}, SPairQuery{.enabled = true});
+    EXPECT_EQ(DECL.producer, PRODUCER_NONE);
+    EXPECT_EQ(DECL.layout, CONTENT_OFF);
+    EXPECT_EQ(quadsFor(DECL), 1u);
+}
+
+TEST(XRDepthPair, StructuralDepthStillHonorsThePairKillSwitch) {
+    const auto DECL = resolvePublishedDecl(depthDecl(), SPairQuery{.enabled = false});
+    EXPECT_EQ(DECL.producer, PRODUCER_DEPTH);
+    EXPECT_EQ(DECL.layout, CONTENT_SBS);
+    EXPECT_FALSE(DECL.submit);
+    EXPECT_EQ(quadsFor(DECL), 1u);
+    EXPECT_EQ(paneFullRect(packed(), 0).w, 2688);
+}
+
+TEST(XRDepthPair, AnOrdinaryModeStillUsesTheFullscreenContentDeclaration) {
+    const auto DECL = resolvePublishedDecl(SPairDecl{}, SPairQuery{.declared = CONTENT_TAB, .coversOutput = true, .enabled = true});
+    EXPECT_EQ(DECL.producer, PRODUCER_CONTENT);
+    EXPECT_EQ(DECL.layout, CONTENT_TAB);
+    EXPECT_TRUE(DECL.submit);
+    EXPECT_EQ(quadsFor(DECL), 2u);
+}
+
 // ---------------------------------------------------------------------------------------------
 // The kill switch degrades to ONE MONO PANE, never to a doubled image
 // ---------------------------------------------------------------------------------------------

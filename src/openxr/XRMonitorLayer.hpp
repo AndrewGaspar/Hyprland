@@ -62,6 +62,7 @@ class CXRMonitorLayer {
     // MAIN THREAD ONLY. Resolve + publish m_stereoPairDecl for this monitor (WP X1/X3). Called from
     // the `presented` listener, and directly on a config change so the kill switch applies at once.
     void publishStereoPairLayout(const PHLMONITOR& mon);
+    void publishStereoMode(const PHLMONITOR& mon);
     // MAIN THREAD ONLY (WP X3, §5.4). The XR ray cursor's depth, as a fraction of one pane's width.
     void publishCursorDisparity(const PHLMONITOR& mon, bool depthPaired);
 
@@ -278,6 +279,13 @@ class CXRMonitorLayer {
     // monitor mid-mode-change would otherwise let the frame thread pair up an image the declaration
     // is not talking about, and spend a frame showing each eye half of a mono desktop.
     std::atomic<uint64_t> m_stereoPairDecl{0};
+
+    // The structural half of m_stereoPairDecl. A depth desktop's two panes belong to the monitor
+    // MODE, not to whichever frame happened to be presented most recently. Updated only at bind /
+    // modeChanged and folded into m_stereoPairDecl by publishStereoPairLayout(). This prevents an
+    // OpenXR focus/visibility bounce from transiently publishing a mono declaration for a buffer
+    // that is still physically packed SBS.
+    std::atomic<uint64_t> m_stereoModeDecl{0};
 
     // The XR ray cursor's depth disparity (§5.4, WP X3): the eye-0 shift as a fraction of ONE PANE's
     // width, for whatever the pointer is currently over. MAIN thread publishes the target (it needs
