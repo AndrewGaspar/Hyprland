@@ -844,6 +844,15 @@ void CPointerManager::damageIfSoftware() {
 }
 
 void CPointerManager::warpTo(const Vector2D& logical) {
+    warpTo(logical, false);
+}
+
+void CPointerManager::warpTo(const Vector2D& logical, bool preserveXRCrossPush) {
+#ifdef HAVE_OPENXR
+    if (!preserveXRCrossPush && g_pOpenXRManager)
+        g_pOpenXRManager->resetCursorCrossing();
+#endif
+
     damageIfSoftware();
 
     m_pointerPos = closestValid(logical);
@@ -883,12 +892,17 @@ void CPointerManager::move(const Vector2D& deltaLogical) {
     }
 #endif
 
-    warpTo(newPos);
+    warpTo(newPos, true);
 }
 
 void CPointerManager::warpAbsolute(Vector2D abs, SP<IHID> dev) {
     if (!dev || State::monitorState()->monitors().empty())
         return;
+
+#ifdef HAVE_OPENXR
+    if (g_pOpenXRManager)
+        g_pOpenXRManager->resetCursorCrossing();
+#endif
 
     if (!std::isnan(abs.x))
         abs.x = std::clamp(abs.x, 0.0, 1.0);
@@ -969,6 +983,11 @@ void CPointerManager::warpAbsolute(Vector2D abs, SP<IHID> dev) {
 }
 
 void CPointerManager::onMonitorLayoutChange() {
+#ifdef HAVE_OPENXR
+    if (g_pOpenXRManager)
+        g_pOpenXRManager->resetCursorCrossing();
+#endif
+
     m_currentMonitorLayout.monitorBoxes.clear();
     for (auto const& m : State::monitorState()->monitors()) {
         if (m->isMirror() || !m->m_enabled || !m->m_output)

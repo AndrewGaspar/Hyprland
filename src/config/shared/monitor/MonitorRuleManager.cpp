@@ -90,15 +90,17 @@ CMonitorRule CMonitorRuleManager::get(const PHLMONITOR PMONITOR) {
                 Log::logger->log(Log::WARN, " > wlr-output-management picked mode {:.0f}x{:.0f} on {}, which does not divide into stereo panes — dropping the depth pack",
                                  CONFIG->resolution.x, CONFIG->resolution.y, PMONITOR->m_name);
 
-            rule.m_resolution        = ADOPTED.resolution;
-            rule.m_stereo            = ADOPTED.stereo;
-            rule.m_stereoVirtualMode = ADOPTED.virtualPack;
-            rule.m_refreshRate       = CONFIG->refresh / 1000.F;
+            rule.m_resolution          = ADOPTED.resolution;
+            rule.m_resolutionOwnedByXR = false;
+            rule.m_stereo              = ADOPTED.stereo;
+            rule.m_stereoVirtualMode   = ADOPTED.virtualPack;
+            rule.m_refreshRate         = CONFIG->refresh / 1000.F;
         }
 
         if (CONFIG->committedProperties & OUTPUT_HEAD_COMMITTED_POSITION) {
             Log::logger->log(Log::DEBUG, " > overriding offset: {:.0f}, {:.0f} -> {:.0f}, {:.0f}", rule.m_offset.x, rule.m_offset.y, CONFIG->position.x, CONFIG->position.y);
-            rule.m_offset = CONFIG->position;
+            rule.m_offset          = CONFIG->position;
+            rule.m_offsetOwnedByXR = false;
         }
 
         if (CONFIG->committedProperties & OUTPUT_HEAD_COMMITTED_TRANSFORM) {
@@ -108,7 +110,8 @@ CMonitorRule CMonitorRuleManager::get(const PHLMONITOR PMONITOR) {
 
         if (CONFIG->committedProperties & OUTPUT_HEAD_COMMITTED_SCALE) {
             Log::logger->log(Log::DEBUG, " > overriding scale: {} -> {}", sc<uint8_t>(rule.m_scale), sc<uint8_t>(CONFIG->scale));
-            rule.m_scale = CONFIG->scale;
+            rule.m_scale          = CONFIG->scale;
+            rule.m_scaleOwnedByXR = false;
         }
 
         if (CONFIG->committedProperties & OUTPUT_HEAD_COMMITTED_ADAPTIVE_SYNC) {

@@ -108,6 +108,8 @@ std::optional<std::string> CMonitorRuleParser::getError() {
 }
 
 bool CMonitorRuleParser::parseMode(const std::string& value) {
+    m_rule.m_resolutionOwnedByXR = false;
+
     if (value.empty() || value.starts_with("pref"))
         m_rule.m_resolution = Vector2D();
     else if (value.starts_with("highrr"))
@@ -143,6 +145,11 @@ bool CMonitorRuleParser::parseMode(const std::string& value) {
 }
 
 bool CMonitorRuleParser::parsePosition(const std::string& value, bool isFirst) {
+    // Lua monitor tables may seed the parser by copying the existing rule. If that rule carries a
+    // runtime-owned XR layout position, parsing a user position must take ownership back even when
+    // the numeric value happens to be identical.
+    m_rule.m_offsetOwnedByXR = false;
+
     if (value.empty() || value.starts_with("auto")) {
         m_rule.m_offset = Vector2D(-INT32_MAX, -INT32_MAX);
         // If this is the first monitor rule needs to be on the right.
@@ -191,6 +198,8 @@ bool CMonitorRuleParser::parsePosition(const std::string& value, bool isFirst) {
 }
 
 bool CMonitorRuleParser::parseScale(const std::string& value) {
+    m_rule.m_scaleOwnedByXR = false;
+
     if (value.empty() || value.starts_with("auto"))
         m_rule.m_scale = -1;
     else {

@@ -295,6 +295,9 @@ void COpenXRManager::start() {
     if (m_state != XR_STATE_DISABLED && m_state != XR_STATE_UNAVAILABLE)
         return;
 
+    // lastWorld and layers survive a session restart, but last session's submitted counts must not:
+    // LOCAL_FLOOR has not been established yet and no quad is eligible until this session submits it.
+    clearCrossingSubmissionState();
     setState(XR_STATE_STARTING);
 
     // `xrmonitor view` is deliberately a session-scoped convenience latch. Always recover to a
@@ -1006,6 +1009,10 @@ void COpenXRManager::stop() {
     if (m_frameThread.joinable())
         m_frameThread.join();
 
+    // The frame thread can publish a final submitted count while it exits, so clear only after the
+    // join. Surviving layers keep their anchors for restart, but none remains raycast-visible.
+    clearCrossingSubmissionState();
+
     teardownFrameChannel();
 
     // Teardown ordering (doc 01). The frame thread is gone, so no removal barrier is needed
@@ -1435,8 +1442,11 @@ void COpenXRManager::frameThread() {
         // churn, output/workspace movement, and session recreation; xrEndFrame below legally submits
         // zero layers. CXRInput still samples actions and processPointer receives no targets, which
         // clears hover/releases without letting an invisible quad intercept the pointer.
-        if (!m_monitorViewVisible.load(std::memory_order_acquire))
+        if (!m_monitorViewVisible.load(std::memory_order_acquire)) {
+            for (auto& l : active)
+                l->m_quadsSubmitted.store(0, std::memory_order_relaxed);
             active.clear();
+        }
 
         // DEVIATION from doc 01's frame-loop pseudocode (which gates the pump on the state
         // already being SYNCHRONIZED/VISIBLE/FOCUSED): the runtime only advances
@@ -2400,16 +2410,19 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
     if (layer->m_createdByXR)
         mon->m_xrManagedPlug = true;
 
-    // report 12 §4 per-monitor opt-out: capture ONCE, before the sync engine has ever written an
-    // offset for this output, whether an explicit user `monitor=NAME,...,<x>x<y>,...` rule owns its
-    // POSITION (the same shape as m_userProvidedMode owning its MODE). Such a monitor is excluded
-    // from the projection for good — checking explicitPosition() later would be useless, because by
-    // then the sync engine's own offset is sitting in exactly that field.
+    // report 12 §4 per-monitor opt-out: capture whether an explicit user
+    // `monitor=NAME,...,<x>x<y>,...` rule owns POSITION (and likewise MODE) before registering our
+    // durable rule. Such a monitor is excluded from the projection. Field provenance, rather than
+    // the numeric value alone, keeps a same-name output recreation from promoting the sync engine's
+    // old offset to a user pin. refreshMonitorRuleOwnership repeats this on config reload.
     if (Config::monitorRuleMgr()) {
-        const auto USERRULE      = Config::monitorRuleMgr()->get(mon);
-        layer->m_l2dUserPinned   = USERRULE.m_offset != Vector2D{-INT32_MAX, -INT32_MAX};
+        const auto USERRULE       = Config::monitorRuleMgr()->get(mon);
+        layer->m_l2dUserPinned    = USERRULE.m_offset != Vector2D{-INT32_MAX, -INT32_MAX} && !USERRULE.m_offsetOwnedByXR;
+        layer->m_userProvidedMode = USERRULE.m_resolution != Vector2D{} && !USERRULE.m_resolutionOwnedByXR;
         if (layer->m_l2dUserPinned)
             Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}' is pinned by an explicit monitor= offset — excluded from 2D-plane sync", params.m_name);
+        if (params.m_resolution && layer->m_userProvidedMode)
+            Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}' keeps its explicit monitor= resolution", params.m_name);
     }
 
     // 4. Bind: cache the monitor + wire listeners. The onGone callback runs the removal
@@ -2456,11 +2469,6 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
     //    The registration is NOT gated on a requested mode: it also carries this monitor's default
     //    scale (task #129), which a mode-less create needs just as much.
     if (Config::monitorRuleMgr()) {
-        if (params.m_resolution) {
-            layer->m_userProvidedMode = Config::monitorRuleMgr()->get(mon).m_resolution != Vector2D{};
-            if (layer->m_userProvidedMode)
-                Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}' keeps its explicit monitor= resolution", params.m_name);
-        }
         registerDeclaredMonitorRule(mon, layer);
         Config::CMonitorRule rule = Config::monitorRuleMgr()->get(mon);
         mon->applyMonitorRule(std::move(rule));
@@ -2559,6 +2567,9 @@ void COpenXRManager::finalizeLayerRemoval(const std::string& name) {
         layer->destroySwapchain();
     }
 
+    // Path B (external output destruction) has already expired m_monitor, so rule cleanup must be
+    // name-based and unconditional. The generated rule itself uses this exact output name.
+    releaseLayout2DRuleOffset(name);
     if (auto mon = layer->m_monitor.lock(); mon && mon->m_output)
         destroyOutputDeferred(mon->m_output); // path B (external destroy) already gone -> mon expired, skipped
 
@@ -2623,7 +2634,7 @@ void COpenXRManager::registerDeclaredMonitorRule(const PHLMONITOR& mon, const PX
     // persistent named rule for the XR output — otherwise every plug edge's onConnect (and every
     // ensureMonitorStatus refresh) re-derives the mode from a rule manager that has no XR entry and
     // falls back to the headless default (1920x1080@60), silently dropping the declared 2560x1440@90.
-    // Precedence: an explicit user `monitor=NAME,<mode>,...` wins — captured once at create as
+    // Precedence: an explicit user `monitor=NAME,<mode>,...` wins — tracked as
     // layer->m_userProvidedMode, so we never clobber it. Building the rule from get(mon) preserves
     // every user-set field we do not deliberately own (mode, offset, and — task #129 — scale).
     // add() replaces our own prior rule by name (idempotent) and schedules an ensureMonitorStatus
@@ -2636,8 +2647,19 @@ void COpenXRManager::registerDeclaredMonitorRule(const PHLMONITOR& mon, const PX
     // light path — no rule-manager traffic, no mode re-apply), but a rule refresh from any other
     // source re-derives m_activeMonitorRule from the rule MANAGER, which would otherwise hand back
     // the {-INT32_MAX,-INT32_MAX} "auto" sentinel and drop us back to append-right.
-    const bool           wantOffset = layer->m_l2dPlaced;
-    Config::CMonitorRule rule       = Config::monitorRuleMgr()->get(mon);
+    const bool           wantOffset  = layer->m_l2dPlaced;
+    Config::CMonitorRule rule        = Config::monitorRuleMgr()->get(mon);
+    const bool           clearMode   = !layer->m_reqResolution && rule.m_resolutionOwnedByXR;
+    const bool           clearOffset = !wantOffset && rule.m_offsetOwnedByXR;
+
+    // A same-name output with no requested mode belongs on the headless preferred/default rung,
+    // not on the previous incarnation's XR-owned request. Clear before deriving depthPane and
+    // effectiveMode below so stereo/depth policy cannot accidentally adopt that stale pane.
+    if (clearMode) {
+        rule.m_resolution          = Vector2D{};
+        rule.m_resolutionOwnedByXR = false;
+        rule.m_refreshRate         = 60.F;
+    }
 
     // task #129: the same durability, for SCALE. A headless output has no EDID, so getDefaultScale()'s
     // PPI heuristic reads an XR quad as a tiny dense panel and picks 2.0 — cramped through a headset,
@@ -2650,12 +2672,10 @@ void COpenXRManager::registerDeclaredMonitorRule(const PHLMONITOR& mon, const PX
     // override is not consulted either, and needs not be — get() re-applies it on top of whatever we
     // store, every time, so a display GUI still wins.
     //
-    // Re-deciding from the live rules on every call (rather than from a flag captured at create, as
-    // the mode does) is what keeps the precedence live in both directions: a reload clears the rule
-    // manager, so a scale the user ADDS later — or a retuned default — lands on the next reassert
-    // instead of being shadowed by a stale capture. One caveat, shared with the mode above: our own
-    // rule outlives a destroy, so re-creating the same NAME before any reload re-reads our previous
-    // default as if it were the user's. A reload clears it.
+    // Re-deciding from the live rules on every call keeps precedence live in both directions: a
+    // reload clears the rule manager, so a scale the user ADDS later — or a retuned default — lands
+    // on the next reassert instead of being shadowed by a stale capture. XR-owned scales carry
+    // provenance and are skipped, so same-name output recreation also re-derives the default.
     static auto PDEFAULTSCALE = CConfigValue<Hyprlang::FLOAT>("openxr:default_monitor_scale");
     static auto PNOSCALECHECK = CConfigValue<Hyprlang::INT>("debug:disable_scale_checks");
     const float PINNEDSCALE   = OpenXR::xrPinnedRuleScale(Config::monitorRuleMgr()->all(), [&mon](const std::string& sel) { return mon->matchesStaticSelector(sel); });
@@ -2679,13 +2699,19 @@ void COpenXRManager::registerDeclaredMonitorRule(const PHLMONITOR& mon, const PX
     // headless output that is simply its current mode); if even that is unknown, decline.
     static auto PDEPTHDESKTOP = CConfigValue<Hyprlang::INT>("openxr:depth_desktop");
     Vector2D    depthPane     = wantMode && layer->m_reqResolution ? *layer->m_reqResolution : rule.m_resolution;
-    if (depthPane.x <= 0 || depthPane.y <= 0)
-        depthPane = mon->paneSize();
-    const bool WANTDEPTH = *PDEPTHDESKTOP != 0 && layer->m_createdByXR && depthPane.x > 0 && depthPane.y > 0;
-    const auto  WANTSTEREO    = WANTDEPTH ? Config::STEREO_SBS : Config::STEREO_OFF;
+    if (depthPane.x <= 0 || depthPane.y <= 0) {
+        // createOutput() applies the named rule synchronously. On same-name reuse that means the
+        // monitor's current pane can still describe the previous XR-owned request even though we
+        // just handed that request back above. Prefer the backend's actual default in that one
+        // handback case so depth packing cannot immediately claim the stale pane again.
+        const auto preferred = clearMode && mon->m_output ? mon->m_output->preferredMode() : nullptr;
+        depthPane            = preferred ? preferred->pixelSize : mon->paneSize();
+    }
+    const bool WANTDEPTH  = *PDEPTHDESKTOP != 0 && layer->m_createdByXR && depthPane.x > 0 && depthPane.y > 0;
+    const auto WANTSTEREO = WANTDEPTH ? Config::STEREO_SBS : Config::STEREO_OFF;
     // A user who wrote an explicit `stereo:` token on this output keeps it when depth is off; depth
     // on takes over, because a virtual pack and a physical one are not composable.
-    const bool  STEREOCHANGED = WANTDEPTH ? (rule.m_stereo != WANTSTEREO || !rule.m_stereoVirtualMode) : rule.m_stereoVirtualMode;
+    const bool STEREOCHANGED = WANTDEPTH ? (rule.m_stereo != WANTSTEREO || !rule.m_stereoVirtualMode) : rule.m_stereoVirtualMode;
     // The mode the output will run once this rule lands — the divisor gate needs it. What we are
     // about to ask for, else what the rule asks for, else what it is scanning out now: `preferred` /
     // `highres` / `maxwidth` leave m_resolution zeroed or at a negative sentinel, and the mode those
@@ -2694,16 +2720,19 @@ void COpenXRManager::registerDeclaredMonitorRule(const PHLMONITOR& mon, const PX
     Vector2D effectiveMode = wantMode ? *layer->m_reqResolution : rule.m_resolution;
     // paneSize(), not m_pixelSize: applyMonitorRule validates pane/scale, so proving the divisor on
     // a packed mode would prove the wrong quantity. Identical off a pack.
-    if (effectiveMode.x <= 0 || effectiveMode.y <= 0)
-        effectiveMode = mon->paneSize();
+    if (effectiveMode.x <= 0 || effectiveMode.y <= 0) {
+        const auto preferred = clearMode && mon->m_output ? mon->m_output->preferredMode() : nullptr;
+        effectiveMode        = preferred ? preferred->pixelSize : mon->paneSize();
+    }
     // `stereoOutput` asks "is this a PHYSICAL per-eye panel", because that is the only case whose
     // scale must be pinned to 1.0. A virtual pack has no physical pixel grid, its pane IS the
     // declared size, and openxr:default_monitor_scale still divides that pane cleanly — so the XR
     // scale default keeps applying and turning depth on does not reflow the session.
-    const auto WANTSCALE = OpenXR::xrDefaultMonitorScale(layer->m_createdByXR, OpenXR::xrRuleScaleIsExplicit(PINNEDSCALE),
-                                                         WANTSTEREO != Config::STEREO_OFF && !WANTDEPTH, effectiveMode, *PNOSCALECHECK, (float)*PDEFAULTSCALE);
+    const auto WANTSCALE  = OpenXR::xrDefaultMonitorScale(layer->m_createdByXR, OpenXR::xrRuleScaleIsExplicit(PINNEDSCALE), WANTSTEREO != Config::STEREO_OFF && !WANTDEPTH,
+                                                          effectiveMode, *PNOSCALECHECK, (float)*PDEFAULTSCALE);
+    const bool clearScale = !WANTSCALE && rule.m_scaleOwnedByXR;
 
-    if (!wantMode && !wantOffset && !WANTSCALE && !STEREOCHANGED)
+    if (!wantMode && !clearMode && !wantOffset && !clearOffset && !WANTSCALE && !clearScale && !STEREOCHANGED)
         return;
     rule.m_name = mon->m_name;
     if (WANTDEPTH) {
@@ -2711,21 +2740,33 @@ void COpenXRManager::registerDeclaredMonitorRule(const PHLMONITOR& mon, const PX
         rule.m_stereoVirtualMode = true;
         // ...and NAME the pane, so the derivation has something to derive from even when the rule
         // only asked for `preferred`. Writing it is what makes the pack expressible at all.
-        rule.m_resolution        = depthPane;
+        rule.m_resolution = depthPane;
+        if (!layer->m_userProvidedMode)
+            rule.m_resolutionOwnedByXR = true;
     } else if (rule.m_stereoVirtualMode) {
         // Ours to clear, and only ours: a physical `stereo:` token never sets the virtual flag.
         rule.m_stereo            = Config::STEREO_OFF;
         rule.m_stereoVirtualMode = false;
     }
     if (wantMode) {
-        rule.m_resolution = *layer->m_reqResolution;
-        if (layer->m_reqRefresh)
-            rule.m_refreshRate = *layer->m_reqRefresh;
+        rule.m_resolution          = *layer->m_reqResolution;
+        rule.m_resolutionOwnedByXR = true;
+        rule.m_refreshRate         = layer->m_reqRefresh.value_or(60.F);
     }
-    if (wantOffset)
-        rule.m_offset = layer->m_l2dOffset;
-    if (WANTSCALE)
-        rule.m_scale = *WANTSCALE;
+    if (wantOffset) {
+        rule.m_offset          = layer->m_l2dOffset;
+        rule.m_offsetOwnedByXR = true;
+    } else if (clearOffset) {
+        rule.m_offset          = Vector2D{-INT32_MAX, -INT32_MAX};
+        rule.m_offsetOwnedByXR = false;
+    }
+    if (WANTSCALE) {
+        rule.m_scale          = *WANTSCALE;
+        rule.m_scaleOwnedByXR = true;
+    } else if (clearScale) {
+        rule.m_scale          = -1.F;
+        rule.m_scaleOwnedByXR = false;
+    }
     // Keep the output ENABLED in the rule — the unplug lifecycle is driven separately through
     // onConnect/onDisconnect + the m_xrManagedPlug guard (issue A), not the rule's disabled bit.
     rule.m_disabled = false;
@@ -2765,6 +2806,64 @@ void COpenXRManager::reassertMonitorModeRules() {
     // Outside m_layersMu: the rule manager runs listeners of its own.
     for (auto& [mon, layer] : pending)
         registerDeclaredMonitorRule(mon, layer);
+}
+
+void COpenXRManager::refreshMonitorRuleOwnership() {
+    // MAIN THREAD, immediately after a config/keyword reparse. Snapshot the monitor handles without
+    // holding m_layersMu across rule-manager lookups; get() consults output-management state and may
+    // run independently-owned code.
+    if (!Config::monitorRuleMgr())
+        return;
+
+    struct SRuleOwnership {
+        PXRLAYER   layer;
+        PHLMONITOR mon;
+        bool       userPosition = false;
+        bool       userMode     = false;
+    };
+    std::vector<SRuleOwnership> ownership;
+    {
+        std::scoped_lock lock(m_layersMu);
+        ownership.reserve(m_layers.size());
+        for (auto& l : m_layers) {
+            if (!l || l->m_pendingRemoval.load(std::memory_order_acquire))
+                continue;
+            if (auto mon = l->m_monitor.lock())
+                ownership.push_back({l, mon});
+        }
+    }
+
+    for (auto& o : ownership) {
+        const auto rule = Config::monitorRuleMgr()->get(o.mon);
+        o.userPosition  = rule.m_offset != Vector2D{-INT32_MAX, -INT32_MAX} && !rule.m_offsetOwnedByXR;
+        o.userMode      = rule.m_resolution != Vector2D{} && !rule.m_resolutionOwnedByXR;
+    }
+
+    bool layoutOwnershipChanged = false;
+    {
+        std::scoped_lock lock(m_layersMu);
+        for (const auto& o : ownership) {
+            if (o.layer->m_l2dUserPinned != o.userPosition) {
+                Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}' {} explicit monitor= position ownership", o.layer->m_monitorName, o.userPosition ? "gained" : "released");
+                layoutOwnershipChanged = true;
+            }
+            o.layer->m_l2dUserPinned    = o.userPosition;
+            o.layer->m_userProvidedMode = o.userMode;
+            if (o.userPosition)
+                o.layer->m_l2dPlaced = false;
+        }
+    }
+
+    if (layoutOwnershipChanged)
+        requestLayout2DSync();
+}
+
+void COpenXRManager::onMonitorRulesChanged() {
+    // MAIN THREAD. The legacy dynamic-monitor keyword updates the rule manager synchronously but
+    // emits neither config.reloaded nor config.props_refreshed. Keep this deliberately narrower
+    // than onConfigReload(): only ownership and the durable monitor-rule fields depend on it.
+    refreshMonitorRuleOwnership();
+    reassertMonitorModeRules();
 }
 
 void COpenXRManager::bindExistingLayers() {
@@ -3591,6 +3690,10 @@ void COpenXRManager::markSwapchainsDirtyIfChromeChanged() {
 }
 
 void COpenXRManager::onConfigReload() {
+    // The rule manager now contains either freshly parsed config or a runtime keyword update. Take
+    // field ownership before any reassertion can copy our durable mode/position back over it.
+    refreshMonitorRuleOwnership();
+
     // Re-parse the adaptive string options to enums for the frame thread (main-thread parse). Cheap
     // + unconditional so hot re-tuning (openxr:adaptive_roam_mode / adaptive_transition_ease) applies
     // live on both /reload and the keyword special-cases below.
@@ -4733,24 +4836,48 @@ OpenXR::eXRLayout2DAttach COpenXRManager::readLayout2DAttach() {
     return OpenXR::xrParseLayout2DAttach(*PATTACH).value_or(OpenXR::XR_L2D_ATTACH_RIGHT);
 }
 
+void COpenXRManager::releaseLayout2DRuleOffset(const std::string& name) {
+    if (!Config::monitorRuleMgr())
+        return;
+
+    // XR-owned offsets are only ever persisted in the exact-name rule installed by
+    // registerDeclaredMonitorRule. Read that raw rule rather than get(mon): the monitor is already
+    // gone on external-destroy path B, and matching a selector requires the live monitor object.
+    const auto& rules = Config::monitorRuleMgr()->all();
+    const auto  found = std::ranges::find_if(rules, [&](const auto& r) { return r.m_name == name && r.m_offsetOwnedByXR; });
+    if (found == rules.end())
+        return;
+
+    Config::CMonitorRule rule = *found;
+    rule.m_offset             = Vector2D{-INT32_MAX, -INT32_MAX};
+    rule.m_offsetOwnedByXR    = false;
+    Config::monitorRuleMgr()->add(std::move(rule));
+}
+
 void COpenXRManager::releaseLayout2DPlacements() {
     // MAIN THREAD. Clear every offset the sync engine owns, back to the {-INT32_MAX,-INT32_MAX}
     // "auto" sentinel arrange() treats as append-right. Idempotent: a no-op once nothing is placed.
-    bool changed = false;
+    bool                     changed = false;
+    std::vector<std::string> released;
     {
         std::scoped_lock lock(m_layersMu);
         for (auto& l : m_layers) {
             if (!l->m_l2dPlaced)
                 continue;
             l->m_l2dPlaced = false;
-            if (auto mon = l->m_monitor.lock())
-                mon->m_activeMonitorRule.m_offset = Vector2D{-INT32_MAX, -INT32_MAX};
+            released.push_back(l->m_monitorName);
+            if (auto mon = l->m_monitor.lock()) {
+                mon->m_activeMonitorRule.m_offset          = Vector2D{-INT32_MAX, -INT32_MAX};
+                mon->m_activeMonitorRule.m_offsetOwnedByXR = false;
+            }
             changed = true;
         }
     }
     m_l2dPrev.clear();
     m_l2dPlacedCount = 0;
     m_l2dRows = m_l2dWidth = m_l2dHeight = 0;
+    for (const auto& name : released)
+        releaseLayout2DRuleOffset(name);
     if (!changed)
         return;
     Log::logger->log(Log::DEBUG, "[OPENXR] 2D-plane sync off — XR monitors handed back to auto placement");
@@ -4919,10 +5046,7 @@ void COpenXRManager::syncLayout2D(bool force) {
         return;
     }
     if (in.empty()) {
-        m_l2dPlacedCount = 0;
-        m_l2dRows        = 0;
-        m_l2dWidth       = 0;
-        m_l2dHeight      = 0;
+        releaseLayout2DPlacements();
         return;
     }
 
@@ -4953,7 +5077,8 @@ void COpenXRManager::syncLayout2D(bool force) {
     // pipeline do the rest. moveTo() then shifts floating windows by the delta, re-arranges the
     // monitor's LAYER SURFACES (c3bdf3aa — layers cache GLOBAL geometry and would otherwise be
     // stranded outside their own monitor), relayouts tiled windows, and re-clamps the cursor.
-    bool changed = false;
+    bool                     changed = false;
+    std::vector<std::string> released;
     {
         std::scoped_lock lock(m_layersMu);
 
@@ -4965,8 +5090,11 @@ void COpenXRManager::syncLayout2D(bool force) {
             if (!l->m_l2dPlaced || std::ranges::any_of(chosen, [&](const PXRLAYER& c) { return c == l; }))
                 continue;
             l->m_l2dPlaced = false;
-            if (auto mon = l->m_monitor.lock())
-                mon->m_activeMonitorRule.m_offset = Vector2D{-INT32_MAX, -INT32_MAX};
+            released.push_back(l->m_monitorName);
+            if (auto mon = l->m_monitor.lock()) {
+                mon->m_activeMonitorRule.m_offset          = Vector2D{-INT32_MAX, -INT32_MAX};
+                mon->m_activeMonitorRule.m_offsetOwnedByXR = false;
+            }
             changed = true;
         }
 
@@ -4999,10 +5127,14 @@ void COpenXRManager::syncLayout2D(bool force) {
                 // syncs). Noticing the disagreement here is what makes the sync self-healing.
                 if (mon->m_activeMonitorRule.m_offset != pos || mon->m_position != pos)
                     changed = true;
-                mon->m_activeMonitorRule.m_offset = pos;
+                mon->m_activeMonitorRule.m_offset          = pos;
+                mon->m_activeMonitorRule.m_offsetOwnedByXR = true;
             }
         }
     }
+
+    for (const auto& name : released)
+        releaseLayout2DRuleOffset(name);
 
     m_l2dPrev        = OpenXR::xrLayout2DPrevOf(res);
     m_l2dPlacedCount = (int)chosen.size();
@@ -5042,16 +5174,34 @@ COpenXRManager::SXRLayout2DStatus COpenXRManager::layout2DStatus() {
 
 // ---- ray-cast cursor edge crossing (task #139, XRCursorCross.hpp) --------------------------------
 
+void COpenXRManager::clearCrossingSubmissionState() {
+    // MAIN THREAD, with the frame thread absent/joined or the global view gate closed. Submission is
+    // session/frame state; quad geometry and partial cursor pressure derived from it must cross
+    // neither a view gate nor a session boundary.
+    {
+        std::scoped_lock lock(m_layersMu);
+        for (auto& l : m_layers)
+            l->m_quadsSubmitted.store(0, std::memory_order_relaxed);
+    }
+    m_crossQuads.clear();
+    m_crossQuadLayers.clear();
+    m_crossQuadsMs = 0;
+    m_crossPush.reset();
+}
+
 void COpenXRManager::refreshCrossQuads(int64_t nowMs) {
     // MAIN THREAD. See the header for why only the 3D half is cached and why the TTL exists.
     if (m_crossQuadsMs != 0 && nowMs - m_crossQuadsMs < OpenXR::XR_CROSS_GEOM_TTL_MS)
         return;
     m_crossQuadsMs = nowMs;
     m_crossQuads.clear();
+    m_crossQuadLayers.clear();
 
     std::scoped_lock lock(m_layersMu);
     for (auto& l : m_layers) {
         if (l->m_pendingRemoval.load(std::memory_order_acquire))
+            continue;
+        if (l->m_quadsSubmitted.load(std::memory_order_relaxed) == 0)
             continue;
         const MONITORID id = l->m_monitorId.load(std::memory_order_acquire);
         if (id < 0)
@@ -5076,9 +5226,9 @@ void COpenXRManager::refreshCrossQuads(int64_t nowMs) {
         // its height on every paired monitor — a ray aimed at the bottom of a quad would cross to
         // nothing. Latent while only a fullscreen 3D film paired (WP X1); the steady state once
         // every XR monitor is a depth pack (WP X3).
-        const auto   PANEPX = Render::Stereo::presentedPaneSize(l->m_contentSize, layerDecl(*l).layout);
-        const double pxW    = PANEPX.x > 0.0 ? PANEPX.x : 1.0;
-        const double pxH    = PANEPX.y > 0.0 ? PANEPX.y : 1.0;
+        const auto           PANEPX = Render::Stereo::presentedPaneSize(l->m_contentSize, layerDecl(*l).layout);
+        const double         pxW    = PANEPX.x > 0.0 ? PANEPX.x : 1.0;
+        const double         pxH    = PANEPX.y > 0.0 ? PANEPX.y : 1.0;
 
         OpenXR::SXRCrossQuad q;
         q.id      = id;
@@ -5086,15 +5236,30 @@ void COpenXRManager::refreshCrossQuads(int64_t nowMs) {
         q.wMeters = st.widthMeters;
         q.hMeters = st.widthMeters * (float)(pxH / pxW);
         m_crossQuads.push_back(q);
+        m_crossQuadLayers.push_back(l);
     }
+}
+
+void COpenXRManager::resetCursorCrossing() {
+    // MAIN THREAD. Absolute/external cursor warps do not pass through redirectCursorCrossing, so
+    // CPointerManager calls this to prevent a pre-warp edge gesture carrying into the new place.
+    m_crossPush.reset();
 }
 
 std::optional<Vector2D> COpenXRManager::redirectCursorCrossing(const Vector2D& oldPos, const Vector2D& newPos) {
     // MAIN THREAD (CPointerManager::move). Every early return means "leave it to the 2D layout".
-    if (m_cursorCrossMode.load(std::memory_order_relaxed) != OpenXR::XR_CURSORCROSS_RAYCAST)
+    if (m_cursorCrossMode.load(std::memory_order_relaxed) != OpenXR::XR_CURSORCROSS_RAYCAST) {
+        m_crossPush.reset();
         return std::nullopt;
-    if (!m_running.load(std::memory_order_acquire))
+    }
+    if (!m_running.load(std::memory_order_acquire)) {
+        m_crossPush.reset();
         return std::nullopt;
+    }
+    if (!m_monitorViewVisible.load(std::memory_order_acquire)) {
+        m_crossPush.reset();
+        return std::nullopt;
+    }
     if (oldPos == newPos)
         return std::nullopt;
 
@@ -5121,50 +5286,68 @@ std::optional<Vector2D> COpenXRManager::redirectCursorCrossing(const Vector2D& o
             break;
         }
     }
-    if (!src)
+    if (!src) {
+        m_crossPush.reset();
         return std::nullopt;
-    const CBox srcBox = src->logicalBox();
-    if (srcBox.containsPoint(newPos))
+    }
+    const CBox    srcBox = src->logicalBox();
+    const int64_t nowMs  = (int64_t)Time::millis(Time::steadyNow());
+    const auto exitUV = OpenXR::xrAccumulateCrossPush(m_crossPush, src->m_id, srcBox, oldPos, newPos, nowMs, OpenXR::XR_CROSS_PUSH_TIMEOUT_MS, OpenXR::XR_CROSS_MAX_OVERSHOOT_UV);
+    if (!exitUV)
         return std::nullopt;
 
     // 2. Where the head is NOW. A ray cast from a stale head is a ray cast from where the user is
     //    not, which is worse than the layout answer — so staleness falls back rather than guesses.
     OpenXR::SXRPoseSample head;
-    if (!newestPoseSample(head) || !head.viewValid)
+    if (!newestPoseSample(head) || !head.viewValid) {
+        m_crossPush.reset();
         return std::nullopt;
-    const int64_t nowMs = (int64_t)Time::millis(Time::steadyNow());
-    if (nowMs - head.timestampMs > OpenXR::XR_CROSS_POSE_MAX_AGE_MS)
+    }
+    if (nowMs - head.timestampMs > OpenXR::XR_CROSS_POSE_MAX_AGE_MS) {
+        m_crossPush.reset();
         return std::nullopt;
+    }
 
     // 3. Is the monitor we are leaving an XR quad at all? Crossing OFF a physical output keeps the
     //    2D behaviour: a physical output has no pose in the room, so there is no plane to exit from.
     refreshCrossQuads(nowMs);
     const OpenXR::SXRCrossQuad* srcQuad = nullptr;
-    for (auto const& q : m_crossQuads) {
+    for (size_t i = 0; i < m_crossQuads.size(); ++i) {
+        const auto& q     = m_crossQuads[i];
+        const auto  layer = m_crossQuadLayers[i].lock();
+        if (!layer || layer->m_quadsSubmitted.load(std::memory_order_relaxed) == 0)
+            continue;
         if (q.id == src->m_id) {
             srcQuad = &q;
             break;
         }
     }
-    if (!srcQuad || !(srcQuad->wMeters > 0.F) || !(srcQuad->hMeters > 0.F))
+    if (!srcQuad || !(srcQuad->wMeters > 0.F) || !(srcQuad->hMeters > 0.F)) {
+        m_crossPush.reset();
         return std::nullopt;
+    }
 
     // 4. Candidates: every OTHER XR quad that is currently a real, enabled monitor in the layout.
     //    (Physical outputs are never candidates — nothing to intersect. That asymmetry is by
     //    construction and documented: crossing between XR and physical monitors stays 2D.)
     std::vector<OpenXR::SXRCrossQuad> cands;
     cands.reserve(m_crossQuads.size());
-    for (auto const& q : m_crossQuads) {
+    for (size_t i = 0; i < m_crossQuads.size(); ++i) {
+        const auto& q     = m_crossQuads[i];
+        const auto  layer = m_crossQuadLayers[i].lock();
+        if (!layer || layer->m_quadsSubmitted.load(std::memory_order_relaxed) == 0)
+            continue;
         if (q.id == srcQuad->id || !byId(q.id))
             continue;
         cands.push_back(q);
     }
-    if (cands.empty())
+    if (cands.empty()) {
+        m_crossPush.reset();
         return std::nullopt;
+    }
 
     // 5. The exit point on the source quad's EXTENDED plane, and the line of sight through it.
-    const Vector2D     exitUV  = OpenXR::xrCrossExitUV(srcBox, newPos, OpenXR::XR_CROSS_MAX_OVERSHOOT_UV);
-    const OpenXR::Vec3 through = OpenXR::quadPointFromUV(srcQuad->pose, srcQuad->wMeters, srcQuad->hMeters, (float)exitUV.x, (float)exitUV.y);
+    const OpenXR::Vec3 through = OpenXR::quadPointFromUV(srcQuad->pose, srcQuad->wMeters, srcQuad->hMeters, (float)exitUV->x, (float)exitUV->y);
     const auto         pick    = OpenXR::xrPickCrossTarget(head.headPos, through, cands, srcQuad->id, OpenXR::XR_CROSS_TOLERANCE_DEG);
     if (!pick.ok)
         return std::nullopt; // nothing over there — the layout's answer is as good as any
@@ -5172,11 +5355,14 @@ std::optional<Vector2D> COpenXRManager::redirectCursorCrossing(const Vector2D& o
     // 6. The hit point, in the target's layout pixels. Its box is read LIVE (never from the cached
     //    snapshot) so a 2D-sync relayout between motion events cannot land us on stale coordinates.
     auto tgt = byId(pick.id);
-    if (!tgt)
+    if (!tgt) {
+        m_crossPush.reset();
         return std::nullopt;
+    }
     const Vector2D land = OpenXR::xrCrossEntryPoint(tgt->logicalBox(), pick.u, pick.v, OpenXR::XR_CROSS_ENTRY_INSET_PX);
     Log::logger->log(Log::TRACE, "[OPENXR] cursor ray-crossing {} -> {} at uv {:.3f},{:.3f} ({:.2f}m{})", src->m_name, tgt->m_name, pick.u, pick.v, pick.t,
                      pick.tolerated ? ", tolerated" : "");
+    m_crossPush.reset();
     return land;
 }
 
@@ -5799,11 +5985,7 @@ std::expected<void, std::string> COpenXRManager::cmdView(const std::string& args
     if (!visible) {
         // Status should reflect the gate immediately instead of retaining last frame's quad count or
         // hover until the frame thread reaches its next zero-layer submission.
-        {
-            std::scoped_lock lock(m_layersMu);
-            for (auto& l : m_layers)
-                l->m_quadsSubmitted.store(0, std::memory_order_relaxed);
-        }
+        clearCrossingSubmissionState();
         setHoveredMonitor("");
     }
 

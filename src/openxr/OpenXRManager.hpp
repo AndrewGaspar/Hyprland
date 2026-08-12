@@ -333,6 +333,7 @@ class COpenXRManager {
     // motion that never left its monitor, or a ray that met nothing. nullopt therefore means "the
     // 2D-plane sync's layout adjacency decides", exactly as before this existed.
     std::optional<Vector2D>          redirectCursorCrossing(const Vector2D& oldPos, const Vector2D& newPos);
+    void                             resetCursorCrossing();
 
     // WP-G5: per-hand active input device for `hyprctl openxr status`. Reads CXRInput's atomic
     // interaction-profile mirror (main-thread safe) + the openxr:hand_grab mode. `hands` is true
@@ -425,6 +426,11 @@ class COpenXRManager {
     // legacy config parser fires neither event (see CConfigManager::parseKeyword's special-case
     // cluster), so that path calls this directly. Idempotent; safe to call redundantly.
     void onConfigReload();
+
+    // Legacy `hyprctl keyword monitor ...` also emits no reload/props-refreshed event. Re-evaluate
+    // per-field user ownership after that rule has been installed, then restore any XR-owned fields
+    // the user just handed back to auto.
+    void onMonitorRulesChanged();
 
     // "disabled" | "unavailable" | "starting" | "idle" | "visible" | "focused" | "stopping"
     static const char* stateToString(eXRManagerState state);
@@ -582,6 +588,12 @@ class COpenXRManager {
     // preferred` line / the headless default 1920x1080 (live 2026-08-01). Idempotent, and still a
     // no-op for any layer whose mode the user pinned themselves (m_userProvidedMode).
     void reassertMonitorModeRules();
+    // Re-read user ownership after monitor rules are reparsed. Runtime-owned rule fields carry
+    // provenance, so adding/removing a user mode or position applies live without mistaking our
+    // durable values for configuration.
+    void refreshMonitorRuleOwnership();
+    // Return only an XR-owned durable layout offset to auto; user positions are never touched.
+    void releaseLayout2DRuleOffset(const std::string& name);
     // Main thread: decide (openxr:force_linear + the XR EGL node vs this output's buffer allocator
     // node) whether the XR-bound headless output must allocate LINEAR buffers for cross-GPU import,
     // set CMonitor::m_forceLinearSwapchain accordingly, and reconfigure the swapchain if it changed.
@@ -847,11 +859,14 @@ class COpenXRManager {
     // under m_layersMu at most once per XR_CROSS_GEOM_TTL_MS. The TTL is what keeps a cursor held
     // against a non-crossing edge (which asks us on every motion event, up to 1 kHz) from hammering
     // the mutex the frame thread solves under. Only the 3D geometry is cached: each monitor's 2D
-    // box is resolved live on every call, because the 2D-plane sync can move a monitor between two
-    // motion events and a cached box would warp the cursor to where the monitor no longer is.
-    void                              refreshCrossQuads(int64_t nowMs);
-    std::vector<OpenXR::SXRCrossQuad> m_crossQuads;
-    int64_t                           m_crossQuadsMs = 0; // 0 = never built
+    // box and last-frame submission state are resolved live on every call, because the 2D-plane
+    // sync can move a monitor between two motion events and a hidden/unsent quad is not a target.
+    void                                        clearCrossingSubmissionState();
+    void                                        refreshCrossQuads(int64_t nowMs);
+    std::vector<OpenXR::SXRCrossQuad>           m_crossQuads;
+    std::vector<std::weak_ptr<CXRMonitorLayer>> m_crossQuadLayers;  // same indices; validates live submission
+    int64_t                                     m_crossQuadsMs = 0; // 0 = never built
+    OpenXR::SXRCrossPushState                   m_crossPush;
 
     // Copy of the most recent frame-thread solve inputs, so verbs (main thread) get a view/grip
     // context without blocking the frame thread. Written by the frame thread under m_layersMu.

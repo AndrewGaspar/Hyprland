@@ -57,11 +57,18 @@ namespace Config {
 
         eAutoDirs                    m_autoDir       = DIR_AUTO_NONE;
         std::string                  m_name          = "";
-        Vector2D                     m_resolution    = Vector2D();
-        Vector2D                     m_offset        = Vector2D(-INT32_MAX, -INT32_MAX);
-        float                        m_scale         = -1;
-        float                        m_refreshRate   = 60; // Hz
-        bool                         m_disabled      = false;
+        // OpenXR persists runtime defaults through the ordinary monitor-rule pipeline. Keep field
+        // ownership with those values: without provenance, destroying and recreating an output with
+        // the same name makes internal mode/position/scale values indistinguishable from explicit
+        // user configuration. Parsers and output-management writes clear the corresponding bit.
+        Vector2D m_resolution          = Vector2D();
+        bool     m_resolutionOwnedByXR = false;
+        Vector2D m_offset              = Vector2D(-INT32_MAX, -INT32_MAX);
+        bool     m_offsetOwnedByXR     = false;
+        float    m_scale               = -1;
+        bool     m_scaleOwnedByXR      = false;
+        float    m_refreshRate         = 60; // Hz
+        bool     m_disabled            = false;
         // HypXRland (XREAL V2.2 leasable-on-demand direct mode): when set via the `lease` monitor-rule
         // flag, this named DESKTOP output is NOT configured as a desktop and is instead offered to
         // drm-lease-v1 clients (monado direct mode owns the flip). Default false ⇒ ordinary desktop
