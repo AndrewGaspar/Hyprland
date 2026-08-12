@@ -369,9 +369,9 @@ bool OpenXR::wantXRMonitorsPlugged(eXRMonitorFollowMode mode, bool sessionUp, bo
 
 std::optional<float> OpenXR::xrDefaultMonitorScale(bool createdByXR, bool ruleScaleExplicit, bool stereoOutput, const Vector2D& pixelSize, bool skipScaleChecks,
                                                    float configuredDefault) {
-    // task #129. See the header for the precedence ladder. Every rejection is a "leave the rule's
-    // scale exactly as it is" — this function never returns the auto sentinel, so a caller can write
-    // its result unconditionally when it has one.
+    // task #129. See the header for the precedence ladder. Every rejection is "do not own the
+    // scale" — this function never returns the auto sentinel, so a caller can write its result
+    // unconditionally when present and use field provenance to hand an old runtime value back.
     if (!createdByXR)         // adopted real monitor: its scale is the user's business
         return std::nullopt;
     if (ruleScaleExplicit)    // an explicit `monitor = NAME, ..., <scale>` outranks us

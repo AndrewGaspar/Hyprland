@@ -130,6 +130,148 @@ TEST(XRCursorCross, ExitUVLeavesASmallOvershootAlone) {
     EXPECT_LT(uv.x, 1.01);
 }
 
+TEST(XRCursorCross, ContinuedSmallPushesAccumulateAndCap) {
+    const CBox              box{0.0, 0.0, 100.0, 100.0};
+    SXRCrossPushState       state;
+    std::optional<Vector2D> uv;
+
+    for (int i = 0; i < 12; ++i)
+        uv = xrAccumulateCrossPush(state, 7, box, Vector2D{99.999, 50.0}, Vector2D{101.0, 50.0}, i, XR_CROSS_PUSH_TIMEOUT_MS, 0.1F);
+
+    ASSERT_TRUE(uv);
+    EXPECT_EQ(state.sourceId, 7);
+    EXPECT_EQ(state.edge, XR_CROSSEDGE_RIGHT);
+    EXPECT_DOUBLE_EQ(state.overshootUV, (double)0.1F);
+    EXPECT_DOUBLE_EQ(uv->x, 1.0 + (double)0.1F);
+    EXPECT_NEAR(uv->y, 0.5, 1e-9);
+}
+
+TEST(XRCursorCross, InwardMotionResetsAContinuedPush) {
+    const CBox        box{0.0, 0.0, 100.0, 100.0};
+    SXRCrossPushState state;
+
+    ASSERT_TRUE(xrAccumulateCrossPush(state, 7, box, Vector2D{99.999, 50.0}, Vector2D{102.0, 50.0}, 10, XR_CROSS_PUSH_TIMEOUT_MS, 0.5F));
+    ASSERT_GT(state.overshootUV, 0.0);
+
+    EXPECT_FALSE(xrAccumulateCrossPush(state, 7, box, Vector2D{99.999, 50.0}, Vector2D{98.0, 50.0}, 11, XR_CROSS_PUSH_TIMEOUT_MS, 0.5F));
+    EXPECT_EQ(state.edge, XR_CROSSEDGE_NONE);
+    EXPECT_EQ(state.sourceId, -1);
+    EXPECT_DOUBLE_EQ(state.overshootUV, 0.0);
+}
+
+TEST(XRCursorCross, TransverseMotionNeitherAddsNorResetsPressure) {
+    const CBox        box{0.0, 0.0, 100.0, 100.0};
+    SXRCrossPushState state;
+
+    ASSERT_TRUE(xrAccumulateCrossPush(state, 7, box, Vector2D{99.999, 40.0}, Vector2D{102.0, 40.0}, 10, XR_CROSS_PUSH_TIMEOUT_MS, 0.5F));
+    const double pressure = state.overshootUV;
+
+    EXPECT_FALSE(xrAccumulateCrossPush(state, 7, box, Vector2D{99.999, 40.0}, Vector2D{99.999, 55.0}, 11, XR_CROSS_PUSH_TIMEOUT_MS, 0.5F));
+    EXPECT_EQ(state.edge, XR_CROSSEDGE_RIGHT);
+    EXPECT_DOUBLE_EQ(state.overshootUV, pressure);
+    EXPECT_EQ(state.lastPushMs, 10);
+}
+
+TEST(XRCursorCross, SourceEdgeAndTimeoutStartFreshGestures) {
+    const CBox        box{0.0, 0.0, 100.0, 100.0};
+    SXRCrossPushState state;
+
+    ASSERT_TRUE(xrAccumulateCrossPush(state, 7, box, Vector2D{99.999, 50.0}, Vector2D{102.0, 50.0}, 10, XR_CROSS_PUSH_TIMEOUT_MS, 0.5F));
+    EXPECT_NEAR(state.overshootUV, 0.02, 1e-9);
+
+    ASSERT_TRUE(xrAccumulateCrossPush(state, 8, box, Vector2D{99.999, 50.0}, Vector2D{101.0, 50.0}, 11, XR_CROSS_PUSH_TIMEOUT_MS, 0.5F));
+    EXPECT_EQ(state.sourceId, 8);
+    EXPECT_NEAR(state.overshootUV, 0.01, 1e-9);
+
+    ASSERT_TRUE(xrAccumulateCrossPush(state, 8, box, Vector2D{99.999, 50.0}, Vector2D{101.0, 50.0}, 11 + XR_CROSS_PUSH_TIMEOUT_MS + 1, XR_CROSS_PUSH_TIMEOUT_MS, 0.5F));
+    EXPECT_NEAR(state.overshootUV, 0.01, 1e-9);
+
+    ASSERT_TRUE(xrAccumulateCrossPush(state, 8, box, Vector2D{50.0, 99.999}, Vector2D{50.0, 103.0}, 12 + XR_CROSS_PUSH_TIMEOUT_MS, XR_CROSS_PUSH_TIMEOUT_MS, 0.5F));
+    EXPECT_EQ(state.edge, XR_CROSSEDGE_BOTTOM);
+    EXPECT_NEAR(state.overshootUV, 0.03, 1e-9);
+
+    ASSERT_TRUE(xrAccumulateCrossPush(state, 8, box, Vector2D{50.0, 99.999}, Vector2D{50.0, 101.0}, 5, XR_CROSS_PUSH_TIMEOUT_MS, 0.5F));
+    EXPECT_EQ(state.edge, XR_CROSSEDGE_BOTTOM);
+    EXPECT_NEAR(state.overshootUV, 0.01, 1e-9) << "a monotonic-clock rollback starts fresh";
+}
+
+TEST(XRCursorCross, CornerJitterKeepsTheEstablishedEdge) {
+    const CBox        box{0.0, 0.0, 100.0, 100.0};
+    SXRCrossPushState state;
+
+    ASSERT_TRUE(xrAccumulateCrossPush(state, 7, box, Vector2D{99.999, 99.999}, Vector2D{102.0, 101.0}, 10, XR_CROSS_PUSH_TIMEOUT_MS, 0.5F));
+    EXPECT_EQ(state.edge, XR_CROSSEDGE_RIGHT);
+    EXPECT_NEAR(state.overshootUV, 0.02, 1e-9);
+
+    const auto uv = xrAccumulateCrossPush(state, 7, box, Vector2D{99.999, 99.999}, Vector2D{101.0, 120.0}, 11, XR_CROSS_PUSH_TIMEOUT_MS, 0.5F);
+    ASSERT_TRUE(uv);
+    EXPECT_EQ(state.edge, XR_CROSSEDGE_RIGHT);
+    EXPECT_NEAR(state.overshootUV, 0.03, 1e-9);
+    EXPECT_NEAR(uv->y, 1.2, 1e-9);
+}
+
+TEST(XRCursorCross, CapturedStackedQuadsNeedAccumulatedPressure) {
+    // Live XR-2 -> XR-3 geometry from the reported failure. The quads look vertically stacked in
+    // the headset, but their perspective gap is wider than the 4-degree tolerance at a grazing
+    // ray. Ten ordinary 12 px pushes must therefore accumulate; requiring one 120 px input event
+    // was the DPI-dependent bug this state machine fixes.
+    const Vec3   eye{8.399F, 1.574F, -0.997F};
+
+    SXRCrossQuad src;
+    src.id      = 2;
+    src.pose    = SXRPose{Vec3{7.126F, 1.897F, -0.266F}, Quat{0.0538F, 0.8620F, -0.0936F, 0.4953F}};
+    src.wMeters = 1.6F;
+    src.hMeters = 0.9F;
+
+    SXRCrossQuad tgt;
+    tgt.id      = 3;
+    tgt.pose    = SXRPose{Vec3{7.226F, 0.865F, -0.212F}, Quat{-0.1037F, 0.8590F, 0.1924F, 0.4629F}};
+    tgt.wMeters = 1.6F;
+    tgt.hMeters = 0.9F;
+
+    const std::vector<SXRCrossQuad> quads{src, tgt};
+    const CBox                      srcBox{880.0, 1152.0, 2048.0, 1152.0};
+    SXRCrossPushState               state;
+    auto                            cast = [&](const Vector2D& uv) {
+        const Vec3 through = quadPointFromUV(src.pose, src.wMeters, src.hMeters, (float)uv.x, (float)uv.y);
+        return xrPickCrossTarget(eye, through, quads, src.id, XR_CROSS_TOLERANCE_DEG);
+    };
+
+    auto uv = xrAccumulateCrossPush(state, src.id, srcBox, Vector2D{1904.0, 2303.999}, Vector2D{1904.0, 2316.0}, 10, XR_CROSS_PUSH_TIMEOUT_MS, XR_CROSS_MAX_OVERSHOOT_UV);
+    ASSERT_TRUE(uv);
+    EXPECT_FALSE(cast(*uv).ok) << "one ordinary event should still use the layout fallback";
+
+    for (int i = 1; i < 10; ++i)
+        uv = xrAccumulateCrossPush(state, src.id, srcBox, Vector2D{1904.0, 2303.999}, Vector2D{1904.0, 2316.0}, 10 + i, XR_CROSS_PUSH_TIMEOUT_MS, XR_CROSS_MAX_OVERSHOOT_UV);
+
+    ASSERT_TRUE(uv);
+    const auto pick = cast(*uv);
+    ASSERT_TRUE(pick.ok);
+    EXPECT_EQ(pick.id, tgt.id);
+    EXPECT_TRUE(pick.tolerated);
+
+    const CBox        reverseBox{4912.0, 1728.0, 2048.0, 1152.0};
+    SXRCrossPushState reverseState;
+    auto              castReverse = [&](const Vector2D& reverseUV) {
+        const Vec3 through = quadPointFromUV(tgt.pose, tgt.wMeters, tgt.hMeters, (float)reverseUV.x, (float)reverseUV.y);
+        return xrPickCrossTarget(eye, through, quads, tgt.id, XR_CROSS_TOLERANCE_DEG);
+    };
+
+    uv = xrAccumulateCrossPush(reverseState, tgt.id, reverseBox, Vector2D{5936.0, 1728.001}, Vector2D{5936.0, 1716.0}, 30, XR_CROSS_PUSH_TIMEOUT_MS, XR_CROSS_MAX_OVERSHOOT_UV);
+    ASSERT_TRUE(uv);
+    EXPECT_FALSE(castReverse(*uv).ok);
+
+    for (int i = 1; i < 10; ++i)
+        uv = xrAccumulateCrossPush(reverseState, tgt.id, reverseBox, Vector2D{5936.0, 1728.001}, Vector2D{5936.0, 1716.0}, 30 + i, XR_CROSS_PUSH_TIMEOUT_MS,
+                                   XR_CROSS_MAX_OVERSHOOT_UV);
+
+    ASSERT_TRUE(uv);
+    const auto reversePick = castReverse(*uv);
+    ASSERT_TRUE(reversePick.ok);
+    EXPECT_EQ(reversePick.id, src.id);
+    EXPECT_TRUE(reversePick.tolerated);
+}
+
 TEST(XRCursorCross, EntryPointMapsUVBackToLayoutPixels) {
     const CBox     b = boxAt(3000.0, 500.0);
     const Vector2D p = xrCrossEntryPoint(b, 0.5f, 0.25f, XR_CROSS_ENTRY_INSET_PX);

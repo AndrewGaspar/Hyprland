@@ -1144,6 +1144,19 @@ std::string CConfigManager::parseKeyword(const std::string& COMMAND, const std::
         g_pInputManager->recheckIdleInhibitorStatus();
 
 #ifdef HAVE_OPENXR
+    // A legacy dynamic `monitor` keyword updates the rule manager synchronously but emits neither
+    // config.reloaded nor config.props_refreshed. Notify OpenXR after parseDynamic has installed the
+    // rule so an existing XR monitor can enter/leave the 2D projection as its explicit position is
+    // added/removed (and likewise hand requested mode/scale ownership back cleanly).
+    if (COMMAND == "monitor" && g_pOpenXRManager)
+        g_pOpenXRManager->onMonitorRulesChanged();
+
+    // openxr:default_monitor_scale is re-derived into each XR-created monitor's durable rule.
+    // Legacy dynamic keywords emit no refresh event, so route the documented hot toggle through
+    // the same reload applicator that handles file/Lua config changes.
+    if (COMMAND == "openxr:default_monitor_scale" && g_pOpenXRManager)
+        g_pOpenXRManager->onConfigReload();
+
     // openxr:enabled is documented (docs/openxr/05-ipc-config.md §1.3) as a "hot" toggle: setting
     // it starts/stops the session immediately. That path is wired through
     // COpenXRManager::onConfigReload(), reached via the config.reloaded/props_refreshed listeners

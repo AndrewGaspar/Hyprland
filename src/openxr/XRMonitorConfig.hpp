@@ -165,14 +165,17 @@ namespace OpenXR {
         for (const auto& r : rules) {
             if (r.m_name.empty())
                 continue;
+            if (r.m_scaleOwnedByXR)
+                continue;
             if (matches(r.m_name))
                 pinned = r.m_scale; // keep walking: later rules outrank earlier ones, as in get()
         }
         return pinned;
     }
 
-    // Which scale the compositor should write into an XR monitor's persistent rule, or nullopt to
-    // leave the rule's scale alone.
+    // Which scale the compositor should own in an XR monitor's persistent rule, or nullopt to
+    // decline ownership. A caller that previously stored an XR-owned scale must then return that
+    // field to auto; a user-owned value remains untouched.
     //
     // Why this exists: a headless output has no EDID, so getDefaultScale()'s PPI heuristic reads a
     // 1920x1080 quad as a tiny high-density panel and picks 2.0 — legible on a desk, unusably cramped
