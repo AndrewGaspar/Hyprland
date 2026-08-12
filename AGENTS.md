@@ -1,5 +1,13 @@
 # AGENTS.md
 
+## Workflow preferences
+
+- Use isolated git worktrees for implementation, testing, and review work. Do not make feature changes directly in the primary checkout.
+- Commit completed work eagerly in its owning worktree. Small, coherent commits are preferred; they can be squashed or amended during rebase later.
+- When a work item is done, cherry-pick its completed commit(s) onto the primary `hypxrland` branch rather than leaving finished work only in a temporary worktree.
+- For work spanning other repositories, commit in each owning repository first. Do not cherry-pick a foreign repository's commits into Hyprland; integrate its corresponding Hyprland patch carrier or documentation commit onto `hypxrland` when one exists.
+- Every Codex-created or Codex-amended commit must include this exact trailer: `Co-Authored-By: Codex GPT-5.6 Sol <noreply@openai.com>`
+
 ## Review guidelines
 
 - Prioritize correctness, lack of regressions, performance, API stability, and code clarity and readability.
