@@ -115,6 +115,56 @@ capability probe ignores the configured `device` and probes the *compositor's* G
 (`W/server/encoder/encoder_settings.cpp:136-146`), so with an NVIDIA compositor it will likely
 report vaapi unsupported. That is a genuine WiVRn bug and a 1-task fix (§7).
 
+### 0.1 2026-08-12 addendum: client-local D32S8 depth for Walkabout
+
+The Meta PC build of Walkabout Mini Golf, through Oculus OVRPlugin 1.92 and wineopenxr, requests a
+`VK_FORMAT_D32_SFLOAT_S8_UINT` (`130`) swapchain with
+`DEPTH_STENCIL_ATTACHMENT | SAMPLED` usage. The existing cross-device format intersection rejects
+it correctly: RADV cannot export D32S8 through the only common modifier, `DRM_FORMAT_MOD_LINEAR`.
+The rejection reproduces even when the importer is also AMD, so adding the format to the existing
+allowlist would only move the failure from `xrCreateSwapchain` into allocation or import.
+
+There is nevertheless a correct path for the compositor that exists today. WiVRn's single-layer
+projection fast path consumes only color. Its layer-squashing path carries a depth image index into
+the descriptor data, but Monado's `layer.comp` shader never samples that image. In other words,
+WiVRn currently implements neither depth-aware positional reprojection nor depth composition; it
+already renders a projection-depth submission as color-only output.
+
+The implemented split therefore gives the application real, optimal-tiling D32S8 images on its
+NVIDIA device while maintaining the native compositor's acquire/wait/release bookkeeping with a
+private 1x1 `R8G8B8A8_UNORM` swapchain on AMD. When a layer references one of these client-local
+depth swapchains, the Vulkan client wrapper submits an ordinary projection layer rather than
+misrepresenting the private color images as depth. D32S8 is advertised only when all of these
+conditions hold:
+
+- the OpenXR Vulkan client is on a device different from the compositor;
+- the client device supports D32S8 with depth/stencil-attachment and sampled usage; and
+- the native compositor can create the private bookkeeping format.
+
+The complete Vulkan lifecycle is exercised independently of Walkabout by
+`~/code/wivrn-xg/tools/xg-depth-swapchain-probe`. It creates, enumerates, acquires, waits, renders
+into, releases and submits two color plus two D32S8 swapchains, including an
+`XrCompositionLayerDepthInfoKHR` for each view. The lower-level regression in
+`tools/xg-cross-gpu-harness --client-local-depth` measures the exact allocation split on this
+machine at the Quest per-eye size, 2064x2208:
+
+```
+application: 3 x 22.78 MiB optimal D32S8 images on NVIDIA
+bookkeeping: 3 x 0.25 KiB images on AMD
+cross-GPU depth transfer: 0 bytes/frame
+additional depth copy time: 0 ms/frame
+```
+
+The ordinary AMD-to-NVIDIA LINEAR color path remains byte-exact after this change. The full harness
+verified 54,687,744 bytes for each of the legacy AMD-only, forced-cross-device same-GPU and actual
+AMD-to-NVIDIA paths.
+
+This is intentionally bounded by current compositor behavior. It restores the application-visible
+D32S8 lifecycle and does not pretend to add depth reprojection. If WiVRn later starts consuming
+`XR_KHR_composition_layer_depth`, the projection downgrade must be removed and replaced by a real
+depth transfer or conversion representation. A direct modifier import is not available on this
+topology; that future path will necessarily add bandwidth and synchronization cost.
+
 ---
 
 ## 1. What already exists (verified, not remembered)
