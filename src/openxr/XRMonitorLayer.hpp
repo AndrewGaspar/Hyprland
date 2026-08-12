@@ -103,9 +103,10 @@ class CXRMonitorLayer {
     std::optional<Vector2D> m_reqResolution;   // last requested pixel mode (for reconcile diff)
     std::optional<float>    m_reqRefresh;      // last requested refresh (for reconcile diff)
     // report-20 issue E: true iff an explicit user `monitor=NAME,...` rule set this output's
-    // resolution when it was created. Captured once (before the manager registers its own declared-mode
-    // rule), so the manager never clobbers the user's mode. When false, the manager owns a persistent
-    // monitor rule carrying the xrmonitor-declared mode so it survives plug/unplug/reload.
+    // resolution. Captured before the manager registers its own declared-mode rule, then refreshed
+    // from field provenance on config reload, so adding/removing a user mode applies live without
+    // confusing the manager's durable mode for user configuration. When false, the manager owns a
+    // persistent rule carrying the xrmonitor-declared mode so it survives plug/unplug/reload.
     bool                    m_userProvidedMode = false;
     bool                    m_hovered = false; // last ray-hovered (WP7 sets this; status field)
 
@@ -114,8 +115,8 @@ class CXRMonitorLayer {
     // `monitor=NAME,...,<x>x<y>,...` rule gave this output a layout offset when it was created. Such a
     // monitor is excluded from the projection entirely — the user's rule keeps it where they put it,
     // arrange() places it first (explicitPosition wins), and the auto-placed XR block attaches clear
-    // of it. Captured once at create, exactly like m_userProvidedMode, so the flag cannot be confused
-    // by the offset the sync engine itself writes.
+    // of it. Rule-field provenance keeps this distinct from the offset the sync engine writes and
+    // lets a config reload add or remove a user pin live.
     bool                    m_l2dUserPinned = false;
     // The placement the projection last assigned, kept so registerDeclaredMonitorRule can carry it
     // into the persistent monitor rule (durability across a rule refresh) and so `hyprctl openxr
@@ -290,11 +291,12 @@ class CXRMonitorLayer {
 
     // How many composition layers this monitor submitted LAST FRAME: 0 (nothing — no content yet,
     // suspended by the layer cap, or a pair the budget refused), 1 (an ordinary quad) or 2 (a
-    // stereo pair). Zeroed for every active layer at the top of the quad assembly so it can never
-    // report a stale count. Frame thread → main thread (status only), so `hyprctl openxr` can
+    // stereo pair). Starts at zero, is cleared at every session/view boundary, and is zeroed for
+    // every active layer at the top of quad assembly so it can never report a stale count. Frame
+    // thread → main thread (status + cursor eligibility), so `hyprctl openxr` can
     // answer "is the pair actually being submitted" rather than only "was it declared" — the two
     // differ when the budget refuses a pair, which is the one failure mode with no visual tell.
-    std::atomic<uint8_t> m_quadsSubmitted{1};
+    std::atomic<uint8_t> m_quadsSubmitted{0};
 
     // Whether the chrome draw pass ran for this monitor LAST FRAME (WP X4). Frame thread → main
     // thread (status only). It exists because chrome suppression is a frame-thread decision with no

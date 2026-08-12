@@ -199,7 +199,8 @@ namespace {
     // matches against the EDID description, plain ones are exact name matches.
     struct SFakeRule {
         std::string m_name;
-        float       m_scale = -1.F;
+        float       m_scale          = -1.F;
+        bool        m_scaleOwnedByXR = false;
     };
 
     float pinnedFor(const std::string& monitorName, const std::string& monitorDesc, const std::vector<SFakeRule>& rules) {
@@ -236,6 +237,11 @@ TEST(XRPinnedRuleScale, LaterRulesOutrankEarlierOnes) {
     // match), so a `hyprctl keyword monitor XR-2,...` issued at runtime beats the config's line.
     EXPECT_FLOAT_EQ(pinnedFor("XR-2", "", {{"XR-2", 1.25F}, {"XR-2", 2.F}}), 2.F);
     EXPECT_FALSE(xrRuleScaleIsExplicit(pinnedFor("XR-2", "", {{"XR-2", 2.F}, {"XR-2", -1.F}})));
+}
+
+TEST(XRPinnedRuleScale, RuntimeOwnedScaleDoesNotBecomeAUserPinOnNameReuse) {
+    EXPECT_FALSE(xrRuleScaleIsExplicit(pinnedFor("XR-2", "", {{"XR-2", 1.25F, true}})));
+    EXPECT_FLOAT_EQ(pinnedFor("XR-2", "", {{"XR-2", 1.25F, true}, {"XR-2", 1.5F, false}}), 1.5F);
 }
 
 TEST(XRPinnedRuleScale, DescSelectorsAlsoPin) {

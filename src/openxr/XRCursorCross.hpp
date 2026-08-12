@@ -46,6 +46,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -92,10 +93,14 @@ namespace OpenXR {
     constexpr float XR_CROSS_TOLERANCE_DEG = 4.0F;
 
     // How far past the source edge the exit point is allowed to travel, in units of the source
-    // monitor (0.5 = half a monitor width). One motion event overshoots by a few pixels, so this
-    // only bites on a hard flick or a coalesced delta; capping it keeps a fast flick aiming at what
-    // is beside the monitor instead of sweeping the ray across the whole room.
+    // monitor (0.5 = half a monitor width/height). Continued outward pushes accumulate up to this
+    // limit; capping them keeps the ray aimed beside the monitor instead of sweeping the room.
     constexpr float XR_CROSS_MAX_OVERSHOOT_UV = 0.5F;
+
+    // Forget a partial edge push after this much inactivity. A mouse reports continued pressure at
+    // hundreds of Hz, so 250 ms leaves ample room for a deliberate shove while preventing a miss
+    // from priming an unrelated crossing much later.
+    constexpr int64_t XR_CROSS_PUSH_TIMEOUT_MS = 250;
 
     // Head-pose freshness budget. The ring is written once per frame (~11 ms at 90 Hz), so 200 ms
     // is ~18 frames: generous enough that a compositor hitch or a dropped frame still crosses by
@@ -122,7 +127,7 @@ namespace OpenXR {
     // One XR monitor's live CONTENT quad (the desktop pixels — NOT the chrome-expanded full quad
     // the ray pointer hit-tests, whose margins are transparent and carry no cursor coordinates).
     struct SXRCrossQuad {
-        int64_t id      = -1;  // MONITORID, the handle back to the CMonitor and its layout box
+        int64_t id = -1;       // MONITORID, the handle back to the CMonitor and its layout box
         SXRPose pose;          // content-quad centre, LOCAL_FLOOR metres
         float   wMeters = 0.F; // content width
         float   hMeters = 0.F; // content height (= wMeters * contentPxH / contentPxW)
@@ -133,8 +138,33 @@ namespace OpenXR {
         int64_t id        = -1;  // winning monitor
         float   u         = 0.F; // hit point in the winner's quad UV, always clamped to [0,1]
         float   v         = 0.F;
-        float   t         = 0.F; // distance along the ray, metres
+        float   t         = 0.F;   // distance along the ray, metres
         bool    tolerated = false; // true = won on the angular margin, not a square hit
+    };
+
+    enum eXRCrossEdge : uint8_t {
+        XR_CROSSEDGE_NONE = 0,
+        XR_CROSSEDGE_LEFT,
+        XR_CROSSEDGE_RIGHT,
+        XR_CROSSEDGE_TOP,
+        XR_CROSSEDGE_BOTTOM,
+    };
+
+    // MAIN-THREAD gesture state. The cursor itself is clamped back into the layout after every
+    // missed cast, so without remembering this normalized pressure every small event starts again
+    // at the edge and only a single hard flick can ever sweep the ray across a visible gap.
+    struct SXRCrossPushState {
+        int64_t      sourceId    = -1;
+        eXRCrossEdge edge        = XR_CROSSEDGE_NONE;
+        double       overshootUV = 0.0;
+        int64_t      lastPushMs  = -1;
+
+        void         reset() {
+            sourceId    = -1;
+            edge        = XR_CROSSEDGE_NONE;
+            overshootUV = 0.0;
+            lastPushMs  = -1;
+        }
     };
 
     // ---- 2D <-> quad UV ----
@@ -150,10 +180,86 @@ namespace OpenXR {
 
     // The exit point of a crossing, in source-quad UV, with the overshoot budget applied.
     inline Vector2D xrCrossExitUV(const CBox& box, const Vector2D& p, float maxOvershoot) {
-        const double lo = -(double)maxOvershoot;
-        const double hi = 1.0 + (double)maxOvershoot;
+        const double   lo = -(double)maxOvershoot;
+        const double   hi = 1.0 + (double)maxOvershoot;
         const Vector2D uv = xrBoxUV(box, p);
         return Vector2D{std::clamp(uv.x, lo, hi), std::clamp(uv.y, lo, hi)};
+    }
+
+    // Add one relative-motion event to a continued edge push. A miss intentionally leaves `state`
+    // alive: CPointerManager will perform its ordinary 2D-layout fallback and, if that fallback
+    // clamps the cursor back to this edge, the next outward event advances the ray instead of
+    // starting over. If the fallback actually reaches another monitor, sourceId changes and the
+    // gesture resets on the next event.
+    inline std::optional<Vector2D> xrAccumulateCrossPush(SXRCrossPushState& state, int64_t sourceId, const CBox& box, const Vector2D& oldPos, const Vector2D& newPos, int64_t nowMs,
+                                                         int64_t timeoutMs, float maxOvershoot) {
+        if (sourceId < 0 || !(box.w > 0.0) || !(box.h > 0.0) || !(maxOvershoot > 0.F)) {
+            state.reset();
+            return std::nullopt;
+        }
+
+        if (state.edge != XR_CROSSEDGE_NONE && (state.sourceId != sourceId || nowMs < state.lastPushMs || nowMs - state.lastPushMs > std::max<int64_t>(0, timeoutMs)))
+            state.reset();
+
+        const Vector2D delta  = newPos - oldPos;
+        const bool     inward = (state.edge == XR_CROSSEDGE_LEFT && delta.x > 0.0) || (state.edge == XR_CROSSEDGE_RIGHT && delta.x < 0.0) ||
+            (state.edge == XR_CROSSEDGE_TOP && delta.y > 0.0) || (state.edge == XR_CROSSEDGE_BOTTOM && delta.y < 0.0);
+        if (inward)
+            state.reset();
+
+        const double left   = std::max(0.0, (box.x - newPos.x) / box.w);
+        const double right  = std::max(0.0, (newPos.x - (box.x + box.w)) / box.w);
+        const double top    = std::max(0.0, (box.y - newPos.y) / box.h);
+        const double bottom = std::max(0.0, (newPos.y - (box.y + box.h)) / box.h);
+
+        // At a corner, keep the gesture on its current edge while that edge is still crossed. This
+        // prevents tiny diagonal jitter from alternating edges and throwing accumulated intent
+        // away. A new gesture chooses the edge with the greatest normalized excursion.
+        eXRCrossEdge edge     = XR_CROSSEDGE_NONE;
+        double       amount   = 0.0;
+        const auto   consider = [&](eXRCrossEdge candidate, double excursion) {
+            if (excursion > amount) {
+                edge   = candidate;
+                amount = excursion;
+            }
+        };
+
+        if (state.edge == XR_CROSSEDGE_LEFT && left > 0.0)
+            edge = state.edge, amount = left;
+        else if (state.edge == XR_CROSSEDGE_RIGHT && right > 0.0)
+            edge = state.edge, amount = right;
+        else if (state.edge == XR_CROSSEDGE_TOP && top > 0.0)
+            edge = state.edge, amount = top;
+        else if (state.edge == XR_CROSSEDGE_BOTTOM && bottom > 0.0)
+            edge = state.edge, amount = bottom;
+        else {
+            consider(XR_CROSSEDGE_LEFT, left);
+            consider(XR_CROSSEDGE_RIGHT, right);
+            consider(XR_CROSSEDGE_TOP, top);
+            consider(XR_CROSSEDGE_BOTTOM, bottom);
+        }
+
+        if (edge == XR_CROSSEDGE_NONE)
+            return std::nullopt;
+
+        if (state.edge != edge) {
+            state.reset();
+            state.sourceId = sourceId;
+            state.edge     = edge;
+        }
+
+        state.overshootUV = std::clamp(state.overshootUV + amount, 0.0, (double)maxOvershoot);
+        state.lastPushMs  = nowMs;
+
+        Vector2D uv = xrCrossExitUV(box, newPos, maxOvershoot);
+        switch (edge) {
+            case XR_CROSSEDGE_LEFT: uv.x = -state.overshootUV; break;
+            case XR_CROSSEDGE_RIGHT: uv.x = 1.0 + state.overshootUV; break;
+            case XR_CROSSEDGE_TOP: uv.y = -state.overshootUV; break;
+            case XR_CROSSEDGE_BOTTOM: uv.y = 1.0 + state.overshootUV; break;
+            default: break;
+        }
+        return uv;
     }
 
     // The layout point a quad-UV hit corresponds to, inset from the box edges (see the constant).

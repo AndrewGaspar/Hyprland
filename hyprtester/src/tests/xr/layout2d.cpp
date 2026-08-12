@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <functional>
 #include <limits>
 #include <string>
@@ -30,6 +31,7 @@ namespace {
         const bool&              failed;
         std::string              testName;
         std::vector<std::string> monitorNames;
+        bool                     reloadConfig = false;
         ~SGuard() {
             // Always thaw: a test that fails mid-way while frozen would otherwise leave the sync
             // engine paused for every test after it.
@@ -37,6 +39,9 @@ namespace {
             for (auto& n : monitorNames)
                 if (!n.empty())
                     getFromSocket("/openxr destroy " + n);
+            // Tests that install a runtime monitor rule must restore the file-backed rule set.
+            if (reloadConfig)
+                getFromSocket("/reload");
             if (failed)
                 XR::dumpXrArtifacts(testName);
         }
@@ -286,6 +291,122 @@ TEST_CASE(xr_layout2d_freeze_thaw) {
                },
                10000, /*nudge=*/false),
            true);
+}
+
+// xr_layout2d_rule_provenance — the layout engine persists its projected offsets through the
+// ordinary monitor-rule manager so unrelated rule refreshes cannot throw the cursor topology back
+// to append-right. Those values are compositor state, not user configuration. After the output is
+// destroyed, creating a new output with the same name must therefore rejoin automatic projection;
+// an actual `monitor = NAME,...,<x>x<y>,...` rule must still exclude it.
+TEST_CASE(xr_layout2d_rule_provenance) {
+    XR_SKIP_IF_UNAVAILABLE();
+    SGuard guard{this->failed, name(), {}};
+
+    if (!gateUp()) {
+        XR::logSkip(name(), "session never reached focused/visible (known env instability)");
+        return;
+    }
+    if (getFromSocket("/openxr status").contains("2d-plane sync: off")) {
+        XR::logSkip(name(), "openxr:layout2d:enabled is off");
+        return;
+    }
+
+    const std::string reused   = XR::monitorName(74);
+    const std::string pinned   = XR::monitorName(75);
+    const auto        marker   = [](const std::string& n) { return "\"name\": \"" + n + "\""; };
+    const auto        sourceIs = [&](const std::string& n, const std::string& source) {
+        return XR::waitForJson(
+            "j/openxr",
+            [&](const std::string& r) {
+                const auto at = XR::findAfter(r, marker(n));
+                return at != std::string::npos && XR::fieldAfter(r, at, "source") == source;
+            },
+            std::chrono::milliseconds(10000));
+    };
+    const auto scaleIs = [&](const std::string& n, float scale) {
+        return XR::waitForJson(
+            "j/monitors",
+            [&](const std::string& r) {
+                const auto at = XR::findAfter(r, marker(n));
+                return at != std::string::npos && std::abs(XR::toFloatOr(XR::fieldAfter(r, at, "scale"), -1.F) - scale) < 0.01F;
+            },
+            std::chrono::milliseconds(10000));
+    };
+    const auto createEventually = [](const std::string& command) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10000);
+        do {
+            if (getFromSocket(command) == "ok")
+                return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        } while (std::chrono::steady_clock::now() < deadline);
+        return false;
+    };
+
+    // Create -> project -> reload is the path that copies the live projection into a durable named
+    // rule. The old implementation then saw only its numeric offset on same-name recreation and
+    // promoted it to a permanent user pin.
+    ASSERT(getFromSocket("/openxr create " + reused + " 1280x720 anchor:local pos:-0.8,1.4,-1.5 yaw:0"), std::string("ok"));
+    guard.monitorNames.push_back(reused);
+    ASSERT(syncNow(), true);
+    ASSERT(sourceIs(reused, "auto"), true);
+    ASSERT(getFromSocket("/reload"), std::string("ok"));
+    ASSERT(sourceIs(reused, "auto"), true);
+
+    // Destroy the backing output externally to exercise removal path B, where the monitor weak
+    // pointer has expired before the layer finalizer gets to clean its persistent rule.
+    ASSERT(getFromSocket("/output destroy " + reused), std::string("ok"));
+    ASSERT(XR::waitForJson("j/openxr", [&](const std::string& r) { return !r.contains(marker(reused)); }, std::chrono::milliseconds(10000)), true);
+    ASSERT(XR::waitForJson("j/monitors", [&](const std::string& r) { return !r.contains(marker(reused)); }, std::chrono::milliseconds(10000)), true);
+
+    ASSERT(createEventually("/openxr create " + reused + " 1600x900 anchor:local pos:0.8,1.4,-1.5 yaw:0"), true);
+    ASSERT(syncNow(), true);
+    ASSERT(sourceIs(reused, "auto"), true);
+    // The same stale generated rule also carries the old requested MODE. Its field provenance must
+    // not turn 1280x720 into a user mode that outranks this new create request.
+    ASSERT(XR::waitForJson(
+               "j/monitors",
+               [&](const std::string& r) {
+                   const auto at = XR::findAfter(r, marker(reused));
+                   return at != std::string::npos && XR::toFloatOr(XR::fieldAfter(r, at, "width"), -1.f) == 1600.f && XR::toFloatOr(XR::fieldAfter(r, at, "height"), -1.f) == 900.f;
+               },
+               std::chrono::milliseconds(10000)),
+           true);
+
+    // Scale provenance has the same handback requirement. Opting the hot default out must remove
+    // our durable 1.25 request and let the headless output's PPI policy choose 2.0; opting back in
+    // must claim the field again. Without the clearScale branch the first transition stays at 1.25.
+    guard.reloadConfig = true;
+    ASSERT(scaleIs(reused, 1.25F), true);
+    ASSERT(getFromSocket("/keyword openxr:default_monitor_scale 0"), std::string("ok"));
+    ASSERT(scaleIs(reused, 2.F), true);
+    ASSERT(getFromSocket("/keyword openxr:default_monitor_scale 1.25"), std::string("ok"));
+    ASSERT(scaleIs(reused, 1.25F), true);
+
+    // A real user offset follows the opposite branch. Use a different name so the assertion also
+    // proves provenance, rather than accidentally passing because the numeric values differ from
+    // the old projection.
+    ASSERT(getFromSocket("/keyword monitor " + pinned + ", preferred, 320x240, 1"), std::string("ok"));
+    ASSERT(getFromSocket("/openxr create " + pinned + " 1280x720 anchor:local pos:0,1.4,-1.5 yaw:0"), std::string("ok"));
+    guard.monitorNames.push_back(pinned);
+    ASSERT(sourceIs(pinned, "pinned"), true);
+    ASSERT(XR::waitForJson(
+               "j/monitors",
+               [&](const std::string& r) {
+                   const auto at = XR::findAfter(r, marker(pinned));
+                   return at != std::string::npos && XR::toFloatOr(XR::fieldAfter(r, at, "x"), -1.f) == 320.f && XR::toFloatOr(XR::fieldAfter(r, at, "y"), -1.f) == 240.f;
+               },
+               std::chrono::milliseconds(10000)),
+           true);
+
+    // Ownership is re-evaluated on runtime rule updates too: removing the explicit position lets
+    // the existing monitor rejoin projection, and restoring it excludes the monitor again.
+    ASSERT(getFromSocket("/keyword monitor " + pinned + ", preferred, auto, 1"), std::string("ok"));
+    ASSERT(syncNow(), true);
+    ASSERT(sourceIs(pinned, "auto"), true);
+    ASSERT(getFromSocket("/keyword monitor " + pinned + ", preferred, 320x240, 1"), std::string("ok"));
+    ASSERT(sourceIs(pinned, "pinned"), true);
+
+    NLog::green("xr_layout2d_rule_provenance: same-name recreation stayed auto; scale handback and explicit offset precedence held");
 }
 
 #endif // WITH_XR_TESTS

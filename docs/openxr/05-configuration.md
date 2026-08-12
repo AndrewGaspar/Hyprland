@@ -376,11 +376,13 @@ the nearest quad that ray meets wins, and the cursor is warped to the 2D coordin
 point** — so it reappears at the place in space the ray met, not at an edge midpoint. Depth,
 elevation and yaw are all respected for free, because they are all just geometry to a ray.
 
-**How far you push matters.** The overshoot is what sweeps the ray outward, so nudging an edge aims
-just past it while a deliberate shove reaches further around the room — that is how the cursor gets
-across a *gap* between two quads that are not mathematically edge-to-edge. The overshoot is capped at
-half a monitor width so a fast flick still aims at what is beside the monitor rather than across the
-whole room.
+**How far you push matters.** Continued outward motion against an edge accumulates normalized
+pressure and sweeps the ray outward, so nudging an edge aims just past it while a deliberate shove
+reaches further around the room — even when that shove arrives as many small mouse events. That is
+how the cursor gets across a *gap* between two quads that are not mathematically edge-to-edge. The
+pressure is capped at half a monitor width/height and resets when you pull inward, change edge or
+monitor, pause for 250 ms, or cross successfully. A fast flick therefore still works, but is no
+longer required (and mouse DPI no longer decides whether a gap is traversable).
 
 **Forgiveness.** Hand-placed quads leave centimetre gaps, so a ray that had to hit a rectangle exactly
 would miss constantly. A ray that meets nothing squarely gets a second pass with **4° of angular
@@ -400,6 +402,7 @@ exactly the `layout` behaviour, unchanged:
   are candidates;
 - an XR monitor with no solved pose yet, or a `device`-anchored quad (a hand-held palette is not a
   place to send a cursor — the 2D sync excludes these too);
+- monitor view is hidden, or the source/target quad was not submitted in the latest frame;
 - the ray meets nothing, even with the margin.
 
 **It does not touch the layout.** No monitor is moved, no offset is written; `hyprctl openxr status`,

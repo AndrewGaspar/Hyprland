@@ -16,7 +16,10 @@ TEST(Config, monitorParserDefaults) {
     CMonitorRuleParser parser("DP-1");
     EXPECT_EQ(parser.rule().m_resolution, Vector2D());                   // preferred
     EXPECT_EQ(parser.rule().m_offset, Vector2D(-INT32_MAX, -INT32_MAX)); // auto
-    EXPECT_FLOAT_EQ(parser.rule().m_scale, -1.0f);                       // auto
+    EXPECT_FALSE(parser.rule().m_resolutionOwnedByXR);
+    EXPECT_FALSE(parser.rule().m_offsetOwnedByXR);
+    EXPECT_FALSE(parser.rule().m_scaleOwnedByXR);
+    EXPECT_FLOAT_EQ(parser.rule().m_scale, -1.0f); // auto
     EXPECT_FALSE(parser.getError().has_value());
 }
 
@@ -24,6 +27,7 @@ TEST(Config, monitorParserModeStandard) {
     CMonitorRuleParser parser("DP-1");
     EXPECT_TRUE(parser.parseMode("1920x1080"));
     EXPECT_EQ(parser.rule().m_resolution, Vector2D(1920, 1080));
+    EXPECT_FALSE(parser.rule().m_resolutionOwnedByXR);
 
     CMonitorRuleParser parser2("DP-2");
     EXPECT_TRUE(parser2.parseMode("2560x1440@144"));
@@ -61,6 +65,16 @@ TEST(Config, monitorParserModeOmitted) {
     EXPECT_FALSE(parser.getError().has_value());
 }
 
+TEST(Config, monitorParserModeTakesOwnershipFromRuntimeRule) {
+    CMonitorRuleParser parser("XR-2");
+    parser.rule().m_resolution          = {1280, 720};
+    parser.rule().m_resolutionOwnedByXR = true;
+
+    EXPECT_TRUE(parser.parseMode("1600x900@75"));
+    EXPECT_EQ(parser.rule().m_resolution, Vector2D(1600, 900));
+    EXPECT_FALSE(parser.rule().m_resolutionOwnedByXR);
+}
+
 TEST(Config, monitorParserModeInvalid) {
     CMonitorRuleParser parser("DP-1");
     EXPECT_FALSE(parser.parseMode("notaresolution"));
@@ -71,10 +85,27 @@ TEST(Config, monitorParserPositionExplicit) {
     CMonitorRuleParser parser("DP-1");
     EXPECT_TRUE(parser.parsePosition("1920x0"));
     EXPECT_EQ(parser.rule().m_offset, Vector2D(1920, 0));
+    EXPECT_FALSE(parser.rule().m_offsetOwnedByXR);
 
     CMonitorRuleParser parser2("DP-2");
     EXPECT_TRUE(parser2.parsePosition("0x1080"));
     EXPECT_EQ(parser2.rule().m_offset, Vector2D(0, 1080));
+    EXPECT_FALSE(parser2.rule().m_offsetOwnedByXR);
+}
+
+TEST(Config, monitorParserPositionTakesOwnershipFromRuntimeRule) {
+    CMonitorRuleParser parser("XR-2");
+    parser.rule().m_offset          = {2048, 1152};
+    parser.rule().m_offsetOwnedByXR = true;
+
+    EXPECT_TRUE(parser.parsePosition("4096x0"));
+    EXPECT_EQ(parser.rule().m_offset, Vector2D(4096, 0));
+    EXPECT_FALSE(parser.rule().m_offsetOwnedByXR);
+
+    parser.rule().m_offsetOwnedByXR = true;
+    EXPECT_TRUE(parser.parsePosition("auto"));
+    EXPECT_EQ(parser.rule().m_offset, Vector2D(-INT32_MAX, -INT32_MAX));
+    EXPECT_FALSE(parser.rule().m_offsetOwnedByXR);
 }
 
 TEST(Config, monitorParserPositionAuto) {
@@ -129,6 +160,7 @@ TEST(Config, monitorParserScaleValid) {
     CMonitorRuleParser p1("DP-1");
     EXPECT_TRUE(p1.parseScale("1.5"));
     EXPECT_FLOAT_EQ(p1.rule().m_scale, 1.5f);
+    EXPECT_FALSE(p1.rule().m_scaleOwnedByXR);
 
     CMonitorRuleParser p2("DP-1");
     EXPECT_TRUE(p2.parseScale("2"));
@@ -141,6 +173,16 @@ TEST(Config, monitorParserScaleValid) {
     CMonitorRuleParser p4("DP-1");
     EXPECT_TRUE(p4.parseScale("0.25"));
     EXPECT_FLOAT_EQ(p4.rule().m_scale, 0.25f);
+}
+
+TEST(Config, monitorParserScaleTakesOwnershipFromRuntimeRule) {
+    CMonitorRuleParser parser("XR-2");
+    parser.rule().m_scale          = 1.25F;
+    parser.rule().m_scaleOwnedByXR = true;
+
+    EXPECT_TRUE(parser.parseScale("1.5"));
+    EXPECT_FLOAT_EQ(parser.rule().m_scale, 1.5F);
+    EXPECT_FALSE(parser.rule().m_scaleOwnedByXR);
 }
 
 TEST(Config, monitorParserScaleOmitted) {
@@ -333,6 +375,21 @@ TEST(Config, monitorRuleStereoChangeIsAHardMismatch) {
     CMonitorRule c = a;
     c.m_offset     = {100, 100};
     EXPECT_EQ(a.compare(c), COMPARISON_SOFT_MISMATCH);
+}
+
+TEST(Config, monitorRuleRuntimeOwnershipIsMetadataOnly) {
+    CMonitorRule configured;
+    configured.m_resolution = {1600, 900};
+    configured.m_offset     = {320, 240};
+    configured.m_scale      = 1.25F;
+
+    CMonitorRule runtime          = configured;
+    runtime.m_resolutionOwnedByXR = true;
+    runtime.m_offsetOwnedByXR     = true;
+    runtime.m_scaleOwnedByXR      = true;
+
+    EXPECT_EQ(configured.compare(runtime), COMPARISON_FULL_MATCH);
+    EXPECT_EQ(runtime.compare(configured), COMPARISON_FULL_MATCH);
 }
 
 // The un-stereo guard on the wlr-output-management write-back path (MonitorRuleManager) and the

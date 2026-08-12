@@ -123,6 +123,7 @@ namespace Pointer {
         } m_events;
 
       private:
+        void warpTo(const Vector2D& logical, bool preserveXRCrossPush);
         void recheckPointerPosition();
         void onMonitorLayoutChange();
         void onMonitorDisconnect();
