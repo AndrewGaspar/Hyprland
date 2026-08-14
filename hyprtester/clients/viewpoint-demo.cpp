@@ -82,21 +82,22 @@ struct SApp {
     CSharedPointer<CCHypxrViewpointV1>        viewpoint;
     std::vector<CUniquePointer<SBuffer>>      buffers;
 
-    bool                                      xrgb8888         = false;
-    bool                                      configured       = false;
-    bool                                      running          = true;
-    bool                                      fallbackDirty    = true;
-    bool                                      active           = false;
-    bool                                      feedbackDisabled = false;
-    uint32_t                                  pendingWidth     = 0;
-    uint32_t                                  pendingHeight    = 0;
-    uint32_t                                  logicalWidth     = 0;
-    uint32_t                                  logicalHeight    = 0;
-    uint32_t                                  renderWidth      = 0;
-    uint32_t                                  renderHeight     = 0;
-    uint64_t                                  epoch            = 0;
-    uint64_t                                  geometry         = 0;
-    uint64_t                                  lastSample       = 0;
+    bool                                      xrgb8888      = false;
+    bool                                      configured    = false;
+    bool                                      running       = true;
+    bool                                      fallbackDirty = true;
+    bool                                      active        = false;
+    SFeedbackState                            feedback;
+    bool                                      feedbackRequested = false;
+    uint32_t                                  pendingWidth      = 0;
+    uint32_t                                  pendingHeight     = 0;
+    uint32_t                                  logicalWidth      = 0;
+    uint32_t                                  logicalHeight     = 0;
+    uint32_t                                  renderWidth       = 0;
+    uint32_t                                  renderHeight      = 0;
+    uint64_t                                  epoch             = 0;
+    uint64_t                                  geometry          = 0;
+    uint64_t                                  lastSample        = 0;
     SPortalSize                               portal;
     std::optional<SSample>                    pendingSample;
     uint64_t                                  renderedFrames = 0;
@@ -247,37 +248,43 @@ static void invalidateFeedback(SApp& app, std::string_view reason) {
     app.fallbackDirty = true;
 }
 
+static void updateFeedbackRequest(SApp& app) {
+    const bool ENABLED = feedbackShouldBeEnabled(app.feedback);
+    if (!app.viewpoint || ENABLED == app.feedbackRequested)
+        return;
+
+    app.feedbackRequested = ENABLED;
+    app.viewpoint->sendSetEnabled(ENABLED ? 1U : 0U);
+}
+
 static void rejectFeedback(SApp& app, std::string_view reason) {
     invalidateFeedback(app, reason);
-    if (!app.feedbackDisabled && app.viewpoint) {
-        app.feedbackDisabled = true;
-        app.viewpoint->sendSetEnabled(0);
-    }
+    app.feedback.stickyDisabled = true;
+    updateFeedbackRequest(app);
 }
 
 static void installViewpointHandlers(SApp& app) {
     app.viewpoint->setCapabilities([&app](CCHypxrViewpointV1*, hypxrViewpointV1Layout layouts, hypxrViewpointV1Capability flags) {
         debugLine(app, "compositor capabilities layouts={:#x}, flags={:#x}", sc<uint32_t>(layouts), sc<uint32_t>(flags));
         app.viewpoint->sendSetCapabilities(HYPXR_VIEWPOINT_V1_LAYOUT_SBS, HYPXR_VIEWPOINT_V1_CAPABILITY_PAIR_LATCHED);
-        if (app.feedbackDisabled) {
-            app.viewpoint->sendSetEnabled(0);
-            return;
-        }
         const bool SBS          = (sc<uint32_t>(layouts) & sc<uint32_t>(HYPXR_VIEWPOINT_V1_LAYOUT_SBS)) != 0;
         const bool PAIR_LATCHED = (sc<uint32_t>(flags) & sc<uint32_t>(HYPXR_VIEWPOINT_V1_CAPABILITY_PAIR_LATCHED)) != 0;
         if (!SBS || !PAIR_LATCHED) {
-            app.feedbackDisabled = true;
-            app.viewpoint->sendSetEnabled(0);
+            app.feedback.capabilitiesSupported = false;
+            app.feedback.stickyDisabled        = true;
+            updateFeedbackRequest(app);
             logLine("viewpoint SBS + pair-latched feedback unavailable; remaining on static zero-disparity fallback");
             return;
         }
-        app.feedbackDisabled = false;
-        app.viewpoint->sendSetEnabled(1);
+        app.feedback.capabilitiesSupported = true;
+        updateFeedbackRequest(app);
+        if (!app.feedback.mappingSupported)
+            debugLine(app, "viewpoint capability ready; waiting for an eligible final configure");
     });
     app.viewpoint->setActive([&app](CCHypxrViewpointV1*, uint32_t epochHigh, uint32_t epochLow, uint32_t geometryHigh, uint32_t geometryLow, uint32_t widthUm, uint32_t heightUm,
                                     hypxrViewpointV1Layout layout, hypxrViewpointV1Capability flags) {
-        if (app.feedbackDisabled) {
-            invalidateFeedback(app, "ignored late activation after feedback was disabled");
+        if (!feedbackShouldBeEnabled(app.feedback)) {
+            invalidateFeedback(app, "ignored activation while feedback was deferred or disabled");
             return;
         }
         const bool PAIR_LATCHED = (sc<uint32_t>(flags) & sc<uint32_t>(HYPXR_VIEWPOINT_V1_CAPABILITY_PAIR_LATCHED)) != 0;
@@ -298,7 +305,7 @@ static void installViewpointHandlers(SApp& app) {
     app.viewpoint->setSample([&app](CCHypxrViewpointV1*, uint32_t epochHigh, uint32_t epochLow, uint32_t sampleHigh, uint32_t sampleLow, uint32_t geometryHigh,
                                     uint32_t geometryLow, uint32_t, uint32_t, uint32_t, uint32_t, int32_t leftX, int32_t leftY, int32_t leftZ, int32_t rightX, int32_t rightY,
                                     int32_t rightZ, uint32_t viewCount, hypxrViewpointV1SampleFlag flags) {
-        if (app.feedbackDisabled)
+        if (app.feedback.stickyDisabled || !app.feedback.capabilitiesSupported || !app.feedback.mappingSupported)
             return;
         const uint64_t EPOCH     = combineWords(epochHigh, epochLow);
         const uint64_t SAMPLE    = combineWords(sampleHigh, sampleLow);
@@ -367,13 +374,16 @@ static bool setupSurface(SApp& app) {
         app.fallbackDirty = true;
         SRenderSize renderSize;
         if (fitSBSRenderSize(app.logicalWidth, app.logicalHeight, app.options.renderWidth, app.options.renderHeight, renderSize)) {
-            app.renderWidth  = renderSize.width;
-            app.renderHeight = renderSize.height;
+            app.renderWidth               = renderSize.width;
+            app.renderHeight              = renderSize.height;
+            app.feedback.mappingSupported = true;
         } else {
-            app.renderWidth  = app.options.renderWidth;
-            app.renderHeight = app.options.renderHeight;
-            rejectFeedback(app, "destination aspect cannot fit the bounded render buffer; feedback disabled");
+            app.renderWidth               = app.options.renderWidth;
+            app.renderHeight              = app.options.renderHeight;
+            app.feedback.mappingSupported = false;
+            invalidateFeedback(app, "destination aspect cannot fit the bounded render buffer; feedback deferred");
         }
+        updateFeedbackRequest(app);
         app.xdgSurface->sendSetWindowGeometry(0, 0, sc<int32_t>(app.logicalWidth), sc<int32_t>(app.logicalHeight));
         app.viewport->sendSetDestination(sc<int32_t>(app.logicalWidth), sc<int32_t>(app.logicalHeight));
         logLine("surface configured: logical {}x{}, aspect-matched full-SBS buffer {}x{}", app.logicalWidth, app.logicalHeight, app.renderWidth * 2U, app.renderHeight);
