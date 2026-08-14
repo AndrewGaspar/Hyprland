@@ -5,9 +5,13 @@
 #include <hyprutils/memory/Casts.hpp>
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 
 namespace OpenXR {
+    inline constexpr size_t XR_VIEWPOINT_MAX_SUBSURFACE_DEPTH   = 32;
+    inline constexpr size_t XR_VIEWPOINT_MAX_SUBSURFACE_WATCHES = 256;
+
     enum eXRViewpointRuntimeState : uint8_t {
         XR_VIEWPOINT_RUNTIME_UNKNOWN = 0,
         XR_VIEWPOINT_RUNTIME_VALID,
@@ -27,6 +31,14 @@ namespace OpenXR {
     inline bool viewpointActivationUnchanged(uint32_t existingSurfaceId, uint32_t surfaceId, uint64_t existingEpoch, uint64_t existingToken, uint64_t resourceToken,
                                              uint32_t existingWidthUM, uint32_t widthUM, uint32_t existingHeightUM, uint32_t heightUM, bool anchorSame) {
         return existingSurfaceId == surfaceId && existingEpoch != 0 && existingToken == resourceToken && existingWidthUM == widthUM && existingHeightUM == heightUM && anchorSame;
+    }
+
+    inline bool viewpointSurfaceStateRequiresReevaluation(bool transform, bool scale, bool viewport, bool offset, bool bufferGeometryChanged) {
+        return transform || scale || viewport || offset || bufferGeometryChanged;
+    }
+
+    inline bool viewpointSubsurfaceWatchWithinBudget(size_t depth, size_t watchCount) {
+        return depth < XR_VIEWPOINT_MAX_SUBSURFACE_DEPTH && watchCount < XR_VIEWPOINT_MAX_SUBSURFACE_WATCHES;
     }
 
     // The v1 visual path accepts exactly one compositor mapping: a full-SBS buffer scaled as a

@@ -44,3 +44,16 @@ TEST(XRViewpointEligibility, RepeatedEquivalentEligibilityPreservesActivation) {
     EXPECT_FALSE(viewpointActivationUnchanged(11, 11, 9, 7, 7, 1600000, 1600001, 900000, 900000, true));
     EXPECT_FALSE(viewpointActivationUnchanged(11, 11, 9, 7, 7, 1600000, 1600000, 900000, 900000, false));
 }
+
+TEST(XRViewpointEligibility, SurfaceOffsetRequiresReevaluation) {
+    EXPECT_FALSE(viewpointSurfaceStateRequiresReevaluation(false, false, false, false, false));
+    EXPECT_TRUE(viewpointSurfaceStateRequiresReevaluation(false, false, false, true, false));
+    EXPECT_TRUE(viewpointSurfaceStateRequiresReevaluation(false, false, false, false, true));
+}
+
+TEST(XRViewpointEligibility, SubsurfaceWatchBudgetFailsClosedAtEitherLimit) {
+    EXPECT_TRUE(viewpointSubsurfaceWatchWithinBudget(0, 0));
+    EXPECT_TRUE(viewpointSubsurfaceWatchWithinBudget(XR_VIEWPOINT_MAX_SUBSURFACE_DEPTH - 1, XR_VIEWPOINT_MAX_SUBSURFACE_WATCHES - 1));
+    EXPECT_FALSE(viewpointSubsurfaceWatchWithinBudget(XR_VIEWPOINT_MAX_SUBSURFACE_DEPTH, 0));
+    EXPECT_FALSE(viewpointSubsurfaceWatchWithinBudget(0, XR_VIEWPOINT_MAX_SUBSURFACE_WATCHES));
+}

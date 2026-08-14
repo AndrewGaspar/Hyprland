@@ -1,6 +1,8 @@
 #include "XRViewpointProtocol.hpp"
 
 #include "core/Compositor.hpp"
+#include "core/Subcompositor.hpp"
+#include "../openxr/XRViewpointEligibility.hpp"
 #ifdef HAVE_OPENXR
 #include "../openxr/OpenXRManager.hpp"
 #endif
@@ -85,10 +87,18 @@ CXRViewpointResource::CXRViewpointResource(UP<CHypxrViewpointV1>&& resource, SP<
     m_listeners.stateCommit      = m_surface->m_events.stateCommit.listen([this](WP<SSurfaceState> state) {
         if (!state)
             return;
-        if (state->updated.bits.transform || state->updated.bits.scale || state->updated.bits.viewport ||
-            (state->updated.bits.buffer && m_surface && state->bufferSize != m_surface->m_current.bufferSize))
+        if (OpenXR::viewpointSurfaceStateRequiresReevaluation(state->updated.bits.transform, state->updated.bits.scale, state->updated.bits.viewport, state->updated.bits.offset,
+                                                              state->updated.bits.buffer && m_surface && state->bufferSize != m_surface->m_current.bufferSize))
             requestReevaluation();
     });
+    m_listeners.newSubsurface    = m_surface->m_events.newSubsurface.listen([this](const auto& subsurface) {
+        watchSubsurface(subsurface, 0);
+        requestReevaluation();
+    });
+    for (const auto& subsurface : m_surface->m_subsurfaces) {
+        if (subsurface)
+            watchSubsurface(subsurface.lock(), 0);
+    }
 
 #ifdef HAVE_OPENXR
     m_resource->sendCapabilities(sc<hypxrViewpointV1Layout>(AVAILABLE_LAYOUTS), sc<hypxrViewpointV1Capability>(AVAILABLE_CAPS));
@@ -111,6 +121,10 @@ bool CXRViewpointResource::requested() const {
 
 bool CXRViewpointResource::enabled() const {
     return m_enabled;
+}
+
+bool CXRViewpointResource::subsurfaceTreeObservable() const {
+    return m_subsurfaceTreeObservable;
 }
 
 uint64_t CXRViewpointResource::token() const {
@@ -187,7 +201,43 @@ void CXRViewpointResource::surfaceDestroyed() {
         return;
 
     invalidate(HYPXR_VIEWPOINT_V1_INACTIVE_REASON_SURFACE_DESTROYED);
+    m_subsurfaceWatches.clear();
     m_surface.reset();
+}
+
+void CXRViewpointResource::watchSubsurface(SP<CWLSubsurfaceResource> subsurface, size_t depth) {
+    if (!subsurface || !subsurface->m_surface)
+        return;
+
+    std::erase_if(m_subsurfaceWatches, [](const auto& watch) { return !watch->subsurface; });
+    if (std::ranges::any_of(m_subsurfaceWatches, [&](const auto& watch) { return watch->subsurface == subsurface; }))
+        return;
+
+    if (!OpenXR::viewpointSubsurfaceWatchWithinBudget(depth, m_subsurfaceWatches.size())) {
+        m_subsurfaceTreeObservable = false;
+        return;
+    }
+
+    const auto SURFACE = subsurface->m_surface.lock();
+    if (!SURFACE)
+        return;
+
+    auto watch                 = makeUnique<SSubsurfaceWatch>();
+    watch->subsurface          = subsurface;
+    watch->subsurfaceDestroyed = subsurface->m_events.destroy.listen([] { requestReevaluation(); });
+    watch->surfaceDestroyed    = SURFACE->m_events.destroy.listen([] { requestReevaluation(); });
+    watch->map                 = SURFACE->m_events.map.listen([] { requestReevaluation(); });
+    watch->unmap               = SURFACE->m_events.unmap.listen([] { requestReevaluation(); });
+    watch->newSubsurface       = SURFACE->m_events.newSubsurface.listen([this, depth](const auto& child) {
+        watchSubsurface(child, depth + 1);
+        requestReevaluation();
+    });
+    m_subsurfaceWatches.emplace_back(std::move(watch));
+
+    for (const auto& child : SURFACE->m_subsurfaces) {
+        if (child)
+            watchSubsurface(child.lock(), depth + 1);
+    }
 }
 
 CXRViewpointProtocol::CXRViewpointProtocol(const wl_interface* iface, const int& ver, const std::string& name) : IWaylandProtocol(iface, ver, name) {

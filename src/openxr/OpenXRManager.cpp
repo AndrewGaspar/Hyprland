@@ -4137,7 +4137,8 @@ void COpenXRManager::reevaluateViewpoints() {
 
         const auto MONITOR = WINDOW->m_monitor.lock();
         if (!MONITOR || !WINDOW->m_isMapped || WINDOW->isHidden() || !WINDOW->m_workspace || !WINDOW->m_workspace->isVisible() || !WINDOW->wlSurface()->exists() ||
-            WINDOW->wlSurface()->resource() != SURFACE || !SURFACE->m_mapped || SURFACE->hasVisibleSubsurface() || SURFACE->m_current.offset != Vector2D{} ||
+            WINDOW->wlSurface()->resource() != SURFACE || !SURFACE->m_mapped || !viewpoint->subsurfaceTreeObservable() || SURFACE->hasVisibleSubsurface() ||
+            SURFACE->m_current.offset != Vector2D{} ||
             !OpenXR::viewpointSBSBufferMapping(SURFACE->m_current.bufferSize, SURFACE->m_current.size, MONITOR->m_size, SURFACE->m_current.viewport.hasSource,
                                                SURFACE->m_current.viewport.hasDestination, SURFACE->m_current.viewport.destination,
                                                SURFACE->m_current.transform == WL_OUTPUT_TRANSFORM_NORMAL, SURFACE->m_current.scale) ||
