@@ -69,20 +69,24 @@ TEST(ViewpointDemoRenderer, GeometryRejectsNonfiniteOrBehindViewer) {
     EXPECT_DOUBLE_EQ(ray.origin.x, 0.0);
 }
 
-TEST(ViewpointDemoRenderer, RenderSizePreservesDestinationAspectWithinBudget) {
+TEST(ViewpointDemoRenderer, RenderSizePreservesPackedSbsDestinationAspectWithinBudget) {
     SRenderSize size;
-    ASSERT_TRUE(fitRenderSize(2560, 1440, 256, 144, size));
+    ASSERT_TRUE(fitSBSRenderSize(3840, 1080, 256, 144, size));
     EXPECT_EQ(size.width, 256U);
     EXPECT_EQ(size.height, 144U);
-    EXPECT_EQ(sc<uint64_t>(size.width) * 1440U, sc<uint64_t>(size.height) * 2560U);
+    EXPECT_EQ(sc<uint64_t>(size.width * 2U) * 1080U, sc<uint64_t>(size.height) * 3840U);
 
-    ASSERT_TRUE(fitRenderSize(3440, 1440, 256, 144, size));
-    EXPECT_EQ(size.width, 215U);
-    EXPECT_EQ(size.height, 90U);
-    EXPECT_EQ(sc<uint64_t>(size.width) * 1440U, sc<uint64_t>(size.height) * 3440U);
+    ASSERT_TRUE(fitSBSRenderSize(1920, 1080, 256, 144, size));
+    EXPECT_EQ(size.width, 128U);
+    EXPECT_EQ(size.height, 144U);
+    EXPECT_EQ(sc<uint64_t>(size.width * 2U) * 1080U, sc<uint64_t>(size.height) * 1920U);
 
     size = {.width = 9, .height = 9};
-    EXPECT_FALSE(fitRenderSize(1279, 720, 256, 144, size));
+    EXPECT_FALSE(fitSBSRenderSize(1279, 720, 256, 144, size));
+    EXPECT_EQ(size.width, 0U);
+    EXPECT_EQ(size.height, 0U);
+
+    EXPECT_FALSE(fitSBSRenderSize(2558, 720, 256, 144, size));
     EXPECT_EQ(size.width, 0U);
     EXPECT_EQ(size.height, 0U);
 }

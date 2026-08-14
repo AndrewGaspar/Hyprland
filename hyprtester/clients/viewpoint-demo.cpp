@@ -147,7 +147,8 @@ static void printHelp(const char* program) {
     std::println("Usage: {} [OPTIONS]\n"
                  "\n"
                  "Synthetic full-SBS portal for the experimental hypxr_viewpoint_v1 protocol.\n"
-                 "The logical surface remains one-eye sized; its wl_shm buffer is twice as wide.\n"
+                 "The logical surface is the packed SBS rectangle; each buffer pane is aspect-\n"
+                 "matched to one half of that destination.\n"
                  "\n"
                  "  --width N      render/one-eye width, 64..4096 (default 256)\n"
                  "  --height N     render/one-eye height, 64..4096 (default 144)\n"
@@ -157,6 +158,7 @@ static void printHelp(const char* program) {
                  "  --render FILE  write a deterministic active full-SBS PPM without Wayland\n"
                  "  --render-fallback FILE\n"
                  "                 write the inactive zero-disparity PPM without Wayland\n"
+                 "                 (offline output is 2*width by height; default 512x144)\n"
                  "  -h, --help     show this help\n",
                  program);
 }
@@ -340,8 +342,8 @@ static bool setupSurface(SApp& app) {
         !app.viewpoint->resource())
         return false;
 
-    // Classification must precede the initial map. The buffer is full SBS, but
-    // wp_viewport keeps surface/window geometry at the one-eye dimensions.
+    // Classification must precede the initial map. wp_viewport scales the
+    // low-resolution full-SBS buffer to the packed logical surface rectangle.
     app.tagManager->sendSetToplevelTag(app.xdgToplevel->resource(), "stereo:sbs");
     app.xdgToplevel->sendSetTitle("HypXRland Viewpoint Portal Demo");
     app.xdgToplevel->sendSetAppId("hypxr-viewpoint-demo");
@@ -364,7 +366,7 @@ static bool setupSurface(SApp& app) {
         app.configured    = true;
         app.fallbackDirty = true;
         SRenderSize renderSize;
-        if (fitRenderSize(app.logicalWidth, app.logicalHeight, app.options.renderWidth, app.options.renderHeight, renderSize)) {
+        if (fitSBSRenderSize(app.logicalWidth, app.logicalHeight, app.options.renderWidth, app.options.renderHeight, renderSize)) {
             app.renderWidth  = renderSize.width;
             app.renderHeight = renderSize.height;
         } else {
@@ -572,8 +574,8 @@ static bool renderOffline(const SOptions& options) {
     if (!RENDERED || !writePpm(*options.renderPath, image))
         return false;
 
-    logLine("wrote {} {}x{} full-SBS PPM '{}' (hash {:#x})", options.renderFallback ? "fallback" : "active portal", image.width, image.height, *options.renderPath,
-            pixelHash(image));
+    logLine("wrote {} {}x{} full-SBS PPM '{}' ({}x{} per eye, hash {:#x})", options.renderFallback ? "fallback" : "active portal", image.width, image.height, *options.renderPath,
+            options.renderWidth, options.renderHeight, pixelHash(image));
     return true;
 }
 
