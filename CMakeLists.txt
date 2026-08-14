@@ -840,7 +840,7 @@ if(BUILD_TESTING OR WITH_TESTS)
     PUBLIC "./include"
     PRIVATE "./src" "./src/include" "./protocols" "${CMAKE_BINARY_DIR}")
 
-  target_link_libraries(hyprland_gtests hyprland_lib GTest::gtest_main)
+  target_link_libraries(hyprland_gtests hyprland_lib hypxr-viewpoint-demo-renderer GTest::gtest_main)
 
   gtest_discover_tests(hyprland_gtests)
 
