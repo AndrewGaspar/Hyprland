@@ -1,0 +1,235 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  EXPERIMENTAL: this protocol currently has no compatibility commitment and
+  advertises no active viewpoint capability. Do not treat the presence of its
+  global as authorization or as evidence that viewpoint rendering is active.
+-->
+<protocol name="hypxr_viewpoint_v1">
+  <copyright>
+    Copyright © 2026 HypXRland contributors
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice (including the next
+    paragraph) shall be included in all copies or substantial portions of the
+    Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+  </copyright>
+
+  <description summary="experimental surface-relative XR viewpoints">
+    This experimental protocol lets an authorized Wayland surface receive
+    viewer positions relative to the physical rectangle on which the compositor
+    presents it. A client can use those positions to render a view-dependent
+    portal while remaining an ordinary Wayland client.
+
+    This protocol is not stable and currently makes no compatibility promise.
+    Once a version is deployed as a compatibility commitment, its wire ABI is
+    immutable: interface version bumps may only append compatible requests and
+    events, and an incompatible revision requires a new interface name.
+
+    The initial HypXRland implementation deliberately advertises no rendering
+    capability and never activates a viewpoint. The requests and events below
+    reserve the intended version-1 synchronization shape so clients can be
+    developed without mistaking this transport-only implementation for working
+    viewpoint feedback.
+
+    Viewer motion is sensitive data. A client request is not authorization;
+    compositors must apply explicit user policy before sending samples.
+  </description>
+
+  <interface name="hypxr_viewpoint_manager_v1" version="1">
+    <description summary="surface viewpoint factory">
+      Creates at most one live viewpoint object for a wl_surface owned by the
+      requesting client.
+    </description>
+
+    <enum name="error">
+      <entry name="invalid_surface" value="0"
+             summary="the wl_surface is invalid or belongs to another client"/>
+      <entry name="already_constructed" value="1"
+             summary="the wl_surface already has a live viewpoint object"/>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager">
+        Destroy the manager. Viewpoint objects created from it remain valid.
+      </description>
+    </request>
+
+    <request name="get_viewpoint">
+      <description summary="create a viewpoint object for a surface">
+        Create a viewpoint object associated with surface. The compositor sends
+        capabilities before any other event on the new object.
+      </description>
+      <arg name="id" type="new_id" interface="hypxr_viewpoint_v1"
+           summary="the new viewpoint object"/>
+      <arg name="surface" type="object" interface="wl_surface"
+           summary="the client's surface"/>
+    </request>
+  </interface>
+
+  <interface name="hypxr_viewpoint_v1" version="1">
+    <description summary="viewpoint feedback for one surface">
+      A viewpoint object is initially inactive. The client declares its
+      capabilities and enables feedback; the compositor either activates it or
+      reports why it remains inactive.
+
+      Destroying the associated wl_surface makes this object inert. The
+      compositor sends inactive with surface_destroyed, and all subsequent
+      requests except destroy have no effect.
+    </description>
+
+    <enum name="error">
+      <entry name="invalid_state" value="0"
+             summary="a request is not valid in the current state"/>
+      <entry name="invalid_capabilities" value="1"
+             summary="the capability mask contains unknown bits"/>
+      <entry name="invalid_sample" value="2"
+             summary="the sample or activation identifier is invalid"/>
+    </enum>
+
+    <enum name="layout" bitfield="true">
+      <entry name="none" value="0" summary="no packed stereo layout is available"/>
+      <entry name="sbs" value="1" summary="full side-by-side stereo"/>
+      <entry name="hsbs" value="2" summary="half side-by-side stereo"/>
+      <entry name="tab" value="4" summary="full top-and-bottom stereo"/>
+      <entry name="htab" value="8" summary="half top-and-bottom stereo"/>
+    </enum>
+
+    <enum name="capability" bitfield="true">
+      <entry name="none" value="0" summary="no rendering guarantee is available"/>
+      <entry name="pair_latched" value="1"
+             summary="both eyes are rendered from one sample and simulation state"/>
+      <entry name="monotonic_timestamps" value="2"
+             summary="sample and target timestamps use CLOCK_MONOTONIC nanoseconds"/>
+    </enum>
+
+    <enum name="inactive_reason">
+      <entry name="disabled" value="0" summary="the client disabled feedback"/>
+      <entry name="not_supported" value="1" summary="feedback is not implemented or available"/>
+      <entry name="surface_destroyed" value="2" summary="the associated wl_surface was destroyed"/>
+      <entry name="not_authorized" value="3" summary="user policy did not authorize this surface"/>
+      <entry name="not_eligible" value="4" summary="the surface is not currently presentation-eligible"/>
+      <entry name="xr_inactive" value="5" summary="the XR session is not active"/>
+      <entry name="tracking_lost" value="6" summary="required tracking data is invalid"/>
+      <entry name="superseded" value="7" summary="another surface owns this presentation rectangle"/>
+    </enum>
+
+    <enum name="sample_flag" bitfield="true">
+      <entry name="positions_valid" value="1" summary="all advertised eye positions are valid"/>
+      <entry name="sample_time_valid" value="2" summary="sample_time is valid"/>
+      <entry name="target_time_valid" value="4" summary="target_time is valid"/>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the viewpoint object"/>
+    </request>
+
+    <request name="set_capabilities">
+      <description summary="declare client rendering capabilities">
+        layouts is a mask of layout values. flags is a mask of capability
+        values. This state applies to subsequent activation attempts.
+      </description>
+      <arg name="layouts" type="uint" enum="layout" summary="supported packed layouts"/>
+      <arg name="flags" type="uint" enum="capability" summary="supported rendering guarantees"/>
+    </request>
+
+    <request name="set_enabled">
+      <description summary="enable or disable viewpoint feedback">
+        enabled must be zero or one. Enabling is a request, not authorization.
+      </description>
+      <arg name="enabled" type="uint" summary="one to request feedback, zero to disable it"/>
+    </request>
+
+    <request name="rendered">
+      <description summary="associate a sample with the next surface commit">
+        The identified sample applies to the next wl_surface commit carrying a
+        newly attached non-null buffer. Both words use network-independent
+        semantic high/low ordering.
+      </description>
+      <arg name="epoch_hi" type="uint" summary="activation epoch, high 32 bits"/>
+      <arg name="epoch_lo" type="uint" summary="activation epoch, low 32 bits"/>
+      <arg name="sample_hi" type="uint" summary="sample identifier, high 32 bits"/>
+      <arg name="sample_lo" type="uint" summary="sample identifier, low 32 bits"/>
+    </request>
+
+    <event name="capabilities">
+      <description summary="advertise compositor capabilities">
+        layouts and flags contain only behavior the compositor can currently
+        provide. Zero masks are valid and mean that this object cannot activate.
+      </description>
+      <arg name="layouts" type="uint" enum="layout" summary="available packed layouts"/>
+      <arg name="flags" type="uint" enum="capability" summary="available guarantees"/>
+    </event>
+
+    <event name="active">
+      <description summary="viewpoint feedback became active">
+        The content rectangle has the given physical size in micrometers.
+        geometry_id changes whenever that rectangle's calibration changes.
+      </description>
+      <arg name="epoch_hi" type="uint" summary="activation epoch, high 32 bits"/>
+      <arg name="epoch_lo" type="uint" summary="activation epoch, low 32 bits"/>
+      <arg name="geometry_hi" type="uint" summary="geometry identifier, high 32 bits"/>
+      <arg name="geometry_lo" type="uint" summary="geometry identifier, low 32 bits"/>
+      <arg name="width_um" type="uint" summary="content width in micrometers"/>
+      <arg name="height_um" type="uint" summary="content height in micrometers"/>
+      <arg name="layout" type="uint" enum="layout" summary="selected packed layout"/>
+      <arg name="flags" type="uint" enum="capability" summary="selected guarantees"/>
+    </event>
+
+    <event name="sample">
+      <description summary="surface-relative stereo viewer sample">
+        Eye points are signed micrometers in a content-local frame whose origin
+        is the content center, +X is right, +Y is up, and +Z points out of the
+        visible surface toward the viewer. Timestamps are CLOCK_MONOTONIC
+        nanoseconds only when the corresponding sample_flag is present.
+
+        Every sample sets positions_valid and has a view_count of one or two.
+        All positions named by view_count are valid as one atomic unit. When
+        view_count is one, right_x_um, right_y_um, and right_z_um must be zero.
+        Invalid tracking is reported with inactive.tracking_lost instead of a
+        partial or invalid sample.
+      </description>
+      <arg name="epoch_hi" type="uint" summary="activation epoch, high 32 bits"/>
+      <arg name="epoch_lo" type="uint" summary="activation epoch, low 32 bits"/>
+      <arg name="sample_hi" type="uint" summary="sample identifier, high 32 bits"/>
+      <arg name="sample_lo" type="uint" summary="sample identifier, low 32 bits"/>
+      <arg name="geometry_hi" type="uint" summary="geometry identifier, high 32 bits"/>
+      <arg name="geometry_lo" type="uint" summary="geometry identifier, low 32 bits"/>
+      <arg name="sample_time_hi" type="uint" summary="sample time, high 32 bits"/>
+      <arg name="sample_time_lo" type="uint" summary="sample time, low 32 bits"/>
+      <arg name="target_time_hi" type="uint" summary="target time, high 32 bits"/>
+      <arg name="target_time_lo" type="uint" summary="target time, low 32 bits"/>
+      <arg name="left_x_um" type="int" summary="left-eye X in micrometers"/>
+      <arg name="left_y_um" type="int" summary="left-eye Y in micrometers"/>
+      <arg name="left_z_um" type="int" summary="left-eye Z in micrometers"/>
+      <arg name="right_x_um" type="int" summary="right-eye X in micrometers"/>
+      <arg name="right_y_um" type="int" summary="right-eye Y in micrometers"/>
+      <arg name="right_z_um" type="int" summary="right-eye Z in micrometers"/>
+      <arg name="view_count" type="uint" summary="one or two valid eye points"/>
+      <arg name="flags" type="uint" enum="sample_flag" summary="sample validity flags"/>
+    </event>
+
+    <event name="inactive">
+      <description summary="viewpoint feedback is inactive">
+        Samples from epoch are no longer valid. Epoch is zero if this object has
+        never activated.
+      </description>
+      <arg name="epoch_hi" type="uint" summary="invalidated epoch, high 32 bits"/>
+      <arg name="epoch_lo" type="uint" summary="invalidated epoch, low 32 bits"/>
+      <arg name="reason" type="uint" enum="inactive_reason" summary="why feedback is inactive"/>
+    </event>
+  </interface>
+</protocol>

@@ -51,6 +51,7 @@
 #include "../protocols/CTMControl.hpp"
 #include "../protocols/InputCapture.hpp"
 #include "../protocols/HyprlandSurface.hpp"
+#include "../protocols/XRViewpointProtocol.hpp"
 #include "../protocols/ImageCaptureSource.hpp"
 #include "../protocols/ImageCopyCapture.hpp"
 #include "../protocols/BackgroundEffect.hpp"
@@ -210,6 +211,7 @@ CProtocolManager::CProtocolManager() {
     PROTO::ctm                 = makeUnique<CHyprlandCTMControlProtocol>(&hyprland_ctm_control_manager_v1_interface, 2, "CTMControl");
     PROTO::inputCapture        = makeUnique<CInputCaptureProtocol>(&hyprland_input_capture_manager_v1_interface, 1, "InputCapture");
     PROTO::hyprlandSurface     = makeUnique<CHyprlandSurfaceProtocol>(&hyprland_surface_manager_v1_interface, 2, "HyprlandSurface");
+    PROTO::xrViewpoint         = makeUnique<CXRViewpointProtocol>(&hypxr_viewpoint_manager_v1_interface, 1, "XRViewpoint");
     PROTO::contentType         = makeUnique<CContentTypeProtocol>(&wp_content_type_manager_v1_interface, 1, "ContentType");
     PROTO::xdgTag              = makeUnique<CXDGToplevelTagProtocol>(&xdg_toplevel_tag_manager_v1_interface, 1, "XDGTag");
     PROTO::xdgBell             = makeUnique<CXDGSystemBellProtocol>(&xdg_system_bell_v1_interface, 1, "XDGBell");
@@ -322,6 +324,7 @@ CProtocolManager::~CProtocolManager() {
     PROTO::ctm.reset();
     PROTO::inputCapture.reset();
     PROTO::hyprlandSurface.reset();
+    PROTO::xrViewpoint.reset();
     PROTO::contentType.reset();
     PROTO::colorManagement.reset();
     PROTO::xdgTag.reset();
@@ -356,6 +359,7 @@ bool CProtocolManager::isGlobalPrivileged(const wl_global* global) {
 
     // this is a static whitelist of allowed protocols,
     // outputs are dynamic so we checked them above
+    // XRViewpoint is intentionally excluded: surface-relative viewer motion is sensitive data.
     // clang-format off
     static const std::vector<wl_global*> ALLOWED_WHITELIST = {
         PROTO::seat->getGlobal(),
