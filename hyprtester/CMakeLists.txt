@@ -188,6 +188,8 @@ protocolnew("../protocols" "wlr-screencopy-unstable-v1" true)
 # xdg-interactive --tag (research/24 §4.2, WP S2): the cooperative stereo-content channel, which is
 # also a plain window-rule match property.
 protocolnew("staging/xdg-toplevel-tag" "xdg-toplevel-tag-v1" false)
+# Inactive walking-skeleton coverage for the experimental HypXRland viewpoint protocol.
+protocolnew("../protocols" "hypxr-viewpoint-v1" true)
 
 clientNew("pointer-warp" PROTOS "pointer-warp-v1" "xdg-shell")
 clientNew("pointer-constraints" PROTOS "pointer-constraints-unstable-v1" "xdg-shell")
@@ -208,3 +210,4 @@ clientNew("layer-surface" PROTOS "wlr-layer-shell-unstable-v1" "xdg-shell") # la
 clientNew("output-info" PROTOS "xdg-output-unstable-v1")
 clientNew("screencopy-crop" PROTOS "wlr-screencopy-unstable-v1")
 clientNew("screencopy-probe" PROTOS "wlr-screencopy-unstable-v1")
+clientNew("viewpoint-inactive" PROTOS "hypxr-viewpoint-v1")
