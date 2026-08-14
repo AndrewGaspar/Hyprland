@@ -437,6 +437,9 @@ class COpenXRManager {
 
   private:
     void setState(eXRManagerState newState);
+    void reevaluateViewpoints();
+    void drainViewpointSamples();
+    void invalidateViewpoints(uint32_t reason);
 
     // --- plugged-state grace timer (report-18 addendum). Main thread only. ---
     // Session facts derived from m_state for the plugged predicate.
@@ -720,6 +723,8 @@ class COpenXRManager {
     bool                         m_rulesUseTitle    = false;
     bool                         m_effectEvalQueued = false; // one deferred evaluation is already pending
     bool                         m_fxKeyGateWarned  = false; // warned once that a rule's blackalpha is gated off
+    uint64_t                     m_viewpointTokenCounter    = 0;
+    uint64_t                     m_viewpointGeometryCounter = 0;
 
     // Re-resolve every layer's effects from its OWN context tuple and retarget its envelopes. Never
     // call directly from a trigger — go through requestEffectEval() so bursts coalesce.
@@ -748,6 +753,10 @@ class COpenXRManager {
     CHyprSignalListener m_fxWindowFullscreenListener;
     CHyprSignalListener m_fxWindowTitleListener;
     CHyprSignalListener m_fxWindowCloseListener;
+    CHyprSignalListener m_viewpointWindowRulesListener;
+    CHyprSignalListener m_viewpointWindowFloatingListener;
+    CHyprSignalListener m_viewpointWindowWorkspaceListener;
+    CHyprSignalListener m_viewpointMonitorLayoutListener;
     CHyprSignalListener m_fxWorkspaceActiveListener;
     CHyprSignalListener m_fxMonitorAddedListener;
     CHyprSignalListener m_fxMonitorRemovedListener;

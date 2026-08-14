@@ -12,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,8 @@
 #include "XRStereoPair.hpp"    // OpenXR::Stereo::SPaneGeom / SPairDecl (pure, unguarded)
 #include "XRMonitorConfig.hpp" // SXRMonitorParams / OpenXR::SXRAnchorSpec (unguarded)
 #include "XRRule.hpp"          // SXREffects / SXRResolvedEffects / SXRFxEnv (unguarded)
+#include "XRViewpointTransport.hpp"
+#include "XRViewpointEligibility.hpp"
 #include "../helpers/memory/Memory.hpp"
 #include "../helpers/signal/Signal.hpp"
 #include "../helpers/math/Math.hpp"
@@ -84,6 +87,24 @@ class CXRMonitorLayer {
     // (a doomed round-trip; xrDestroyInstance reaps it). Frees the local image list + content state.
     void destroySwapchain(bool skipXrCall = false);
 
+    struct SViewpointSubscription {
+        uint64_t               token      = 0;
+        uint64_t               epoch      = 0;
+        uint64_t               geometryId = 0;
+        uint32_t               surfaceId  = 0;
+        uint32_t               widthUM    = 0;
+        uint32_t               heightUM   = 0;
+        OpenXR::SXRAnchorState anchorState;
+
+        bool                   operator==(const SViewpointSubscription&) const = default;
+    };
+
+    void                                  setViewpointSubscription(const std::optional<SViewpointSubscription>& subscription);
+    std::optional<SViewpointSubscription> viewpointSubscription();
+    OpenXR::SXRViewpointPublishResult     publishViewpointSample(const SViewpointSubscription& subscription, const OpenXR::SXRViewpointEncodedSample& sample);
+    bool                                  consumeViewpointSample(SViewpointSubscription& subscription, OpenXR::SXRViewpointMailboxRead& sample);
+    void                                  revokeViewpointEpoch(uint64_t token);
+
     // ---- main thread ----
     std::string         m_monitorName;         // key; survives monitor teardown
     PHLMONITORREF       m_monitor;             // weak ref to the headless output's CMonitor
@@ -138,6 +159,15 @@ class CXRMonitorLayer {
     std::atomic<bool>       m_swapchainDirty{false}; // set on mode change / (re)bind
     std::atomic<bool>       m_pendingRemoval{false}; // removal barrier flag
     std::atomic<bool>       m_removalAcked{false};   // frame thread acked removal once
+
+    // One authorized surface may subscribe to one XR monitor layer. The mutex makes subscription
+    // replacement + mailbox clearing atomic with frame publication, preventing stale-token races.
+    std::mutex                            m_viewpointMu;
+    std::optional<SViewpointSubscription> m_viewpointSubscription;
+    OpenXR::CXRViewpointSampleMailbox     m_viewpointMailbox;
+    uint64_t                              m_viewpointFrameToken  = 0; // frame thread only
+    uint64_t                              m_viewpointFrameSerial = 0; // frame thread only
+    std::atomic<uint8_t>                  m_viewpointRuntimeState{OpenXR::XR_VIEWPOINT_RUNTIME_UNKNOWN};
 
     // ---- quad params: main writes under COpenXRManager::m_layersMu, frame copies per frame ----
     float    m_sizeMeters = 1.6f; // quad width (m); height = width * pxH/pxW
