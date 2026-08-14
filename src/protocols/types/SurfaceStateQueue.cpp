@@ -84,3 +84,12 @@ void CSurfaceStateQueue::tryProcess() {
         m_queue.pop_front();
     }
 }
+
+void CSurfaceStateQueue::clearViewpointAssociations(uint64_t epoch) {
+    for (auto& state : m_queue) {
+        if (state->viewpointAssociation && state->viewpointAssociation->epoch == epoch) {
+            state->viewpointAssociation.reset();
+            state->updated.bits.viewpoint = true;
+        }
+    }
+}

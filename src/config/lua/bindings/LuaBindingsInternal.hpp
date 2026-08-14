@@ -115,6 +115,7 @@ namespace Config::Lua::Bindings::Internal {
         // Two front ends for one rule must not disagree about whether it parses. The clamp still
         // happens, once, where the rule is resolved against the tier (Desktop::Depth::resolve).
         {"depth", []() -> ILuaConfigValue* { return new CLuaConfigFloat(0.F); }, WE::WINDOW_RULE_EFFECT_DEPTH},
+        {"viewpoint", []() -> ILuaConfigValue* { return new CLuaConfigBool(false); }, WE::WINDOW_RULE_EFFECT_VIEWPOINT},
     };
 
     std::string                                        argStr(lua_State* L, int idx);

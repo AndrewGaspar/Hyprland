@@ -33,6 +33,45 @@ static SXRViewpointEncodedSample encoded(uint64_t serial) {
     return sample;
 }
 
+TEST(XRViewpointTransport, CommitLatchConsumesOnlyOnANewNonNullBuffer) {
+    CXRViewpointCommitLatch       latch;
+    const SXRViewpointAssociation association{.epoch = 7, .sample = 11};
+
+    latch.stage(association);
+    EXPECT_EQ(latch.commit(false), SXRViewpointCommitAssociation{});
+    EXPECT_EQ(latch.commit(false), SXRViewpointCommitAssociation{});
+
+    const auto tagged = latch.commit(true);
+    EXPECT_TRUE(tagged.updated);
+    EXPECT_EQ(tagged.association, association);
+
+    const auto untagged = latch.commit(true);
+    EXPECT_TRUE(untagged.updated);
+    EXPECT_FALSE(untagged.association);
+}
+
+TEST(XRViewpointTransport, CommitLatchRevocationPreventsAStaleFutureAssociation) {
+    CXRViewpointCommitLatch latch;
+    latch.stage({.epoch = 7, .sample = 11});
+
+    EXPECT_FALSE(latch.clear(6));
+    EXPECT_TRUE(latch.clear(7));
+    EXPECT_FALSE(latch.clear(7));
+
+    const auto committed = latch.commit(true);
+    EXPECT_TRUE(committed.updated);
+    EXPECT_FALSE(committed.association);
+}
+
+TEST(XRViewpointTransport, AssociationClearIsScopedToItsEpoch) {
+    std::optional<SXRViewpointAssociation> association = SXRViewpointAssociation{.epoch = 7, .sample = 11};
+
+    EXPECT_FALSE(clearViewpointAssociation(association, 6));
+    EXPECT_TRUE(association);
+    EXPECT_TRUE(clearViewpointAssociation(association, 7));
+    EXPECT_FALSE(association);
+}
+
 TEST(XRViewpointTransport, SignedPositionMicrometersRoundTripAndRoundHalfAwayFromZero) {
     for (const double meters : {-12.345678, -0.000001, 0.0, 0.000001, 27.125432}) {
         int32_t encodedUM = 7;

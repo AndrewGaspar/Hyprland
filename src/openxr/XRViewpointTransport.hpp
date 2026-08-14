@@ -11,12 +11,45 @@
 #include <array>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <type_traits>
 
 namespace OpenXR {
     inline constexpr double   XR_VIEWPOINT_UM_PER_METER = 1'000'000.0;
     inline constexpr int32_t  XR_VIEWPOINT_Z_EPSILON_UM = 100;
     inline constexpr uint32_t XR_VIEWPOINT_SAMPLE_VALID = 1U << 0;
+
+    // wl_surface commit metadata only. It does not prove that the corresponding surface buffer has
+    // reached an XR swapchain; that requires a later exact output-buffer carrier rather than
+    // sampling a surface's possibly newer current state from an output-presented callback.
+    struct SXRViewpointAssociation {
+        uint64_t epoch  = 0;
+        uint64_t sample = 0;
+
+        bool     operator==(const SXRViewpointAssociation&) const = default;
+    };
+
+    struct SXRViewpointCommitAssociation {
+        bool                                   updated = false;
+        std::optional<SXRViewpointAssociation> association;
+
+        bool                                   operator==(const SXRViewpointCommitAssociation&) const = default;
+    };
+
+    // `rendered` stages one association until a newly attached non-null buffer consumes it.
+    // Bufferless commits and attach(null) do not consume it. A new untagged buffer returns an
+    // explicit null update, which clears the association inherited by damage-only commits.
+    class CXRViewpointCommitLatch {
+      public:
+        void                          stage(const SXRViewpointAssociation& association);
+        SXRViewpointCommitAssociation commit(bool newlyAttachedNonNullBuffer);
+        bool                          clear(uint64_t epoch);
+
+      private:
+        std::optional<SXRViewpointAssociation> m_staged;
+    };
+
+    bool clearViewpointAssociation(std::optional<SXRViewpointAssociation>& association, uint64_t epoch);
 
     // Explicit high/low representation of a complete uint64 value. Word order is semantic, not a
     // byte serialization: no host-endian or Wayland binding assumption is made here.
