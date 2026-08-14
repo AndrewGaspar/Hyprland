@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  EXPERIMENTAL: this protocol currently has no compatibility commitment and
-  advertises no active viewpoint capability. Do not treat the presence of its
-  global as authorization or as evidence that viewpoint rendering is active.
+  EXPERIMENTAL: this protocol currently has no compatibility commitment.
+  HypXRland gates activation through explicit default-deny user policy and
+  presentation eligibility. Do not treat the presence of its global as
+  authorization or as evidence that viewpoint rendering is active.
 -->
 <protocol name="hypxr_viewpoint_v1">
   <copyright>
@@ -39,11 +40,12 @@
     immutable: interface version bumps may only append compatible requests and
     events, and an incompatible revision requires a new interface name.
 
-    The initial HypXRland implementation deliberately advertises no rendering
-    capability and never activates a viewpoint. The requests and events below
-    reserve the intended version-1 synchronization shape so clients can be
-    developed without mistaking this transport-only implementation for working
-    viewpoint feedback.
+    The current HypXRland implementation advertises full side-by-side layout
+    and pair-latched rendering when built with OpenXR support. Activation is
+    default-deny: it also requires explicit compositor policy, an eligible
+    fullscreen XR-monitor surface, and a usable XR session and tracking state.
+    A build without OpenXR support advertises zero capability masks and cannot
+    activate a viewpoint.
 
     Viewer motion is sensitive data. A client request is not authorization;
     compositors must apply explicit user policy before sending samples.
