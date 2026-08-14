@@ -182,6 +182,11 @@ protocolnew("../protocols" "wlr-screencopy-unstable-v1" true)
 protocolnew("staging/xdg-toplevel-tag" "xdg-toplevel-tag-v1" false)
 # Inactive walking-skeleton coverage for the experimental HypXRland viewpoint protocol.
 protocolnew("../protocols" "hypxr-viewpoint-v1" true)
+protocolnew("stable/viewporter" "viewporter" false)
+
+add_library(hypxr-viewpoint-demo-renderer STATIC viewpoint/PortalRenderer.cpp)
+target_include_directories(hypxr-viewpoint-demo-renderer PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/viewpoint")
+target_link_libraries(hypxr-viewpoint-demo-renderer PUBLIC PkgConfig::protocols_deps)
 
 clientNew("pointer-warp" PROTOS "pointer-warp-v1" "xdg-shell")
 clientNew("surface-scale-transform" PROTOS "fractional-scale-v1" "xdg-shell")
@@ -196,3 +201,5 @@ clientNew("output-info" PROTOS "xdg-output-unstable-v1")
 clientNew("screencopy-crop" PROTOS "wlr-screencopy-unstable-v1")
 clientNew("screencopy-probe" PROTOS "wlr-screencopy-unstable-v1")
 clientNew("viewpoint-inactive" PROTOS "hypxr-viewpoint-v1")
+clientNew("viewpoint-demo" PROTOS "hypxr-viewpoint-v1" "viewporter" "xdg-shell" "xdg-toplevel-tag-v1")
+target_link_libraries(viewpoint-demo PRIVATE hypxr-viewpoint-demo-renderer)
