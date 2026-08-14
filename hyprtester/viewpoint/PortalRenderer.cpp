@@ -209,15 +209,16 @@ ViewpointDemo::SVec3 ViewpointDemo::authoritativeAimImpact() {
     return {.x = 0.0, .y = 0.0, .z = -3.65};
 }
 
-bool ViewpointDemo::fitRenderSize(uint32_t destinationWidth, uint32_t destinationHeight, uint32_t maximumWidth, uint32_t maximumHeight, SRenderSize& out) {
+bool ViewpointDemo::fitSBSRenderSize(uint32_t packedDestinationWidth, uint32_t packedDestinationHeight, uint32_t maximumEyeWidth, uint32_t maximumHeight, SRenderSize& out) {
     out = {};
-    if (destinationWidth == 0 || destinationHeight == 0 || maximumWidth == 0 || maximumHeight == 0)
+    if (packedDestinationWidth == 0 || (packedDestinationWidth & 1U) != 0 || packedDestinationHeight == 0 || maximumEyeWidth == 0 || maximumHeight == 0)
         return false;
 
-    const uint32_t DIVISOR       = std::gcd(destinationWidth, destinationHeight);
-    const uint32_t ASPECT_WIDTH  = destinationWidth / DIVISOR;
-    const uint32_t ASPECT_HEIGHT = destinationHeight / DIVISOR;
-    const uint32_t SCALE         = std::min(maximumWidth / ASPECT_WIDTH, maximumHeight / ASPECT_HEIGHT);
+    const uint32_t EYE_DESTINATION_WIDTH = packedDestinationWidth / 2U;
+    const uint32_t DIVISOR               = std::gcd(EYE_DESTINATION_WIDTH, packedDestinationHeight);
+    const uint32_t ASPECT_WIDTH          = EYE_DESTINATION_WIDTH / DIVISOR;
+    const uint32_t ASPECT_HEIGHT         = packedDestinationHeight / DIVISOR;
+    const uint32_t SCALE                 = std::min(maximumEyeWidth / ASPECT_WIDTH, maximumHeight / ASPECT_HEIGHT);
     if (SCALE == 0)
         return false;
 

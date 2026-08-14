@@ -55,10 +55,10 @@ namespace ViewpointDemo {
     // ray. Viewpoint samples never alter this state; they only alter its projection.
     SVec3 authoritativeAimImpact();
 
-    // Chooses the largest integer render size within the requested bounds whose
-    // aspect ratio exactly equals the logical destination. This keeps low-resolution
-    // viewporter scaling unambiguous; impossible ratios fail closed.
-    bool fitRenderSize(uint32_t destinationWidth, uint32_t destinationHeight, uint32_t maximumWidth, uint32_t maximumHeight, SRenderSize& out);
+    // Chooses the largest per-eye render size within the requested bounds whose
+    // aspect ratio exactly equals one half of a packed full-SBS destination.
+    // The destination width must be even; impossible ratios fail closed.
+    bool fitSBSRenderSize(uint32_t packedDestinationWidth, uint32_t packedDestinationHeight, uint32_t maximumEyeWidth, uint32_t maximumHeight, SRenderSize& out);
 
     // Returns the ray from a surface-relative eye through the selected pixel center
     // on the portal plane. The portal center is the origin and +Z points toward the
