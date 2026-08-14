@@ -124,6 +124,15 @@ CWLSurfaceResource::CWLSurfaceResource(SP<CWlSurface> resource_) : m_resource(re
     });
 
     m_resource->setCommit([this](CWlSurface* r) {
+        // Viewpoint feedback labels buffers, not arbitrary surface-state commits. Attach(null)
+        // does not consume a staged sample; the next non-null attach does. An untagged new buffer
+        // explicitly clears the association inherited by damage-only commits.
+        const auto VIEWPOINT = m_viewpointCommitLatch.commit(m_pending.updated.bits.buffer && m_pending.buffer);
+        if (VIEWPOINT.updated) {
+            m_pending.updated.bits.viewpoint = true;
+            m_pending.viewpointAssociation   = VIEWPOINT.association;
+        }
+
         if (m_pending.buffer)
             m_pending.bufferDamage.intersect(CBox{{}, m_pending.bufferSize});
 
@@ -748,6 +757,18 @@ bool CWLSurfaceResource::isTearing() {
         }
     }
     return false;
+}
+
+void CWLSurfaceResource::stageViewpointAssociation(const OpenXR::SXRViewpointAssociation& association) {
+    m_viewpointCommitLatch.stage(association);
+}
+
+void CWLSurfaceResource::clearViewpointAssociations(uint64_t epoch) {
+    m_viewpointCommitLatch.clear(epoch);
+    if (OpenXR::clearViewpointAssociation(m_pending.viewpointAssociation, epoch))
+        m_pending.updated.bits.viewpoint = true;
+    OpenXR::clearViewpointAssociation(m_current.viewpointAssociation, epoch);
+    m_stateQueue.clearViewpointAssociations(epoch);
 }
 
 void CWLSurfaceResource::updateCursorShm(CRegion damage) {

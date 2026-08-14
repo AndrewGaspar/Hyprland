@@ -134,6 +134,9 @@ namespace Desktop::Rule {
         // CWindow::updateDepth() and this var carries ONLY an explicit rule override. Read it with
         // hasValue(), never valueOrDefault().
         DEFINE_PROP(Config::FLOAT, depth, 0.F, WINDOW_RULE_EFFECT_DEPTH)
+        // Explicit privacy authorization for surface-relative XR head pose. Default false: binding
+        // the protocol or declaring client capabilities never grants access by itself.
+        DEFINE_PROP(bool, viewpoint, false, WINDOW_RULE_EFFECT_VIEWPOINT)
 
         DEFINE_PROP(Config::FLOAT, roundingPower, {std::string("decoration:rounding_power")}, WINDOW_RULE_EFFECT_ROUNDING_POWER)
         DEFINE_PROP(Config::FLOAT, scrollMouse, {std::string("input:scroll_factor")}, WINDOW_RULE_EFFECT_SCROLL_MOUSE)

@@ -5,6 +5,7 @@
 #include "../../managers/eventLoop/EventLoopTimer.hpp"
 #include "../WaylandProtocol.hpp"
 #include "./Buffer.hpp"
+#include "../../openxr/XRViewpointTransport.hpp"
 
 namespace Render {
     class ITexture;
@@ -55,6 +56,7 @@ struct SSurfaceState {
             bool frame : 1;
             bool fifo : 1;
             bool presentation : 1;
+            bool viewpoint : 1;
         } bits;
     } updated;
 
@@ -108,6 +110,11 @@ struct SSurfaceState {
     std::optional<Time::steady_dur> pendingTimeout;
     std::optional<Time::steady_tp>  commitTimingTarget;
     SP<CEventLoopTimer>             timer;
+
+    // Sample used to render this exact buffer. A buffer-bearing commit always updates this field:
+    // a tagged buffer installs an association and an untagged buffer clears the previous one.
+    // Bufferless commits deliberately leave the current association untouched.
+    std::optional<OpenXR::SXRViewpointAssociation> viewpointAssociation;
 
     // helpers
     CRegion accumulateBufferDamage();       // transforms state.damage and merges it into state.bufferDamage

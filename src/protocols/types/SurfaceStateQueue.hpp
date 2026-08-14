@@ -18,6 +18,7 @@ class CSurfaceStateQueue {
     void              unlock(const WP<SSurfaceState>& state, eLockReason reason);
     void              unlockFirst(eLockReason reason);
     void              tryProcess();
+    void              clearViewpointAssociations(uint64_t epoch);
 
   private:
     std::deque<UP<SSurfaceState>>                    m_queue;

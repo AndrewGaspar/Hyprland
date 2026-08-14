@@ -130,6 +130,10 @@ class CWLSurfaceResource {
     void                                   sortSubsurfaces();
     bool                                   hasVisibleSubsurface();
     bool                                   isTearing();
+    // Stage a validated viewpoint sample for the next newly-attached non-null buffer. It survives
+    // bufferless commits. Every new buffer consumes the stage; no stage means clear association.
+    void stageViewpointAssociation(const OpenXR::SXRViewpointAssociation& association);
+    void clearViewpointAssociations(uint64_t epoch);
 
     // returns a pair: found surface (null if not found) and surface local coords.
     // localCoords param is relative to 0,0 of this surface
@@ -140,6 +144,7 @@ class CWLSurfaceResource {
     wl_client*                         m_client        = nullptr;
     std::optional<wl_output_transform> m_lastTransform = std::nullopt;
     std::optional<int>                 m_lastScale     = std::nullopt;
+    OpenXR::CXRViewpointCommitLatch    m_viewpointCommitLatch;
 
     void                               destroy();
     void                               releaseBuffers(bool onlyCurrent = true);
