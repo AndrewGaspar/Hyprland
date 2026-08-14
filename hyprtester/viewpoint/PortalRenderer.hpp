@@ -22,6 +22,12 @@ namespace ViewpointDemo {
         uint32_t height = 0;
     };
 
+    struct SFeedbackState {
+        bool capabilitiesSupported = false;
+        bool mappingSupported      = false;
+        bool stickyDisabled        = false;
+    };
+
     struct SRay {
         SVec3 origin;
         SVec3 direction;
@@ -59,6 +65,10 @@ namespace ViewpointDemo {
     // aspect ratio exactly equals one half of a packed full-SBS destination.
     // The destination width must be even; impossible ratios fail closed.
     bool fitSBSRenderSize(uint32_t packedDestinationWidth, uint32_t packedDestinationHeight, uint32_t maximumEyeWidth, uint32_t maximumHeight, SRenderSize& out);
+
+    // Configure eligibility is intentionally reversible; malformed protocol
+    // data and unsupported capabilities can independently disable feedback.
+    bool feedbackShouldBeEnabled(const SFeedbackState& state);
 
     // Returns the ray from a surface-relative eye through the selected pixel center
     // on the portal plane. The portal center is the origin and +Z points toward the
