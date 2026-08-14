@@ -177,7 +177,7 @@ manager.get_viewpoint(new_id, wl_surface)
 client -> compositor:
   set_capabilities(layouts, pair_latched)
   set_enabled(bool)
-  rendered(sample_id)                 # applies to the next surface commit
+  rendered(sample_id)                 # applies to the next newly attached non-null buffer
 
 compositor -> client:
   capabilities(flags)
@@ -197,11 +197,14 @@ language-neutral integer ABI. Timestamps are separate 64-bit quantities carried 
 high/low words, with their clock domain defined by the protocol; they are never packed into the
 coordinate representation.
 
-### 5.3 Per-commit sample association
+### 5.3 Per-buffer sample association
 
 `sample_id` is monotonic within one viewpoint-object activation. The client latches a complete
 sample, renders both eyes from it, sends `rendered(sample_id)`, then commits the buffer. The request
-applies to that next commit and is consumed by it, like other double-buffered surface state.
+is consumed only by the next `wl_surface.commit` carrying a newly attached non-null buffer.
+Bufferless commits and commits carrying a null buffer do not consume a staged request. A newly
+attached non-null buffer without a staged `rendered` request explicitly clears the association
+inherited by bufferless commits; it must not silently retain the previous buffer's sample ID.
 
 HypXRland records at least:
 
@@ -481,7 +484,7 @@ Each stage should land independently with its own rollback and evidence.
 ### Stage 2 — experimental Wayland protocol
 
 - Add `hypxr_viewpoint_v1` negotiation, authorization, active/inactive events, timestamps, and
-  per-commit sample association.
+  per-buffer sample association.
 - Add status counters for samples, commit association, drops, and pose age.
 - Add a native synthetic client before integrating Wine.
 
@@ -525,7 +528,10 @@ Each stage should land independently with its own rollback and evidence.
 - only the owning, authorized surface receives samples;
 - denial, revocation, surface destruction, remap, and XR session loss invalidate the object;
 - sample IDs are monotonic within an activation and cannot cross activation epochs;
-- `rendered(sample_id)` applies to exactly the next commit;
+- `rendered(sample_id)` applies to exactly the next commit carrying a newly attached non-null
+  buffer; bufferless and null-buffer commits do not consume it;
+- a newly attached, untagged non-null buffer clears the association retained across bufferless
+  commits;
 - malformed, reused, unknown, and future sample IDs fail safely;
 - a runtime reference-space recenter preserves surface-relative eye coordinates, while moving only
   the monitor produces the expected local-coordinate delta;
@@ -591,7 +597,7 @@ This is a routing guide, not a claim that the files already implement viewpoint 
 | final monitor/content pose and meters | `CXRAnchor`, `CXRMonitorLayer`, stereo/chrome geometry | transform eye points into the authoritative content-local frame |
 | Wayland object and surface lifetime | `src/protocols/` | negotiate and authorize a per-surface viewpoint object on the main thread |
 | frame → main delivery | new per-layer coalesced latest-value POD mailbox + wake | overwrite stale samples rather than queueing 90 Hz events; keep protocol objects and sends main-thread-only |
-| commit/sample association | Wayland surface commit path | consume double-buffered `sample_id` state and attach it to the presented buffer |
+| buffer/sample association | Wayland surface commit path | consume staged `sample_id` state only with the next newly attached non-null buffer; retain it across bufferless/null-buffer commits and clear the prior association on an untagged new buffer |
 | packed content declaration | `xdg-toplevel-tag-v1`, `StereoContent.hpp` | remain unchanged; describe only the client's pixel layout |
 | XR pair submission | `OpenXRManager.cpp`, `XRStereoPair.hpp` | reuse the existing atomic two-quad presentation after validating sample association |
 | game/Wine integration | owning Wine and game-mod repositories | receive samples and generate one pair-latched SBS buffer without changing gameplay state |
