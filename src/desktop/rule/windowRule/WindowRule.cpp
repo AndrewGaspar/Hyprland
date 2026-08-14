@@ -263,7 +263,8 @@ static std::expected<WindowRuleEffectValue, std::string> parseWindowRuleEffect(C
         case WINDOW_RULE_EFFECT_NO_AUTO_HDR:
         case WINDOW_RULE_EFFECT_CONFINE_POINTER:
         case WINDOW_RULE_EFFECT_NO_XDG_DRAGS:
-        case WINDOW_RULE_EFFECT_STAY_FOCUSED: return truthy(raw);
+        case WINDOW_RULE_EFFECT_STAY_FOCUSED:
+        case WINDOW_RULE_EFFECT_VIEWPOINT: return truthy(raw);
 
         case WINDOW_RULE_EFFECT_FULLSCREENSTATE: {
             auto parsed = parseFullscreenState(raw);

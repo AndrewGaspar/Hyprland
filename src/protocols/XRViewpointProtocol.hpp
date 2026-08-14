@@ -2,9 +2,12 @@
 
 #include <unordered_map>
 #include <vector>
+#include <optional>
 
 #include "WaylandProtocol.hpp"
 #include "hypxr-viewpoint-v1.hpp"
+#include "../openxr/XRViewpointLedger.hpp"
+#include "../openxr/XRViewpointTransport.hpp"
 #include "../helpers/signal/Signal.hpp"
 
 class CWLSurfaceResource;
@@ -13,17 +16,38 @@ class CXRViewpointResource {
   public:
     CXRViewpointResource(UP<CHypxrViewpointV1>&& resource, SP<CWLSurfaceResource> surface);
 
-    bool good() const;
+    bool                   good() const;
+
+    SP<CWLSurfaceResource> surface() const;
+    bool                   requested() const;
+    bool                   enabled() const;
+    uint64_t               token() const;
+
+    uint64_t               activate(uint64_t token, uint64_t geometryId, uint32_t widthUM, uint32_t heightUM);
+    void                   invalidate(hypxrViewpointV1InactiveReason reason);
+    void                   sendSample(uint64_t token, const OpenXR::SXRViewpointEncodedSample& sample);
 
   private:
-    void                   destroy();
-    void                   surfaceDestroyed();
+    void                                          destroy();
+    void                                          surfaceDestroyed();
 
-    UP<CHypxrViewpointV1>  m_resource;
-    WP<CWLSurfaceResource> m_surface;
+    UP<CHypxrViewpointV1>                         m_resource;
+    WP<CWLSurfaceResource>                        m_surface;
+    uint32_t                                      m_layouts      = 0;
+    uint32_t                                      m_capabilities = 0;
+    bool                                          m_enabled      = false;
+    uint64_t                                      m_epochCounter = 0;
+    uint64_t                                      m_epoch        = 0;
+    uint64_t                                      m_geometryId   = 0;
+    uint64_t                                      m_token        = 0;
+    std::optional<hypxrViewpointV1InactiveReason> m_lastInactiveReason;
+    OpenXR::CXRViewpointIssuedSampleLedger        m_issuedSamples;
 
     struct {
         CHyprSignalListener surfaceDestroyed;
+        CHyprSignalListener map;
+        CHyprSignalListener unmap;
+        CHyprSignalListener stateCommit;
     } m_listeners;
 
     friend class CXRViewpointProtocol;
@@ -34,6 +58,9 @@ class CXRViewpointProtocol : public IWaylandProtocol {
     CXRViewpointProtocol(const wl_interface* iface, const int& ver, const std::string& name);
 
     virtual void bindManager(wl_client* client, void* data, uint32_t ver, uint32_t id);
+
+    void         forEachViewpoint(const std::function<void(CXRViewpointResource&)>& fn);
+    void         deliverSample(uint64_t token, const OpenXR::SXRViewpointEncodedSample& sample);
 
   private:
     void                                                                 getViewpoint(CHypxrViewpointManagerV1* manager, uint32_t id, wl_resource* surfaceResource);

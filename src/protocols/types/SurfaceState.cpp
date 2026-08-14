@@ -243,6 +243,9 @@ void SSurfaceState::updateFrom(SSurfaceState& ref) {
         ref.presentationFeedbacks.clear();
     }
 
+    if (ref.updated.bits.viewpoint)
+        viewpointAssociation = ref.viewpointAssociation;
+
     if (ref.barrierSet)
         waitingOnPresentation = true;
 }

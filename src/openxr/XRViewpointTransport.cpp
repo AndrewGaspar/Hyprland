@@ -6,6 +6,30 @@
 #include <limits>
 
 using namespace OpenXR;
+
+void CXRViewpointCommitLatch::stage(const SXRViewpointAssociation& association) {
+    m_staged = association;
+}
+
+SXRViewpointCommitAssociation CXRViewpointCommitLatch::commit(bool newlyAttachedNonNullBuffer) {
+    if (!newlyAttachedNonNullBuffer)
+        return {};
+
+    SXRViewpointCommitAssociation result{.updated = true, .association = m_staged};
+    m_staged.reset();
+    return result;
+}
+
+bool CXRViewpointCommitLatch::clear(uint64_t epoch) {
+    return clearViewpointAssociation(m_staged, epoch);
+}
+
+bool OpenXR::clearViewpointAssociation(std::optional<SXRViewpointAssociation>& association, uint64_t epoch) {
+    if (!association || association->epoch != epoch)
+        return false;
+    association.reset();
+    return true;
+}
 using namespace Hyprutils::Memory;
 
 SXRViewpointU64 OpenXR::splitViewpointU64(uint64_t value) {
