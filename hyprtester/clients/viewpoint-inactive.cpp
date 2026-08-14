@@ -1,6 +1,6 @@
-// Headless client for the experimental viewpoint protocol's deliberately inactive first stage.
-// It proves the global can create an object, honestly advertises zero capabilities, reports an
-// enable attempt as unsupported, and becomes inert after its wl_surface is destroyed.
+// Headless client for the experimental viewpoint protocol's inactive lifecycle. It proves the
+// global can create an object, advertises the active SBS/pair-latched contract, reports an enable
+// attempt without a negotiated layout as unsupported, and becomes inert after surface destruction.
 
 #include <algorithm>
 #include <cerrno>
@@ -81,7 +81,7 @@ static bool exerciseInactiveLifecycle(SState& state) {
             ++state.destroyedEvents;
     });
 
-    if (!roundtrip(state) || state.capabilitiesEvents != 1 || state.layouts != HYPXR_VIEWPOINT_V1_LAYOUT_NONE || state.capabilities != HYPXR_VIEWPOINT_V1_CAPABILITY_NONE)
+    if (!roundtrip(state) || state.capabilitiesEvents != 1 || state.layouts != HYPXR_VIEWPOINT_V1_LAYOUT_SBS || state.capabilities != HYPXR_VIEWPOINT_V1_CAPABILITY_PAIR_LATCHED)
         return false;
 
     state.viewpoint->sendSetEnabled(0);
