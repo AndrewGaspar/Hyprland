@@ -91,6 +91,25 @@ TEST(ViewpointDemoRenderer, RenderSizePreservesPackedSbsDestinationAspectWithinB
     EXPECT_EQ(size.height, 0U);
 }
 
+TEST(ViewpointDemoRenderer, TransientConfigureDoesNotStickyDisableFinalMapping) {
+    SFeedbackState feedback = {.capabilitiesSupported = true};
+    SRenderSize    size;
+
+    EXPECT_FALSE(fitSBSRenderSize(1024, 1126, 256, 144, size));
+    feedback.mappingSupported = false;
+    EXPECT_FALSE(feedbackShouldBeEnabled(feedback));
+    EXPECT_FALSE(feedback.stickyDisabled);
+
+    ASSERT_TRUE(fitSBSRenderSize(2048, 1152, 256, 144, size));
+    EXPECT_EQ(size.width, 128U);
+    EXPECT_EQ(size.height, 144U);
+    feedback.mappingSupported = true;
+    EXPECT_TRUE(feedbackShouldBeEnabled(feedback));
+
+    feedback.stickyDisabled = true;
+    EXPECT_FALSE(feedbackShouldBeEnabled(feedback));
+}
+
 TEST(ViewpointDemoRenderer, FullSbsIsPairLatchedAndEyeOrdered) {
     std::vector<uint32_t>  pixelsA;
     std::vector<uint32_t>  pixelsB;

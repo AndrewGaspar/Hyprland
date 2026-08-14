@@ -226,6 +226,10 @@ bool ViewpointDemo::fitSBSRenderSize(uint32_t packedDestinationWidth, uint32_t p
     return true;
 }
 
+bool ViewpointDemo::feedbackShouldBeEnabled(const SFeedbackState& state) {
+    return state.capabilitiesSupported && state.mappingSupported && !state.stickyDisabled;
+}
+
 bool ViewpointDemo::portalRay(const SVec3& eye, const SPortalSize& portal, uint32_t pixelX, uint32_t pixelY, uint32_t paneWidth, uint32_t paneHeight, SRay& out) {
     out = {};
     if (!finiteVec(eye) || !std::isfinite(portal.widthMeters) || !std::isfinite(portal.heightMeters) || portal.widthMeters <= 0.0 || portal.heightMeters <= 0.0 || eye.z <= 1e-6 ||
