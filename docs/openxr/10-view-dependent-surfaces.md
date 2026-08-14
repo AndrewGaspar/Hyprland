@@ -1,10 +1,11 @@
 # 10 — View-dependent Wayland surfaces (portal design)
 
-> **Status: proposed; no protocol or pose bridge described on this page is implemented.**
+> **Status: experimental prototype; the protocol, compositor pose path, and native synthetic client
+> are implemented, but the ABI is not stable.**
 >
-> Landed behavior is called out explicitly below. Names such as `hypxr_viewpoint_v1` are working
-> design names, not compatibility promises. This page is the implementation plan and acceptance
-> contract for an iterative prototype.
+> Landed behavior and deferred work are called out explicitly below. `hypxr_viewpoint_v1` remains
+> an experimental name, not a compatibility promise. This page is both the design contract and the
+> acceptance plan for iterating beyond the synthetic proof.
 
 This design lets an ordinary Wayland window behave like a tracked window into a 3D scene. Moving
 the viewer's eyes relative to the window changes the scene perspective through it, while the
@@ -53,21 +54,32 @@ The following exists today:
 - Depth-desktop and stereo-content presentation create binocular disparity, but the submitted
   images contain no viewer-dependent projection. As documented in §9 of doc 05, they provide no
   head-motion parallax.
+- The experimental `hypxr_viewpoint_v1` protocol can expose pair-latched, per-eye points for one
+  explicitly authorized fullscreen surface per XR monitor. Its frame-to-main transport is a
+  coalesced per-layer POD mailbox; Wayland protocol objects remain on the main thread.
+- HypXRland locates the primary-stereo views at `predictedDisplayTime`, transforms their positions
+  into the solved content rectangle, and rejects tracking loss, grabs, carries, and late-latched
+  anchors.
+- `rendered(epoch, sample_id)` is associated with the next newly attached non-null `wl_buffer`, including
+  through the surface-state queue. The native `viewpoint-demo` client produces one pair-latched
+  full-SBS buffer from the newest accepted sample and falls back to zero-disparity SBS when
+  inactive.
 
 The following does **not** exist today:
 
-- no Wayland protocol, socket, or shared-memory bridge exports a viewpoint to a client;
-- no client buffer is associated with a pose sample or intended presentation time;
-- the XR frame thread locates head-center `VIEW`, not the individual primary-stereo views with
-  `xrLocateViews`;
-- HypXRland does not derive viewer coordinates relative to a surface's final presented rectangle;
-- the current stereo declaration describes pixel layout only; it is not a high-rate transport;
 - Wine does not expose a compositor-provided viewpoint to injected Windows code;
-- HypXRland does not validate that two eye images came from one simulation state and one viewpoint
-  sample.
+- sample/target timestamps and pose-age telemetry are not implemented; the timestamp capability is
+  not advertised and the wire fields are zero rather than raw `XrTime` values;
+- the surface-state association is not yet carried through the renderer into an exact output-buffer
+  generation. HypXRland therefore cannot yet prove which tagged client buffer produced a presented
+  XR image or report its presentation age;
+- HypXRland trusts a capable client to honor the pair-latched simulation-state guarantee. The
+  synthetic client tests that invariant, but the compositor cannot infer it from pixels;
+- nested forwarding, transformed/clipped portal rectangles, and game-specific HUD/culling/effects
+  classification remain future work.
 
-The first prototype must add these pieces without silently changing existing stereo, depth,
-monitor, or tag behavior.
+Further increments must add the remaining pieces without silently changing existing stereo,
+depth, monitor, or tag behavior.
 
 ## 3. Requirements and non-goals
 
@@ -130,8 +142,13 @@ and parallax gain, but must not independently guess where the physical panel is.
 For version 1, the eligible rectangle is deliberately narrow:
 
 - one undecorated, fullscreen surface covering one XR monitor;
-- a 1:1 mapping from the surface's content to the monitor content rectangle;
-- no output transform, crop, viewport, or compositor effect that changes the rectangle geometry;
+- the surface's logical destination is exactly the monitor content rectangle;
+- either a native-size full-SBS buffer or an aspect-preserving lower-resolution full-SBS buffer:
+  the buffer width is even, the whole packed buffer has exactly the destination aspect, and
+  `wp_viewport` supplies only that full logical destination. Each eye therefore has the aspect of
+  half the logical destination, and both panes are scaled together;
+- no `wp_viewport` source/crop, implicit sizing, non-normal buffer transform, buffer scale other
+  than 1, or compositor effect that changes the rectangle geometry;
 - the quad pose used for the sample is the same reference-space pose submitted to OpenXR;
 - no `anchor:device`, grip/pinch late-latch, or active carry/grab. Those paths submit an action
   space whose final display-time pose the runtime can update after HypXRland sampled it;
@@ -154,7 +171,7 @@ or portal-specific fields. HypXRland's current implementation stores one topleve
 second `viewpoint:*` tag would also displace the stereo declaration. The viewpoint protocol object,
 not another tag, is the client request.
 
-### 5.2 Proposed Wayland object
+### 5.2 Experimental Wayland object
 
 The working protocol name is `hypxr_viewpoint_v1`, separate from `hyprland-surface-v1` and
 `xdg-toplevel-tag-v1`. Conceptually:
@@ -163,13 +180,14 @@ The working protocol name is `hypxr_viewpoint_v1`, separate from `hyprland-surfa
    `xdg_toplevel`.
 2. The client declares its supported layouts and whether it can produce pair-latched stereo.
 3. Compositor policy accepts or denies the request and reports the active presentation rectangle.
-4. While active, the compositor emits timestamped viewpoint samples.
+4. While active, the compositor emits viewpoint samples; time words are meaningful only when their
+   capability and clock domain are advertised.
 5. The client associates a committed buffer with the sample it rendered.
 6. Deactivation or tracking loss invalidates feedback explicitly; the client falls back without
    reinterpreting an old sample as current.
 
-The eventual XML should remain capability-based and versioned. A provisional event/request shape
-is:
+The landed experimental XML is capability-based and versioned; `protocols/hypxr-viewpoint-v1.xml`
+is authoritative. Its abbreviated event/request shape is:
 
 ```text
 manager.get_viewpoint(new_id, wl_surface)
@@ -177,17 +195,17 @@ manager.get_viewpoint(new_id, wl_surface)
 client -> compositor:
   set_capabilities(layouts, pair_latched)
   set_enabled(bool)
-  rendered(sample_id)                 # applies to the next newly attached non-null buffer
+  rendered(epoch, sample_id)          # applies to the next newly attached non-null buffer
 
 compositor -> client:
   capabilities(flags)
-  active(width_um, height_um, flags)
-  sample(sample_id, sample_time_hi, sample_time_lo,
+  active(epoch, geometry_id, width_um, height_um, layout, flags)
+  sample(epoch, sample_id, geometry_id, sample_time_hi, sample_time_lo,
          target_time_hi, target_time_lo,
          left_x_um, left_y_um, left_z_um,
          right_x_um, right_y_um, right_z_um,
          validity_flags)
-  inactive(reason)
+  inactive(epoch, reason)
 ```
 
 This is a semantic sketch, not settled request numbering. Coordinate fields should be signed
@@ -200,13 +218,13 @@ coordinate representation.
 ### 5.3 Per-buffer sample association
 
 `sample_id` is monotonic within one viewpoint-object activation. The client latches a complete
-sample, renders both eyes from it, sends `rendered(sample_id)`, then commits the buffer. The request
+sample, renders both eyes from it, sends `rendered(epoch, sample_id)`, then commits the buffer. The request
 is consumed only by the next `wl_surface.commit` carrying a newly attached non-null buffer.
 Bufferless commits and commits carrying a null buffer do not consume a staged request. A newly
 attached non-null buffer without a staged `rendered` request explicitly clears the association
 inherited by bufferless commits; it must not silently retain the previous buffer's sample ID.
 
-HypXRland records at least:
+The completed design must eventually record:
 
 - the sample ID the buffer claims;
 - sample and target times;
@@ -214,8 +232,17 @@ HypXRland records at least:
 - whether the buffer was presented, superseded, or rejected;
 - pose age when the buffer was consumed by the XR frame.
 
+The prototype currently retains only the activation epoch and sample ID on the `wl_surface` state;
+the remaining timing and presentation observations are deferred.
+
 An unknown, already-consumed, future, or activation-old ID is a protocol error or an explicitly
 untracked commit; it must never be silently paired with the newest pose.
+
+The prototype lands the association through `wl_surface` state and queued commits, but not through
+the compositor renderer's output-buffer generation. Reading the surface's current association from
+an output `presented` callback would be incorrect: a newer surface commit can already be current
+while the callback refers to an older composite. Exact presentation attribution therefore remains
+deferred until the render/output path carries commit generation and association together.
 
 ### 5.4 Event stream before shared memory
 
@@ -271,6 +298,10 @@ Both timestamps must have documented clock domains. `XrTime` must not be exposed
 that relationship. A protocol can either expose a compositor monotonic sample time plus target
 delta, or negotiate a clock-domain identifier and conversion. Sample IDs remain authoritative even
 when a timestamp cannot be mapped exactly.
+
+The current prototype deliberately does not advertise monotonic timestamps and sends zero in all
+sample/target time words. This is an explicit unavailable value, not a claim that raw `XrTime` is a
+POSIX monotonic timestamp.
 
 Velocity-based prediction and client-specific render-time estimates can be evaluated only after
 pose-age measurements exist. Prediction is not required for the first proof.
@@ -462,6 +493,10 @@ protocol is considered stable.
 
 Each stage should land independently with its own rollback and evidence.
 
+The synthetic prototype covers the compositor/client slices of Stages 0, 2, and 3. The bullets
+below remain completion criteria for the general design; unchecked game, timing, observability,
+and renderer-carrier work is not implied by the native proof.
+
 ### Stage 0 — math and game invariants, no live transport
 
 - Add an OpenXR-header-free pure HypXRland geometry helper that transforms synthetic world-space
@@ -509,6 +544,48 @@ Each stage should land independently with its own rollback and evidence.
 - Validate a second native client or game integration before considering a compositor-neutral
   protocol proposal.
 
+### 13.1 Build and run the native proof
+
+Build the client without configuring the full compositor tree:
+
+```sh
+cmake -S hyprtester -B build-viewpoint-demo -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-viewpoint-demo --target viewpoint-demo -j
+```
+
+The renderer can produce deterministic active and fallback images without Wayland or OpenXR:
+
+```sh
+./build-viewpoint-demo/viewpoint-demo --render /tmp/viewpoint-active.ppm
+./build-viewpoint-demo/viewpoint-demo --render-fallback /tmp/viewpoint-fallback.ppm
+```
+
+Live feedback is privacy-gated by an explicit window rule. The client already declares
+`stereo:sbs`; the stereo rule opts into honoring that declaration, while `viewpoint on` authorizes
+head-pose-relative feedback only for this app ID:
+
+```ini
+windowrule = stereo auto, match:xdg_tag ^stereo:sbs$
+windowrule = viewpoint on, match:class ^(hypxr-viewpoint-demo)$
+```
+
+Launch the demo on one dedicated XR monitor, with its anchor local and docked, then run:
+
+```sh
+./build-viewpoint-demo/viewpoint-demo --debug
+```
+
+The default per-eye render budget is at most 256×144. The client chooses an exact-aspect size from
+the configured destination: a 3840×1080 packed destination uses 256×144 per eye and a 512×144
+full-SBS buffer, while 1920×1080 uses 128×144 per eye and a 256×144 full-SBS buffer.
+`wp_viewporter` scales the whole packed buffer to the exact fullscreen destination. `--width` and
+`--height` change the per-eye upper bounds. `--windowed` is useful for fallback inspection but is
+intentionally ineligible for feedback. In a successful live proof, lateral head movement shifts
+near, middle, and far geometry by different amounts, the cyan portal reticle stays
+surface-centered, and the red authoritative world-space aim impact changes projection without
+changing its world coordinate. Stereo disparity without that depth-dependent motion is not a
+successful portal-parallax result.
+
 ## 14. Tests and acceptance criteria
 
 ### 14.1 Pure math
@@ -528,7 +605,7 @@ Each stage should land independently with its own rollback and evidence.
 - only the owning, authorized surface receives samples;
 - denial, revocation, surface destruction, remap, and XR session loss invalidate the object;
 - sample IDs are monotonic within an activation and cannot cross activation epochs;
-- `rendered(sample_id)` applies to exactly the next commit carrying a newly attached non-null
+- `rendered(epoch, sample_id)` applies to exactly the next commit carrying a newly attached non-null
   buffer; bufferless and null-buffer commits do not consume it;
 - a newly attached, untagged non-null buffer clears the association retained across bufferless
   commits;
