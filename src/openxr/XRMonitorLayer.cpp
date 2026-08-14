@@ -10,6 +10,7 @@
 #include "../debug/log/Logger.hpp"
 #include "XRDmabufImport.hpp" // OpenXR::shouldStashPresentedBuffer (cross-GPU stale-buffer guard)
 #include "XRStereoPair.hpp"   // WP X1: the stereo quad-pair policy (pure)
+#include "OpenXRManager.hpp"
 #include "../config/ConfigValue.hpp"
 #include "../desktop/view/Window.hpp"
 #include "../managers/fullscreen/FullscreenController.hpp"
@@ -19,6 +20,44 @@
 
 CXRMonitorLayer::CXRMonitorLayer(const std::string& name, uint64_t seq, float sizeMeters) : m_monitorName(name), m_sizeMeters(sizeMeters), m_seq(seq) {
     ;
+}
+
+void CXRMonitorLayer::setViewpointSubscription(const std::optional<SViewpointSubscription>& subscription) {
+    std::scoped_lock lock(m_viewpointMu);
+    if (m_viewpointSubscription == subscription)
+        return;
+
+    m_viewpointSubscription = subscription;
+    m_viewpointMailbox.clearPending();
+    m_viewpointRuntimeState.store(OpenXR::XR_VIEWPOINT_RUNTIME_UNKNOWN, std::memory_order_release);
+}
+
+std::optional<CXRMonitorLayer::SViewpointSubscription> CXRMonitorLayer::viewpointSubscription() {
+    std::scoped_lock lock(m_viewpointMu);
+    return m_viewpointSubscription;
+}
+
+OpenXR::SXRViewpointPublishResult CXRMonitorLayer::publishViewpointSample(const SViewpointSubscription& subscription, const OpenXR::SXRViewpointEncodedSample& sample) {
+    std::scoped_lock lock(m_viewpointMu);
+    if (m_viewpointSubscription != subscription)
+        return {};
+    return m_viewpointMailbox.publish(sample);
+}
+
+bool CXRMonitorLayer::consumeViewpointSample(SViewpointSubscription& subscription, OpenXR::SXRViewpointMailboxRead& sample) {
+    std::scoped_lock lock(m_viewpointMu);
+    if (!m_viewpointSubscription || !m_viewpointMailbox.consumeLatest(sample))
+        return false;
+    subscription = *m_viewpointSubscription;
+    return true;
+}
+
+void CXRMonitorLayer::revokeViewpointEpoch(uint64_t token) {
+    std::scoped_lock lock(m_viewpointMu);
+    if (!m_viewpointSubscription || m_viewpointSubscription->token != token)
+        return;
+    m_viewpointSubscription->epoch = 0;
+    m_viewpointMailbox.clearPending();
 }
 
 void CXRMonitorLayer::bindToMonitor(PHLMONITOR mon, std::function<void()> onGone) {
@@ -89,6 +128,8 @@ void CXRMonitorLayer::bindToMonitor(PHLMONITOR mon, std::function<void()> onGone
         // the frame thread sees this declaration, any pane-count rebuild must also see its mode.
         publishStereoMode(pmon);
         publishStereoPairLayout(pmon);
+        if (g_pOpenXRManager)
+            g_pOpenXRManager->requestEffectEval();
     });
 
     // destroy: external monitor teardown (hyprctl output destroy, backend teardown).
