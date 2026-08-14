@@ -49,6 +49,9 @@
 #include "XRStereoPair.hpp" // WP X1: the stereo quad-pair policy + pane rect math (pure)
 #include "XRInput.hpp"
 #include "XRPointerDevice.hpp"
+#include "XRViewpointEligibility.hpp"
+#include "../protocols/XRViewpointProtocol.hpp"
+#include "../protocols/core/Compositor.hpp"
 #include "../Compositor.hpp"
 #include "../debug/log/Logger.hpp"
 #include "../config/ConfigValue.hpp"
@@ -142,6 +145,10 @@ void COpenXRManager::init() {
     m_fxWindowActiveListener     = Event::bus()->m_events.window.active.listen([this](PHLWINDOW, Desktop::eFocusReason) { requestEffectEval(); });
     m_fxWindowFullscreenListener = Event::bus()->m_events.window.fullscreen.listen([this](PHLWINDOW) { requestEffectEval(); });
     m_fxWindowCloseListener      = Event::bus()->m_events.window.close.listen([this](PHLWINDOW) { requestEffectEval(); });
+    m_viewpointWindowRulesListener     = Event::bus()->m_events.window.updateRules.listen([this](PHLWINDOW) { requestEffectEval(); });
+    m_viewpointWindowFloatingListener  = Event::bus()->m_events.window.floating.listen([this](PHLWINDOW) { requestEffectEval(); });
+    m_viewpointWindowWorkspaceListener = Event::bus()->m_events.window.moveToWorkspace.listen([this](PHLWINDOW, PHLWORKSPACE) { requestEffectEval(); });
+    m_viewpointMonitorLayoutListener   = Event::bus()->m_events.monitor.layoutChanged.listen([this] { requestEffectEval(); });
     m_fxWorkspaceActiveListener  = Event::bus()->m_events.workspace.active.listen([this](PHLWORKSPACE) { requestEffectEval(); });
     m_fxMonitorAddedListener     = Event::bus()->m_events.monitor.added.listen([this](PHLMONITOR) { requestEffectEval(); });
     m_fxMonitorRemovedListener   = Event::bus()->m_events.monitor.removed.listen([this](PHLMONITOR) { requestEffectEval(); });
@@ -259,6 +266,7 @@ void COpenXRManager::setState(eXRManagerState newState) {
         return;
 
     m_state = newState;
+    requestEffectEval();
 
     if (g_pEventManager)
         g_pEventManager->postEvent(SHyprIPCEvent{"openxrsessionstate", stateToString(newState)});
@@ -1177,6 +1185,7 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
             // a re-don inside it silently cancels.
             if (g_pInputManager)
                 g_pInputManager->recheckIdleInhibitorStatus();
+            requestEffectEval();
             break;
         case eXRStateEventType::LAYER_REMOVED:
             // Removal barrier step 3: the frame thread released a layer's resources and acked.
@@ -1208,6 +1217,26 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
             // desk arrangement after a roam rather than tracking you around the room.
             requestLayout2DSync();
             break;
+        case eXRStateEventType::VIEWPOINT_STATE: {
+            const auto layer        = layerByName(e.str);
+            const auto subscription = layer ? layer->viewpointSubscription() : std::nullopt;
+            if (!subscription || !PROTO::xrViewpoint)
+                break;
+
+            bool hasActiveOwner = false;
+            PROTO::xrViewpoint->forEachViewpoint([&](CXRViewpointResource& viewpoint) {
+                if (viewpoint.token() != subscription->token)
+                    return;
+                hasActiveOwner = true;
+                if (!e.a)
+                    viewpoint.invalidate(HYPXR_VIEWPOINT_V1_INACTIVE_REASON_TRACKING_LOST);
+            });
+            if (!e.a)
+                layer->revokeViewpointEpoch(subscription->token);
+            if (e.a && !hasActiveOwner)
+                requestEffectEval();
+            break;
+        }
         case eXRStateEventType::TRACKING: Log::logger->log(Log::DEBUG, "[OPENXR] device-lock tracking {} (monitor {})", e.a ? "gained" : "lost", e.str); break;
         case eXRStateEventType::SCHEDULE_FRAMES: {
             // Pacing on behalf of the frame thread (see the frame loop): scheduleFrame() is
@@ -1317,6 +1346,8 @@ void COpenXRManager::onFrameChannelReadable() {
         else if (auto* ie = std::get_if<SXRInputEvent>(&item))
             dispatchInputEvent(*ie);
     }
+
+    drainViewpointSamples();
 
     // report 12 §3a: a runtime recenter (the user pressed the recenter button) moved LOCAL_FLOOR
     // under us. Every anchor was re-expressed into the new space by the frame loop, but the latched
@@ -1497,6 +1528,25 @@ void COpenXRManager::frameThread() {
         // space. Only delivers real input while the session is FOCUSED (a success code otherwise).
         if (m_input)
             m_input->sample(fs.predictedDisplayTime, m_session->m_refSpace);
+
+        // One PRIMARY_STEREO locate per runtime frame, shared by every subscribed surface. These
+        // are real per-eye view positions at predictedDisplayTime; the XrTime itself is not exposed
+        // because no XrTime↔CLOCK_MONOTONIC conversion has been established.
+        std::array<XrView, 2> viewpointViews{};
+        for (auto& view : viewpointViews)
+            view.type = XR_TYPE_VIEW;
+        bool anyViewpointSubscription = std::ranges::any_of(active, [](const auto& layer) { return layer->viewpointSubscription().has_value(); });
+        bool viewpointViewsValid      = false;
+        if (visible && anyViewpointSubscription) {
+            XrViewLocateInfo locateInfo{XR_TYPE_VIEW_LOCATE_INFO};
+            locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+            locateInfo.displayTime           = fs.predictedDisplayTime;
+            locateInfo.space                 = m_session->m_refSpace;
+            XrViewState viewState{XR_TYPE_VIEW_STATE};
+            uint32_t    viewCount = 0;
+            viewpointViewsValid   = XR_SUCCEEDED(xrLocateViews(m_session->m_session, &locateInfo, &viewState, viewpointViews.size(), &viewCount, viewpointViews.data())) &&
+                viewCount == viewpointViews.size() && (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT);
+        }
 
         // Per-layer: ensure a swapchain, then blit the latest presented buffer into it.
         bool lostInFrame = false; // set if a per-layer xr call reveals a dead/wedged runtime
@@ -2164,6 +2214,56 @@ void COpenXRManager::frameThread() {
                     }
                     l->m_cursorPacked[hand].store(packed, std::memory_order_release);
                 }
+            }
+        }
+
+        // Publish surface-relative eye geometry only after input/gaze processing. A grab or carry
+        // can begin in that pass; checking afterward prevents one last stable-looking sample from
+        // escaping after the layer has entered any hand/device/gaze late-latched path.
+        {
+            std::scoped_lock lock(m_layersMu);
+            for (size_t i = 0; i < active.size(); ++i) {
+                auto&      layer        = active[i];
+                const auto subscription = layer->viewpointSubscription();
+                if (!subscription)
+                    continue;
+
+                if (layer->m_viewpointFrameToken != subscription->token) {
+                    layer->m_viewpointFrameToken  = subscription->token;
+                    layer->m_viewpointFrameSerial = 0;
+                }
+
+                bool valid = visible && viewpointViewsValid && solved[i] && layer->m_quadsSubmitted.load(std::memory_order_relaxed) == 2 &&
+                    layer->m_anchor.state().mode == OpenXR::XR_ANCHOR_LOCAL && !layer->m_anchor.grabbed() && !layer->m_anchor.gazeGrabbed() &&
+                    (!layer->m_anchor.adaptiveEnabled() || layer->m_anchor.adaptivePhase() == OpenXR::XRAD_DOCKED) && results[i].space == OpenXR::XR_SPACE_LOCAL_FLOOR &&
+                    layer->m_viewpointFrameSerial != std::numeric_limits<uint64_t>::max();
+
+                OpenXR::SXRViewpointEncodedSample sample;
+                if (valid) {
+                    OpenXR::SXRPose contentPose = results[i].worldPose;
+                    if (!m_session->m_usingLocalFloor)
+                        contentPose.pos.y -= floorOffset;
+                    const std::array<OpenXR::Vec3, 2> viewPositions{
+                        OpenXR::Vec3{viewpointViews[0].pose.position.x, viewpointViews[0].pose.position.y, viewpointViews[0].pose.position.z},
+                        OpenXR::Vec3{viewpointViews[1].pose.position.x, viewpointViews[1].pose.position.y, viewpointViews[1].pose.position.z},
+                    };
+                    const auto geometry = OpenXR::surfaceRelativeViewpoint(contentPose, results[i].widthMeters, results[i].heightMeters, viewPositions, 2);
+                    valid = OpenXR::encodeViewpointSample(geometry, ++layer->m_viewpointFrameSerial, subscription->geometryId, sample) && sample.widthUM == subscription->widthUM &&
+                        sample.heightUM == subscription->heightUM;
+                }
+
+                const auto PREVIOUS   = sc<OpenXR::eXRViewpointRuntimeState>(layer->m_viewpointRuntimeState.load(std::memory_order_acquire));
+                const auto TRANSITION = OpenXR::viewpointRuntimeTransition(PREVIOUS, valid);
+                if (TRANSITION.changed) {
+                    layer->m_viewpointRuntimeState.store(TRANSITION.state, std::memory_order_release);
+                    enqueue(SXRStateEvent{.type = eXRStateEventType::VIEWPOINT_STATE, .a = valid ? 1 : 0, .str = layer->m_monitorName});
+                }
+                if (!valid)
+                    continue;
+
+                const auto published = layer->publishViewpointSample(*subscription, sample);
+                if (published.shouldWake)
+                    wakeMain();
             }
         }
 
@@ -3981,6 +4081,178 @@ void COpenXRManager::requestEffectEval() {
 void COpenXRManager::onEffectEvalDue() {
     m_effectEvalQueued = false;
     evaluateMonitorEffects();
+    reevaluateViewpoints();
+}
+
+void COpenXRManager::invalidateViewpoints(uint32_t reason) {
+    {
+        std::scoped_lock lock(m_layersMu);
+        for (auto& layer : m_layers)
+            layer->setViewpointSubscription(std::nullopt);
+    }
+
+    if (!PROTO::xrViewpoint)
+        return;
+    PROTO::xrViewpoint->forEachViewpoint([reason](CXRViewpointResource& viewpoint) { viewpoint.invalidate(sc<hypxrViewpointV1InactiveReason>(reason)); });
+}
+
+void COpenXRManager::reevaluateViewpoints() {
+    if (!PROTO::xrViewpoint)
+        return;
+
+    std::vector<CXRViewpointResource*> viewpoints;
+    PROTO::xrViewpoint->forEachViewpoint([&](CXRViewpointResource& viewpoint) { viewpoints.push_back(&viewpoint); });
+    std::ranges::sort(viewpoints, [](const auto* a, const auto* b) {
+        const auto AS = a->surface();
+        const auto BS = b->surface();
+        return AS && BS ? AS->id() < BS->id() : std::less<>{}(a, b);
+    });
+
+    std::scoped_lock              lock(m_layersMu);
+    std::vector<CXRMonitorLayer*> claimed;
+    for (auto* viewpoint : viewpoints) {
+        if (!viewpoint->enabled())
+            continue;
+        if (!viewpoint->requested()) {
+            viewpoint->invalidate(HYPXR_VIEWPOINT_V1_INACTIVE_REASON_NOT_SUPPORTED);
+            continue;
+        }
+
+        const auto SURFACE = viewpoint->surface();
+        if (!SURFACE || !SURFACE->m_hlSurface) {
+            viewpoint->invalidate(HYPXR_VIEWPOINT_V1_INACTIVE_REASON_NOT_ELIGIBLE);
+            continue;
+        }
+
+        const auto WINDOW = Desktop::View::CWindow::fromView(SURFACE->m_hlSurface->view());
+        if (!WINDOW || !WINDOW->m_ruleApplicator->viewpoint().valueOrDefault()) {
+            viewpoint->invalidate(HYPXR_VIEWPOINT_V1_INACTIVE_REASON_NOT_AUTHORIZED);
+            continue;
+        }
+
+        if (!sessionVisible() || !m_monitorViewVisible.load(std::memory_order_acquire) || (m_userPresenceSupported && (!m_presenceKnown || !m_userPresent))) {
+            viewpoint->invalidate(HYPXR_VIEWPOINT_V1_INACTIVE_REASON_XR_INACTIVE);
+            continue;
+        }
+
+        const auto MONITOR = WINDOW->m_monitor.lock();
+        if (!MONITOR || !WINDOW->m_isMapped || WINDOW->isHidden() || !WINDOW->m_workspace || !WINDOW->m_workspace->isVisible() || !WINDOW->wlSurface()->exists() ||
+            WINDOW->wlSurface()->resource() != SURFACE || !SURFACE->m_mapped || SURFACE->hasVisibleSubsurface() || SURFACE->m_current.offset != Vector2D{} ||
+            !OpenXR::viewpointSBSBufferMapping(SURFACE->m_current.bufferSize, SURFACE->m_current.size, MONITOR->m_size, SURFACE->m_current.viewport.hasSource,
+                                               SURFACE->m_current.viewport.hasDestination, SURFACE->m_current.viewport.destination,
+                                               SURFACE->m_current.transform == WL_OUTPUT_TRANSFORM_NORMAL, SURFACE->m_current.scale) ||
+            WINDOW->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT) != MONITOR->m_position ||
+            WINDOW->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT) != MONITOR->m_size || Fullscreen::controller()->getFullscreenWindow(MONITOR) != WINDOW ||
+            !Fullscreen::controller()->isFullscreen(WINDOW, Fullscreen::FSMODE_FULLSCREEN, true) || WINDOW->stereoLayout() != Render::Stereo::CONTENT_SBS) {
+            viewpoint->invalidate(HYPXR_VIEWPOINT_V1_INACTIVE_REASON_NOT_ELIGIBLE);
+            continue;
+        }
+
+        const auto LAYERIT =
+            std::ranges::find_if(m_layers, [&](const auto& layer) { return !layer->m_pendingRemoval.load(std::memory_order_acquire) && layer->m_monitor.lock() == MONITOR; });
+        if (LAYERIT == m_layers.end()) {
+            viewpoint->invalidate(HYPXR_VIEWPOINT_V1_INACTIVE_REASON_NOT_ELIGIBLE);
+            continue;
+        }
+
+        auto& LAYER = *LAYERIT;
+        if (std::ranges::find(claimed, LAYER.get()) != claimed.end()) {
+            viewpoint->invalidate(HYPXR_VIEWPOINT_V1_INACTIVE_REASON_SUPERSEDED);
+            continue;
+        }
+        if (LAYER->m_anchor.state().mode != OpenXR::XR_ANCHOR_LOCAL || LAYER->m_anchor.grabbed() || LAYER->m_anchor.gazeGrabbed() ||
+            (LAYER->m_anchor.adaptiveEnabled() && LAYER->m_anchor.adaptivePhase() != OpenXR::XRAD_DOCKED)) {
+            viewpoint->invalidate(HYPXR_VIEWPOINT_V1_INACTIVE_REASON_NOT_ELIGIBLE);
+            continue;
+        }
+
+        const float WIDTH   = LAYER->m_anchor.state().widthMeters;
+        const float HEIGHT  = WIDTH * Render::Stereo::presentedAspect(MONITOR->m_pixelSize, Render::Stereo::CONTENT_SBS);
+        uint32_t    widthUM = 0, heightUM = 0;
+        if (!OpenXR::encodeViewpointDimensionUM(WIDTH, widthUM) || !OpenXR::encodeViewpointDimensionUM(HEIGHT, heightUM)) {
+            viewpoint->invalidate(HYPXR_VIEWPOINT_V1_INACTIVE_REASON_NOT_ELIGIBLE);
+            continue;
+        }
+
+        const auto RUNTIME_STATE = sc<OpenXR::eXRViewpointRuntimeState>(LAYER->m_viewpointRuntimeState.load(std::memory_order_acquire));
+        const auto EXISTING      = LAYER->viewpointSubscription();
+        if (RUNTIME_STATE != OpenXR::XR_VIEWPOINT_RUNTIME_INVALID && EXISTING &&
+            OpenXR::viewpointActivationUnchanged(EXISTING->surfaceId, SURFACE->id(), EXISTING->epoch, EXISTING->token, viewpoint->token(), EXISTING->widthUM, widthUM,
+                                                 EXISTING->heightUM, heightUM, EXISTING->anchorState == LAYER->m_anchor.state())) {
+            claimed.push_back(LAYER.get());
+            continue;
+        }
+        if (RUNTIME_STATE == OpenXR::XR_VIEWPOINT_RUNTIME_INVALID) {
+            if ((!EXISTING || EXISTING->surfaceId != SURFACE->id()) &&
+                (m_viewpointTokenCounter == std::numeric_limits<uint64_t>::max() || m_viewpointGeometryCounter == std::numeric_limits<uint64_t>::max())) {
+                viewpoint->invalidate(HYPXR_VIEWPOINT_V1_INACTIVE_REASON_NOT_ELIGIBLE);
+                continue;
+            }
+            const uint64_t TOKEN      = EXISTING && EXISTING->surfaceId == SURFACE->id() ? EXISTING->token : ++m_viewpointTokenCounter;
+            const uint64_t GEOMETRYID = EXISTING && EXISTING->surfaceId == SURFACE->id() ? EXISTING->geometryId : ++m_viewpointGeometryCounter;
+            LAYER->setViewpointSubscription(CXRMonitorLayer::SViewpointSubscription{
+                .token       = TOKEN,
+                .epoch       = 0,
+                .geometryId  = GEOMETRYID,
+                .surfaceId   = SURFACE->id(),
+                .widthUM     = widthUM,
+                .heightUM    = heightUM,
+                .anchorState = LAYER->m_anchor.state(),
+            });
+            viewpoint->invalidate(HYPXR_VIEWPOINT_V1_INACTIVE_REASON_TRACKING_LOST);
+            claimed.push_back(LAYER.get());
+            continue;
+        }
+
+        if (m_viewpointTokenCounter == std::numeric_limits<uint64_t>::max() || m_viewpointGeometryCounter == std::numeric_limits<uint64_t>::max()) {
+            viewpoint->invalidate(HYPXR_VIEWPOINT_V1_INACTIVE_REASON_NOT_ELIGIBLE);
+            continue;
+        }
+
+        const uint64_t TOKEN      = ++m_viewpointTokenCounter;
+        const uint64_t GEOMETRYID = ++m_viewpointGeometryCounter;
+        const uint64_t EPOCH      = viewpoint->activate(TOKEN, GEOMETRYID, widthUM, heightUM);
+        if (EPOCH == 0)
+            continue;
+        LAYER->setViewpointSubscription(CXRMonitorLayer::SViewpointSubscription{
+            .token       = TOKEN,
+            .epoch       = EPOCH,
+            .geometryId  = GEOMETRYID,
+            .surfaceId   = SURFACE->id(),
+            .widthUM     = widthUM,
+            .heightUM    = heightUM,
+            .anchorState = LAYER->m_anchor.state(),
+        });
+        claimed.push_back(LAYER.get());
+    }
+
+    for (auto& layer : m_layers)
+        if (std::ranges::find(claimed, layer.get()) == claimed.end())
+            layer->setViewpointSubscription(std::nullopt);
+}
+
+void COpenXRManager::drainViewpointSamples() {
+    if (!PROTO::xrViewpoint)
+        return;
+
+    struct SDelivery {
+        uint64_t                          token = 0;
+        OpenXR::SXRViewpointEncodedSample sample;
+    };
+    std::vector<SDelivery> deliveries;
+    {
+        std::scoped_lock lock(m_layersMu);
+        deliveries.reserve(m_layers.size());
+        for (auto& layer : m_layers) {
+            CXRMonitorLayer::SViewpointSubscription subscription;
+            OpenXR::SXRViewpointMailboxRead         sample;
+            if (layer->consumeViewpointSample(subscription, sample))
+                deliveries.push_back({.token = subscription.token, .sample = sample.sample});
+        }
+    }
+
+    for (const auto& delivery : deliveries)
+        PROTO::xrViewpoint->deliverSample(delivery.token, delivery.sample);
 }
 
 OpenXR::eXRAnchorState COpenXRManager::layerAnchorState(const PXRLAYER& layer) {
@@ -5981,6 +6253,7 @@ std::expected<void, std::string> COpenXRManager::cmdView(const std::string& args
     const bool wasVisible = m_monitorViewVisible.load(std::memory_order_acquire);
     const bool visible    = arg == "toggle" ? !wasVisible : arg == "on";
     m_monitorViewVisible.store(visible, std::memory_order_release);
+    requestEffectEval();
 
     if (!visible) {
         // Status should reflect the gate immediately instead of retaining last frame's quad count or

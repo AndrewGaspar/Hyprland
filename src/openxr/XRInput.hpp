@@ -61,6 +61,7 @@ enum class eXRStateEventType : uint8_t {
     SCHEDULE_FRAMES, // pacing: main thread must scheduleFrame() the visible XR monitors —
                      // aquamarine's idle-callback list is not thread-safe, so the frame thread
                      // may NOT call CMonitor::scheduleFrame() directly (heap corruption)
+    VIEWPOINT_STATE, // subscribed layer stable-valid edge (a=1) or tracking/geometry loss (a=0)
 };
 
 struct SXRStateEvent {
