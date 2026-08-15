@@ -96,14 +96,16 @@ TEST(XRViewpointEligibility, MixedSurfaceOrderIsAStrictWeakOrdering) {
     for (const auto& a : KEYS)
         for (const auto& b : KEYS)
             for (const auto& c : KEYS) {
-                if (viewpointOrderBefore(a, b) && viewpointOrderBefore(b, c))
+                if (viewpointOrderBefore(a, b) && viewpointOrderBefore(b, c)) {
                     EXPECT_TRUE(viewpointOrderBefore(a, c)) << "transitivity";
+                }
 
                 // Transitivity of incomparability — the axiom the old comparator broke.
                 const bool AB = !viewpointOrderBefore(a, b) && !viewpointOrderBefore(b, a);
                 const bool BC = !viewpointOrderBefore(b, c) && !viewpointOrderBefore(c, b);
-                if (AB && BC)
+                if (AB && BC) {
                     EXPECT_TRUE(!viewpointOrderBefore(a, c) && !viewpointOrderBefore(c, a)) << "transitivity of incomparability";
+                }
             }
 }
 
