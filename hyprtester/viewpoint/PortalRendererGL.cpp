@@ -1,7 +1,6 @@
 #include "PortalRendererGL.hpp"
 
 #include <array>
-#include <cmath>
 #include <format>
 #include <string_view>
 #include <vector>
@@ -255,6 +254,12 @@ void main() {
 
     // trace() and the derivative below run for every fragment, reticle included, so
     // fwidth() is always reached in uniform control flow.
+    //
+    // Across a silhouette the quad straddles two surfaces and the derivative is not a
+    // footprint at all, but the filter is self-limiting: a huge radius integrates whole
+    // cells and converges on the grid's duty cycle, which is exactly what an
+    // infinitely distant surface should return. The artifact is therefore one rim of
+    // wall pixels shaded as if very far away, not a smear.
     SHit hit   = trace(eye, dir);
     vec3 color = resolve(hit, fwidth(hit.cell));
 
