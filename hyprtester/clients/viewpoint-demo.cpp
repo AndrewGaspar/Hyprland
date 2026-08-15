@@ -544,8 +544,7 @@ static void destroyObjects(SApp& app) {
         app.xdgWmBase->sendDestroy();
     if (app.shm)
         app.shm->sendRelease();
-    if (app.compositor)
-        app.compositor->sendRelease();
+    // wl_compositor has no destructor request; the proxy is dropped with the connection.
 }
 
 static bool writePpm(const std::string& path, const SImage& image) {
