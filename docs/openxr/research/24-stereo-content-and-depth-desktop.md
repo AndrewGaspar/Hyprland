@@ -1,7 +1,9 @@
 # Research: stereoscopic 3D content + a depth-styled desktop
 
-**Status:** research / decision-support. **Nothing is implemented.** This memo answers two
-questions that turn out to be the same question:
+**Status (updated 2026-08-14):** the core flat-SBS, stereo-window, depth-desktop, and OpenXR
+pair paths described here are implemented. The authoritative user reference is doc 05 §§8.5–8.9;
+this memo remains decision history plus the tuning/generalization backlog. It answers two questions
+that turn out to be the same question:
 
 - **Q1 — stereo content.** When a window or a monitor contains side-by-side / half-SBS /
   over-under stereo content (the user's Dead Space mod, a 3D movie in mpv, a YouTube 3D clip),
@@ -2284,9 +2286,10 @@ optional; it is now Phase F.
 > same thing (and `xrrule`'s enum-valued effect fold is still the open F8/D7 work). X3 and X4 remain
 > as scoped.
 >
-> Not yet validated in a headset — the pair has never been looked at through a Quest or an XREAL.
-> §14's open question 1 (does the XREAL's scanline split interact with a half-covering quad) is
-> still open and this is what would answer it.
+> Attended Quest validation arrived on 2026-08-14: the depth desktop visibly raised a focused
+> terminal, and the tagged full-SBS viewpoint demo resolved correctly through the per-eye path.
+> XREAL validation remains open, including §14's question 1 about its scanline split interacting
+> with a half-covering quad.
 
 > **STATUS (WP X3 + X4): IMPLEMENTED**, shipped together because splitting them would have shipped
 > a regression — see point 3. `openxr:depth_desktop`, default ON.
@@ -2370,10 +2373,11 @@ optional; it is now Phase F.
 > chrome pass ran — otherwise "my monitor stopped being grabbable" is a bug report with nothing to
 > look at.
 >
-> **Not yet validated in a headset.** The depth desktop has never been looked at through a Quest or
-> an XREAL, and §14's open questions 4 (`depth_scale` default) and 11 (reading at a rung) are exactly
-> what an XR monitor at arm's length answers. D0's ergonomics spike is now runnable in the place it
-> was always meant for.
+> **Attended proof, not ergonomic certification.** On 2026-08-14 the wearer confirmed on Quest 3
+> that a focused terminal was visibly raised from neighboring desktop content. That establishes
+> that the depth pair and disparity reach the headset. It does not answer §14's open questions 4
+> (`depth_scale` default), 11 (reading at a rung), comfort over time, capture behavior, or XREAL
+> tuning; D0's systematic ergonomics pass remains open.
 
 **Suggested order:** F0 → **F1** → F2 → F3 → F4 → S0 → **S1** → S2 → S3 → S5 → **ship Q1, flat**
 → X1 → X2 → **ship Q1, XR** → D0 → D1 → **D2** → D4 → **ship Q2, flat** → X3 → D5 → F5 → X4 →
@@ -2386,11 +2390,8 @@ SBS mode. The XR tier then lands as a small delta on a producer that is already 
 Rough totals: **Phase F core (F1–F3) ≈ 450–650 lines**, dominated by F1's fifteen touch points
 and F2's cursor work. **Phase S core (S1–S3) is IMPLEMENTED** — S1, S2, S3 and S5 all landed, so
 Q1 on the flat presenter is complete end to end: declaration, crop, tests, docs and the mpv
-helper. Only S0 (a headset eyeball check) and the XR tier (X1) remain before "ship Q1".
-**Phase D core (D1–D2, D4) **Phase D core (D1–D2, D4)
-≈ 700–900 lines**, dominated by the producer and the 14 `m_floatingOffset` call sites. **Phase X
-(X1–X3) ≈ 250–350 lines** — the cheapest phase, and now the last one, which is the whole point of
-the inversion. **X1–X4 are IMPLEMENTED.** X1 + X2 came in at the low end: the submission change is
+helper. **Phase D core (D1–D2, D4) is IMPLEMENTED**; the remaining D work is ergonomic tuning and
+optional polish/generalization. **Phase X (X1–X4) is IMPLEMENTED.** X1 + X2 came in at the low end: the submission change is
 ~90 lines in the frame loop, on top of a ~135-line pure header and its tests. X3 + X4 overran it,
 but not where the estimate expected — the pane geometry and the second producer are ~180 lines of
 pure header, and the largest single piece is not OpenXR at all but the two-directional pack in

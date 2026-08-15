@@ -1,8 +1,11 @@
 # Research: WiVRn multi-GPU — the OpenXR client renders on a different GPU than the compositor
 
-**Status:** research + **measured**, and **round 1 of the workplan is implemented** (WP-XG-B1, XG1,
-XG2, XG3 — see §8.1 for what landed, what deviated and what is still unproven). The rest of the
-workplan is not. The architectural findings are
+**Status (updated 2026-08-14):** research + **measured**; the carried XG-B1/XG1–XG7 mechanism and
+XG8 bring-up progressed through rounds 1–7 across `/home/ajg/code/wivrn-xg` and the Proton carrier,
+and a real xrizer/DXVK client reached `FOCUSED` (see §§8.1–8.5). The later Meta work added
+client-local D32S8 and staged D3D11 color, but
+visible Walkabout output and steady-state performance are not certified; doc 09 is the concise
+current compatibility status. XG9 performance/fast-path verification remains open. The architectural findings are
 code-read against WiVRn 26.6.2 at `~/code/wivrn-26.6.2` (branch `hypxr-patches-26.6.2`, read-only —
 another session owns that tree) and its vendored Monado `1b526bb3a0ff326ecd05af4c2c541407f53c6d4b`
 at `build-server-26.6.2/_deps/monado-src`. The **cross-vendor buffer-sharing findings in §4 are not
