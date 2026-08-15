@@ -359,6 +359,11 @@ bool ViewpointDemo::feedbackShouldBeEnabled(const SFeedbackState& state) {
     return state.capabilitiesSupported && state.mappingSupported && !state.stickyDisabled;
 }
 
+bool ViewpointDemo::portalSceneValid(const SPortalSize& portal, const SStereoViews& views) {
+    return std::isfinite(portal.widthMeters) && std::isfinite(portal.heightMeters) && portal.widthMeters > 0.0 && portal.heightMeters > 0.0 && finiteVec(views.left) &&
+        finiteVec(views.right) && views.left.z > 1e-6 && views.right.z > 1e-6;
+}
+
 bool ViewpointDemo::portalRay(const SVec3& eye, const SPortalSize& portal, uint32_t pixelX, uint32_t pixelY, uint32_t paneWidth, uint32_t paneHeight, SRay& out) {
     out = {};
     if (!finiteVec(eye) || !std::isfinite(portal.widthMeters) || !std::isfinite(portal.heightMeters) || portal.widthMeters <= 0.0 || portal.heightMeters <= 0.0 || eye.z <= 1e-6 ||
@@ -378,8 +383,7 @@ uint32_t ViewpointDemo::defaultRenderThreads() {
 }
 
 bool ViewpointDemo::renderPortalSBS(const SImage& image, const SPortalSize& portal, const SStereoViews& views, uint32_t threads) {
-    if (!imageValid(image) || !std::isfinite(portal.widthMeters) || !std::isfinite(portal.heightMeters) || portal.widthMeters <= 0.0 || portal.heightMeters <= 0.0 ||
-        !finiteVec(views.left) || !finiteVec(views.right) || views.left.z <= 1e-6 || views.right.z <= 1e-6)
+    if (!imageValid(image) || !portalSceneValid(portal, views))
         return false;
 
     const uint32_t PANE_WIDTH = image.width / 2U;
@@ -453,6 +457,43 @@ bool ViewpointDemo::renderFallbackSBS(const SImage& image, uint32_t threads) {
     });
 
     return true;
+}
+
+ViewpointDemo::SImageDelta ViewpointDemo::compareImages(const SImage& reference, const SImage& candidate, uint32_t tolerance) {
+    SImageDelta delta;
+    if (!imageValid(reference) || !imageValid(candidate) || reference.width != candidate.width || reference.height != candidate.height)
+        return delta;
+
+    delta.comparable = true;
+    delta.pixels     = sc<uint64_t>(reference.width) * reference.height;
+
+    for (uint32_t y = 0; y < reference.height; ++y) {
+        for (uint32_t x = 0; x < reference.width; ++x) {
+            const uint32_t LEFT  = reference.pixels[sc<size_t>(y) * reference.stridePixels + x];
+            const uint32_t RIGHT = candidate.pixels[sc<size_t>(y) * candidate.stridePixels + x];
+            if (((LEFT ^ RIGHT) & 0x00FFFFFFU) == 0)
+                continue;
+
+            uint32_t worst = 0;
+            for (uint32_t shift : {16U, 8U, 0U}) {
+                const uint32_t A = (LEFT >> shift) & 0xFFU;
+                const uint32_t B = (RIGHT >> shift) & 0xFFU;
+                worst            = std::max(worst, A > B ? A - B : B - A);
+            }
+
+            ++delta.differing;
+            if (worst > tolerance)
+                ++delta.outliers;
+            if (worst > delta.maxDelta) {
+                delta.maxDelta       = worst;
+                delta.worstX         = x;
+                delta.worstY         = y;
+                delta.worstReference = LEFT;
+                delta.worstCandidate = RIGHT;
+            }
+        }
+    }
+    return delta;
 }
 
 uint64_t ViewpointDemo::pixelHash(const SImage& image) {
