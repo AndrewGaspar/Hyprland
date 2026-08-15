@@ -184,9 +184,13 @@ protocolnew("staging/xdg-toplevel-tag" "xdg-toplevel-tag-v1" false)
 protocolnew("../protocols" "hypxr-viewpoint-v1" true)
 protocolnew("stable/viewporter" "viewporter" false)
 
+# The CPU raymarcher spreads rows over a persistent worker pool (docs/openxr/
+# 10-view-dependent-surfaces.md §13.1), so it needs pthreads wherever it is linked:
+# the standalone viewpoint-demo here and hyprland_gtests from the root project.
+find_package(Threads REQUIRED)
 add_library(hypxr-viewpoint-demo-renderer STATIC viewpoint/PortalRenderer.cpp)
 target_include_directories(hypxr-viewpoint-demo-renderer PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/viewpoint")
-target_link_libraries(hypxr-viewpoint-demo-renderer PUBLIC PkgConfig::protocols_deps)
+target_link_libraries(hypxr-viewpoint-demo-renderer PUBLIC PkgConfig::protocols_deps Threads::Threads)
 
 clientNew("pointer-warp" PROTOS "pointer-warp-v1" "xdg-shell")
 clientNew("surface-scale-transform" PROTOS "fractional-scale-v1" "xdg-shell")
