@@ -753,6 +753,14 @@ transports, one implementation.
 | `blackalpha` | `<name\|active> <0..1\|off\|auto>` | Manual luma-key override (§3.5). `off` disables keying on that monitor; `auto` hands it back to the rules. |
 | `sync` | *(none)* \| `freeze` \| `thaw` | 2D-plane sync. Bare: re-latch the desk orientation and re-derive the 2D layout **now**. `freeze` pauses the automatic recompute (rearrange quads without your mouse mapping moving under you); `thaw` resumes it and catches up. Same implementation as `hyprctl openxr sync-layout`. |
 
+**“Center” has three different meanings.** `xrmonitor center` moves only the currently selected
+monitor; it is not an all-monitor recenter. `xrmonitor sync` / `hyprctl openxr sync-layout`
+re-latches the 2D mouse/workspace projection around the current head pose but does not move any
+quad. `openxr:recenter_on_plug = true` is the operation that re-seats every declared
+`anchor:local` monitor as one rigid arrangement around the current head pose, and it runs only on
+the first plug/don of a newly started OpenXR session. There is currently no one-shot dispatcher
+that performs that all-local-monitor re-seat without restarting the session.
+
 **Selected-target resolution** (for `active` / omitted targets): explicit `select` > last
 ray-hovered monitor > focused-monitor-if-XR — else the verb errors with "no XR monitor
 selected".

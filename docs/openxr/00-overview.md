@@ -55,7 +55,8 @@ Runtimes exercised: **Monado** (including its null compositor for headless testi
 | `07-xreal.md` | the XREAL Air 2 Ultra 3DoF display rig (WP-XR1): udev, the xreal Monado build flavor, the `xreal-ctl` HID helper, the flat↔XR toggle, the 3DoF profile, and the live checklist |
 | `08-machine-setup.md` | bringing the whole stack up on a new machine (`scripts/hypxr-setup.sh`): the eight components, the per-machine decision table (GPU profile, distro paths), Arch/Omarchy vs Fedora/omedora, the force-push-safe update path, and the verification checklist |
 | `09-meta-horizon-compatibility.md` | tested status and known deficiencies for Windows Meta Horizon PC VR titles through Heroic, Proton, WineOpenXR, DXVK, Monado, and WiVRn |
-| `10-view-dependent-surfaces.md` | proposed architecture and staged implementation contract for head-tracked “portal” Wayland surfaces: surface-relative eye points, timing/sample association, pair-latched SBS, Wine integration, security, nesting, and acceptance tests |
+| `10-view-dependent-surfaces.md` | experimental implementation and staged contract for head-tracked “portal” Wayland surfaces: the landed protocol/compositor/native demo, surface-relative eye points, timing/sample association, pair-latched SBS, Wine integration, security, nesting, and acceptance tests |
+| `11-handoff-2026-08.md` | exact cross-repository source/deployment state after the August 2026 portal, Meta compatibility, recorder-control, and HUD-key work; pending attended checks and restart commands |
 
 A ready-to-copy config with every variable, several `xrmonitor` declarations, and example
 binds lives at `example/openxr.conf`. For the XREAL Air 2 Ultra as a 3DoF display, see

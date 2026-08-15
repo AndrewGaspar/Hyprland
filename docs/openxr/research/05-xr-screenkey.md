@@ -1,17 +1,54 @@
-# Design: "screenkey for OpenXR" — a head-locked keystroke display
+# Historical design: "screenkey for OpenXR" — a head-locked keystroke display
 
 Design memo (2026-07-07; **revised 2026-07-08** — added §8 "IPC command
 display", the second lane showing issued hyprctl commands / bind dispatches /
-xr events for demo recordings, plus WPs K9–K12). **No implementation.** Proposes
-a new standalone OpenXR utility, a sibling to `hypxrpaper`, that displays the
-user's keystrokes as a head-locked composition layer, composited alongside
-HypXRland's monitor quads and hypxrpaper's ambient background. The user reviews
-this before any code.
+xr events for demo recordings, plus WPs K9–K12). This is preserved as design history; its
+standalone-OpenXR architecture and work-package status are superseded by the implementation below.
 
 Evidence base: the vendored Monado tree at `subprojects/monado` (pinned
 `c2ddab59d`, the exact runtime the test suite runs against); `hypxrpaper`
 (`/home/ajg/code/hypxrpaper`); HypXRland's `src/openxr/`; and web research on
 `wshowkeys` / `showmethekey` / `screenkey` (URLs cited inline, sourced 2026-07).
+
+---
+
+## Current status (2026-08-14): implemented through HypXRHUD
+
+The film-ready MVP is `hypxrhud-keys` in the sibling `hypxrhud` repository, integrated at commit
+`c9b1a78610a067780048723775802187bb9cdd3d`. It reuses HypXRHUD's existing head-locked `keys`
+panel and D-Bus producer API. It does **not** create another OpenXR session, does not need an
+`XR_EXTX_overlay` placement of its own, and does not implement the proposed IPC-command lane.
+
+The producer launches only the fixed `/usr/bin/showmethekey-cli` JSON backend, translates evdev
+keycodes with xkbcommon's required `+8` offset, and provides chord ordering, repeat suppression,
+coalescing, bounded history, and `--mods-only`. The installed service is static/manual rather than
+login-enabled. The safest manual filming command is:
+
+```sh
+~/.local/bin/hypxrhud-keys --mods-only --verbose
+```
+
+This is intentionally a disclosed, short-lived keylogger. Capture cannot start merely because
+D-Bus accepted a panel: it waits until the numeric ID of the panel visibly labeled `KEY DISPLAY
+ON` has been continuously included in successful XR layer submissions. Loss of that presentation, the HUD D-Bus owner, bus
+processing, or the live runtime terminates the tracked input child and requires a deliberate
+restart. Raw key JSON/text is never logged, no automatic privilege escalation is provided, and no
+automated test or install step starts the capture backend. There is still no reliable automatic
+password-field masking; use `--mods-only`, stop the producer before entering secrets, and keep the
+disclosure in the recording.
+
+One premise in the historical proposal below is incorrect:
+`libinput_udev_assign_seat()` enumerates devices for a seat but does not broker restricted device
+file descriptors through logind. A direct libinput client must still supply an
+`open_restricted`/`close_restricted` backend with adequate device access. The MVP avoids inventing
+that privilege boundary by using the already installed ShowMeTheKey CLI and requiring the account's
+existing input-device policy to permit it. Wayland, input-method, portal, and layer-shell protocols
+do not grant a background client arbitrary global keystrokes.
+
+The authoritative build, privacy, configuration, service, and test documentation is
+`/home/ajg/code/hypxrhud/docs/keys-overlay.md`; the compact cross-repository state is in
+[`../11-handoff-2026-08.md`](../11-handoff-2026-08.md). Everything after this addendum describes
+the earlier proposal and must not be read as the current implementation plan.
 
 ---
 

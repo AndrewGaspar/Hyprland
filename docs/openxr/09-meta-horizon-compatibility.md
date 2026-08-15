@@ -159,6 +159,20 @@ it can take focus, appear on a virtual monitor, or cover desktop content while t
 headset. Route preview windows to a dedicated workspace with normal window policy; the OpenXR
 runtime does not identify or suppress them for HypXRland.
 
+For example, after identifying the preview's stable class/title with `hyprctl clients`, route it to
+a named workspace without changing the current workspace or allowing the preview to take focus:
+
+```ini
+# Replace the matcher with the title/class of the specific game's preview.
+windowrule = workspace name:preview silent, no_initial_focus on, no_focus on, match:title ^.*[Pp]review.*$
+```
+
+This is deliberately ordinary, per-title Hyprland policy. “Preview” is not an OpenXR role and a
+broad title regex can catch unrelated applications, so prefer an exact `match:class` or
+`match:initial_class` when the game exposes one. `silent` prevents the move from switching the
+visible workspace; `no_initial_focus` and `no_focus` prevent the preview from stealing keyboard
+focus. Use `hyprctl dispatch workspace name:preview` when you intentionally want to inspect it.
+
 Monado also delivers controller input to both the primary application and an `XR_EXTX_overlay`
 client. HypXRland does not yet arbitrate a modal "game input versus desktop input" owner. See
 [`05-configuration.md`](05-configuration.md#8-compose-over-another-vr-app--hypxrpaper-overlay-mode)

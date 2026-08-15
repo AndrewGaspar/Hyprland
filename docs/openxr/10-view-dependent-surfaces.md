@@ -569,6 +569,31 @@ windowrule = stereo auto, match:xdg_tag ^stereo:sbs$
 windowrule = viewpoint on, match:class ^(hypxr-viewpoint-demo)$
 ```
 
+There are two different kinds of “tag” in common configurations:
+
+- the demo's **xdg toplevel tag** is `stereo:sbs`, set by the client through
+  `xdg-toplevel-tag-v1`; `match:xdg_tag` matches it;
+- a plain Hyprland **window tag** such as `stereo-sbs` is a user policy selector and is matched by
+  `match:tag`. It is not set by the demo.
+
+If the existing configuration uses the latter policy style, use these rules instead and apply the
+policy tag after the window maps:
+
+```ini
+windowrule = stereo sbs always, match:tag stereo-sbs
+windowrule = viewpoint on, match:class ^(hypxr-viewpoint-demo)$
+
+# Resolve the address from `hyprctl clients`; do not copy this placeholder literally.
+hyprctl dispatch tagwindow +stereo-sbs address:0xWINDOW_ADDRESS
+```
+
+Do not configure both stereo rules merely as a troubleshooting reflex; one matching authorization
+path is enough. If the image looks like a doubled/mispacked SBS surface, inspect the client in
+`hyprctl -j clients`: `xdgTag` should equal `stereo:sbs`, the ordinary `tags` list
+should include `stereo-sbs` only when using the second recipe, and the resolved `stereo` field must
+be `sbs`, not `off`. An output name such as `XR-4` is not evidence that it is non-XR; confirm the
+monitor in `hyprctl -j openxr`.
+
 Launch the demo on one dedicated XR monitor, with its anchor local and docked, then run:
 
 ```sh
@@ -585,6 +610,14 @@ near, middle, and far geometry by different amounts, the cyan portal reticle sta
 surface-centered, and the red authoritative world-space aim impact changes projection without
 changing its world coordinate. Stereo disparity without that depth-dependent motion is not a
 successful portal-parallax result.
+
+An active hand/controller grab or gaze carry intentionally makes the v1 surface ineligible: the
+final runtime-latched panel pose is not knowable at the point where the sample is produced. The
+demo therefore falls back to static SBS while the monitor is being moved and should reactivate
+with a new epoch after release. Seeing the portal stop responding *during* the move is expected;
+remaining static after release is not. Check the demo's `--debug` output for a fresh `active`
+event/sample stream and re-check fullscreen coverage, the resolved `stereo` field, and the
+`viewpoint on` authorization before relaunching anything.
 
 ## 14. Tests and acceptance criteria
 
