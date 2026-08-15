@@ -338,6 +338,17 @@ namespace OpenXR {
         void grabResizeCorner(const SXRPose& gripWorld, const SXRSolveInput& in, const SXRAnchorTuning& tune);
         void endResize(const SXRPose& gripWorldLatched, const SXRSolveInput& in, const SXRAnchorTuning& tune);
 
+        // ---- abort (a grab ended by something other than the hand that started it) ----
+        // End a MOVE or RESIZE grab from OUTSIDE the input machine, leaving the quad exactly where
+        // it is displayed. `openxr view off` is what needs this: the view latch keeps every layer
+        // ALIVE while removing it from the frame loop's presentation set, so CXRInput stops being
+        // handed a target for the grabbed monitor and force-releases only its own bookkeeping (that
+        // liveness path was written for "the layer was destroyed mid-grab", where re-anchoring a
+        // dead quad would be meaningless). With the latch the quad is still there, and nothing else
+        // would ever clear m_grabbed/m_resizing. Returns true iff a grab was in progress. MAIN
+        // THREAD, under COpenXRManager::m_layersMu — same discipline as the gaze-release verb.
+        bool abortGrab(const SXRSolveInput& in, const SXRAnchorTuning& tune);
+
         // ---- gaze carry (research/16 §4) — main thread verbs mutate, frame-thread solve reads ----
         // A gaze grab is a fourth solve() override (placed AFTER the hand-grab override, so a hand
         // grab wins if both somehow fire — research/16 §4.1): "place the quad on the gaze ray at

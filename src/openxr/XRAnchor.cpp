@@ -749,6 +749,37 @@ void CXRAnchor::endGrab(const SXRPose& releaseWorld, const SXRSolveInput& in, co
     reanchorFromWorld(releaseWorld, ctx, tune);
 }
 
+bool CXRAnchor::abortGrab(const SXRSolveInput& in, const SXRAnchorTuning& tune) {
+    if (!m_grabbed && !m_resizing)
+        return false;
+
+    // A RESIZE grab needs nothing but the flag cleared, and must NOT be re-anchored: it never
+    // device-locked the quad (solve keeps running the persistent mode), and grabResizeCorner
+    // already re-anchored at the dragged size on every frame of the drag. m_lastWorld is one solve
+    // BEHIND that (the frame loop solves before it runs the grab machine), so re-anchoring from it
+    // would rewind the last drag step and unpin the corner the resize was holding.
+    const bool WASMOVE = m_grabbed;
+    m_grabbed          = false;
+    m_grabPinch        = false;
+    m_resizing         = false;
+
+    // A MOVE grab is a device lock, so the quad's persistent state is still the PRE-grab pose and
+    // dropping the flag alone would teleport it back. m_lastWorld is this frame's composed
+    // device ∘ offset pose — the one the user is looking at — so re-express that into the
+    // persistent mode exactly as endGrab/endGazeGrab do. There is deliberately no release-latch
+    // ring here: the hand never released, so there is no release jerk to reject.
+    if (!WASMOVE || !m_hasLastWorld)
+        return true;
+
+    SXRVerbContext ctx;
+    ctx.view      = in.view;
+    ctx.viewValid = true;
+    ctx.gripLeft  = in.gripLeft;
+    ctx.gripRight = in.gripRight;
+    reanchorFromWorld(m_lastWorld, ctx, tune);
+    return true;
+}
+
 // ---- gaze carry (research/16 §4) ----
 
 void CXRAnchor::beginGazeGrab(const SXRPose& view, bool follow) {

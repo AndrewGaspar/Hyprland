@@ -6268,6 +6268,38 @@ std::expected<void, std::string> COpenXRManager::cmdView(const std::string& args
         // hover until the frame thread reaches its next zero-layer submission.
         clearCrossingSubmissionState();
         setHoveredMonitor("");
+
+        // …and so must the GRAB state, which is the one piece the frame thread cannot clean up for
+        // itself. Hiding the view empties the frame loop's presentation set, so CXRInput is handed
+        // no target for a monitor being carried and takes its liveness branch, which force-releases
+        // only its own bookkeeping — it was written for a layer DESTROYED mid-grab, where there is
+        // nothing left to re-anchor. Under the latch the layer is very much alive, so without this
+        // its CXRAnchor keeps m_grabbed/m_resizing set forever: the monitor returns on `view on`
+        // still device-locked to a hand, status reports it grabbed, and viewpoint eligibility
+        // (which requires !grabbed()) is blocked for the rest of the session. End them here, on the
+        // main thread, re-anchoring each quad from the pose it was last displayed at.
+        //
+        // currentVerbContext() takes m_layersMu, so it must be read BEFORE the lock below (same
+        // ordering as cmdGazeRelease). A gaze carry is deliberately left alone: its state is not
+        // force-cleared by anything, and `openxr gazerelease` still ends it while the view is
+        // hidden.
+        const auto            CTX  = currentVerbContext();
+        const auto            TUNE = readAnchorTuning();
+        OpenXR::SXRSolveInput in;
+        in.view      = CTX.view;
+        in.gripLeft  = CTX.gripLeft;
+        in.gripRight = CTX.gripRight;
+
+        std::vector<std::string> aborted;
+        {
+            std::scoped_lock lock(m_layersMu);
+            for (auto& l : m_layers) {
+                if (l->m_anchor.abortGrab(in, TUNE))
+                    aborted.push_back(l->m_monitorName);
+            }
+        }
+        for (const auto& name : aborted)
+            Log::logger->log(Log::DEBUG, "[OPENXR] monitor view hidden mid-grab: released '{}' where it was last displayed", name);
     }
 
     Log::logger->log(Log::DEBUG, "[OPENXR] monitor view {}", visible ? "shown" : "hidden");
