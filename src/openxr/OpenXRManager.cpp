@@ -145,6 +145,15 @@ void COpenXRManager::init() {
     m_fxWindowActiveListener     = Event::bus()->m_events.window.active.listen([this](PHLWINDOW, Desktop::eFocusReason) { requestEffectEval(); });
     m_fxWindowFullscreenListener = Event::bus()->m_events.window.fullscreen.listen([this](PHLWINDOW) { requestEffectEval(); });
     m_fxWindowCloseListener      = Event::bus()->m_events.window.close.listen([this](PHLWINDOW) { requestEffectEval(); });
+    // Viewpoint eligibility triggers. These four are safe to raise the eval rate with because the
+    // pass they schedule cannot re-emit any of them, so there is no doLater that feeds itself:
+    // evaluateMonitorEffects only reads state (rule context, config) and writes layer atomics +
+    // monitor damage, and reevaluateViewpoints only reads window/workspace/fullscreen state and
+    // sends protocol events. The four emitters are the window-rule applicator, the float toggle,
+    // CWindow::moveToWorkspace, and the three monitor-layout sites (ensureMonitorStatus, setMirror,
+    // MonitorLayoutController::arrange) — none of which is on either path. Anything added to that
+    // pass which can move a window, a workspace, a rule or the monitor layout needs a re-entrancy
+    // guard here, because requestEffectEval clears its queued flag BEFORE running the pass.
     m_viewpointWindowRulesListener     = Event::bus()->m_events.window.updateRules.listen([this](PHLWINDOW) { requestEffectEval(); });
     m_viewpointWindowFloatingListener  = Event::bus()->m_events.window.floating.listen([this](PHLWINDOW) { requestEffectEval(); });
     m_viewpointWindowWorkspaceListener = Event::bus()->m_events.window.moveToWorkspace.listen([this](PHLWINDOW, PHLWORKSPACE) { requestEffectEval(); });
@@ -3989,6 +3998,18 @@ void COpenXRManager::publishBlackAlphaTuning(std::optional<OpenXR::eXRBlendMode>
 // is showing something wrong, and "it applies once the desktop next repaints" is not good enough
 // when the whole point is to get out of a broken picture. Re-resolve every monitor unconditionally
 // (cheap: one fullscreen lookup each), and force a composite only when the switch itself moved.
+//
+// It re-publishes the frame DECLARATION only, never publishStereoMode, and that asymmetry is
+// correct rather than an oversight: the mode declaration describes how the OUTPUT BUFFER is
+// physically laid out, and nothing this function reacts to (a windowrule fold, a config keyword) can
+// move it. The pane count only ever moves through CMonitorRule::compare, which treats m_stereo and
+// m_stereoVirtualMode as HARD props — so a stereo change is COMPARISON_NO_MATCH and takes the full
+// applyMonitorRule path, which emits modeChanged unconditionally and re-runs publishStereoMode. The
+// soft path cannot smuggle one past: applyMonitorRuleSoft re-derives m_stereoMode from the same rule
+// and narrows it only through sanitizeStereoMode, whose non-rule inputs (m_pixelSize,
+// m_modeSearchFellBack) a soft apply cannot change — backComputeMode is the exact inverse of
+// deriveGeometry, so even the m_createdByUser re-derivation is a fixed point under a soft transform
+// change. The stereo WATCH, the other way a live pack moves, deliberately re-applies the whole rule.
 void COpenXRManager::publishStereoPairTuning() {
     static auto PPAIR = CConfigValue<Hyprlang::INT>("openxr:stereo_quad_pair");
 
