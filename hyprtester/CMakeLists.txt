@@ -191,6 +191,16 @@ find_package(Threads REQUIRED)
 add_library(hypxr-viewpoint-demo-renderer STATIC viewpoint/PortalRenderer.cpp)
 target_include_directories(hypxr-viewpoint-demo-renderer PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/viewpoint")
 target_link_libraries(hypxr-viewpoint-demo-renderer PUBLIC PkgConfig::protocols_deps Threads::Threads)
+# This translation unit is the demo's whole frame cost and none of its logic: pure
+# scene math with no compositor state, covered end to end by hyprland_gtests. An
+# unoptimized Debug frame is ~4x slower, which is the difference between a live
+# parallax proof and a slideshow, so optimize it even in Debug. -ffp-contract=off
+# pins the arithmetic against FMA contraction, so the frame hashes the suite and
+# --render assert on survive an -march=native build the same way they survive -O0.
+target_compile_options(hypxr-viewpoint-demo-renderer PRIVATE -ffp-contract=off)
+if(CMAKE_BUILD_TYPE MATCHES "[Dd][Ee][Bb][Uu][Gg]")
+  target_compile_options(hypxr-viewpoint-demo-renderer PRIVATE -O2)
+endif()
 
 clientNew("pointer-warp" PROTOS "pointer-warp-v1" "xdg-shell")
 clientNew("surface-scale-transform" PROTOS "fractional-scale-v1" "xdg-shell")
