@@ -4147,7 +4147,44 @@ void COpenXRManager::reevaluateViewpoints() {
     };
     std::ranges::sort(viewpoints, [&](const auto* a, const auto* b) { return OpenXR::viewpointOrderBefore(ORDERKEY(a), ORDERKEY(b)); });
 
-    std::scoped_lock              lock(m_layersMu);
+    // m_layersMu is the frame thread's mutex: it takes it every frame, twice, around the solve and
+    // the pointer pass. This walk used to hold it across the whole eligibility test — window,
+    // workspace, fullscreen, rule and surface queries for every viewpoint — and across every
+    // protocol send, and the four new listeners made it run far more often than the old
+    // effects-only triggers did. That is contention the frame loop pays for in the headset.
+    //
+    // Only two things here actually need the mutex: the m_layers container itself, and the anchor
+    // state (which the frame thread mutates under it). Both are snapshotted here, and nothing below
+    // touches either again. The subscription accessors carry their OWN mutex (m_viewpointMu, which
+    // is what makes subscription replacement atomic against frame publication), so they never
+    // needed this one.
+    struct SLayerEligibility {
+        PXRLAYER               layer;
+        PHLMONITOR             monitor;
+        OpenXR::SXRAnchorState anchorState;
+        bool                   pendingRemoval = false;
+        // LOCAL, not carried by hand or gaze, and not mid-adaptive-transition: the anchor is sitting
+        // still enough for a client to render view-dependent content against it.
+        bool                   anchorSettled = false;
+    };
+
+    std::vector<SLayerEligibility> layers;
+    {
+        std::scoped_lock lock(m_layersMu);
+        layers.reserve(m_layers.size());
+        for (auto& l : m_layers) {
+            const auto& ANCHOR = l->m_anchor;
+            layers.push_back(SLayerEligibility{
+                .layer          = l,
+                .monitor        = l->m_monitor.lock(),
+                .anchorState    = ANCHOR.state(),
+                .pendingRemoval = l->m_pendingRemoval.load(std::memory_order_acquire),
+                .anchorSettled  = ANCHOR.state().mode == OpenXR::XR_ANCHOR_LOCAL && !ANCHOR.grabbed() && !ANCHOR.gazeGrabbed() &&
+                    (!ANCHOR.adaptiveEnabled() || ANCHOR.adaptivePhase() == OpenXR::XRAD_DOCKED),
+            });
+        }
+    }
+
     std::vector<CXRMonitorLayer*> claimed;
     for (auto* viewpoint : viewpoints) {
         if (!viewpoint->enabled())
@@ -4188,20 +4225,18 @@ void COpenXRManager::reevaluateViewpoints() {
             continue;
         }
 
-        const auto LAYERIT =
-            std::ranges::find_if(m_layers, [&](const auto& layer) { return !layer->m_pendingRemoval.load(std::memory_order_acquire) && layer->m_monitor.lock() == MONITOR; });
-        if (LAYERIT == m_layers.end()) {
+        const auto LAYERIT = std::ranges::find_if(layers, [&](const auto& snapshot) { return !snapshot.pendingRemoval && snapshot.monitor == MONITOR; });
+        if (LAYERIT == layers.end()) {
             viewpoint->invalidate(HYPXR_VIEWPOINT_V1_INACTIVE_REASON_NOT_ELIGIBLE);
             continue;
         }
 
-        auto& LAYER = *LAYERIT;
+        const auto& LAYER = LAYERIT->layer;
         if (std::ranges::find(claimed, LAYER.get()) != claimed.end()) {
             viewpoint->invalidate(HYPXR_VIEWPOINT_V1_INACTIVE_REASON_SUPERSEDED);
             continue;
         }
-        if (LAYER->m_anchor.state().mode != OpenXR::XR_ANCHOR_LOCAL || LAYER->m_anchor.grabbed() || LAYER->m_anchor.gazeGrabbed() ||
-            (LAYER->m_anchor.adaptiveEnabled() && LAYER->m_anchor.adaptivePhase() != OpenXR::XRAD_DOCKED)) {
+        if (!LAYERIT->anchorSettled) {
             viewpoint->invalidate(HYPXR_VIEWPOINT_V1_INACTIVE_REASON_NOT_ELIGIBLE);
             continue;
         }
@@ -4215,7 +4250,7 @@ void COpenXRManager::reevaluateViewpoints() {
         // (the main thread must not read m_contentSize — it is frame-thread-owned and non-atomic).
         // While a mode change is in flight the two genuinely disagree, and that is exactly when the
         // publish interlock should hold the samples back.
-        const float WIDTH   = LAYER->m_anchor.state().widthMeters;
+        const float WIDTH   = LAYERIT->anchorState.widthMeters;
         const auto  PANEPX  = Render::Stereo::presentedPaneSize(MONITOR->m_pixelSize, Render::Stereo::CONTENT_SBS);
         const float HEIGHT  = OpenXR::quadHeightMeters(WIDTH, (uint32_t)std::max(1.0, PANEPX.x), (uint32_t)std::max(1.0, PANEPX.y));
         uint32_t    widthUM = 0, heightUM = 0;
@@ -4228,7 +4263,7 @@ void COpenXRManager::reevaluateViewpoints() {
         const auto EXISTING      = LAYER->viewpointSubscription();
         if (RUNTIME_STATE != OpenXR::XR_VIEWPOINT_RUNTIME_INVALID && EXISTING &&
             OpenXR::viewpointActivationUnchanged(EXISTING->surfaceId, SURFACE->id(), EXISTING->epoch, EXISTING->token, viewpoint->token(), EXISTING->widthUM, widthUM,
-                                                 EXISTING->heightUM, heightUM, EXISTING->anchorState == LAYER->m_anchor.state())) {
+                                                 EXISTING->heightUM, heightUM, EXISTING->anchorState == LAYERIT->anchorState)) {
             claimed.push_back(LAYER.get());
             continue;
         }
@@ -4247,7 +4282,7 @@ void COpenXRManager::reevaluateViewpoints() {
                 .surfaceId   = SURFACE->id(),
                 .widthUM     = widthUM,
                 .heightUM    = heightUM,
-                .anchorState = LAYER->m_anchor.state(),
+                .anchorState = LAYERIT->anchorState,
             });
             viewpoint->invalidate(HYPXR_VIEWPOINT_V1_INACTIVE_REASON_TRACKING_LOST);
             claimed.push_back(LAYER.get());
@@ -4271,14 +4306,14 @@ void COpenXRManager::reevaluateViewpoints() {
             .surfaceId   = SURFACE->id(),
             .widthUM     = widthUM,
             .heightUM    = heightUM,
-            .anchorState = LAYER->m_anchor.state(),
+            .anchorState = LAYERIT->anchorState,
         });
         claimed.push_back(LAYER.get());
     }
 
-    for (auto& layer : m_layers)
-        if (std::ranges::find(claimed, layer.get()) == claimed.end())
-            layer->setViewpointSubscription(std::nullopt);
+    for (auto& snapshot : layers)
+        if (std::ranges::find(claimed, snapshot.layer.get()) == claimed.end())
+            snapshot.layer->setViewpointSubscription(std::nullopt);
 }
 
 void COpenXRManager::drainViewpointSamples() {
