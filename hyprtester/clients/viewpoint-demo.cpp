@@ -3,16 +3,20 @@
 // OpenXR dependency or connection of its own.
 
 #include "PortalRenderer.hpp"
+#include "PortalRendererGL.hpp"
 
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <format>
 #include <fstream>
+#include <iterator>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <print>
 #include <string>
@@ -46,6 +50,16 @@ struct SOptions {
     // Worker budget including this thread; resolved from defaultRenderThreads().
     uint32_t threads     = 0;
     uint32_t benchFrames = 0;
+    // The live client is GPU by default; --software selects the CPU raymarcher, and
+    // a failed EGL init selects it on its own. The offline --render/--bench modes stay
+    // CPU-only and deterministic no matter what these say.
+    bool                       software  = false;
+    bool                       antialias = true;
+    std::optional<std::string> renderGpuPath;
+    uint32_t                   benchGpuFrames = 0;
+    bool                       compareGpu     = false;
+    // Added to both offline eyes, so the parallax math can be exercised off axis.
+    SVec3 head;
 };
 
 struct SSample {
@@ -85,6 +99,9 @@ struct SApp {
     CSharedPointer<CCWpViewport>              viewport;
     CSharedPointer<CCHypxrViewpointV1>        viewpoint;
     std::vector<CUniquePointer<SBuffer>>      buffers;
+    // Null whenever the client is on the software path, either by --software or
+    // because EGL refused to initialize.
+    std::unique_ptr<CPortalRendererGL> gl;
 
     bool                                      xrgb8888      = false;
     bool                                      configured    = false;
@@ -152,17 +169,44 @@ static bool parseDimension(std::string_view value, uint32_t& out) {
     return parseCount(value, 64, 4096, out);
 }
 
+// "X,Y,Z" in meters. Bounded well inside the room so an offline pose can never put
+// the eye behind the portal plane, where the projection has no meaning.
+static bool parseHeadOffset(std::string_view value, SVec3& out) {
+    SVec3        parsed;
+    const double LIMIT = 1.0;
+    double*      slots[] = {&parsed.x, &parsed.y, &parsed.z};
+
+    for (size_t index = 0; index < std::size(slots); ++index) {
+        const bool       LAST  = index + 1 == std::size(slots);
+        const size_t     COMMA = value.find(',');
+        const auto       FIELD = value.substr(0, COMMA);
+        const auto [end, error] = std::from_chars(FIELD.data(), FIELD.data() + FIELD.size(), *slots[index]);
+        if (error != std::errc{} || end != FIELD.data() + FIELD.size() || !std::isfinite(*slots[index]) || std::abs(*slots[index]) > LIMIT)
+            return false;
+        if (LAST != (COMMA == std::string_view::npos))
+            return false;
+        if (!LAST)
+            value = value.substr(COMMA + 1);
+    }
+
+    out = parsed;
+    return true;
+}
+
 static void printHelp(const char* program) {
     std::println("Usage: {} [OPTIONS]\n"
                  "\n"
                  "Synthetic full-SBS portal for the experimental hypxr_viewpoint_v1 protocol.\n"
                  "The logical surface is the packed SBS rectangle; each buffer pane is aspect-\n"
-                 "matched to one half of that destination.\n"
+                 "matched to one half of that destination. The live client renders on the GPU\n"
+                 "through EGL/GLES3 by default and drops to the CPU raymarcher if EGL fails.\n"
                  "\n"
                  "  --width N      render/one-eye width, 64..4096 (default 256)\n"
                  "  --height N     render/one-eye height, 64..4096 (default 144)\n"
                  "  --threads N    raymarcher worker budget, 1..64 (default {}, this machine)\n"
                  "                 output is byte-identical for every value\n"
+                 "  --software     render the live client on the CPU raymarcher\n"
+                 "  --no-aa        disable the GPU path's grid-line antialiasing\n"
                  "  --windowed     create a resizable window instead of requesting fullscreen\n"
                  "  --once         exit after the first viewpoint-associated frame\n"
                  "  --debug        print activation, coalescing, and frame identifiers\n"
@@ -171,6 +215,14 @@ static void printHelp(const char* program) {
                  "                 write the inactive zero-disparity PPM without Wayland\n"
                  "                 (offline output is 2*width by height; default 512x144)\n"
                  "  --bench N      render N offline active frames and report the frame budget\n"
+                 "  --render-gpu FILE\n"
+                 "                 same active image through the shader, on surfaceless EGL\n"
+                 "                 (pair it with --no-aa to compare against --render)\n"
+                 "  --bench-gpu N  N offline shader frames on surfaceless EGL\n"
+                 "  --compare-gpu  render both paths offline and report the per-channel delta\n"
+                 "                 (nonzero exit if the shader leaves the tolerance budget)\n"
+                 "  --head X,Y,Z   translate both offline eyes, in meters, off the reference\n"
+                 "                 pose; applies to every offline mode above\n"
                  "  -h, --help     show this help\n",
                  program, defaultRenderThreads());
 }
@@ -195,9 +247,32 @@ static std::optional<SOptions> parseOptions(int argc, char** argv) {
             options.debug = true;
             continue;
         }
+        if (ARG == "--software") {
+            options.software = true;
+            continue;
+        }
+        if (ARG == "--no-aa") {
+            options.antialias = false;
+            continue;
+        }
+        if (ARG == "--compare-gpu") {
+            options.compareGpu = true;
+            continue;
+        }
         if ((ARG == "--render" || ARG == "--render-fallback") && index + 1 < argc) {
             options.renderPath     = argv[++index];
             options.renderFallback = ARG == "--render-fallback";
+            continue;
+        }
+        if (ARG == "--render-gpu" && index + 1 < argc) {
+            options.renderGpuPath = argv[++index];
+            continue;
+        }
+        if (ARG == "--head" && index + 1 < argc) {
+            if (!parseHeadOffset(argv[++index], options.head)) {
+                logLine("error: --head must be three finite meters as X,Y,Z, each within 1 m");
+                return std::nullopt;
+            }
             continue;
         }
         if ((ARG == "--width" || ARG == "--height") && index + 1 < argc) {
@@ -215,9 +290,10 @@ static std::optional<SOptions> parseOptions(int argc, char** argv) {
             }
             continue;
         }
-        if (ARG == "--bench" && index + 1 < argc) {
-            if (!parseCount(argv[++index], 1, 100000, options.benchFrames)) {
-                logLine("error: --bench must be an integer from 1 through 100000");
+        if ((ARG == "--bench" || ARG == "--bench-gpu") && index + 1 < argc) {
+            uint32_t& destination = ARG == "--bench" ? options.benchFrames : options.benchGpuFrames;
+            if (!parseCount(argv[++index], 1, 100000, destination)) {
+                logLine("error: {} must be an integer from 1 through 100000", ARG);
                 return std::nullopt;
             }
             continue;
@@ -494,13 +570,18 @@ static SBuffer* acquireBuffer(SApp& app, uint32_t width, uint32_t height) {
     return result;
 }
 
-static bool commitFrame(SApp& app, SBuffer& buffer, const std::optional<SSample>& sample) {
+// The destination scale and the rendered() association both belong to the single
+// commit that carries this frame. rendered() is intentionally adjacent to that
+// commit — on the GPU path eglSwapBuffers() issues it — and no other wl_surface
+// commit may be inserted into the sequence.
+static void announceFrame(SApp& app, const std::optional<SSample>& sample) {
     app.viewport->sendSetDestination(sc<int32_t>(app.logicalWidth), sc<int32_t>(app.logicalHeight));
     if (sample)
         app.viewpoint->sendRendered(highWord(sample->epoch), lowWord(sample->epoch), highWord(sample->sample), lowWord(sample->sample));
+}
 
-    // rendered() is intentionally adjacent to the one matching attach/commit.
-    // No other wl_surface commit may be inserted into this sequence.
+static bool commitFrame(SApp& app, SBuffer& buffer, const std::optional<SSample>& sample) {
+    announceFrame(app, sample);
     app.surface->sendAttach(buffer.resource.get(), 0, 0);
     app.surface->sendDamageBuffer(0, 0, sc<int32_t>(buffer.width), sc<int32_t>(buffer.height));
     buffer.busy = true;
@@ -508,12 +589,42 @@ static bool commitFrame(SApp& app, SBuffer& buffer, const std::optional<SSample>
     return wl_display_flush(app.display) >= 0;
 }
 
-static bool drawPending(SApp& app) {
-    if (!app.configured || (!app.pendingSample && !app.fallbackDirty))
-        return true;
-    if (app.logicalWidth == 0 || app.logicalHeight == 0)
+// GPU twin of drawPendingSoftware() below: same coalescing, same activation gate,
+// same rejection path, same one-commit-per-sample protocol flow. The only structural
+// difference is that the swap owns the attach and the commit, so there is no shm
+// buffer to acquire and no per-frame pixel hash to print (a readback purely to log a
+// hash would stall the pipeline every frame).
+static bool drawPendingGpu(SApp& app) {
+    if (!app.gl->resize(app.renderWidth * 2U, app.renderHeight))
         return false;
 
+    if (app.active && app.pendingSample) {
+        const SSample SAMPLE = *app.pendingSample;
+        if (SAMPLE.epoch != app.epoch || SAMPLE.geometry != app.geometry || !app.gl->drawPortal(app.portal, SAMPLE.views)) {
+            rejectFeedback(app, "sample failed final render validation; feedback disabled");
+            return true;
+        }
+        app.pendingSample.reset();
+        app.fallbackDirty = false;
+        announceFrame(app, SAMPLE);
+        if (!app.gl->present())
+            return false;
+        ++app.renderedFrames;
+        debugLine(app, "committed epoch={} sample={} frame={} (gpu)", SAMPLE.epoch, SAMPLE.sample, app.renderedFrames);
+        if (app.options.once)
+            app.running = false;
+        return true;
+    }
+
+    if (!app.gl->drawFallback())
+        return false;
+    app.fallbackDirty = false;
+    debugLine(app, "committing inactive zero-disparity fallback (gpu)");
+    announceFrame(app, std::nullopt);
+    return app.gl->present();
+}
+
+static bool drawPendingSoftware(SApp& app) {
     const uint32_t BUFFER_WIDTH = app.renderWidth * 2U;
     auto*          buffer       = acquireBuffer(app, BUFFER_WIDTH, app.renderHeight);
     if (!buffer)
@@ -554,7 +665,18 @@ static bool drawPending(SApp& app) {
     return commitFrame(app, *buffer, std::nullopt);
 }
 
+static bool drawPending(SApp& app) {
+    if (!app.configured || (!app.pendingSample && !app.fallbackDirty))
+        return true;
+    if (app.logicalWidth == 0 || app.logicalHeight == 0)
+        return false;
+
+    return app.gl ? drawPendingGpu(app) : drawPendingSoftware(app);
+}
+
 static void destroyObjects(SApp& app) {
+    // The EGL window surface holds the wl_surface, so it has to go first.
+    app.gl.reset();
     app.buffers.clear();
     if (app.viewpoint)
         app.viewpoint->sendDestroy();
@@ -603,7 +725,17 @@ static bool writePpm(const std::string& path, const SImage& image) {
 static constexpr SPortalSize  OFFLINE_PORTAL = {.widthMeters = 1.6, .heightMeters = 0.9};
 static constexpr SStereoViews OFFLINE_VIEWS  = {.left = {.x = -0.032, .z = 1.2}, .right = {.x = 0.032, .z = 1.2}};
 
-static bool                   renderOffline(const SOptions& options) {
+// --head translates both eyes off the reference pose. The default offset is exactly
+// zero, and adding 0.0 to a double is exact, so an unmodified --render/--bench keeps
+// producing the same frame hashes it always has.
+static SStereoViews offlineViews(const SOptions& options) {
+    const auto TRANSLATE = [&options](const SVec3& eye) {
+        return SVec3{.x = eye.x + options.head.x, .y = eye.y + options.head.y, .z = eye.z + options.head.z};
+    };
+    return {.left = TRANSLATE(OFFLINE_VIEWS.left), .right = TRANSLATE(OFFLINE_VIEWS.right)};
+}
+
+static bool renderOffline(const SOptions& options) {
     const uint32_t        BUFFER_WIDTH = options.renderWidth * 2U;
     std::vector<uint32_t> pixels(sc<size_t>(BUFFER_WIDTH) * options.renderHeight);
     const SImage          image = {
@@ -613,7 +745,7 @@ static bool                   renderOffline(const SOptions& options) {
         .stridePixels = BUFFER_WIDTH,
     };
 
-    const bool RENDERED = options.renderFallback ? renderFallbackSBS(image, options.threads) : renderPortalSBS(image, OFFLINE_PORTAL, OFFLINE_VIEWS, options.threads);
+    const bool RENDERED = options.renderFallback ? renderFallbackSBS(image, options.threads) : renderPortalSBS(image, OFFLINE_PORTAL, offlineViews(options), options.threads);
     if (!RENDERED || !writePpm(*options.renderPath, image))
         return false;
 
@@ -636,12 +768,12 @@ static bool benchmarkOffline(const SOptions& options) {
     };
 
     // One warm-up frame spawns the pool so thread creation is not billed to a frame.
-    if (!renderPortalSBS(image, OFFLINE_PORTAL, OFFLINE_VIEWS, options.threads))
+    if (!renderPortalSBS(image, OFFLINE_PORTAL, offlineViews(options), options.threads))
         return false;
 
     const auto START = std::chrono::steady_clock::now();
     for (uint32_t frame = 0; frame < options.benchFrames; ++frame) {
-        if (!renderPortalSBS(image, OFFLINE_PORTAL, OFFLINE_VIEWS, options.threads))
+        if (!renderPortalSBS(image, OFFLINE_PORTAL, offlineViews(options), options.threads))
             return false;
     }
     const double SECONDS = std::chrono::duration<double>(std::chrono::steady_clock::now() - START).count();
@@ -651,14 +783,170 @@ static bool benchmarkOffline(const SOptions& options) {
     return true;
 }
 
+// Every offline GPU mode below runs on EGL_MESA_platform_surfaceless with an FBO, so
+// no compositor, no display, and no window system are involved. Which device that
+// resolves to is the EGL implementation's business; the demo never names one.
+static std::unique_ptr<CPortalRendererGL> offlineRenderer(const SOptions& options) {
+    std::string error;
+    auto        gl = CPortalRendererGL::offscreen(options.renderWidth * 2U, options.renderHeight, error);
+    if (!gl) {
+        logLine("error: surfaceless EGL is unavailable: {}", error);
+        return nullptr;
+    }
+    gl->setAntialiasGrid(options.antialias);
+    return gl;
+}
+
+static SImage offlineImage(const SOptions& options, std::vector<uint32_t>& pixels) {
+    const uint32_t BUFFER_WIDTH = options.renderWidth * 2U;
+    pixels.assign(sc<size_t>(BUFFER_WIDTH) * options.renderHeight, 0);
+    return {.pixels = pixels, .width = BUFFER_WIDTH, .height = options.renderHeight, .stridePixels = BUFFER_WIDTH};
+}
+
+static bool renderOfflineGpu(const SOptions& options) {
+    auto gl = offlineRenderer(options);
+    if (!gl)
+        return false;
+
+    std::vector<uint32_t> pixels;
+    const SImage          IMAGE = offlineImage(options, pixels);
+    if (!gl->drawPortal(OFFLINE_PORTAL, offlineViews(options)) || !gl->readback(IMAGE) || !writePpm(*options.renderGpuPath, IMAGE))
+        return false;
+
+    logLine("wrote shader active portal {}x{} full-SBS PPM '{}' ({}x{} per eye, grid AA {}, {}, hash {:#x})", IMAGE.width, IMAGE.height, *options.renderGpuPath,
+            options.renderWidth, options.renderHeight, options.antialias ? "on" : "off", gl->description(), pixelHash(IMAGE));
+    return true;
+}
+
+// Two numbers, because a GPU frame has two honest budgets. The pipelined figure
+// queues every frame and waits once at the end, which is the direct analogue of what
+// --bench measures on the CPU. The serialized figure waits for each frame in turn,
+// which is closer to what a live sample-driven client sees, since the compositor
+// cannot scan out a frame the GPU has not finished.
+static bool benchmarkOfflineGpu(const SOptions& options) {
+    auto gl = offlineRenderer(options);
+    if (!gl)
+        return false;
+
+    const auto DRAW = [&gl, &options] { return gl->drawPortal(OFFLINE_PORTAL, offlineViews(options)); };
+
+    // Warm-up: shader compilation and the first allocation are not billed to a frame.
+    for (uint32_t frame = 0; frame < 4; ++frame) {
+        if (!DRAW())
+            return false;
+    }
+    if (!gl->finish())
+        return false;
+
+    auto start = std::chrono::steady_clock::now();
+    for (uint32_t frame = 0; frame < options.benchGpuFrames; ++frame) {
+        if (!DRAW())
+            return false;
+    }
+    if (!gl->finish())
+        return false;
+    const double PIPELINED = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+
+    start = std::chrono::steady_clock::now();
+    for (uint32_t frame = 0; frame < options.benchGpuFrames; ++frame) {
+        if (!DRAW() || !gl->finish())
+            return false;
+    }
+    const double SERIALIZED = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+
+    logLine("bench-gpu: {} frames of {}x{} per eye, grid AA {}, on {}", options.benchGpuFrames, options.renderWidth, options.renderHeight, options.antialias ? "on" : "off",
+            gl->description());
+    logLine("  pipelined  {:.3f}s -> {:.2f} fps ({:.3f} ms/frame)", PIPELINED, options.benchGpuFrames / PIPELINED, PIPELINED * 1000.0 / options.benchGpuFrames);
+    logLine("  serialized {:.3f}s -> {:.2f} fps ({:.3f} ms/frame)", SERIALIZED, options.benchGpuFrames / SERIALIZED, SERIALIZED * 1000.0 / options.benchGpuFrames);
+    return true;
+}
+
+// The shader runs in 32-bit floats and the reference runs in doubles, so the two
+// images agree per channel but not bit for bit. Every deviation is one of two kinds:
+//
+//   - a rounding difference in shade(), which moves a channel by at most one step;
+//   - a decision that landed on the wrong side of a hard threshold — a grid-line
+//     edge, a box silhouette, the aim marker's rim — where the two paths pick
+//     genuinely different surfaces and the delta is as large as the two colors are.
+//
+// The first kind is bounded by COMPARE_TOLERANCE and allowed anywhere. The second is
+// unbounded in size but must stay confined to a thin edge set, so it is bounded by
+// count instead: the outlier budget below is a fraction of the frame, not a fixed
+// number, because the edge set grows with resolution.
+//
+// Three per mille is where that budget sits. One pane shows on the order of a dozen
+// grid lines per axis, so a pathological head pose that aligns one whole line with
+// the sampling grid can flip an entire row or column at once — a few per mille of the
+// frame. A divergence that was systematic rather than incidental would instead flip
+// every line's edge and land at percent scale, an order of magnitude clear of this.
+// Measured worst case across the poses in §13.1 of the design doc: 0.095%.
+static constexpr uint32_t COMPARE_TOLERANCE       = 2;
+static constexpr uint64_t COMPARE_OUTLIER_PER_MIL = 3;
+
+static bool reportComparison(std::string_view what, const SImageDelta& delta) {
+    if (!delta.comparable) {
+        logLine("compare-gpu {}: images are not comparable", what);
+        return false;
+    }
+
+    const uint64_t BUDGET = std::max<uint64_t>(16, delta.pixels * COMPARE_OUTLIER_PER_MIL / 1000);
+    const bool     WITHIN = delta.outliers <= BUDGET;
+    logLine("compare-gpu {}: max delta {} at ({}, {}) cpu {:#08x} vs gpu {:#08x}, {} of {} pixels differ, {} over tolerance {} (budget {}) -> {}", what, delta.maxDelta,
+            delta.worstX, delta.worstY, delta.worstReference & 0xFFFFFFU, delta.worstCandidate & 0xFFFFFFU, delta.differing, delta.pixels, delta.outliers, COMPARE_TOLERANCE,
+            BUDGET, WITHIN ? "pass" : "FAIL");
+    return WITHIN;
+}
+
+static bool compareOfflineGpu(const SOptions& options) {
+    auto gl = offlineRenderer(options);
+    if (!gl)
+        return false;
+
+    std::vector<uint32_t> cpuPixels;
+    std::vector<uint32_t> gpuPixels;
+    const SImage          CPU_IMAGE = offlineImage(options, cpuPixels);
+    const SImage          GPU_IMAGE = offlineImage(options, gpuPixels);
+    const SStereoViews    VIEWS     = offlineViews(options);
+
+    logLine("compare-gpu: {}x{} per eye, head offset ({:.3f}, {:.3f}, {:.3f}) m, on {}", options.renderWidth, options.renderHeight, options.head.x, options.head.y, options.head.z,
+            gl->description());
+
+    // Antialiasing is off for the assertions: it is a deliberate visual divergence
+    // from the CPU reference, so an image carrying it has nothing to be equal to.
+    gl->setAntialiasGrid(false);
+    if (!renderPortalSBS(CPU_IMAGE, OFFLINE_PORTAL, VIEWS, options.threads) || !gl->drawPortal(OFFLINE_PORTAL, VIEWS) || !gl->readback(GPU_IMAGE))
+        return false;
+    bool passed = reportComparison("portal", compareImages(CPU_IMAGE, GPU_IMAGE, COMPARE_TOLERANCE));
+
+    if (!renderFallbackSBS(CPU_IMAGE, options.threads) || !gl->drawFallback() || !gl->readback(GPU_IMAGE))
+        return false;
+    passed = reportComparison("fallback", compareImages(CPU_IMAGE, GPU_IMAGE, COMPARE_TOLERANCE)) && passed;
+
+    // Informational only: how far the antialiased image moves away from the hard-edged
+    // reference. A large delta here is the feature working, not a regression.
+    gl->setAntialiasGrid(true);
+    if (!renderPortalSBS(CPU_IMAGE, OFFLINE_PORTAL, VIEWS, options.threads) || !gl->drawPortal(OFFLINE_PORTAL, VIEWS) || !gl->readback(GPU_IMAGE))
+        return false;
+    const auto ANTIALIASED = compareImages(CPU_IMAGE, GPU_IMAGE, COMPARE_TOLERANCE);
+    logLine("compare-gpu portal with grid AA on (not asserted): max delta {} at ({}, {}), {} of {} pixels differ", ANTIALIASED.maxDelta, ANTIALIASED.worstX, ANTIALIASED.worstY,
+            ANTIALIASED.differing, ANTIALIASED.pixels);
+    return passed;
+}
+
 int main(int argc, char** argv) {
     const auto OPTIONS = parseOptions(argc, argv);
     if (!OPTIONS)
         return argc > 1 && (std::strcmp(argv[1], "-h") == 0 || std::strcmp(argv[1], "--help") == 0) ? 0 : 2;
     if (OPTIONS->renderPath)
         return renderOffline(*OPTIONS) ? 0 : 1;
+    if (OPTIONS->renderGpuPath)
+        return renderOfflineGpu(*OPTIONS) ? 0 : 1;
     if (OPTIONS->benchFrames > 0)
         return benchmarkOffline(*OPTIONS) ? 0 : 1;
+    if (OPTIONS->benchGpuFrames > 0)
+        return benchmarkOfflineGpu(*OPTIONS) ? 0 : 1;
+    if (OPTIONS->compareGpu)
+        return compareOfflineGpu(*OPTIONS) ? 0 : 1;
 
     wl_display* display = wl_display_connect(nullptr);
     if (!display) {
@@ -678,8 +966,23 @@ int main(int argc, char** argv) {
             logLine("error: could not create the tagged viewpoint toplevel");
             result = 1;
         } else {
-            logLine("viewpoint demo mapped; waiting for surface size and viewpoint activation (render buffer {}x{}, {} raymarcher threads)", app.options.renderWidth * 2U,
-                    app.options.renderHeight, app.options.threads);
+            // The GPU path is the default. A machine with no usable EGL is not a
+            // failure — it is the software path, announced in one line and no more.
+            if (!app.options.software) {
+                std::string error;
+                app.gl = CPortalRendererGL::onSurface(display, rc<wl_surface*>(app.surface->resource()), app.options.renderWidth * 2U, app.options.renderHeight, error);
+                if (!app.gl)
+                    logLine("GPU path unavailable ({}); falling back to the software raymarcher", error);
+                else
+                    app.gl->setAntialiasGrid(app.options.antialias);
+            }
+
+            if (app.gl)
+                logLine("viewpoint demo mapped; waiting for surface size and viewpoint activation (render buffer {}x{}, GPU shader on {}, grid AA {})",
+                        app.options.renderWidth * 2U, app.options.renderHeight, app.gl->description(), app.options.antialias ? "on" : "off");
+            else
+                logLine("viewpoint demo mapped; waiting for surface size and viewpoint activation (render buffer {}x{}, {} raymarcher threads)", app.options.renderWidth * 2U,
+                        app.options.renderHeight, app.options.threads);
             while (app.running && result == 0) {
                 if (wl_display_dispatch(app.display) < 0 || !drawPending(app))
                     result = 1;
