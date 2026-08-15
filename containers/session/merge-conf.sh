@@ -8,6 +8,7 @@
 #                            output; the omarchy monitors.conf pins scale 2 / auto)
 #   openxr { … }             enabled + gpu pin + optional overlay/passthrough
 #   xrmonitor = …            the two default XR monitors (mirrors preview-xr.conf)
+#   bind… = …                the container-session XR keybinds (unless XR_BINDS=0)
 #
 # Env inputs:
 #   XR_BASE_CONF    base config to source (default ~/.config/hypr/hyprland.conf)
@@ -15,7 +16,12 @@
 #                   a /dev/dri/renderD* path)
 #   XR_OVERLAY      1 -> openxr:overlay = 1 (XR_EXTX_overlay; the --env hook, unused
 #                   in WP3 but wired so a later ambient-background mode is a one-liner)
-#   XR_PASSTHROUGH  1 -> openxr:blend_mode = alpha (composite over passthrough)
+#   XR_PASSTHROUGH  1 -> openxr:blend_mode = alpha (composite over passthrough) plus
+#                   the luma-key default (black_alpha) that makes it read as AR.
+#                   Defaulted ON for --wivrn by the wrapper (xr-container.sh).
+#   XR_BINDS        1 (default) -> append the container-session XR keybind block;
+#                   0 -> emit none (a --conf base config that binds the same chords
+#                   would double-fire them).
 #
 # Usage: merge-conf.sh <output-file>   (writes the config there; echoes the path)
 set -euo pipefail
@@ -37,7 +43,26 @@ BASE="${XR_BASE_CONF:-$HOME/.config/hypr/hyprland.conf}"
     echo "    enabled = 1"
     [[ -n ${XR_GPU_NODE:-} ]]      && echo "    gpu = $XR_GPU_NODE"
     [[ ${XR_OVERLAY:-0} == 1 ]]    && echo "    overlay = 1"
-    [[ ${XR_PASSTHROUGH:-0} == 1 ]] && echo "    blend_mode = alpha"
+    if [[ ${XR_PASSTHROUGH:-0} == 1 ]]; then
+        cat <<'PASSTHROUGH'
+
+    # Passthrough (container-session default with a real headset; --no-passthrough
+    # opts out). Composite the monitors over the room instead of the opaque VR
+    # void. Read once at session start — flip live with:
+    #   hyprctl keyword openxr:blend_mode opaque
+    #   hyprctl openxr disable && hyprctl openxr enable
+    # A runtime that can't do alpha (the windowed Monado) falls back to its
+    # preferred mode with one warning, so this is never fatal.
+    blend_mode = alpha
+
+    # Luma-keyed transparency ("black-as-alpha"), mirroring the daily-driver
+    # config: black desktop pixels dissolve into the room so a monitor reads as
+    # an AR overlay; 0.2 keeps a faint scrim behind text. Hot — retune in-headset
+    # with `hyprctl keyword openxr:black_alpha <n>` (and black_alpha_knee, 0.10)
+    # and paste the winner into your own config. Force-disabled under opaque.
+    black_alpha = 0.2
+PASSTHROUGH
+    fi
     echo "}"
     echo ""
     echo "# Two default XR monitors (mirrors scripts/preview-xr.conf):"
@@ -45,6 +70,52 @@ BASE="${XR_BASE_CONF:-$HOME/.config/hypr/hyprland.conf}"
     echo "xrmonitor = XR-main, 1920x1080@60, anchor:local pos:0,1.5,-1.5 yaw:0, size:1.6"
     echo "#   and a head-leashed side panel that springs to follow your view."
     echo "xrmonitor = XR-side, 1280x720@60, anchor:head offset:0.9,0,-1.2, size:0.9"
+
+    # ---- container-session XR keybinds -------------------------------------
+    # Defaults so an in-headset test session can drive the extension without
+    # hand-writing a config every time. Chords mirror the daily-driver
+    # ~/.config/hypr/hyprland-xr.conf (muscle memory transfers) and every one of
+    # them is FREE in the stock Omarchy bindings this config sources.
+    if [[ ${XR_BINDS:-1} == 1 ]]; then
+        cat <<'BINDS'
+
+# ---- Container-session XR keybinds (defaults; `--no-binds` omits this block) --
+# Dispatcher vocabulary: docs/openxr/05-configuration.md §4.
+# Chords mirror the daily-driver hyprland-xr.conf and are free in stock Omarchy.
+# NOTE: Hyprland fires EVERY bind matching a chord, so a `--conf` base config
+# that binds these too would run each verb twice (a `toggle` would cancel out).
+# Pass `--no-binds` when your own config already brings XR keybinds.
+
+# Show/hide every XR monitor quad — session, outputs, workspaces and anchors all
+# stay intact (and hidden quads leave ray hit-testing).
+bindd  = SUPER ALT, M, Toggle XR monitor view, xrmonitor, view toggle
+
+# Gaze grab: look at a monitor, tap to carry it with your gaze, tap to drop it.
+bindd  = SUPER SHIFT, G, Gaze-grab the monitor you are looking at, xrmonitor, gazegrab
+# Push/pull the gaze-carried (or gaze-selected) monitor along the gaze ray.
+binded = SUPER ALT, equal, Push the gazed XR monitor away, xrmonitor, gazepush 0.1
+binded = SUPER ALT, minus, Pull the gazed XR monitor closer, xrmonitor, gazepush -0.1
+
+# Re-place the selected monitor centered in view at openxr:default_distance.
+bindd  = SUPER, Home, Recenter the selected XR monitor, xrmonitor, center
+# Re-derive the 2D monitor plane (mouse crossing / directional focus) from where
+# the quads actually float right now. Moves nothing.
+bindd  = SUPER SHIFT, Home, Re-sync the 2D XR layout, xrmonitor, sync
+
+# One scratch monitor to create and throw away. (The daily config mints the
+# lowest free XR-<n> from a helper script; the bare dispatcher keeps the
+# container dependency-free — `hyprctl openxr create <name>` for more.)
+bindd  = SUPER ALT, N, Create the XR-extra scratch monitor, xrmonitor, create XR-extra
+bindd  = SUPER ALT SHIFT, N, Destroy the XR-extra scratch monitor, xrmonitor, destroy XR-extra
+
+# Hand tracking on/off at the keyboard (controllers are never gated by this).
+bindd  = SUPER ALT, H, Toggle XR hand input, xrmonitor, handinput toggle
+
+# Restart the XR session in place: how you apply start-scoped openxr:* changes
+# (blend_mode, overlay, gpu, runtime_json) without restarting the container.
+bindd  = SUPER ALT, R, Restart the XR session, exec, hyprctl openxr disable && hyprctl openxr enable
+BINDS
+    fi
 } > "$OUT"
 
 echo "$OUT"

@@ -24,7 +24,10 @@
 #   HL_WAYLAND_DISPLAY absolute path of the bind-mounted host socket  (required)
 #   XR_BASE_CONF       base config to source (default ~/.config/hypr/hyprland.conf)
 #   XR_OVERLAY         1 -> openxr:overlay = 1 (auto-forced to 1 when XR_ENV is set)
-#   XR_PASSTHROUGH     1 -> openxr:blend_mode = alpha
+#   XR_PASSTHROUGH     1 -> openxr:blend_mode = alpha + the black_alpha luma-key
+#                      default (the wrapper defaults this ON for --wivrn)
+#   XR_BINDS           1 (default) -> merge in the container-session XR keybinds;
+#                      0 -> none (xr-container.sh --no-binds)
 #   XR_ENV             ambient-background spec (pano | forest | <path>); when set,
 #                      hypxrpaper is launched as the PRIMARY OpenXR session and
 #                      HypXRland runs as an XR_EXTX_overlay on top of it (the
@@ -127,9 +130,10 @@ MERGED="$XDG_RUNTIME_DIR/hyprland-xr-merged.conf"
 XR_GPU_NODE="$XR_GPU_NODE" \
 XR_OVERLAY="$XR_OVERLAY" \
 XR_PASSTHROUGH="${XR_PASSTHROUGH:-0}" \
+XR_BINDS="${XR_BINDS:-1}" \
 XR_BASE_CONF="${XR_BASE_CONF:-$HOME/.config/hypr/hyprland.conf}" \
     bash /src/containers/session/merge-conf.sh "$MERGED" >/dev/null
-echo "   merged config -> $MERGED"
+echo "   merged config -> $MERGED  (passthrough=${XR_PASSTHROUGH:-0} xr-binds=${XR_BINDS:-1})"
 
 # --- runtime-specific bring-up ----------------------------------------------
 case "$XR_MODE" in
