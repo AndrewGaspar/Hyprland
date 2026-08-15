@@ -9,6 +9,7 @@
 #include <limits>
 #include <mutex>
 #include <numeric>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -60,9 +61,14 @@ namespace {
         void run(uint32_t rows, uint32_t workers, const std::function<void(uint32_t)>& row) {
             std::unique_lock lock(m_mutex);
             // The generation is captured before the bump below, so a thread spawned
-            // here still observes this job instead of sleeping through it.
-            while (m_threads.size() + 1 < workers)
-                m_threads.emplace_back([this, index = m_threads.size(), seen = m_generation] { work(index, seen); });
+            // here still observes this job instead of sleeping through it. A pool that
+            // cannot grow is a slower frame, not a failed one: renderPortalSBS() runs
+            // inside a Wayland dispatch callback and must not throw through it.
+            while (m_threads.size() + 1 < workers) {
+                try {
+                    m_threads.emplace_back([this, index = m_threads.size(), seen = m_generation] { work(index, seen); });
+                } catch (const std::system_error&) { break; }
+            }
 
             m_row  = &row;
             m_rows = rows;
