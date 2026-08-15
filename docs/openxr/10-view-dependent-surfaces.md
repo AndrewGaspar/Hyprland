@@ -696,6 +696,13 @@ lines lose their staircase and hold an even weight into the distance, while the 
 wall barely changes. Only the grid is filtered — box silhouettes and the aim marker's rim stay
 hard-edged, which is a deliberate scope limit, not an oversight.
 
+One known artifact: the footprint comes from `fwidth`, so across a silhouette the quad straddles
+two surfaces and the derivative is not a footprint. The filter is self-limiting there — a huge
+radius integrates whole cells and returns the grid's duty cycle, which is what an infinitely
+distant surface should return — so the result is a one-pixel rim of wall shaded as if very far
+away, not a smear. Replacing `fwidth` with an analytic ray differential would remove it and is not
+worth the code today.
+
 `--no-aa` turns it off. That exists because the antialiased image is a deliberate divergence from
 the CPU reference and therefore has nothing to be compared against; the tolerance harness below
 asserts only on the hard-edged mode.
