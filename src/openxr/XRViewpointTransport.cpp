@@ -94,16 +94,32 @@ bool OpenXR::encodedViewpointSampleValid(const SXRViewpointEncodedSample& sample
 
 bool OpenXR::encodeViewpointSample(const SXRViewpointGeometry& geometry, uint64_t serial, uint64_t geometryId, SXRViewpointEncodedSample& out) {
     out = {};
+
+    uint32_t widthUM = 0, heightUM = 0;
+    if (!geometry.valid || !encodeViewpointDimensionUM(geometry.widthMeters, widthUM) || !encodeViewpointDimensionUM(geometry.heightMeters, heightUM))
+        return false;
+
+    return encodeViewpointSample(geometry, serial, geometryId, widthUM, heightUM, out);
+}
+
+bool OpenXR::encodeViewpointSample(const SXRViewpointGeometry& geometry, uint64_t serial, uint64_t geometryId, uint32_t widthUM, uint32_t heightUM, SXRViewpointEncodedSample& out) {
+    out = {};
     if (!geometry.valid || geometry.viewCount < 1 || geometry.viewCount > geometry.viewPositions.size())
+        return false;
+
+    // The supplied dimensions ship, but the geometry's own must still be a real rectangle: a caller
+    // handing over a subscription's micrometres must not be able to launder a degenerate or
+    // unencodable shape into a believable sample.
+    uint32_t derivedWidthUM = 0, derivedHeightUM = 0;
+    if (!encodeViewpointDimensionUM(geometry.widthMeters, derivedWidthUM) || !encodeViewpointDimensionUM(geometry.heightMeters, derivedHeightUM))
         return false;
 
     SXRViewpointEncodedSample candidate;
     candidate.serial     = splitViewpointU64(serial);
     candidate.geometryId = splitViewpointU64(geometryId);
     candidate.viewCount  = sc<uint32_t>(geometry.viewCount);
-
-    if (!encodeViewpointDimensionUM(geometry.widthMeters, candidate.widthUM) || !encodeViewpointDimensionUM(geometry.heightMeters, candidate.heightUM))
-        return false;
+    candidate.widthUM    = widthUM;
+    candidate.heightUM   = heightUM;
 
     for (size_t i = 0; i < geometry.viewCount; ++i) {
         const Vec3& view = geometry.viewPositions[i];

@@ -217,7 +217,7 @@ SXRSolveResult CXRAnchor::solve(const SXRSolveInput& in, const SXRAnchorTuning& 
 
     SXRSolveResult res;
     res.widthMeters  = m_state.widthMeters;
-    res.heightMeters = m_state.widthMeters * (float)in.pxH / (float)(in.pxW ? in.pxW : 1);
+    res.heightMeters = quadHeightMeters(m_state.widthMeters, in.pxW, in.pxH);
 
     // Grab override (§4.2): behave as device-locked to the grabbing hand. The device is the wrist
     // grip pose for controllers/grasp, or (WP-G5) the hand pinch pose — the offset was captured

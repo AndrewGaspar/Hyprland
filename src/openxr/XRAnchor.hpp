@@ -195,6 +195,20 @@ namespace OpenXR {
         }
     };
 
+    // THE derivation of a quad's content height in metres from its width and the pixels ONE eye is
+    // presented. It lives here, once, because two threads have to agree on it to the last bit.
+    //
+    // The frame thread solves this into every quad and into every viewpoint sample; the main thread
+    // computes the same number when it builds a viewpoint SUBSCRIPTION — the rectangle the client is
+    // told to render for — and the two are then compared as rounded micrometres. Written twice they
+    // drift: `(w * pxH) / pxW` and `w * (pxH / pxW)` are not the same float, and neither is a double
+    // pane width against the uint32 the solver takes. A drift of one micrometre is invisible in the
+    // headset and fatal to the protocol, because it makes the viewpoint permanently inactive with
+    // nothing logged. So there is one expression, and both callers reach it through here.
+    inline float quadHeightMeters(float widthMeters, uint32_t pxW, uint32_t pxH) {
+        return widthMeters * static_cast<float>(pxH) / static_cast<float>(pxW ? pxW : 1);
+    }
+
     // ---- per-layer persistent state (doc 03 §2.1) ----
     struct SXRAnchorState {
         eXRAnchorMode mode   = XR_ANCHOR_LOCAL;
@@ -208,7 +222,7 @@ namespace OpenXR {
         SXRPose anchorPose;
 
         float   bodyHeight  = 0.F;  // BODY only: stored y of the body frame origin (meters)
-        float   widthMeters = 1.6F; // quad width; height derived = widthMeters * pxH / pxW
+        float   widthMeters = 1.6F; // quad width; height derived = quadHeightMeters(widthMeters, pxW, pxH)
 
         // Adaptive anchoring decorator (research/13). Persisted alongside the LOCAL desk pose.
         SXRAdaptiveConfig adaptive;
