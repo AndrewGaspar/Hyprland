@@ -486,7 +486,8 @@ hermetic GPU; on NVIDIA the nested-into-labwc topology hits an Aquamarine GBM al
 scripts/xr-container.sh session                   # windowed Monado desktop, no headset
 scripts/xr-container.sh session --wivrn           # real Quest via host WiVRn (default --gpu split)
 scripts/xr-container.sh session --env forest      # + hypxrpaper ambient background (overlay)
-scripts/xr-container.sh session --passthrough     # openxr:blend_mode = alpha
+scripts/xr-container.sh session --no-passthrough  # opaque void instead of the --wivrn default
+scripts/xr-container.sh session --no-binds        # omit the default XR keybinds
 ```
 
 `session` nests a full Omarchy desktop as a window on the host, with the dev Hyprland's XR
@@ -503,6 +504,21 @@ port. `session --wivrn` targets a real headset and defaults to `--gpu split`: on
 the nested compositor must render on the host-compositor GPU (`AQ_DRM_DEVICES`) while WiVRn
 encodes on the other (`openxr:gpu`), so both GPUs are exposed and assigned separately
 (`--nested-gpu` / `--xr-gpu`); it degrades to a single node on a one-GPU box.
+
+**Session defaults.** The config `containers/session/merge-conf.sh` generates is not bare:
+
+- **Passthrough is ON by default with a headset** (`--wivrn`) — `openxr:blend_mode = alpha` plus
+  `black_alpha = 0.2`, matching the daily-driver config, so a container session composites over
+  the room instead of an opaque void. OFF for windowed Monado (that runtime enumerates only
+  `OPAQUE`; the request would just warn and fall back) and OFF with `--env` (hypxrpaper's sky
+  hides the room). `--passthrough` / `--no-passthrough` override.
+- **Default XR keybinds** mirror the daily-driver chords and are free in stock Omarchy:
+  `SUPER+ALT+M` view toggle, `SUPER+SHIFT+G` gaze grab, `SUPER+ALT+=`/`-` gaze push/pull,
+  `SUPER+Home` center, `SUPER+SHIFT+Home` 2D re-sync, `SUPER+ALT+N` / `+SHIFT` create/destroy the
+  `XR-extra` scratch monitor, `SUPER+ALT+H` hand input, `SUPER+ALT+R` XR-session restart (the way
+  to apply start-scoped `openxr:*` changes in place). `--no-binds` omits the block — needed when a
+  `--conf` config binds the same chords, since Hyprland fires *every* matching bind and a doubled
+  `toggle` cancels out. Details in [`containers/README.md`](../../containers/README.md).
 
 ### 8.3 Dual-GPU interop note
 
