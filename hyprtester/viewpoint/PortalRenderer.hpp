@@ -53,6 +53,25 @@ namespace ViewpointDemo {
         uint32_t            stridePixels = 0;
     };
 
+    struct SImageDelta {
+        // False when either image fails the renderers' own validity contract or the
+        // two disagree on size. Every other field is then meaningless.
+        bool     comparable = false;
+        uint64_t pixels     = 0;
+        // Largest absolute difference over all three channels of all pixels, the first
+        // pixel that attains it, and what the two images actually hold there — which
+        // is what separates a rounding step from a surface the two paths disagree on.
+        uint32_t maxDelta        = 0;
+        uint32_t worstX          = 0;
+        uint32_t worstY          = 0;
+        uint32_t worstReference  = 0;
+        uint32_t worstCandidate  = 0;
+        // Pixels that differ at all, and pixels where some channel exceeds the
+        // tolerance handed to compareImages().
+        uint64_t differing = 0;
+        uint64_t outliers  = 0;
+    };
+
     // Builds the fixed-orientation, eye-translated off-axis frustum through the
     // physical portal edges. The gameplay/world camera remains unchanged.
     bool offAxisFrustum(const SVec3& eye, const SPortalSize& portal, double nearPlane, SFrustum& out);
@@ -69,6 +88,11 @@ namespace ViewpointDemo {
     // Configure eligibility is intentionally reversible; malformed protocol
     // data and unsupported capabilities can independently disable feedback.
     bool feedbackShouldBeEnabled(const SFeedbackState& state);
+
+    // The scene half of renderPortalSBS()'s acceptance contract, split out so the
+    // GPU renderer in PortalRendererGL.cpp refuses exactly the scenes the CPU one
+    // refuses instead of carrying its own drifting copy of the predicate.
+    bool portalSceneValid(const SPortalSize& portal, const SStereoViews& views);
 
     // Returns the ray from a surface-relative eye through the selected pixel center
     // on the portal plane. The portal center is the origin and +Z points toward the
@@ -102,5 +126,12 @@ namespace ViewpointDemo {
 
     // Stable semantic hash over visible pixels (stride padding is ignored).
     uint64_t pixelHash(const SImage& image);
+
+    // Per-channel comparison of two same-size images, ignoring the alpha byte and
+    // any stride padding. This is how the GPU renderer is held to the CPU reference:
+    // 32-bit shader arithmetic cannot reproduce the reference's doubles bit for bit,
+    // so the harness asserts a tolerance plus a bounded outlier count rather than
+    // equality. Pure and CPU-only, so it is testable without a GPU.
+    SImageDelta compareImages(const SImage& reference, const SImage& candidate, uint32_t tolerance);
 
 }

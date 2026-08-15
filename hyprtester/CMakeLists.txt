@@ -202,6 +202,28 @@ if(CMAKE_BUILD_TYPE MATCHES "[Dd][Ee][Bb][Uu][Gg]")
   target_compile_options(hypxr-viewpoint-demo-renderer PRIVATE -O2)
 endif()
 
+# GPU path for the viewpoint demo (docs/openxr/10-view-dependent-surfaces.md §13.1).
+# EGL and GLES come from find_package(OpenGL) exactly as the root CMakeLists.txt
+# resolves them; wayland-egl is the one extra piece, needed for wl_egl_window on the
+# live back end. This library is deliberately NOT part of
+# hypxr-viewpoint-demo-renderer: hyprland_gtests links that one, and the deterministic
+# CPU renderer must keep building and running with no GPU stack present at all.
+set(GLES_VERSION "GLES3")
+find_package(OpenGL COMPONENTS ${GLES_VERSION})
+pkg_check_modules(wayland_egl_dep QUIET IMPORTED_TARGET wayland-egl)
+if(NOT TARGET OpenGL::EGL
+   OR NOT TARGET OpenGL::${GLES_VERSION}
+   OR NOT wayland_egl_dep_FOUND)
+  message(
+    FATAL_ERROR
+      "the viewpoint demo's GPU path needs EGL, OpenGL ${GLES_VERSION}, and wayland-egl; install the EGL/GLES/wayland-egl development packages (Arch: mesa wayland; Debian: libegl-dev libgles-dev libwayland-dev)"
+  )
+endif()
+add_library(hypxr-viewpoint-demo-gl STATIC viewpoint/PortalRendererGL.cpp)
+target_link_libraries(
+  hypxr-viewpoint-demo-gl PUBLIC hypxr-viewpoint-demo-renderer OpenGL::EGL
+                                 OpenGL::${GLES_VERSION} PkgConfig::wayland_egl_dep)
+
 clientNew("pointer-warp" PROTOS "pointer-warp-v1" "xdg-shell")
 clientNew("surface-scale-transform" PROTOS "fractional-scale-v1" "xdg-shell")
 clientNew("pointer-scroll" PROTOS "xdg-shell")
@@ -216,4 +238,4 @@ clientNew("screencopy-crop" PROTOS "wlr-screencopy-unstable-v1")
 clientNew("screencopy-probe" PROTOS "wlr-screencopy-unstable-v1")
 clientNew("viewpoint-inactive" PROTOS "hypxr-viewpoint-v1")
 clientNew("viewpoint-demo" PROTOS "hypxr-viewpoint-v1" "viewporter" "xdg-shell" "xdg-toplevel-tag-v1")
-target_link_libraries(viewpoint-demo PRIVATE hypxr-viewpoint-demo-renderer)
+target_link_libraries(viewpoint-demo PRIVATE hypxr-viewpoint-demo-renderer hypxr-viewpoint-demo-gl)
