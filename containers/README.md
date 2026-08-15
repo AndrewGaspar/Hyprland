@@ -64,9 +64,13 @@ base config sources — type them **into the nested session**:
 | `SUPER+ALT+R` | *(exec)* | `hyprctl openxr disable && enable` — apply start-scoped `openxr:*` changes |
 
 Vocabulary: [`docs/openxr/05-configuration.md` §4](../docs/openxr/05-configuration.md).
-Use `--no-binds` whenever a `--conf` base config binds the same chords: Hyprland
-fires **every** bind matching a chord, so the verbs would run twice and a `toggle`
-would cancel itself out.
+
+Each chord is `unbind`-ed immediately before it is bound, because Hyprland fires
+**every** bind matching a chord rather than the last one — and the image's seeded
+Omarchy config does claim one of them (`SUPER+SHIFT+G` launches Signal), which
+would otherwise both launch Signal *and* gaze-grab, while a doubled `toggle` verb
+would cancel itself out. So these defaults win over the base config; pass
+`--no-binds` when a `--conf` config should keep its own bindings.
 
 - **windowed** (default, no headset): a vendored Monado runs in-container; a
   container-local rooted `Xwayland` (on the host compositor) is its X target, so
