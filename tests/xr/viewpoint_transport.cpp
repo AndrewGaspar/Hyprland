@@ -349,3 +349,22 @@ TEST(XRViewpointTransport, ConcurrentProducerConsumerNeverObserveATornSample) {
 
     EXPECT_EQ(newest, COUNT);
 }
+
+TEST(XRViewpointTransport, RenderedDispositionDropsStaleReportsSilently) {
+    using OpenXR::eXRViewpointRenderedDisposition;
+    using OpenXR::viewpointRenderedDisposition;
+
+    // Deactivated viewpoint: every in-flight report is the benign wire race, never an error.
+    EXPECT_EQ(viewpointRenderedDisposition(0, 1), eXRViewpointRenderedDisposition::XR_VIEWPOINT_RENDERED_IGNORE_STALE);
+    EXPECT_EQ(viewpointRenderedDisposition(0, 0), eXRViewpointRenderedDisposition::XR_VIEWPOINT_RENDERED_IGNORE_STALE);
+
+    // Re-activation bumped the epoch while a report for the old one was in flight.
+    EXPECT_EQ(viewpointRenderedDisposition(2, 1), eXRViewpointRenderedDisposition::XR_VIEWPOINT_RENDERED_IGNORE_STALE);
+
+    // An epoch the compositor never issued is indistinguishable from the same race on this axis;
+    // only sample consumption inside the current epoch can prove a violation.
+    EXPECT_EQ(viewpointRenderedDisposition(2, 3), eXRViewpointRenderedDisposition::XR_VIEWPOINT_RENDERED_IGNORE_STALE);
+
+    // Current epoch: proceed to consume, where an unknown/replayed sample is a real protocol error.
+    EXPECT_EQ(viewpointRenderedDisposition(2, 2), eXRViewpointRenderedDisposition::XR_VIEWPOINT_RENDERED_CONSUME);
+}
