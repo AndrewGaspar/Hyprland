@@ -90,6 +90,23 @@ namespace OpenXR {
     SXRViewpointU64 splitViewpointU64(uint64_t value);
     uint64_t        joinViewpointU64(const SXRViewpointU64& value);
 
+    // What a `rendered` report deserves. Deactivation (and re-activation with a new epoch) is an
+    // asynchronous compositor->client event, so a report for a no-longer-current epoch can always
+    // legitimately cross it on the wire — that is the client faithfully reporting work it finished
+    // before it could know better, and it must be dropped silently, never answered with a fatal
+    // protocol error. Only a report inside the CURRENT epoch can prove a protocol violation (an
+    // unknown or replayed sample), which the caller detects when consuming the sample id.
+    enum class eXRViewpointRenderedDisposition : uint8_t {
+        XR_VIEWPOINT_RENDERED_IGNORE_STALE = 0, // inactive, or an epoch that is not current: drop silently
+        XR_VIEWPOINT_RENDERED_CONSUME,          // current epoch: consume the sample; failure there IS an error
+    };
+
+    constexpr eXRViewpointRenderedDisposition viewpointRenderedDisposition(uint64_t currentEpoch, uint64_t reportedEpoch) {
+        if (currentEpoch == 0 || reportedEpoch != currentEpoch)
+            return eXRViewpointRenderedDisposition::XR_VIEWPOINT_RENDERED_IGNORE_STALE;
+        return eXRViewpointRenderedDisposition::XR_VIEWPOINT_RENDERED_CONSUME;
+    }
+
     // Round meters to the nearest micrometer (half away from zero). A failure zeroes `out` and
     // returns false; no nonfinite or out-of-range input is saturated into a believable position.
     bool   encodeViewpointPositionUM(double meters, int32_t& out);

@@ -63,15 +63,12 @@ CXRViewpointResource::CXRViewpointResource(UP<CHypxrViewpointV1>&& resource, SP<
         if (!m_surface)
             return;
 
-        if (m_epoch == 0) {
-            resource->error(HYPXR_VIEWPOINT_V1_ERROR_INVALID_STATE, "rendered called while viewpoint feedback is inactive");
-            return;
-        }
-
         const uint64_t EPOCH  = OpenXR::joinViewpointU64({.hi = epochHi, .lo = epochLo});
         const uint64_t SAMPLE = OpenXR::joinViewpointU64({.hi = sampleHi, .lo = sampleLo});
-        if (EPOCH != m_epoch || !m_issuedSamples.consume(SAMPLE)) {
-            resource->error(HYPXR_VIEWPOINT_V1_ERROR_INVALID_SAMPLE, "rendered references an unknown, stale, or already consumed sample");
+        if (OpenXR::viewpointRenderedDisposition(m_epoch, EPOCH) == OpenXR::eXRViewpointRenderedDisposition::XR_VIEWPOINT_RENDERED_IGNORE_STALE)
+            return; // an in-flight report crossed a deactivation on the wire; the client could not have known
+        if (!m_issuedSamples.consume(SAMPLE)) {
+            resource->error(HYPXR_VIEWPOINT_V1_ERROR_INVALID_SAMPLE, "rendered references an unknown or already consumed sample for the current epoch");
             return;
         }
 
