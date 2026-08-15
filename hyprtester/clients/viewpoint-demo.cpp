@@ -6,6 +6,7 @@
 #include "PortalRendererGL.hpp"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -14,7 +15,6 @@
 #include <cstring>
 #include <format>
 #include <fstream>
-#include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -172,24 +172,26 @@ static bool parseDimension(std::string_view value, uint32_t& out) {
 // "X,Y,Z" in meters. Bounded well inside the room so an offline pose can never put
 // the eye behind the portal plane, where the projection has no meaning.
 static bool parseHeadOffset(std::string_view value, SVec3& out) {
-    SVec3        parsed;
-    const double LIMIT = 1.0;
-    double*      slots[] = {&parsed.x, &parsed.y, &parsed.z};
+    constexpr double        LIMIT = 1.0;
+    std::array<double, 3>   axes{};
 
-    for (size_t index = 0; index < std::size(slots); ++index) {
-        const bool       LAST  = index + 1 == std::size(slots);
-        const size_t     COMMA = value.find(',');
-        const auto       FIELD = value.substr(0, COMMA);
-        const auto [end, error] = std::from_chars(FIELD.data(), FIELD.data() + FIELD.size(), *slots[index]);
-        if (error != std::errc{} || end != FIELD.data() + FIELD.size() || !std::isfinite(*slots[index]) || std::abs(*slots[index]) > LIMIT)
-            return false;
+    for (size_t index = 0; index < axes.size(); ++index) {
+        // The separator count is part of the grammar: a missing comma before the last
+        // axis and a trailing one after it are both malformed, not "close enough".
+        const bool   LAST  = index + 1 == axes.size();
+        const size_t COMMA = value.find(',');
         if (LAST != (COMMA == std::string_view::npos))
+            return false;
+
+        const auto FIELD        = value.substr(0, COMMA);
+        const auto [END, ERROR] = std::from_chars(FIELD.data(), FIELD.data() + FIELD.size(), axes[index]);
+        if (ERROR != std::errc{} || END != FIELD.data() + FIELD.size() || !std::isfinite(axes[index]) || std::abs(axes[index]) > LIMIT)
             return false;
         if (!LAST)
             value = value.substr(COMMA + 1);
     }
 
-    out = parsed;
+    out = {.x = axes[0], .y = axes[1], .z = axes[2]};
     return true;
 }
 
