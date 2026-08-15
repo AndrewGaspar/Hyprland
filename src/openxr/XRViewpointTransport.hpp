@@ -105,7 +105,35 @@ namespace OpenXR {
     // Encode/decode the stage-zero geometry as one atomic semantic unit. Every output is reset to a
     // safe default on failure. IDs retain the full uint64 range, including zero and UINT64_MAX.
     bool encodeViewpointSample(const SXRViewpointGeometry& geometry, uint64_t serial, uint64_t geometryId, SXRViewpointEncodedSample& out);
+    // The publish overload: the caller supplies the AUTHORITATIVE dimensions instead of having them
+    // re-derived from the geometry's floats. The viewpoint path needs this because the dimensions a
+    // sample carries are a contract, not a measurement — they must be the micrometres the client was
+    // told to render for when it was activated, and rounding the same shape to micrometres a second
+    // time (on the other thread, out of a differently-associated float) is exactly how a viewpoint
+    // ends up permanently inactive. The geometry's own dimensions are still required to be valid;
+    // they are simply not what ships. Whether they still DESCRIBE the subscribed rectangle is a
+    // separate question, and viewpointDimensionAgrees below is what answers it.
+    bool encodeViewpointSample(const SXRViewpointGeometry& geometry, uint64_t serial, uint64_t geometryId, uint32_t widthUM, uint32_t heightUM, SXRViewpointEncodedSample& out);
     bool decodeViewpointSample(const SXRViewpointEncodedSample& sample, SXRViewpointGeometry& geometry, uint64_t& serial, uint64_t& geometryId);
+
+    // Slack for the agreement test below. One micrometre: far below anything a headset can show or a
+    // client can act on, and far above the last-place float wobble that separates two honest
+    // roundings of the same rectangle.
+    inline constexpr uint32_t XR_VIEWPOINT_DIMENSION_TOLERANCE_UM = 1;
+
+    // Does the geometry the frame thread just solved still describe the rectangle the subscription
+    // promised? This is the interlock that stops samples flowing when a monitor's mode or stereo
+    // declaration has actually moved under a live subscription — relabelling a new shape with the
+    // old dimensions would be worse than publishing nothing. It is deliberately an AGREEMENT test
+    // and not bit equality: an exact comparison also rejects the case where nothing changed at all
+    // and one side merely rounded a half-micrometre the other way, and that rejection is permanent
+    // and silent.
+    inline bool viewpointDimensionAgrees(double meters, uint32_t subscribedUM) {
+        uint32_t um = 0;
+        if (!encodeViewpointDimensionUM(meters, um))
+            return false;
+        return (um > subscribedUM ? um - subscribedUM : subscribedUM - um) <= XR_VIEWPOINT_DIMENSION_TOLERANCE_UM;
+    }
 
     struct SXRViewpointPublishResult {
         bool     accepted   = false;

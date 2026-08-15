@@ -1957,9 +1957,11 @@ void COpenXRManager::frameThread() {
                     results[i].worldPose    = results[i].pose;
                     results[i].widthMeters  = l->m_anchor.state().widthMeters;
                     // Same pane-aspect rule as the solve path above (WP X1) — a tracking dropout
-                    // must not silently un-pair the geometry and pop the quad's height.
-                    results[i].heightMeters =
-                        results[i].widthMeters * Render::Stereo::presentedAspect(l->m_contentSize, layerDecl(*l).layout);
+                    // must not silently un-pair the geometry and pop the quad's height. Through the
+                    // shared derivation and the same truncated pane pixels solve() feeds itself, so
+                    // a dropout does not move the published height by a rounding step either.
+                    const auto HOLDPANEPX   = Render::Stereo::presentedPaneSize(l->m_contentSize, layerDecl(*l).layout);
+                    results[i].heightMeters = OpenXR::quadHeightMeters(results[i].widthMeters, (uint32_t)std::max(1.0, HOLDPANEPX.x), (uint32_t)std::max(1.0, HOLDPANEPX.y));
                     solved[i]               = true;
                 }
             }
@@ -2248,8 +2250,17 @@ void COpenXRManager::frameThread() {
                         OpenXR::Vec3{viewpointViews[1].pose.position.x, viewpointViews[1].pose.position.y, viewpointViews[1].pose.position.z},
                     };
                     const auto geometry = OpenXR::surfaceRelativeViewpoint(contentPose, results[i].widthMeters, results[i].heightMeters, viewPositions, 2);
-                    valid = OpenXR::encodeViewpointSample(geometry, ++layer->m_viewpointFrameSerial, subscription->geometryId, sample) && sample.widthUM == subscription->widthUM &&
-                        sample.heightUM == subscription->heightUM;
+                    // The subscription's micrometres are what the client was told to render for, so
+                    // they are what the sample carries — this thread does not round the rectangle a
+                    // second time and hand the client a value one micrometre off the contract it is
+                    // matching against. The interlock survives as an AGREEMENT test: a monitor whose
+                    // mode or stereo declaration has genuinely moved under the subscription stops
+                    // publishing (main will re-subscribe with the new shape), while two honest
+                    // roundings of the SAME rectangle can no longer disagree their way into a
+                    // permanently inactive viewpoint.
+                    valid = OpenXR::encodeViewpointSample(geometry, ++layer->m_viewpointFrameSerial, subscription->geometryId, subscription->widthUM, subscription->heightUM,
+                                                          sample) &&
+                        OpenXR::viewpointDimensionAgrees(geometry.widthMeters, subscription->widthUM) && OpenXR::viewpointDimensionAgrees(geometry.heightMeters, subscription->heightUM);
                 }
 
                 const auto PREVIOUS   = sc<OpenXR::eXRViewpointRuntimeState>(layer->m_viewpointRuntimeState.load(std::memory_order_acquire));
@@ -4174,8 +4185,18 @@ void COpenXRManager::reevaluateViewpoints() {
             continue;
         }
 
+        // The rectangle the client is about to be told to render for. Derived through the SAME
+        // expression, from the SAME pane pixels, that the frame thread's solve will use — the two
+        // results are compared as micrometres at every publish, and a rounding step between them
+        // would make the viewpoint inactive forever with nothing logged. The size SOURCE is the
+        // monitor's pixel mode on both sides: the frame thread reads it from the layer's
+        // m_contentSize, which the layer latched from this same m_pixelSize at swapchain creation
+        // (the main thread must not read m_contentSize — it is frame-thread-owned and non-atomic).
+        // While a mode change is in flight the two genuinely disagree, and that is exactly when the
+        // publish interlock should hold the samples back.
         const float WIDTH   = LAYER->m_anchor.state().widthMeters;
-        const float HEIGHT  = WIDTH * Render::Stereo::presentedAspect(MONITOR->m_pixelSize, Render::Stereo::CONTENT_SBS);
+        const auto  PANEPX  = Render::Stereo::presentedPaneSize(MONITOR->m_pixelSize, Render::Stereo::CONTENT_SBS);
+        const float HEIGHT  = OpenXR::quadHeightMeters(WIDTH, (uint32_t)std::max(1.0, PANEPX.x), (uint32_t)std::max(1.0, PANEPX.y));
         uint32_t    widthUM = 0, heightUM = 0;
         if (!OpenXR::encodeViewpointDimensionUM(WIDTH, widthUM) || !OpenXR::encodeViewpointDimensionUM(HEIGHT, heightUM)) {
             viewpoint->invalidate(HYPXR_VIEWPOINT_V1_INACTIVE_REASON_NOT_ELIGIBLE);
