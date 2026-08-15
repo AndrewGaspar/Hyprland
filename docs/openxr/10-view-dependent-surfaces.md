@@ -560,6 +560,13 @@ The renderer can produce deterministic active and fallback images without Waylan
 ./build-viewpoint-demo/viewpoint-demo --render-fallback /tmp/viewpoint-fallback.ppm
 ```
 
+`--bench N` renders N offline frames with no Wayland, no PPM write, and no per-frame hash, and
+reports the raymarcher's own frame budget:
+
+```sh
+./build-viewpoint-demo/viewpoint-demo --bench 200 --width 960 --height 540
+```
+
 Live feedback is privacy-gated by an explicit window rule. The client already declares
 `stereo:sbs`; the stereo rule opts into honoring that declaration, while `viewpoint on` authorizes
 head-pose-relative feedback only for this app ID:
@@ -597,7 +604,7 @@ monitor in `hyprctl -j openxr`.
 Launch the demo on one dedicated XR monitor, with its anchor local and docked, then run:
 
 ```sh
-./build-viewpoint-demo/viewpoint-demo --debug
+./build-viewpoint-demo/viewpoint-demo --debug --width 960 --height 540
 ```
 
 The default per-eye render budget is at most 256×144. The client chooses an exact-aspect size from
@@ -605,7 +612,34 @@ the configured destination: a 3840×1080 packed destination uses 256×144 per ey
 full-SBS buffer, while 1920×1080 uses 128×144 per eye and a 256×144 full-SBS buffer.
 `wp_viewporter` scales the whole packed buffer to the exact fullscreen destination. `--width` and
 `--height` change the per-eye upper bounds. `--windowed` is useful for fallback inspection but is
-intentionally ineligible for feedback. In a successful live proof, lateral head movement shifts
+intentionally ineligible for feedback.
+
+#### Frame budget and the worker pool
+
+The CPU raymarcher spreads rows over a persistent worker pool. `--threads N` (1..64) overrides the
+default of `min(hardware_concurrency, 12)`; the demo prints the resolved count when it maps.
+**Output is byte-identical for every worker count** — rows are partitioned, never shared, and no
+state accumulates across them. That is load-bearing, because the gtest suite, `--render`,
+`--render-fallback`, and the `--debug` commit log all assert on frame hashes; the
+`WorkerCountNeverChangesARenderedByte` test in `tests/xr/viewpoint_demo_renderer.cpp` pins it.
+`PortalRenderer.cpp` is compiled `-O2 -ffp-contract=off` even in Debug builds, which keeps those
+hashes stable under `-march=native` too.
+
+Measured with `--bench` on a 24-thread desktop:
+
+| per eye | 1 worker | 12 workers |
+| --- | --- | --- |
+| 960×540 | 32.6 fps (30.7 ms) | **160 fps (6.2 ms)** |
+| 1280×720 | 18.3 fps (54.7 ms) | **100 fps (10.0 ms)** |
+| 1920×1080 | 8.3 fps (120 ms) | **48 fps (20.8 ms)** |
+
+Scaling is close to linear up to the physical core count and flattens past it — 960×540 already
+reaches 98 fps on four workers — so spend spare headroom on `--width`/`--height` rather than on
+more workers. These are raymarcher-only numbers: a live frame additionally pays the SHM buffer
+clear, the `wp_viewporter` scale, and, under `--debug` only, a full-frame `pixelHash()`. Budget
+for a live sample rate somewhat below the table.
+
+In a successful live proof, lateral head movement shifts
 near, middle, and far geometry by different amounts, the cyan portal reticle stays
 surface-centered, and the red authoritative world-space aim impact changes projection without
 changing its world coordinate. Stereo disparity without that depth-dependent motion is not a
