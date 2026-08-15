@@ -76,13 +76,29 @@ namespace ViewpointDemo {
     // l/r/b/t = near * (portal edge - eye coordinate) / eye.z.
     bool portalRay(const SVec3& eye, const SPortalSize& portal, uint32_t pixelX, uint32_t pixelY, uint32_t paneWidth, uint32_t paneHeight, SRay& out);
 
+    // Upper bound on the worker count the demo selects on its own. Beyond roughly a
+    // dozen workers the fixed per-frame costs (buffer clear, hash, commit) dominate.
+    inline constexpr uint32_t MAX_AUTO_RENDER_THREADS = 12;
+
+    // min(std::thread::hardware_concurrency(), MAX_AUTO_RENDER_THREADS), never 0.
+    uint32_t defaultRenderThreads();
+
+    // The `threads` argument of the two render entry points below is a worker budget
+    // *including* the calling thread; 0 or 1 renders entirely on the caller. Rows are
+    // partitioned, never shared, and no accumulation state crosses a row, so output is
+    // byte-identical (padding included) for every worker count — this is load-bearing
+    // for the frame hashes in the gtest suite and in --render/--render-fallback.
+    //
+    // The persistent worker pool is process-wide: a render call with threads > 1 must
+    // not overlap another render call on a different thread.
+
     // Renders one pair-latched sample into an even-width full-SBS image. Both panes are produced
     // from the same immutable scene and simulation state; only eye position changes.
-    bool renderPortalSBS(const SImage& image, const SPortalSize& portal, const SStereoViews& views);
+    bool renderPortalSBS(const SImage& image, const SPortalSize& portal, const SStereoViews& views, uint32_t threads = 1);
 
     // Renders a static, zero-disparity full-SBS calibration image for inactive or
     // stale feedback. It deliberately carries no viewpoint/sample association.
-    bool renderFallbackSBS(const SImage& image);
+    bool renderFallbackSBS(const SImage& image, uint32_t threads = 1);
 
     // Stable semantic hash over visible pixels (stride padding is ignored).
     uint64_t pixelHash(const SImage& image);

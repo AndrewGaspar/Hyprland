@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -42,6 +43,9 @@ struct SOptions {
     bool                       debug        = false;
     std::optional<std::string> renderPath;
     bool                       renderFallback = false;
+    // Worker budget including this thread; resolved from defaultRenderThreads().
+    uint32_t threads     = 0;
+    uint32_t benchFrames = 0;
 };
 
 struct SSample {
@@ -135,13 +139,17 @@ static uint32_t lowWord(uint64_t value) {
     return sc<uint32_t>(value & 0xFFFFFFFFULL);
 }
 
-static bool parseDimension(std::string_view value, uint32_t& out) {
+static bool parseCount(std::string_view value, uint32_t low, uint32_t high, uint32_t& out) {
     uint32_t parsed         = 0;
     const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), parsed);
-    if (error != std::errc{} || end != value.data() + value.size() || parsed < 64 || parsed > 4096)
+    if (error != std::errc{} || end != value.data() + value.size() || parsed < low || parsed > high)
         return false;
     out = parsed;
     return true;
+}
+
+static bool parseDimension(std::string_view value, uint32_t& out) {
+    return parseCount(value, 64, 4096, out);
 }
 
 static void printHelp(const char* program) {
@@ -153,6 +161,8 @@ static void printHelp(const char* program) {
                  "\n"
                  "  --width N      render/one-eye width, 64..4096 (default 256)\n"
                  "  --height N     render/one-eye height, 64..4096 (default 144)\n"
+                 "  --threads N    raymarcher worker budget, 1..64 (default {}, this machine)\n"
+                 "                 output is byte-identical for every value\n"
                  "  --windowed     create a resizable window instead of requesting fullscreen\n"
                  "  --once         exit after the first viewpoint-associated frame\n"
                  "  --debug        print activation, coalescing, and frame identifiers\n"
@@ -160,8 +170,9 @@ static void printHelp(const char* program) {
                  "  --render-fallback FILE\n"
                  "                 write the inactive zero-disparity PPM without Wayland\n"
                  "                 (offline output is 2*width by height; default 512x144)\n"
+                 "  --bench N      render N offline active frames and report the frame budget\n"
                  "  -h, --help     show this help\n",
-                 program);
+                 program, defaultRenderThreads());
 }
 
 static std::optional<SOptions> parseOptions(int argc, char** argv) {
@@ -197,11 +208,28 @@ static std::optional<SOptions> parseOptions(int argc, char** argv) {
             }
             continue;
         }
+        if (ARG == "--threads" && index + 1 < argc) {
+            if (!parseCount(argv[++index], 1, 64, options.threads)) {
+                logLine("error: --threads must be an integer from 1 through 64");
+                return std::nullopt;
+            }
+            continue;
+        }
+        if (ARG == "--bench" && index + 1 < argc) {
+            if (!parseCount(argv[++index], 1, 100000, options.benchFrames)) {
+                logLine("error: --bench must be an integer from 1 through 100000");
+                return std::nullopt;
+            }
+            continue;
+        }
 
         logLine("error: unknown or incomplete option '{}'", ARG);
         printHelp(argv[0]);
         return std::nullopt;
     }
+
+    if (options.threads == 0)
+        options.threads = defaultRenderThreads();
     return options;
 }
 
@@ -500,7 +528,7 @@ static bool drawPending(SApp& app) {
 
     if (app.active && app.pendingSample) {
         const SSample SAMPLE = *app.pendingSample;
-        if (SAMPLE.epoch != app.epoch || SAMPLE.geometry != app.geometry || !renderPortalSBS(image, app.portal, SAMPLE.views)) {
+        if (SAMPLE.epoch != app.epoch || SAMPLE.geometry != app.geometry || !renderPortalSBS(image, app.portal, SAMPLE.views, app.options.threads)) {
             rejectFeedback(app, "sample failed final render validation; feedback disabled");
             return true;
         }
@@ -509,16 +537,20 @@ static bool drawPending(SApp& app) {
         if (!commitFrame(app, *buffer, SAMPLE))
             return false;
         ++app.renderedFrames;
-        debugLine(app, "committed epoch={} sample={} frame={} hash={:#x}", SAMPLE.epoch, SAMPLE.sample, app.renderedFrames, pixelHash(image));
+        // pixelHash() walks every visible pixel, so it stays behind the debug check
+        // instead of riding in as an eagerly evaluated debugLine() argument.
+        if (app.options.debug)
+            logLine("committed epoch={} sample={} frame={} hash={:#x}", SAMPLE.epoch, SAMPLE.sample, app.renderedFrames, pixelHash(image));
         if (app.options.once)
             app.running = false;
         return true;
     }
 
-    if (!renderFallbackSBS(image))
+    if (!renderFallbackSBS(image, app.options.threads))
         return false;
     app.fallbackDirty = false;
-    debugLine(app, "committing inactive zero-disparity fallback hash={:#x}", pixelHash(image));
+    if (app.options.debug)
+        logLine("committing inactive zero-disparity fallback hash={:#x}", pixelHash(image));
     return commitFrame(app, *buffer, std::nullopt);
 }
 
@@ -567,7 +599,11 @@ static bool writePpm(const std::string& path, const SImage& image) {
     return output.good();
 }
 
-static bool renderOffline(const SOptions& options) {
+// The offline scene is the fixed reference pose used by --render and --bench.
+static constexpr SPortalSize  OFFLINE_PORTAL = {.widthMeters = 1.6, .heightMeters = 0.9};
+static constexpr SStereoViews OFFLINE_VIEWS  = {.left = {.x = -0.032, .z = 1.2}, .right = {.x = 0.032, .z = 1.2}};
+
+static bool                   renderOffline(const SOptions& options) {
     const uint32_t        BUFFER_WIDTH = options.renderWidth * 2U;
     std::vector<uint32_t> pixels(sc<size_t>(BUFFER_WIDTH) * options.renderHeight);
     const SImage          image = {
@@ -577,14 +613,41 @@ static bool renderOffline(const SOptions& options) {
         .stridePixels = BUFFER_WIDTH,
     };
 
-    const bool RENDERED = options.renderFallback ?
-        renderFallbackSBS(image) :
-        renderPortalSBS(image, {.widthMeters = 1.6, .heightMeters = 0.9}, {.left = {.x = -0.032, .z = 1.2}, .right = {.x = 0.032, .z = 1.2}});
+    const bool RENDERED = options.renderFallback ? renderFallbackSBS(image, options.threads) : renderPortalSBS(image, OFFLINE_PORTAL, OFFLINE_VIEWS, options.threads);
     if (!RENDERED || !writePpm(*options.renderPath, image))
         return false;
 
-    logLine("wrote {} {}x{} full-SBS PPM '{}' ({}x{} per eye, hash {:#x})", options.renderFallback ? "fallback" : "active portal", image.width, image.height, *options.renderPath,
-            options.renderWidth, options.renderHeight, pixelHash(image));
+    logLine("wrote {} {}x{} full-SBS PPM '{}' ({}x{} per eye, {} threads, hash {:#x})", options.renderFallback ? "fallback" : "active portal", image.width, image.height,
+            *options.renderPath, options.renderWidth, options.renderHeight, options.threads, pixelHash(image));
+    return true;
+}
+
+// Offline frame-budget probe. It renders the reference pose repeatedly into one
+// buffer, with no Wayland, no PPM write, and no per-frame hash, so the reported
+// number is the raymarcher's own budget.
+static bool benchmarkOffline(const SOptions& options) {
+    const uint32_t        BUFFER_WIDTH = options.renderWidth * 2U;
+    std::vector<uint32_t> pixels(sc<size_t>(BUFFER_WIDTH) * options.renderHeight);
+    const SImage          image = {
+        .pixels       = pixels,
+        .width        = BUFFER_WIDTH,
+        .height       = options.renderHeight,
+        .stridePixels = BUFFER_WIDTH,
+    };
+
+    // One warm-up frame spawns the pool so thread creation is not billed to a frame.
+    if (!renderPortalSBS(image, OFFLINE_PORTAL, OFFLINE_VIEWS, options.threads))
+        return false;
+
+    const auto START = std::chrono::steady_clock::now();
+    for (uint32_t frame = 0; frame < options.benchFrames; ++frame) {
+        if (!renderPortalSBS(image, OFFLINE_PORTAL, OFFLINE_VIEWS, options.threads))
+            return false;
+    }
+    const double SECONDS = std::chrono::duration<double>(std::chrono::steady_clock::now() - START).count();
+
+    logLine("bench: {} frames of {}x{} per eye on {} threads in {:.3f}s -> {:.2f} fps ({:.2f} ms/frame, hash {:#x})", options.benchFrames, options.renderWidth,
+            options.renderHeight, options.threads, SECONDS, options.benchFrames / SECONDS, SECONDS * 1000.0 / options.benchFrames, pixelHash(image));
     return true;
 }
 
@@ -594,6 +657,8 @@ int main(int argc, char** argv) {
         return argc > 1 && (std::strcmp(argv[1], "-h") == 0 || std::strcmp(argv[1], "--help") == 0) ? 0 : 2;
     if (OPTIONS->renderPath)
         return renderOffline(*OPTIONS) ? 0 : 1;
+    if (OPTIONS->benchFrames > 0)
+        return benchmarkOffline(*OPTIONS) ? 0 : 1;
 
     wl_display* display = wl_display_connect(nullptr);
     if (!display) {
@@ -613,7 +678,8 @@ int main(int argc, char** argv) {
             logLine("error: could not create the tagged viewpoint toplevel");
             result = 1;
         } else {
-            logLine("viewpoint demo mapped; waiting for surface size and viewpoint activation (render buffer {}x{})", app.options.renderWidth * 2U, app.options.renderHeight);
+            logLine("viewpoint demo mapped; waiting for surface size and viewpoint activation (render buffer {}x{}, {} raymarcher threads)", app.options.renderWidth * 2U,
+                    app.options.renderHeight, app.options.threads);
             while (app.running && result == 0) {
                 if (wl_display_dispatch(app.display) < 0 || !drawPending(app))
                     result = 1;
