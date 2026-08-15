@@ -1148,6 +1148,15 @@ std::string CConfigManager::parseKeyword(const std::string& COMMAND, const std::
     // config.reloaded nor config.props_refreshed. Notify OpenXR after parseDynamic has installed the
     // rule so an existing XR monitor can enter/leave the 2D projection as its explicit position is
     // added/removed (and likewise hand requested mode/scale ownership back cleanly).
+    //
+    // `monitorv2` deliberately needs nothing here, and it is worth saying why so the omission does
+    // not read as the same gap: it is a hyprlang SPECIAL CATEGORY, which can only be populated from
+    // a category block ("special category's first value must be the key"), so no single-line
+    // monitorv2 keyword ever reaches parseKeyword. Even if one did, nothing between parseDynamic
+    // and this point builds a CMonitorRule out of those values — handleMonitorv2() is called only
+    // from the full-reload path, which emits config.reloaded and so already reaches OpenXR through
+    // onConfigReload(). Should a dynamic monitorv2 keyword ever be added, it must rebuild the rule
+    // AND notify here.
     if (COMMAND == "monitor" && g_pOpenXRManager)
         g_pOpenXRManager->onMonitorRulesChanged();
 
