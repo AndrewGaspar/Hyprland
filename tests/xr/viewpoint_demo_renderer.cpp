@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include <hyprutils/memory/Casts.hpp>
@@ -287,4 +288,95 @@ TEST(ViewpointDemoRenderer, RenderingIsDeterministicAcrossStridePadding) {
     ASSERT_TRUE(renderPortalSBS(compact, {.widthMeters = 1.4, .heightMeters = 0.8}, VIEWS));
     ASSERT_TRUE(renderPortalSBS(padded, {.widthMeters = 1.4, .heightMeters = 0.8}, VIEWS));
     EXPECT_EQ(pixelHash(compact), pixelHash(padded));
+}
+
+// The GPU renderer (hyprtester/viewpoint/PortalRendererGL.cpp) cannot match the CPU
+// reference bit for bit, so the demo's --compare-gpu harness holds it to a per-channel
+// tolerance plus a bounded outlier count instead. Only the measuring instrument is
+// covered here — compareImages() is pure and CPU-only, so this suite needs no EGL, no
+// GPU, and no compositor, and it runs identically on a headless build machine.
+
+TEST(ViewpointDemoRenderer, ImageComparisonRejectsIncomparableFrames) {
+    std::vector<uint32_t> smallPixels;
+    std::vector<uint32_t> widePixels;
+    std::vector<uint32_t> oddPixels;
+    const auto            small = imageFor(smallPixels, 32, 18);
+    const auto            wide  = imageFor(widePixels, 64, 18);
+    const auto            odd   = imageFor(oddPixels, 33, 18);
+
+    EXPECT_FALSE(compareImages(small, wide, 0).comparable);
+    EXPECT_FALSE(compareImages(small, odd, 0).comparable);
+    EXPECT_FALSE(compareImages(odd, odd, 0).comparable);
+    EXPECT_TRUE(compareImages(small, small, 0).comparable);
+}
+
+TEST(ViewpointDemoRenderer, ImageComparisonIsZeroForARepeatedRender) {
+    std::vector<uint32_t>  firstPixels;
+    std::vector<uint32_t>  secondPixels;
+    const auto             first  = imageFor(firstPixels, 96, 54);
+    const auto             second = imageFor(secondPixels, 96, 54, 101);
+    constexpr SPortalSize  PORTAL = {.widthMeters = 1.4, .heightMeters = 0.8};
+    constexpr SStereoViews VIEWS  = {.left = {.x = -0.031, .y = 0.02, .z = 1.1}, .right = {.x = 0.033, .y = 0.02, .z = 1.1}};
+
+    ASSERT_TRUE(renderPortalSBS(first, PORTAL, VIEWS));
+    ASSERT_TRUE(renderPortalSBS(second, PORTAL, VIEWS));
+
+    // Differing strides must not leak padding into the comparison.
+    const auto DELTA = compareImages(first, second, 0);
+    ASSERT_TRUE(DELTA.comparable);
+    EXPECT_EQ(DELTA.pixels, sc<uint64_t>(96) * 54);
+    EXPECT_EQ(DELTA.maxDelta, 0U);
+    EXPECT_EQ(DELTA.differing, 0U);
+    EXPECT_EQ(DELTA.outliers, 0U);
+}
+
+TEST(ViewpointDemoRenderer, ImageComparisonSeparatesRoundingStepsFromSurfaceFlips) {
+    std::vector<uint32_t> referencePixels;
+    std::vector<uint32_t> candidatePixels;
+    const auto            reference = imageFor(referencePixels, 8, 4);
+    const auto            candidate = imageFor(candidatePixels, 8, 4);
+    std::fill(referencePixels.begin(), referencePixels.end(), 0xFF204060U);
+    std::fill(candidatePixels.begin(), candidatePixels.end(), 0xFF204060U);
+
+    // Two one-step rounding differences and one surface the two paths disagree on.
+    candidatePixels[0]  = 0xFF214060U;
+    candidatePixels[9]  = 0xFF204061U;
+    candidatePixels[26] = 0xFF20C060U;
+
+    const auto DELTA = compareImages(reference, candidate, 2);
+    ASSERT_TRUE(DELTA.comparable);
+    EXPECT_EQ(DELTA.differing, 3U);
+    EXPECT_EQ(DELTA.outliers, 1U);
+    EXPECT_EQ(DELTA.maxDelta, 0x80U);
+    EXPECT_EQ(DELTA.worstX, 2U);
+    EXPECT_EQ(DELTA.worstY, 3U);
+    EXPECT_EQ(DELTA.worstReference, 0xFF204060U);
+    EXPECT_EQ(DELTA.worstCandidate, 0xFF20C060U);
+
+    // A tolerance of zero counts every difference as an outlier; alpha never counts.
+    EXPECT_EQ(compareImages(reference, candidate, 0).outliers, 3U);
+    candidatePixels[3] = 0x00204060U;
+    EXPECT_EQ(compareImages(reference, candidate, 0).differing, 3U);
+}
+
+TEST(ViewpointDemoRenderer, SceneValidityIsTheSharedRenderAcceptanceContract) {
+    // portalSceneValid() exists so the GPU renderer refuses exactly what
+    // renderPortalSBS() refuses. Assert the two agree rather than restating the rule.
+    constexpr double      NAN_VALUE = std::numeric_limits<double>::quiet_NaN();
+    constexpr SPortalSize PORTAL    = {.widthMeters = 1.6, .heightMeters = 0.9};
+    const std::array      SCENES    = {
+        std::pair{PORTAL, SStereoViews{.left = {.x = -0.032, .z = 1.2}, .right = {.x = 0.032, .z = 1.2}}},
+        std::pair{SPortalSize{.widthMeters = 0.0, .heightMeters = 0.9}, SStereoViews{.left = {.z = 1.2}, .right = {.z = 1.2}}},
+        std::pair{SPortalSize{.widthMeters = 1.6, .heightMeters = -0.9}, SStereoViews{.left = {.z = 1.2}, .right = {.z = 1.2}}},
+        std::pair{SPortalSize{.widthMeters = NAN_VALUE, .heightMeters = 0.9}, SStereoViews{.left = {.z = 1.2}, .right = {.z = 1.2}}},
+        std::pair{PORTAL, SStereoViews{.left = {.z = 0.0}, .right = {.z = 1.2}}},
+        std::pair{PORTAL, SStereoViews{.left = {.z = 1.2}, .right = {.z = -1.2}}},
+        std::pair{PORTAL, SStereoViews{.left = {.x = NAN_VALUE, .z = 1.2}, .right = {.z = 1.2}}},
+        std::pair{PORTAL, SStereoViews{.left = {.z = 1.2}, .right = {.y = NAN_VALUE, .z = 1.2}}},
+    };
+
+    std::vector<uint32_t> pixels;
+    const auto            image = imageFor(pixels, 16, 8);
+    for (const auto& [PORTAL_SIZE, VIEWS] : SCENES)
+        EXPECT_EQ(portalSceneValid(PORTAL_SIZE, VIEWS), renderPortalSBS(image, PORTAL_SIZE, VIEWS));
 }
