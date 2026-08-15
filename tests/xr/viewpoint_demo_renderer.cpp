@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -231,6 +232,49 @@ TEST(ViewpointDemoRenderer, OddFullSbsWidthIsRejected) {
     const auto            image = imageFor(pixels, 161, 73);
     EXPECT_FALSE(renderFallbackSBS(image));
     EXPECT_FALSE(renderPortalSBS(image, {.widthMeters = 1.6, .heightMeters = 0.9}, {.left = {.z = 1.2}, .right = {.z = 1.2}}));
+}
+
+TEST(ViewpointDemoRenderer, WorkerCountNeverChangesARenderedByte) {
+    // Frame hashes are part of the demo's contract (--render, --render-fallback,
+    // the --debug commit log, and the pair-latching assertions above), so the row
+    // partitioning must be a pure scheduling change. Compare whole buffers rather
+    // than hashes: that covers the stride padding the hash deliberately skips.
+    constexpr uint32_t     WIDTH  = 96;
+    constexpr uint32_t     HEIGHT = 54;
+    constexpr uint32_t     STRIDE = 101;
+    constexpr SPortalSize  PORTAL = {.widthMeters = 1.4, .heightMeters = 0.8};
+    constexpr SStereoViews VIEWS  = {.left = {.x = -0.031, .y = 0.02, .z = 1.1}, .right = {.x = 0.033, .y = 0.02, .z = 1.1}};
+    // One count below, one at, and two above MAX_AUTO_RENDER_THREADS, plus a count
+    // that exceeds the row count so the pool has to clamp its participants.
+    constexpr std::array  COUNTS = {2U, 3U, 8U, MAX_AUTO_RENDER_THREADS, 24U, HEIGHT * 4U};
+
+    std::vector<uint32_t> singlePixels;
+    std::vector<uint32_t> threadedPixels;
+    const auto            single   = imageFor(singlePixels, WIDTH, HEIGHT, STRIDE);
+    const auto            threaded = imageFor(threadedPixels, WIDTH, HEIGHT, STRIDE);
+
+    ASSERT_TRUE(renderPortalSBS(single, PORTAL, VIEWS, 1));
+    for (const uint32_t COUNT : COUNTS) {
+        std::fill(threadedPixels.begin(), threadedPixels.end(), 0U);
+        ASSERT_TRUE(renderPortalSBS(threaded, PORTAL, VIEWS, COUNT));
+        EXPECT_EQ(singlePixels, threadedPixels) << "portal render diverged on " << COUNT << " workers";
+    }
+
+    std::vector<uint32_t> singleFallback;
+    std::vector<uint32_t> threadedFallback;
+    const auto            fallbackSingle   = imageFor(singleFallback, WIDTH, HEIGHT, STRIDE);
+    const auto            fallbackThreaded = imageFor(threadedFallback, WIDTH, HEIGHT, STRIDE);
+
+    ASSERT_TRUE(renderFallbackSBS(fallbackSingle, 1));
+    for (const uint32_t COUNT : COUNTS) {
+        std::fill(threadedFallback.begin(), threadedFallback.end(), 0U);
+        ASSERT_TRUE(renderFallbackSBS(fallbackThreaded, COUNT));
+        EXPECT_EQ(singleFallback, threadedFallback) << "fallback render diverged on " << COUNT << " workers";
+    }
+
+    // The demo's own default must be a usable, bounded worker budget.
+    EXPECT_GE(defaultRenderThreads(), 1U);
+    EXPECT_LE(defaultRenderThreads(), MAX_AUTO_RENDER_THREADS);
 }
 
 TEST(ViewpointDemoRenderer, RenderingIsDeterministicAcrossStridePadding) {
