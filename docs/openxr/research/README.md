@@ -22,12 +22,14 @@ archived originals.
 | [LAYOUT-AND-NAMING.md](LAYOUT-AND-NAMING.md) | grids, auto-layout, 2D-plane sync, auto-names | archive 03, 08, 11, 12 |
 | [VISUALS.md](VISUALS.md) | premium chrome, transparency, view-bounding | archive 07, 09, 10 |
 | [PLATFORM-LIFECYCLE-PERFORMANCE.md](PLATFORM-LIFECYCLE-PERFORMANCE.md) | lifecycle & perf remainders, SteamVR backend | archive 17 (L4/L5), 19 (direct-scanout), 01 (OpenVR) |
-| [05-xr-screenkey.md](05-xr-screenkey.md) | head-locked keystroke/command display (`hypxrkeys`) | standalone — unimplemented, does not cluster |
+| [05-xr-screenkey.md](05-xr-screenkey.md) | historical standalone screen-key proposal; current ShowMeTheKey producer is `hypxrhud-keys` | MVP shipped in sibling `hypxrhud`; IPC-command lane deferred |
 | [VOICE-CONTROL.md](VOICE-CONTROL.md) | cascaded voice control of XR monitors + app launch (`hypxrvoice`) | standalone — unimplemented, does not cluster |
 
-`05-xr-screenkey.md` is a standalone design for a new companion tool (a sibling to
-`hypxrpaper`). Nothing is implemented; it is kept live in place because it does not overlap
-the four clusters above. Its WPs are K1–K12.
+`05-xr-screenkey.md` preserves the original standalone companion-tool proposal, but its current
+status addendum is authoritative: the implemented MVP is the manual, privacy-gated
+`hypxrhud-keys` producer in the sibling `hypxrhud` repository. It reuses HypXRHUD's existing
+OpenXR session and `keys` slot. The standalone-session and IPC-command-lane work packages remain
+historical/deferred rather than an active implementation plan.
 
 `VOICE-CONTROL.md` is a standalone design for a new companion daemon `hypxrvoice` (another
 `hypxrpaper`/`hypxrkeys` sibling): natural-language voice control over the existing
@@ -50,9 +52,9 @@ above; when one ships, move it to `archive/` with a disposition line like the ta
 | [21-wivrn-variable-bitrate](21-wivrn-variable-bitrate.md) | variable-rate encoding for WiVRn streaming (+ erratum `e66b91b4`) | unimplemented |
 | [22-spatial-persistence-locations](22-spatial-persistence-locations.md) | spatial persistence and named locations | unimplemented |
 | [23-xr-native-launcher](23-xr-native-launcher.md) | head-leashed presentation of transient layer-shell UI (walker, mako, OSDs) | unimplemented — WPs N0–N10 |
-| [24-stereo-content-and-depth-desktop](24-stereo-content-and-depth-desktop.md) | a flat side-by-side **stereo output** as a generic Hyprland feature (one monitor, logical = one pane, mode = the pack), stereoscopic client content, and "depth" as a first-class window/layer styling axis | unimplemented — WPs F0–F5, S0–S8, D0–D7, X1–X4 (rev. 2026-08-08: flat SBS is the **primary** presenter, OpenXR the upgrade tier) |
+| [24-stereo-content-and-depth-desktop](24-stereo-content-and-depth-desktop.md) | a flat side-by-side **stereo output** as a generic Hyprland feature (one monitor, logical = one pane, mode = the pack), stereoscopic client content, and "depth" as a first-class window/layer styling axis | core shipped, including OpenXR X1–X4; top-level doc 05 §§8.5–8.9 is authoritative; tuning/generalization remainders stay in the memo |
 | [25-staging-container-headset-loop](25-staging-container-headset-loop.md) | a headset-in-the-loop **staging container** — test a candidate build from the real Quest 3 before deploying to the fishfood session, with the live compositor left running and its layout frozen | unimplemented — WPs ST0–ST6 (Path A = zero-code stopgap via `monitors_follow_session off` + existing `session --wivrn`; Path B = a second WiVRn server in-container) |
-| [26-wivrn-multi-gpu-client-render](26-wivrn-multi-gpu-client-render.md) | **multi-GPU WiVRn** — the OpenXR client (a game under xrizer/DXVK) renders on the NVIDIA dGPU while the compositor and encode stay on the AMD iGPU; includes a measured cross-vendor dma-buf probe (`poc/26-cross-gpu-dmabuf/`) proving AMD→NVIDIA LINEAR import works pixel-exact and `sync_fd` orders correctly, plus §10 on optimising the transfer away when the game is exclusive | unimplemented — WPs XG-B1, XG1–XG9 (Shape B = config-only unblock via vaapi `device` encode offload; Shape A = the full split, 4 new `patches/monado/` entries from 0009; marginal cost re-measured at ~2.4 ms/frame) |
+| [26-wivrn-multi-gpu-client-render](26-wivrn-multi-gpu-client-render.md) | **multi-GPU WiVRn** — the OpenXR client (a game under xrizer/DXVK) renders on the NVIDIA dGPU while the compositor and encode stay on the AMD iGPU; includes a measured cross-vendor dma-buf probe (`poc/26-cross-gpu-dmabuf/`) proving AMD→NVIDIA LINEAR import works pixel-exact and `sync_fd` orders correctly, plus §10 on optimising the transfer away when the game is exclusive | XG-B1/XG1–XG7 mechanism carried in `wivrn-xg`; XG8 bring-up reached FOCUSED with a real xrizer/DXVK client; XG9 performance/fast-path verification and general support remain open |
 
 ---
 

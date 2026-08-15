@@ -1,11 +1,11 @@
-# Design: `hypxrhud` — a shared XR HUD daemon (one overlay session, D-Bus API)
+# Historical design: `hypxrhud` — a shared XR HUD daemon (one overlay session, D-Bus API)
 
-Design memo (2026-07-13). **No implementation.** Proposes a new standalone
+Design memo (2026-07-13). It originally proposed a new standalone
 daemon, `hypxrhud`, that owns **one** OpenXR overlay session and exposes a
 **D-Bus API**, so XR utilities — hypxrvoice's feedback HUD, the planned
 `hypxrkeys` screenkey overlay (doc `05`), and in-headset notification toasts —
-stop each reimplementing session lifecycle / EGL / swapchain / fade machinery.
-The user reviews this before any code.
+stop each reimplementing session lifecycle / EGL / swapchain / fade machinery. The implementation
+status below supersedes the original work-package tense in the remainder of this memo.
 
 Evidence base, all read for this memo: hypxrvoice's already-shipped in-process
 HUD (`/home/ajg/code/hypxrvoice`, branch `wp-v5`, commit `4646249`) — which is
@@ -15,6 +15,25 @@ exact runtime the suite runs against); HypXRland's `src/openxr/OpenXRManager.cpp
 (session-lifecycle / re-probe machinery); doc `05-xr-screenkey.md` (the second
 overlay client); the Omarchy 3.8.2 autostart; and web research on Monado
 multi-overlay support + D-Bus monitoring privileges (URLs cited inline).
+
+---
+
+## Current status (2026-08-14)
+
+WP-H1–H7 are implemented and tested in `/home/ajg/code/hypxrhud`. The shared daemon owns one
+OpenXR overlay session, exposes `io.github.andrewgaspar.hypxrhud` on D-Bus, renders the six-slot
+multi-panel scene, persists/reprobes across runtime loss, arbitrates slots, follows the Omarchy
+theme, and ships service/self-test packaging. Commit
+`c9b1a78610a067780048723775802187bb9cdd3d` additionally implements the first-party
+`hypxrhud-keys` ShowMeTheKey producer for the existing `keys` slot.
+
+The keys MVP follows the H9 ownership direction but not every feature listed in the historical H9
+or screen-key work packages: there is no IPC-command lane, and capture uses the fixed
+`/usr/bin/showmethekey-cli` JSON backend rather than a new libinput seat implementation. It is
+manual and presentation-gated; see [`05-xr-screenkey.md`](05-xr-screenkey.md) for the corrected
+status/privacy summary and `/home/ajg/code/hypxrhud/docs/keys-overlay.md` for the authoritative
+operator documentation. H8 (hypxrvoice migration) and H10 (notification mirroring/ownership) were
+not established by this campaign and remain separate work.
 
 ---
 
