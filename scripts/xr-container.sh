@@ -50,7 +50,8 @@
 #
 #   session [--wivrn] [--conf FILE] [--gpu split|amd|nvidia|intel|/dev/dri/renderD*]
 #           [--nested-gpu SPEC] [--xr-gpu SPEC] [--env pano|forest|<path>]
-#           [--passthrough] [--publish-remote[=PORT]] [--no-audio]
+#           [--passthrough|--no-passthrough] [--no-binds]
+#           [--publish-remote[=PORT]] [--no-audio]
 #       Boot :session and launch a full Omarchy desktop as a NESTED window on the
 #       host, with the dev Hyprland's XR extension enabled. waybar/mako/walker/
 #       portals autostart on the container's OWN private buses (no shim; verify
@@ -62,7 +63,23 @@
 #                                this container never starts wivrn-server).
 #         --conf FILE            source FILE (bind-mounted ro) as the base config
 #                                instead of the image's ~/.config/hypr/hyprland.conf.
-#         --passthrough          openxr:blend_mode = alpha (composite over passthrough).
+#         --passthrough / --no-passthrough
+#                                Force passthrough (openxr:blend_mode = alpha plus the
+#                                black_alpha luma key) on / off. DEFAULT: ON with a real
+#                                headset (--wivrn) — an in-headset session comes up
+#                                composited over the room, not in an opaque void — and
+#                                OFF for windowed Monado (no cameras; the runtime would
+#                                just warn and fall back) and with --env (which draws its
+#                                own sky, hiding the room anyway).
+#         --no-binds             Do NOT merge the default XR keybinds into the session
+#                                config. The defaults (see merge-conf.sh) mirror the
+#                                daily-driver chords: SUPER+ALT+M view toggle, SUPER+
+#                                SHIFT+G gaze grab, SUPER+ALT+± gaze push/pull, SUPER+
+#                                Home center, SUPER+SHIFT+Home 2D re-sync, SUPER+ALT+N /
+#                                +SHIFT create/destroy a scratch monitor, SUPER+ALT+H hand
+#                                input, SUPER+ALT+R restart the XR session. Use this when
+#                                a --conf config binds the same chords (Hyprland fires
+#                                EVERY matching bind — a doubled `toggle` cancels out).
 #         --env pano|forest|<path>
 #                                Ambient background: launch hypxrpaper as the PRIMARY
 #                                OpenXR session (gradient sky / bundled 'forest-clearing'
@@ -682,14 +699,16 @@ find_free_tcp_port() {
 }
 
 cmd_session() {
-    local gpu="" use_wivrn=0 passthrough=0 user_conf="" env_spec=""
-    local publish_remote=0 remote_port="" use_audio=1
+    local gpu="" use_wivrn=0 passthrough="" user_conf="" env_spec=""
+    local publish_remote=0 remote_port="" use_audio=1 xr_binds=1
     local nested_gpu="" xr_gpu=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --wivrn)      use_wivrn=1 ;;
             --no-audio)   use_audio=0 ;;
-            --passthrough) passthrough=1 ;;
+            --passthrough)    passthrough=1 ;;
+            --no-passthrough) passthrough=0 ;;
+            --no-binds)   xr_binds=0 ;;
             --env)        [[ $# -ge 2 ]] || die "--env needs an argument (pano|forest|<path>)"; env_spec="$2"; shift ;;
             --env=*)      env_spec="${1#--env=}" ;;
             --gpu)        [[ $# -ge 2 ]] || die "--gpu needs an argument"; gpu="$2"; shift ;;
@@ -708,6 +727,18 @@ cmd_session() {
         shift
     done
     podman image exists "$IMG_SESSION" || die "session image not built (run: $0 build)"
+
+    # --- passthrough default -------------------------------------------------
+    # An in-headset session should come up composited over the ROOM, not floating
+    # in an opaque void, so passthrough is ON by default whenever there is a real
+    # headset (--wivrn). It stays OFF for windowed Monado — that runtime has no
+    # cameras and enumerates only OPAQUE, so requesting alpha would just log a
+    # fallback warning — and OFF with --env, where hypxrpaper deliberately paints
+    # an ambient sky that would hide the room anyway. --passthrough /
+    # --no-passthrough are explicit and always win.
+    if [[ -z $passthrough ]]; then
+        if [[ $use_wivrn -eq 1 && -z $env_spec ]]; then passthrough=1; else passthrough=0; fi
+    fi
 
     # --nested-gpu/--xr-gpu are split-only role overrides -> they imply --gpu split.
     if [[ -n $nested_gpu || -n $xr_gpu ]]; then
@@ -769,6 +800,7 @@ cmd_session() {
     local -a launch_env=(
         "HL_WAYLAND_DISPLAY=$ctr_wl"
         "XR_PASSTHROUGH=$passthrough"
+        "XR_BINDS=$xr_binds"
     )
     # --env: hypxrpaper draws an ambient background as the PRIMARY session and
     # HypXRland composites its monitors on top as an XR_EXTX_overlay (session-launch.sh
@@ -894,7 +926,8 @@ cmd_session() {
         launch_env+=("XR_GPU_NODE=$gpu_node")
     fi
 
-    print_session_banner "$ctr" "$use_wivrn" "$remote_port" "$gpu" "$nested_node" "$xr_node"
+    print_session_banner "$ctr" "$use_wivrn" "$remote_port" "$gpu" "$nested_node" "$xr_node" \
+        "$passthrough" "$xr_binds"
 
     # Build the inline env prefix for the machinectl login (which won't inherit env).
     local envstr=""; local kv
@@ -911,6 +944,7 @@ cmd_session() {
 
 print_session_banner() {
     local ctr="$1" use_wivrn="$2" remote_port="$3" gpu="${4:-}" nested_node="${5:-}" xr_node="${6:-}"
+    local passthrough="${7:-0}" xr_binds="${8:-1}"
     cat <<EOF
 
   ============================ HypXRland session ============================
@@ -949,6 +983,30 @@ EOF
      HMD/controllers with monado-gui from the host on an ephemeral port.)
 EOF
         fi
+    fi
+    if [[ $passthrough -eq 1 ]]; then
+        cat <<EOF
+
+  Passthrough: ON (openxr:blend_mode = alpha + black_alpha 0.2) — monitors
+    composite over the room. --no-passthrough for the opaque VR void.
+EOF
+    else
+        cat <<EOF
+
+  Passthrough: off ($([[ $use_wivrn -eq 1 ]] && echo "--no-passthrough / --env" || echo "windowed Monado has no cameras")).
+    Pass --passthrough to force openxr:blend_mode = alpha.
+EOF
+    fi
+    if [[ $xr_binds -eq 1 ]]; then
+        cat <<EOF
+
+  XR keybinds (defaults; --no-binds to omit; type them INTO the nested session):
+    SUPER+ALT+M          show/hide all XR monitors      SUPER+SHIFT+G   gaze grab
+    SUPER+ALT+= / -      push / pull the gazed monitor  SUPER+ALT+H     hand input
+    SUPER+Home           recenter selected monitor      SUPER+SHIFT+Home  2D re-sync
+    SUPER+ALT+N          create XR-extra                SUPER+ALT+SHIFT+N  destroy it
+    SUPER+ALT+R          restart the XR session (applies start-scoped openxr:*)
+EOF
     fi
     cat <<EOF
 
