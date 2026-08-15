@@ -4102,11 +4102,18 @@ void COpenXRManager::reevaluateViewpoints() {
 
     std::vector<CXRViewpointResource*> viewpoints;
     PROTO::xrViewpoint->forEachViewpoint([&](CXRViewpointResource& viewpoint) { viewpoints.push_back(&viewpoint); });
-    std::ranges::sort(viewpoints, [](const auto* a, const auto* b) {
-        const auto AS = a->surface();
-        const auto BS = b->surface();
-        return AS && BS ? AS->id() < BS->id() : std::less<>{}(a, b);
-    });
+    // Total order (OpenXR::viewpointOrderBefore): a viewpoint whose surface is already destroyed
+    // stays in the list, and a comparator that switches between id-order and pointer-order across
+    // that mix is not a strict weak ordering — see the key's header comment for the cycle.
+    const auto ORDERKEY = [](const CXRViewpointResource* viewpoint) {
+        const auto SURFACE = viewpoint->surface();
+        return OpenXR::SXRViewpointOrderKey{
+            .hasSurface = sc<bool>(SURFACE),
+            .surfaceId  = SURFACE ? SURFACE->id() : 0,
+            .identity   = rc<uintptr_t>(viewpoint),
+        };
+    };
+    std::ranges::sort(viewpoints, [&](const auto* a, const auto* b) { return OpenXR::viewpointOrderBefore(ORDERKEY(a), ORDERKEY(b)); });
 
     std::scoped_lock              lock(m_layersMu);
     std::vector<CXRMonitorLayer*> claimed;

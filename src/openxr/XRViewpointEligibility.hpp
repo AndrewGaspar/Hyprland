@@ -7,10 +7,35 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <tuple>
 
 namespace OpenXR {
     inline constexpr size_t XR_VIEWPOINT_MAX_SUBSURFACE_DEPTH   = 32;
     inline constexpr size_t XR_VIEWPOINT_MAX_SUBSURFACE_WATCHES = 256;
+
+    // The sort key the eligibility walk orders viewpoints by, so that which client wins a contested
+    // monitor is a deterministic function of the surfaces rather than of unordered_map iteration.
+    //
+    // `hasSurface` is NOT decoration. A viewpoint outlives its wl_surface (the protocol keeps the
+    // object usable until the client destroys it — XRViewpointProtocol::surfaceDestroyed only drops
+    // the reference), so the list routinely mixes entries with and without a surface id. Ordering
+    // "by id when BOTH have one, by pointer otherwise" is NOT a strict weak ordering across such a
+    // mix: with a surface-less B sitting between two live A and C by pointer, A < C by id while
+    // C < B < A by pointer closes a cycle, and libstdc++'s insertion sort walks off the front of the
+    // range on a cyclic comparator — memory corruption, not merely a surprising order. So the key is
+    // compared as a whole tuple: surfaced viewpoints first, then by surface id, then by identity
+    // (the resource address, which only ever breaks ties the earlier fields left equal).
+    struct SXRViewpointOrderKey {
+        bool      hasSurface = false;
+        uint32_t  surfaceId  = 0;
+        uintptr_t identity   = 0;
+
+        bool      operator==(const SXRViewpointOrderKey&) const = default;
+    };
+
+    inline bool viewpointOrderBefore(const SXRViewpointOrderKey& a, const SXRViewpointOrderKey& b) {
+        return std::tuple{!a.hasSurface, a.surfaceId, a.identity} < std::tuple{!b.hasSurface, b.surfaceId, b.identity};
+    }
 
     enum eXRViewpointRuntimeState : uint8_t {
         XR_VIEWPOINT_RUNTIME_UNKNOWN = 0,
