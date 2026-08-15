@@ -546,7 +546,9 @@ and renderer-carrier work is not implied by the native proof.
 
 ### 13.1 Build and run the native proof
 
-Build the client without configuring the full compositor tree:
+Build the client without configuring the full compositor tree. EGL, OpenGL ES 3, and
+`wayland-egl` are required — the GPU path is not optional at build time, and configure fails with
+a package list if they are missing:
 
 ```sh
 cmake -S hyprtester -B build-viewpoint-demo -DCMAKE_BUILD_TYPE=Debug
@@ -566,6 +568,11 @@ reports the raymarcher's own frame budget:
 ```sh
 ./build-viewpoint-demo/viewpoint-demo --bench 200 --width 960 --height 540
 ```
+
+`--head X,Y,Z` translates both offline eyes off the reference pose, in meters, so an offline image
+or comparison can be taken from somewhere other than straight ahead. Its default is exactly zero
+and adding zero to a double is exact, so an unmodified `--render`/`--bench` still produces the
+frame hashes it always has.
 
 Live feedback is privacy-gated by an explicit window rule. The client already declares
 `stereo:sbs`; the stereo rule opts into honoring that declaration, while `viewpoint on` authorizes
@@ -638,6 +645,144 @@ reaches 98 fps on four workers — so spend spare headroom on `--width`/`--heigh
 more workers. These are raymarcher-only numbers: a live frame additionally pays the SHM buffer
 clear, the `wp_viewporter` scale, and, under `--debug` only, a full-frame `pixelHash()`. Budget
 for a live sample rate somewhat below the table.
+
+#### The GPU path
+
+The live client renders on the GPU by default, through EGL and a GLES3 fragment shader in
+`hyprtester/viewpoint/PortalRendererGL.cpp`. One fullscreen triangle covers the packed SBS frame
+and the shader splits the panes itself, resolving the per-eye position from `gl_FragCoord`. It
+attaches to the surface with `wl_egl_window` plus `eglCreateWindowSurface`, so the swap chain is
+dmabuf and the device is **whatever Mesa resolves from the compositor's dmabuf feedback** — the
+demo never names a GPU, which is what keeps it zero-copy on a multi-GPU machine.
+
+`--software` selects the CPU raymarcher for the live client instead. Nothing else needs to: if EGL
+cannot initialize — no GPU, missing platform extension, no ES3 config — the client logs one line
+naming the reason and continues on the software path.
+
+Both the active portal and the inactive zero-disparity fallback are GPU-rendered, so the live
+client owns exactly one buffer chain. The fallback shader is a translation of `fallbackPixel()`
+and reproduces it exactly; see the comparison table below.
+
+| flag | effect |
+| --- | --- |
+| `--software` | live client renders on the CPU raymarcher |
+| `--no-aa` | disables grid-line antialiasing on the GPU path |
+| `--render-gpu FILE` | writes the active portal PPM through the shader, on surfaceless EGL |
+| `--bench-gpu N` | N offline shader frames, reporting pipelined and serialized budgets |
+| `--compare-gpu` | renders both paths offline and asserts the shader stays inside tolerance |
+
+`--render-gpu`, `--bench-gpu`, and `--compare-gpu` all run on `EGL_MESA_platform_surfaceless` with
+an FBO and `glReadPixels`, so the GPU path is fully testable with no compositor, no display, and
+no window system.
+
+#### Grid antialiasing
+
+The CPU renderer's grid is a hard threshold on the distance to the nearest line, so a line thinner
+than a pixel either fully lights a pixel or does not. Under head motion those pixels pop in and
+out and the walls scintillate. The shader instead box-filters the grid over the pixel's footprint
+(`fwidth` of the grid coordinate, integrated analytically against the line set), so a sub-pixel
+line converges on its duty cycle rather than blinking.
+
+Measured over a 16-step lateral sweep of 0.4 mm per step — sub-pixel motion, the regime where
+shimmer lives — as peak-to-peak swing of the frame's mean luminance:
+
+| per eye | grid AA off | grid AA on |
+| --- | --- | --- |
+| 256×144 | 0.825% of mean | **0.188%** |
+| 480×270 | 0.568% of mean | **0.097%** |
+
+Visually, the effect is strongest exactly where it should be: the oblique floor and side-wall
+lines lose their staircase and hold an even weight into the distance, while the axis-aligned back
+wall barely changes. Only the grid is filtered — box silhouettes and the aim marker's rim stay
+hard-edged, which is a deliberate scope limit, not an oversight.
+
+`--no-aa` turns it off. That exists because the antialiased image is a deliberate divergence from
+the CPU reference and therefore has nothing to be compared against; the tolerance harness below
+asserts only on the hard-edged mode.
+
+#### Holding the shader to the CPU reference
+
+GLSL ES has no fp64, so the shader runs in 32-bit floats where `PortalRenderer.cpp` runs in
+doubles. The two cannot be bit-identical in principle, so `--compare-gpu` renders the same scene
+both ways and asserts a per-channel tolerance of **2** plus an outlier budget of **3 per mille**
+of the frame. Deviations come in exactly two kinds:
+
+- a rounding difference in `shade()`, which moves a channel by at most one step and is covered by
+  the tolerance;
+- a decision that landed on the wrong side of a hard threshold — a grid-line edge, a box
+  silhouette, the aim marker's rim — where the two paths genuinely pick different surfaces and the
+  delta is as large as the two colors are. These are unbounded in size but confined to a thin edge
+  set, so they are bounded by count instead.
+
+Three per mille is where that budget sits because one pane shows on the order of a dozen grid
+lines per axis, so a pathological head pose that aligns a whole line with the sampling grid can
+flip an entire row at once. A divergence that was systematic rather than incidental would flip
+every line's edge and land at percent scale, an order of magnitude clear of the budget.
+
+Measured, with antialiasing off, on both GPUs in this machine. Head offset A is
+(0.18, −0.07, −0.25) m and B is (0.5, 0.3, −0.5) m — B puts the eye 0.7 m from the portal, where
+the room is at its most oblique:
+
+| per eye | head | budget | NVIDIA RTX 5070 laptop | AMD Radeon 890M (radeonsi) |
+| --- | --- | --- | --- | --- |
+| 256×144 | none | 221 | 1 outlier, max 169 @ (8,138) | 1 outlier, max 169 @ (8,138) |
+| 640×360 | none | 1 382 | 1 outlier, max 99 @ (484,232) | 2 outliers, max 99 @ (484,232) |
+| 960×540 | none | 3 110 | **0 outliers, bit-identical** | 1 outlier, max 167 @ (112,472) |
+| 1920×1080 | none | 12 441 | 5 outliers, max 168 @ (117,1007) | 2 outliers, max 168 @ (117,1007) |
+| 960×540 | A | 3 110 | 303 outliers, max 69 @ (460,142) | **0 outliers, bit-identical** |
+| 960×540 | B | 3 110 | 770 outliers, max 66 @ (1534,3) | 989 outliers, max 66 @ (614,3) |
+| 1920×1080 | A | 12 441 | **0 outliers, bit-identical** | **0 outliers, bit-identical** |
+
+The worst observed density is 989 / 1 036 800 = **0.095% of the frame, against a 0.3% budget** —
+a 3.1× margin, on the most oblique pose at the resolution where a grid line most easily aligns
+with the sampling grid. Note that the density does not grow with resolution: 1920×1080 with the
+same pose is bit-identical on both vendors. The alignment is what matters, not the pixel count.
+
+Every large maximum is the second kind and is individually identifiable. At 256×144 the single
+differing pixel is the orange box's silhouette against a side wall (CPU `0x1e282b` = shaded wall,
+GPU `0xc77e3c` = shaded box); at 640×360 it is the teal box against the same wall; in the
+head-offset cases the worst pixels are back-wall grid-line edges (CPU `0x4b6b7c` = shaded line,
+GPU `0x1d2d37` = shaded base). None is a shifted image or a wrong color — each is one pixel
+choosing the other side of an edge.
+
+The **inactive fallback is bit-identical on both GPUs at every size tested**: it raymarches
+nothing and accumulates no float error, only integer pixel arithmetic.
+
+Nonzero head offsets are the interesting cases and are why `--head` exists: they push the eye off
+axis, make the room's surfaces oblique, and are the only poses that exercise the parallax term of
+the projection.
+
+#### GPU frame budget
+
+`--bench-gpu` reports two numbers. The pipelined figure queues every frame and waits once at the
+end, which is the direct analogue of what `--bench` measures on the CPU. The serialized figure
+waits for each frame in turn, which is closer to what a live sample-driven client sees, since the
+compositor cannot scan out a frame the GPU has not finished.
+
+| per eye | AMD Radeon 890M | NVIDIA RTX 5070 laptop | CPU, 12 workers |
+| --- | --- | --- | --- |
+| 960×540 | 0.147 ms (6 817 fps) | 0.041 ms (24 498 fps) | 6.2 ms (160 fps) |
+| 1920×1080 | 0.493 ms (2 028 fps) | 0.140 ms (7 147 fps) | 20.8 ms (48 fps) |
+
+Serialized budgets are 0.179 ms and 0.494 ms on the 890M, 0.052 ms and 0.164 ms on the 5070.
+Antialiasing costs about 24% of the frame (0.033 → 0.041 ms at 960×540 on the 5070). The iGPU —
+the device a live session actually renders on — is roughly **42× faster than the twelve-thread CPU
+path at 1920×1080**, which is what moves per-eye 1080p from a slideshow to headroom.
+
+#### Why the offline modes stay CPU-only
+
+`--render`, `--render-fallback`, and `--bench` remain CPU-only, and the gtest suite keeps asserting
+on the CPU renderer's frame hashes, because determinism is the property those modes exist to
+provide. The CPU renderer is byte-identical across worker counts, stride padding, optimization
+levels, and machines; a shader's output is none of those things — it depends on the driver's
+choice of FMA contraction, its `round()` tie-breaking, and its precision beyond the ES minimum, as
+the table above shows by disagreeing between two vendors on the same scene. A GPU frame hash would
+be an assertion about the installed driver, not about the renderer. So the GPU path is held to the
+CPU reference by tolerance rather than by equality, and the reference itself never moves.
+
+`compareImages()`, the instrument behind `--compare-gpu`, lives in `PortalRenderer.cpp` and is pure
+and CPU-only. Its gtests in `tests/xr/viewpoint_demo_renderer.cpp` need no EGL, no GPU, and no
+compositor, so the suite still runs on a headless build machine with no GPU stack installed.
 
 In a successful live proof, lateral head movement shifts
 near, middle, and far geometry by different amounts, the cyan portal reticle stays
