@@ -81,10 +81,24 @@ PASSTHROUGH
 
 # ---- Container-session XR keybinds (defaults; `--no-binds` omits this block) --
 # Dispatcher vocabulary: docs/openxr/05-configuration.md §4.
-# Chords mirror the daily-driver hyprland-xr.conf and are free in stock Omarchy.
-# NOTE: Hyprland fires EVERY bind matching a chord, so a `--conf` base config
-# that binds these too would run each verb twice (a `toggle` would cancel out).
-# Pass `--no-binds` when your own config already brings XR keybinds.
+# Chords mirror the daily-driver ~/.config/hypr/hyprland-xr.conf so muscle
+# memory transfers.
+#
+# Each chord is `unbind`-ed first. Hyprland fires EVERY bind matching a chord,
+# not just the last one, so a chord the base config already claims would run
+# both actions — and a doubled `toggle` verb would cancel itself out. The seeded
+# Omarchy config really does claim one of these (SUPER+SHIFT+G = Signal). Pass
+# `--no-binds` to keep the base config's bindings instead of these.
+unbind = SUPER ALT, M
+unbind = SUPER SHIFT, G
+unbind = SUPER ALT, equal
+unbind = SUPER ALT, minus
+unbind = SUPER, Home
+unbind = SUPER SHIFT, Home
+unbind = SUPER ALT, N
+unbind = SUPER ALT SHIFT, N
+unbind = SUPER ALT, H
+unbind = SUPER ALT, R
 
 # Show/hide every XR monitor quad — session, outputs, workspaces and anchors all
 # stay intact (and hidden quads leave ray hit-testing).

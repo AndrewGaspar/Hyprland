@@ -516,9 +516,10 @@ encodes on the other (`openxr:gpu`), so both GPUs are exposed and assigned separ
   `SUPER+ALT+M` view toggle, `SUPER+SHIFT+G` gaze grab, `SUPER+ALT+=`/`-` gaze push/pull,
   `SUPER+Home` center, `SUPER+SHIFT+Home` 2D re-sync, `SUPER+ALT+N` / `+SHIFT` create/destroy the
   `XR-extra` scratch monitor, `SUPER+ALT+H` hand input, `SUPER+ALT+R` XR-session restart (the way
-  to apply start-scoped `openxr:*` changes in place). `--no-binds` omits the block — needed when a
-  `--conf` config binds the same chords, since Hyprland fires *every* matching bind and a doubled
-  `toggle` cancels out. Details in [`containers/README.md`](../../containers/README.md).
+  to apply start-scoped `openxr:*` changes in place). Each chord is `unbind`-ed first — Hyprland
+  fires *every* bind matching a chord, and the seeded Omarchy config claims `SUPER+SHIFT+G`
+  (Signal) — so these win; `--no-binds` omits the block when a `--conf` config should keep its
+  own bindings. Details in [`containers/README.md`](../../containers/README.md).
 
 ### 8.3 Dual-GPU interop note
 

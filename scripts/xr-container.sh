@@ -77,9 +77,12 @@
 #                                SHIFT+G gaze grab, SUPER+ALT+± gaze push/pull, SUPER+
 #                                Home center, SUPER+SHIFT+Home 2D re-sync, SUPER+ALT+N /
 #                                +SHIFT create/destroy a scratch monitor, SUPER+ALT+H hand
-#                                input, SUPER+ALT+R restart the XR session. Use this when
-#                                a --conf config binds the same chords (Hyprland fires
-#                                EVERY matching bind — a doubled `toggle` cancels out).
+#                                input, SUPER+ALT+R restart the XR session. Each chord is
+#                                `unbind`-ed first (the seeded Omarchy config claims
+#                                SUPER+SHIFT+G for Signal, and Hyprland fires EVERY bind
+#                                matching a chord — both actions would run, and a doubled
+#                                `toggle` would cancel out), so use --no-binds when a
+#                                --conf config should keep its own bindings.
 #         --env pano|forest|<path>
 #                                Ambient background: launch hypxrpaper as the PRIMARY
 #                                OpenXR session (gradient sky / bundled 'forest-clearing'
