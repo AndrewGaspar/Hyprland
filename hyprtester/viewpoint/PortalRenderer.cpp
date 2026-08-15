@@ -2,9 +2,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
+#include <functional>
 #include <limits>
+#include <mutex>
 #include <numeric>
+#include <thread>
+#include <vector>
 
 #include <hyprutils/memory/Casts.hpp>
 
@@ -13,7 +19,121 @@ using namespace Hyprutils::Memory;
 struct SHit {
     double   distance = std::numeric_limits<double>::infinity();
     uint32_t color    = 0;
+    // Distance attenuation coefficient for the winning hit. Shading is deferred to
+    // the end of trace() so occluded candidates never pay for it; a negative value
+    // means the surface is emissive and keeps its base color.
+    double attenuation = -1.0;
 };
+
+namespace {
+
+    // Persistent workers for the two pixel loops. Rows are claimed from one shared
+    // cursor, every row is written by exactly one worker, and nothing accumulates
+    // across rows — so the rendered bytes are independent of the schedule and of the
+    // worker count. The pool only ever grows and is joined at process exit.
+    class CRowPool {
+      public:
+        static CRowPool& instance() {
+            static CRowPool POOL;
+            return POOL;
+        }
+
+        CRowPool(const CRowPool&)            = delete;
+        CRowPool(CRowPool&&)                 = delete;
+        CRowPool& operator=(const CRowPool&) = delete;
+        CRowPool& operator=(CRowPool&&)      = delete;
+
+        ~CRowPool() {
+            {
+                const std::lock_guard LOCK(m_mutex);
+                m_quit = true;
+                ++m_generation;
+            }
+            m_wake.notify_all();
+            for (auto& thread : m_threads) {
+                if (thread.joinable())
+                    thread.join();
+            }
+        }
+
+        // `workers` counts the caller, which participates in the same row cursor.
+        void run(uint32_t rows, uint32_t workers, const std::function<void(uint32_t)>& row) {
+            std::unique_lock lock(m_mutex);
+            // The generation is captured before the bump below, so a thread spawned
+            // here still observes this job instead of sleeping through it.
+            while (m_threads.size() + 1 < workers)
+                m_threads.emplace_back([this, index = m_threads.size(), seen = m_generation] { work(index, seen); });
+
+            m_row  = &row;
+            m_rows = rows;
+            m_cursor.store(0, std::memory_order_relaxed);
+            m_participants = sc<uint32_t>(std::min(sc<size_t>(workers - 1U), m_threads.size()));
+            m_outstanding  = m_participants;
+            ++m_generation;
+            lock.unlock();
+            m_wake.notify_all();
+
+            drain();
+
+            lock.lock();
+            m_done.wait(lock, [this] { return m_outstanding == 0; });
+            m_row = nullptr;
+        }
+
+      private:
+        CRowPool() = default;
+
+        void drain() {
+            for (uint32_t row = m_cursor.fetch_add(1, std::memory_order_relaxed); row < m_rows; row = m_cursor.fetch_add(1, std::memory_order_relaxed))
+                (*m_row)(row);
+        }
+
+        void work(size_t index, uint64_t seen) {
+            std::unique_lock lock(m_mutex);
+            while (true) {
+                m_wake.wait(lock, [this, seen] { return m_generation != seen; });
+                seen = m_generation;
+                if (m_quit)
+                    return;
+                if (index >= m_participants)
+                    continue;
+
+                lock.unlock();
+                drain();
+                lock.lock();
+                if (--m_outstanding == 0)
+                    m_done.notify_one();
+            }
+        }
+
+        std::mutex                           m_mutex;
+        std::condition_variable              m_wake;
+        std::condition_variable              m_done;
+        std::vector<std::thread>             m_threads;
+        const std::function<void(uint32_t)>* m_row = nullptr;
+        std::atomic<uint32_t>                m_cursor{0};
+        uint32_t                             m_rows         = 0;
+        uint32_t                             m_participants = 0;
+        uint32_t                             m_outstanding  = 0;
+        uint64_t                             m_generation   = 0;
+        bool                                 m_quit         = false;
+    };
+
+    void renderRows(uint32_t rows, uint32_t threads, const std::function<void(uint32_t)>& row) {
+        if (rows == 0)
+            return;
+
+        const uint32_t WORKERS = std::min(std::max(threads, 1U), rows);
+        if (WORKERS < 2) {
+            for (uint32_t y = 0; y < rows; ++y)
+                row(y);
+            return;
+        }
+
+        CRowPool::instance().run(rows, WORKERS, row);
+    }
+
+}
 
 static bool finiteVec(const ViewpointDemo::SVec3& vec) {
     return std::isfinite(vec.x) && std::isfinite(vec.y) && std::isfinite(vec.z);
@@ -68,59 +188,57 @@ static void considerRoomPlane(const ViewpointDemo::SRay& ray, double numerator, 
     if (DISTANCE <= MIN_DISTANCE || DISTANCE >= hit.distance)
         return;
 
-    const auto POINT  = rayPoint(ray, DISTANCE);
-    bool       inside = false;
-    uint32_t   color  = 0;
+    // The bounds test precedes the grid-line color so a miss never pays for it.
+    const auto POINT = rayPoint(ray, DISTANCE);
+    uint32_t   color = 0;
 
     switch (plane) {
         case 0: // back wall, z = -5
-            inside = inRange(POINT.x, -2.8, 2.8) && inRange(POINT.y, -1.7, 1.7);
-            color  = gridLine(POINT.x, 0.5, 0.035) || gridLine(POINT.y, 0.5, 0.035) ? rgb(91, 130, 151) : rgb(35, 55, 67);
+            if (!inRange(POINT.x, -2.8, 2.8) || !inRange(POINT.y, -1.7, 1.7))
+                return;
+            color = gridLine(POINT.x, 0.5, 0.035) || gridLine(POINT.y, 0.5, 0.035) ? rgb(91, 130, 151) : rgb(35, 55, 67);
             break;
         case 1: // floor / ceiling
-            inside = inRange(POINT.x, -2.8, 2.8) && inRange(POINT.z, -5.0, 0.0);
-            color  = gridLine(POINT.x, 0.5, 0.035) || gridLine(POINT.z, 0.5, 0.035) ? rgb(98, 92, 82) : rgb(42, 39, 37);
+            if (!inRange(POINT.x, -2.8, 2.8) || !inRange(POINT.z, -5.0, 0.0))
+                return;
+            color = gridLine(POINT.x, 0.5, 0.035) || gridLine(POINT.z, 0.5, 0.035) ? rgb(98, 92, 82) : rgb(42, 39, 37);
             break;
         case 2: // side walls
-            inside = inRange(POINT.y, -1.7, 1.7) && inRange(POINT.z, -5.0, 0.0);
-            color  = gridLine(POINT.y, 0.5, 0.035) || gridLine(POINT.z, 0.5, 0.035) ? rgb(84, 104, 111) : rgb(34, 45, 49);
+            if (!inRange(POINT.y, -1.7, 1.7) || !inRange(POINT.z, -5.0, 0.0))
+                return;
+            color = gridLine(POINT.y, 0.5, 0.035) || gridLine(POINT.z, 0.5, 0.035) ? rgb(84, 104, 111) : rgb(34, 45, 49);
             break;
         default: return;
     }
 
-    if (!inside)
-        return;
+    hit.distance    = DISTANCE;
+    hit.color       = color;
+    hit.attenuation = 0.035;
+}
 
-    hit.distance = DISTANCE;
-    hit.color    = shade(color, 1.0 / (1.0 + DISTANCE * 0.035));
+// One slab of the box test. Kept as an explicit per-axis call so the arithmetic is
+// the same sequence the indexed loop used to run, without the array staging.
+static bool clipBoxAxis(double origin, double direction, double low, double high, double& entry, double& exit) {
+    if (std::abs(direction) < 1e-12)
+        return inRange(origin, low, high);
+
+    double nearDistance = (low - origin) / direction;
+    double farDistance  = (high - origin) / direction;
+    if (nearDistance > farDistance)
+        std::swap(nearDistance, farDistance);
+    entry = std::max(entry, nearDistance);
+    exit  = std::min(exit, farDistance);
+    return entry <= exit;
 }
 
 static bool intersectBox(const ViewpointDemo::SRay& ray, const ViewpointDemo::SVec3& low, const ViewpointDemo::SVec3& high, double& outDistance) {
-    constexpr double            MIN_DISTANCE = 1.000001;
-    double                      entry        = MIN_DISTANCE;
-    double                      exit         = std::numeric_limits<double>::infinity();
+    constexpr double MIN_DISTANCE = 1.000001;
+    double           entry        = MIN_DISTANCE;
+    double           exit         = std::numeric_limits<double>::infinity();
 
-    const std::array<double, 3> ORIGIN    = {ray.origin.x, ray.origin.y, ray.origin.z};
-    const std::array<double, 3> DIRECTION = {ray.direction.x, ray.direction.y, ray.direction.z};
-    const std::array<double, 3> LOW       = {low.x, low.y, low.z};
-    const std::array<double, 3> HIGH      = {high.x, high.y, high.z};
-
-    for (size_t axis = 0; axis < ORIGIN.size(); ++axis) {
-        if (std::abs(DIRECTION[axis]) < 1e-12) {
-            if (!inRange(ORIGIN[axis], LOW[axis], HIGH[axis]))
-                return false;
-            continue;
-        }
-
-        double nearDistance = (LOW[axis] - ORIGIN[axis]) / DIRECTION[axis];
-        double farDistance  = (HIGH[axis] - ORIGIN[axis]) / DIRECTION[axis];
-        if (nearDistance > farDistance)
-            std::swap(nearDistance, farDistance);
-        entry = std::max(entry, nearDistance);
-        exit  = std::min(exit, farDistance);
-        if (entry > exit)
-            return false;
-    }
+    if (!clipBoxAxis(ray.origin.x, ray.direction.x, low.x, high.x, entry, exit) || !clipBoxAxis(ray.origin.y, ray.direction.y, low.y, high.y, entry, exit) ||
+        !clipBoxAxis(ray.origin.z, ray.direction.z, low.z, high.z, entry, exit))
+        return false;
 
     outDistance = entry;
     return std::isfinite(entry);
@@ -131,8 +249,9 @@ static void considerBox(const ViewpointDemo::SRay& ray, const ViewpointDemo::SVe
     if (!intersectBox(ray, low, high, distance) || distance >= hit.distance)
         return;
 
-    hit.distance = distance;
-    hit.color    = shade(color, 1.0 / (1.0 + distance * 0.045));
+    hit.distance    = distance;
+    hit.color       = color;
+    hit.attenuation = 0.045;
 }
 
 static void considerAimMarker(const ViewpointDemo::SRay& ray, SHit& hit) {
@@ -153,8 +272,9 @@ static void considerAimMarker(const ViewpointDemo::SRay& ray, SHit& hit) {
     if (DISTANCE <= 1.000001 || DISTANCE >= hit.distance)
         return;
 
-    hit.distance = DISTANCE;
-    hit.color    = rgb(255, 76, 57);
+    hit.distance    = DISTANCE;
+    hit.color       = rgb(255, 76, 57);
+    hit.attenuation = -1.0;
 }
 
 static uint32_t trace(const ViewpointDemo::SRay& ray) {
@@ -171,7 +291,10 @@ static uint32_t trace(const ViewpointDemo::SRay& ray) {
     considerBox(ray, {.x = -0.48, .y = -0.55, .z = -4.35}, {.x = 0.35, .y = 0.45, .z = -3.8}, rgb(110, 99, 196), hit);
     considerAimMarker(ray, hit);
 
-    return std::isfinite(hit.distance) ? hit.color : rgb(10, 14, 18);
+    if (!std::isfinite(hit.distance))
+        return rgb(10, 14, 18);
+    // Identical arithmetic to shading at hit time, evaluated once for the survivor.
+    return hit.attenuation < 0.0 ? hit.color : shade(hit.color, 1.0 / (1.0 + hit.distance * hit.attenuation));
 }
 
 static uint32_t fallbackPixel(uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
@@ -243,7 +366,12 @@ bool ViewpointDemo::portalRay(const SVec3& eye, const SPortalSize& portal, uint3
     return true;
 }
 
-bool ViewpointDemo::renderPortalSBS(const SImage& image, const SPortalSize& portal, const SStereoViews& views) {
+uint32_t ViewpointDemo::defaultRenderThreads() {
+    const uint32_t AVAILABLE = std::thread::hardware_concurrency();
+    return AVAILABLE == 0 ? 1U : std::min(AVAILABLE, MAX_AUTO_RENDER_THREADS);
+}
+
+bool ViewpointDemo::renderPortalSBS(const SImage& image, const SPortalSize& portal, const SStereoViews& views, uint32_t threads) {
     if (!imageValid(image) || !std::isfinite(portal.widthMeters) || !std::isfinite(portal.heightMeters) || portal.widthMeters <= 0.0 || portal.heightMeters <= 0.0 ||
         !finiteVec(views.left) || !finiteVec(views.right) || views.left.z <= 1e-6 || views.right.z <= 1e-6)
         return false;
@@ -252,33 +380,56 @@ bool ViewpointDemo::renderPortalSBS(const SImage& image, const SPortalSize& port
     const uint32_t RIGHT_X    = image.width - PANE_WIDTH;
     std::fill(image.pixels.begin(), image.pixels.end(), rgb(5, 8, 11));
 
-    const std::array<SVec3, 2>    EYES = {views.left, views.right};
-    const std::array<uint32_t, 2> BASE = {0U, RIGHT_X};
-    for (size_t eyeIndex = 0; eyeIndex < EYES.size(); ++eyeIndex) {
-        for (uint32_t y = 0; y < image.height; ++y) {
+    // Pixel-center portal-plane coordinates, evaluated with exactly the expressions
+    // portalRay() uses. imageValid() plus the guard above already establish every
+    // portalRay() precondition for the whole pane, so it cannot fail per pixel; the
+    // tables just move its two divisions out of the hot loop bit-for-bit unchanged.
+    std::vector<double> surfaceX(PANE_WIDTH);
+    for (uint32_t x = 0; x < PANE_WIDTH; ++x)
+        surfaceX[x] = ((sc<double>(x) + 0.5) / sc<double>(PANE_WIDTH) - 0.5) * portal.widthMeters;
+
+    std::vector<double> surfaceY(image.height);
+    for (uint32_t y = 0; y < image.height; ++y)
+        surfaceY[y] = (0.5 - (sc<double>(y) + 0.5) / sc<double>(image.height)) * portal.heightMeters;
+
+    const std::array<SVec3, 2>    EYES     = {views.left, views.right};
+    const std::array<uint32_t, 2> BASE     = {0U, RIGHT_X};
+    const uint32_t                CENTER_X = PANE_WIDTH / 2U;
+    const uint32_t                CENTER_Y = image.height / 2U;
+
+    // One row of the packed frame, both panes. Rows never interact.
+    renderRows(image.height, threads, [&](uint32_t y) {
+        // A portal-locked center reticle makes the invariant visible: the cyan mark
+        // stays fixed while the red authoritative world impact moves under viewer
+        // translation. trace() is pure, so reticle pixels can skip it outright.
+        const bool NARROW_Y = y + 1U >= CENTER_Y && y <= CENTER_Y + 1U;
+        const bool CROSS_Y  = y + 8U >= CENTER_Y && y <= CENTER_Y + 8U;
+
+        for (size_t eyeIndex = 0; eyeIndex < EYES.size(); ++eyeIndex) {
+            const SVec3& EYE = EYES[eyeIndex];
+            uint32_t*    row = image.pixels.data() + sc<size_t>(y) * image.stridePixels + BASE[eyeIndex];
+
+            SRay         ray;
+            ray.origin      = EYE;
+            ray.direction.y = surfaceY[y] - EYE.y;
+            ray.direction.z = -EYE.z;
+
             for (uint32_t x = 0; x < PANE_WIDTH; ++x) {
-                SRay ray;
-                if (!portalRay(EYES[eyeIndex], portal, x, y, PANE_WIDTH, image.height, ray))
-                    return false;
-                uint32_t color = trace(ray);
-                // A portal-locked center reticle makes the invariant visible:
-                // the cyan mark stays fixed while the red authoritative world
-                // impact moves under viewer translation.
-                const uint32_t CENTER_X = PANE_WIDTH / 2U;
-                const uint32_t CENTER_Y = image.height / 2U;
-                const bool     RETICLE  = (x + 8U >= CENTER_X && x <= CENTER_X + 8U && y + 1U >= CENTER_Y && y <= CENTER_Y + 1U) ||
-                    (y + 8U >= CENTER_Y && y <= CENTER_Y + 8U && x + 1U >= CENTER_X && x <= CENTER_X + 1U);
-                if (RETICLE)
-                    color = rgb(71, 225, 231);
-                image.pixels[sc<size_t>(y) * image.stridePixels + BASE[eyeIndex] + x] = color;
+                if ((NARROW_Y && x + 8U >= CENTER_X && x <= CENTER_X + 8U) || (CROSS_Y && x + 1U >= CENTER_X && x <= CENTER_X + 1U)) {
+                    row[x] = rgb(71, 225, 231);
+                    continue;
+                }
+
+                ray.direction.x = surfaceX[x] - EYE.x;
+                row[x]          = trace(ray);
             }
         }
-    }
+    });
 
     return true;
 }
 
-bool ViewpointDemo::renderFallbackSBS(const SImage& image) {
+bool ViewpointDemo::renderFallbackSBS(const SImage& image, uint32_t threads) {
     if (!imageValid(image))
         return false;
 
@@ -286,13 +437,14 @@ bool ViewpointDemo::renderFallbackSBS(const SImage& image) {
     const uint32_t RIGHT_X    = image.width - PANE_WIDTH;
     std::fill(image.pixels.begin(), image.pixels.end(), rgb(5, 8, 11));
 
-    for (uint32_t y = 0; y < image.height; ++y) {
+    renderRows(image.height, threads, [&](uint32_t y) {
+        uint32_t* row = image.pixels.data() + sc<size_t>(y) * image.stridePixels;
         for (uint32_t x = 0; x < PANE_WIDTH; ++x) {
-            const uint32_t COLOR                                           = fallbackPixel(x, y, PANE_WIDTH, image.height);
-            image.pixels[sc<size_t>(y) * image.stridePixels + x]           = COLOR;
-            image.pixels[sc<size_t>(y) * image.stridePixels + RIGHT_X + x] = COLOR;
+            const uint32_t COLOR = fallbackPixel(x, y, PANE_WIDTH, image.height);
+            row[x]               = COLOR;
+            row[RIGHT_X + x]     = COLOR;
         }
-    }
+    });
 
     return true;
 }
