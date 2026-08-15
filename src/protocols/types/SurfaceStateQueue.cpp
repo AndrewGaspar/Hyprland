@@ -87,9 +87,11 @@ void CSurfaceStateQueue::tryProcess() {
 
 void CSurfaceStateQueue::clearViewpointAssociations(uint64_t epoch) {
     for (auto& state : m_queue) {
-        if (state->viewpointAssociation && state->viewpointAssociation->epoch == epoch) {
+        // updated.bits.viewpoint is the guard, not decoration: only a state that actually carries a
+        // viewpoint update will apply its association at commit, so only such a state has anything
+        // to clear. Without it, a state whose association was never meant to be applied would be
+        // promoted into carrying one (a clearing one, but a real update all the same).
+        if (state->updated.bits.viewpoint && state->viewpointAssociation && state->viewpointAssociation->epoch == epoch)
             state->viewpointAssociation.reset();
-            state->updated.bits.viewpoint = true;
-        }
     }
 }

@@ -68,6 +68,13 @@ void SSurfaceState::reset() {
     // applies only to the buffer that is attached to the surface
     acquire = {};
 
+    // Same rule as the buffer: the association belongs to the commit that carried it. The commit
+    // handler re-derives it from the latch on every commit and only ever pairs it with
+    // updated.bits.viewpoint, so leaving it here would let every later queued copy of m_pending
+    // carry a stale association with the bit clear -- inert for updateFrom(), but visible to
+    // CSurfaceStateQueue::clearViewpointAssociations, which walks the raw field.
+    viewpointAssociation.reset();
+
     // wl_surface.commit assigns pending ... and clears pending damage.
     damage.clear();
     bufferDamage.clear();
