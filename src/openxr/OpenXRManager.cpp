@@ -1882,6 +1882,14 @@ void COpenXRManager::frameThread() {
         // applyReferenceSpaceChange takes itself), so this very frame already renders corrected and
         // the user never sees the wrong placement. Held pending while the view is invalid, exactly
         // like the recenter-on-plug arming below, so a change during a tracking dropout still lands.
+        //
+        // Do NOT be tempted to gate this on the event's `changeTime` against predictedDisplayTime,
+        // however spec-shaped that reads. monado's origin offset is not time-indexed: a locate
+        // returns whatever offset is installed at CALL time, regardless of the XrTime asked about.
+        // The previous frame's locate ran before pollEvents saw the event and is therefore old-space
+        // no matter what its predicted display time says — while a changeTime comparison, on a
+        // display time that always sits a frame or two in the future, would routinely misjudge that
+        // sample as post-change and no-op the correction away. Call order is the ground truth here.
         if (recenterSolvePending && viewValid) {
             const int64_t AGE_NS = fs.predictedDisplayTime - recenterHeadOldTime;
             switch (OpenXR::xrRecenterFix(false, recenterHeadOldValid, AGE_NS)) {
