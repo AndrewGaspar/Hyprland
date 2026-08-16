@@ -238,14 +238,14 @@ namespace OpenXR {
         return {-qRotate(ci, p.pos), ci};
     }
 
-    // ---- reference-space change reconstruction (doc 03 §6, research/22 §4.3) ----
+    // ---- reference-space change reconstruction (doc 03 §8.1, research/22 §4.3) ----
     //
     // XrEventDataReferenceSpaceChangePending MAY arrive with poseValid == XR_FALSE, and monado (so
     // WiVRn, so every session on this box) ALWAYS does: u_space_overseer.c pushes pose_valid=false
     // with an identity pose even though recenter_local_spaces just computed the exact delta. Without
     // a reconstruction the old handling had nothing to apply, so every anchor kept coordinates in a
     // frame that no longer exists and the monitors teleported by the whole frame shift — measured in
-    // one live session as 8.3 m and ~157 deg of yaw across a single recenter.
+    // one live session as 8.25 m and ~155 deg of yaw across a single recenter.
     //
     // The head is the one physical object observable on BOTH sides of the swap. The origin moves
     // instantaneously and the skull does not, so the same head sampled just before the event
