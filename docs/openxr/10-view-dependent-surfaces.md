@@ -583,6 +583,23 @@ windowrule = stereo auto, match:xdg_tag ^stereo:sbs$
 windowrule = viewpoint on, match:class ^(hypxr-viewpoint-demo)$
 ```
 
+**Put these rules in the config file, not in `hyprctl keyword`.** Two upstream behaviors make a
+runtime-added `windowrule` a trap here, and together they cost one live session an afternoon of
+believing the compositor was broken:
+
+- `CConfigManager::reload` clears `m_keywordRules`, so every rule added with `hyprctl keyword
+  windowrule` is **dropped by the next config reload** — and reloads fire whenever any sourced file
+  changes, which on an omarchy-style setup is constantly (theme env files are rewritten on ordinary
+  desktop activity);
+- re-adding the rule registers it but does **not** re-run the rule set over already-mapped windows,
+  so the client that was already running stays unauthorized until it is restarted.
+
+The symptom is a viewpoint that never activates and a demo that renders flat forever. The compositor
+now names the cause: `CXRViewpointResource::invalidate` logs one line per inactive-reason
+transition, so `[OPENXR] viewpoint for surface N inactive: not_authorized (…)` in the Hyprland log
+distinguishes a missing rule from a doffed headset (`xr_inactive`) or a geometry mismatch
+(`not_eligible`).
+
 There are two different kinds of “tag” in common configurations:
 
 - the demo's **xdg toplevel tag** is `stereo:sbs`, set by the client through

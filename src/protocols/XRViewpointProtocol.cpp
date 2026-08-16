@@ -2,6 +2,7 @@
 
 #include "core/Compositor.hpp"
 #include "core/Subcompositor.hpp"
+#include "debug/log/Logger.hpp"
 #include "../openxr/XRViewpointEligibility.hpp"
 #ifdef HAVE_OPENXR
 #include "../openxr/OpenXRManager.hpp"
@@ -25,6 +26,8 @@ static void               requestReevaluation() {
 CXRViewpointResource::CXRViewpointResource(UP<CHypxrViewpointV1>&& resource, SP<CWLSurfaceResource> surface) : m_resource(std::move(resource)), m_surface(surface) {
     if UNLIKELY (!m_resource->resource())
         return;
+
+    m_surfaceIdForLog = surface ? surface->id() : 0;
 
     m_resource->setDestroy([this](CHypxrViewpointV1*) { destroy(); });
     m_resource->setOnDestroy([this](CHypxrViewpointV1*) { destroy(); });
@@ -152,12 +155,37 @@ uint64_t CXRViewpointResource::activate(uint64_t token, uint64_t geometryId, uin
     const auto EPOCH    = OpenXR::splitViewpointU64(m_epoch);
     const auto GEOMETRY = OpenXR::splitViewpointU64(m_geometryId);
     m_resource->sendActive(EPOCH.hi, EPOCH.lo, GEOMETRY.hi, GEOMETRY.lo, widthUM, heightUM, HYPXR_VIEWPOINT_V1_LAYOUT_SBS, HYPXR_VIEWPOINT_V1_CAPABILITY_PAIR_LATCHED);
+    // The other half of the inactive-reason trail: without this, "it went active at some point" was
+    // only ever observable in the client's own stdout.
+    Log::logger->log(Log::DEBUG, "[OPENXR] viewpoint for surface {} active (epoch {}, {}x{} um)", m_surfaceIdForLog, m_epoch, widthUM, heightUM);
     return m_epoch;
+}
+
+// Human names for the wire enum, for the diagnostic below only.
+static const char* inactiveReasonName(hypxrViewpointV1InactiveReason reason) {
+    switch (reason) {
+        case HYPXR_VIEWPOINT_V1_INACTIVE_REASON_DISABLED: return "disabled (the client turned feedback off)";
+        case HYPXR_VIEWPOINT_V1_INACTIVE_REASON_NOT_SUPPORTED: return "not_supported (no usable layout/capability request)";
+        case HYPXR_VIEWPOINT_V1_INACTIVE_REASON_SURFACE_DESTROYED: return "surface_destroyed";
+        case HYPXR_VIEWPOINT_V1_INACTIVE_REASON_NOT_AUTHORIZED: return "not_authorized (no `viewpoint on` window rule matched this window AT MAP TIME)";
+        case HYPXR_VIEWPOINT_V1_INACTIVE_REASON_NOT_ELIGIBLE: return "not_eligible (not fullscreen SBS on an XR monitor with a settled anchor)";
+        case HYPXR_VIEWPOINT_V1_INACTIVE_REASON_XR_INACTIVE: return "xr_inactive (session not visible / headset doffed)";
+        case HYPXR_VIEWPOINT_V1_INACTIVE_REASON_TRACKING_LOST: return "tracking_lost";
+        case HYPXR_VIEWPOINT_V1_INACTIVE_REASON_SUPERSEDED: return "superseded (another surface owns this monitor)";
+        default: return "unknown";
+    }
 }
 
 void CXRViewpointResource::invalidate(hypxrViewpointV1InactiveReason reason) {
     if (m_epoch == 0 && m_lastInactiveReason == reason)
         return;
+
+    // One line per REASON TRANSITION (the guard above collapses the per-pass repeats), because the
+    // reason is otherwise visible only inside the client. A viewpoint that silently renders flat
+    // forever looks identical from the compositor side whether the cause is a missing window rule, a
+    // doffed headset, or a geometry mismatch — and telling those apart by guesswork cost a live
+    // session most of an afternoon.
+    Log::logger->log(Log::DEBUG, "[OPENXR] viewpoint for surface {} inactive: {}", m_surfaceIdForLog, inactiveReasonName(reason));
 
     const auto EPOCH = OpenXR::splitViewpointU64(m_epoch);
     m_resource->sendInactive(EPOCH.hi, EPOCH.lo, reason);
