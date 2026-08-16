@@ -368,3 +368,17 @@ TEST(XRViewpointTransport, RenderedDispositionDropsStaleReportsSilently) {
     // Current epoch: proceed to consume, where an unknown/replayed sample is a real protocol error.
     EXPECT_EQ(viewpointRenderedDisposition(2, 2), eXRViewpointRenderedDisposition::XR_VIEWPOINT_RENDERED_CONSUME);
 }
+
+TEST(XRViewpointTransport, DoffCannotTurnAnInFlightReportIntoAFatalError) {
+    using OpenXR::eXRViewpointRenderedDisposition;
+    using OpenXR::viewpointRenderedDisposition;
+
+    // The named live failure this rule exists for. Taking the headset off invalidates every viewpoint
+    // with reason `xr_inactive`, and CXRViewpointResource::invalidate zeroes the epoch — so whatever
+    // epoch the client was faithfully rendering under a millisecond earlier is, by the time its
+    // `rendered` lands, "not current". Answering that with a fatal protocol error killed the client's
+    // whole Wayland connection, and a fullscreen window disappeared off the user's desktop the
+    // instant they doffed. Every epoch a client could plausibly report after a doff must be dropped.
+    for (const uint64_t REPORTED : {uint64_t{0}, uint64_t{1}, uint64_t{2}, uint64_t{1000}, std::numeric_limits<uint64_t>::max()})
+        EXPECT_EQ(viewpointRenderedDisposition(0, REPORTED), eXRViewpointRenderedDisposition::XR_VIEWPOINT_RENDERED_IGNORE_STALE);
+}

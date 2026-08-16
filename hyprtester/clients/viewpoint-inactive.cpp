@@ -152,17 +152,14 @@ static bool exerciseInactiveLifecycle(SState& state) {
     finishProtocolErrorTest(state, hypxr_viewpoint_manager_v1_interface, HYPXR_VIEWPOINT_MANAGER_V1_ERROR_ALREADY_CONSTRUCTED, "viewpoint duplicate rejected");
 }
 
-[[noreturn]] static void exerciseInvalidState(SState& state, bool invalidEnabled) {
+[[noreturn]] static void exerciseInvalidEnabled(SState& state) {
     if (!createViewpoint(state) || !roundtrip(state)) {
-        std::println("error: invalid-state setup");
+        std::println("error: invalid-enabled setup");
         std::fflush(stdout);
         std::_Exit(1);
     }
 
-    if (invalidEnabled)
-        state.viewpoint->sendSetEnabled(2);
-    else
-        state.viewpoint->sendRendered(0, 0, 0, 1);
+    state.viewpoint->sendSetEnabled(2);
 
     if (roundtrip(state)) {
         std::println("error: invalid state accepted");
@@ -170,8 +167,35 @@ static bool exerciseInactiveLifecycle(SState& state) {
         std::_Exit(1);
     }
 
-    finishProtocolErrorTest(state, hypxr_viewpoint_v1_interface, HYPXR_VIEWPOINT_V1_ERROR_INVALID_STATE,
-                            invalidEnabled ? "viewpoint invalid enabled rejected" : "viewpoint inactive rendered rejected");
+    finishProtocolErrorTest(state, hypxr_viewpoint_v1_interface, HYPXR_VIEWPOINT_V1_ERROR_INVALID_STATE, "viewpoint invalid enabled rejected");
+}
+
+// A `rendered` report that arrives while the viewpoint is inactive — or for an epoch that is no
+// longer current — is the benign wire race, NOT a protocol violation: deactivation is an
+// asynchronous compositor->client event, so a report the client had already finished and queued can
+// always cross it. The compositor answered that with a fatal error until 1805e965, and the live
+// consequence was severe: doffing the headset deactivated the viewpoint (reason xr_inactive) while
+// the demo's last report was in flight, the connection was killed, and a fullscreen window simply
+// vanished from the user's desktop. This case pins the tolerant contract, in the shape the doff
+// actually produced.
+[[noreturn]] static void exerciseInactiveRendered(SState& state) {
+    if (!createViewpoint(state) || !roundtrip(state)) {
+        std::println("error: inactive-rendered setup");
+        std::fflush(stdout);
+        std::_Exit(1);
+    }
+
+    state.viewpoint->sendRendered(0, 0, 0, 1); // epoch 0: reported after a deactivation
+    state.viewpoint->sendRendered(0, 7, 0, 3); // an epoch the compositor never issued to this client
+
+    const bool alive = roundtrip(state) && wl_display_get_error(state.display) == 0;
+
+    // _Exit for the same reason the rejection cases use it: the generated wrappers would otherwise
+    // run destructor requests during teardown, which is noise on a connection whose whole point was
+    // to prove nothing killed it.
+    std::println("{}", alive ? "viewpoint inactive rendered tolerated" : "error: inactive rendered killed the connection");
+    std::fflush(stdout);
+    std::_Exit(alive ? 0 : 1);
 }
 
 int main(int argc, char** argv) {
@@ -195,9 +219,9 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::strcmp(argv[1], "--duplicate") == 0)
             exerciseDuplicate(state);
         if (argc == 2 && std::strcmp(argv[1], "--invalid-enabled") == 0)
-            exerciseInvalidState(state, true);
+            exerciseInvalidEnabled(state);
         if (argc == 2 && std::strcmp(argv[1], "--inactive-rendered") == 0)
-            exerciseInvalidState(state, false);
+            exerciseInactiveRendered(state);
 
         passed = exerciseInactiveLifecycle(state);
 

@@ -29,8 +29,11 @@ TEST_CASE(xrViewpointInactiveLifecycle) {
     ASSERT(invalidEnabled.runSync(), true);
     EXPECT_CONTAINS(invalidEnabled.stdOut(), "viewpoint invalid enabled rejected");
 
+    // A rendered report crossing a deactivation on the wire must NOT be fatal (1805e965): the live
+    // failure it caused was a doff killing the demo client's connection, taking a fullscreen window
+    // with it. This case is the tolerance assertion, not a rejection one.
     CProcess inactiveRendered(binaryDir + "/viewpoint-inactive", {"--inactive-rendered"});
     inactiveRendered.addEnv("WAYLAND_DISPLAY", WLDISPLAY);
     ASSERT(inactiveRendered.runSync(), true);
-    EXPECT_CONTAINS(inactiveRendered.stdOut(), "viewpoint inactive rendered rejected");
+    EXPECT_CONTAINS(inactiveRendered.stdOut(), "viewpoint inactive rendered tolerated");
 }
