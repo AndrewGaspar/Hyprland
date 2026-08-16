@@ -45,6 +45,12 @@ class CXRViewpointResource {
 
     UP<CHypxrViewpointV1>                         m_resource;
     WP<CWLSurfaceResource>                        m_surface;
+    // The surface's wl_resource id, captured while it is still alive, FOR LOGGING ONLY. The
+    // diagnostic in invalidate() also fires from surfaceDestroyed(), where m_surface still points at
+    // a live C++ object whose wl_resource is already gone — asking it for its id() there walks into
+    // wl_resource_get_id on freed memory and segfaults the compositor (caught by the container
+    // suite's xrViewpointInactiveLifecycle before this ever shipped).
+    uint32_t                                      m_surfaceIdForLog          = 0;
     uint32_t                                      m_layouts                  = 0;
     uint32_t                                      m_capabilities             = 0;
     bool                                          m_enabled                  = false;

@@ -4282,7 +4282,22 @@ void COpenXRManager::reevaluateViewpoints() {
         }
 
         const auto WINDOW = Desktop::View::CWindow::fromView(SURFACE->m_hlSurface->view());
-        if (!WINDOW || !WINDOW->m_ruleApplicator->viewpoint().valueOrDefault()) {
+        if (!WINDOW) {
+            // A surface that is not a window (yet) is not a policy decision — reporting it as
+            // NOT_AUTHORIZED sent a client hunting for a permission it already had. `not_eligible`
+            // is what "this surface cannot present right now" means.
+            viewpoint->invalidate(HYPXR_VIEWPOINT_V1_INACTIVE_REASON_NOT_ELIGIBLE);
+            continue;
+        }
+        if (!WINDOW->m_ruleApplicator->viewpoint().valueOrDefault()) {
+            // The `viewpoint` window rule is the entire authorization gate. Two upstream facts about
+            // it cost a live session an afternoon of thinking the compositor was broken, so they are
+            // written down here: a rule added by `hyprctl keyword windowrule` is dropped by the next
+            // config reload (CConfigManager::reload clears m_keywordRules, and reloads fire on any
+            // sourced file changing), and re-adding it registers the rule WITHOUT re-running it over
+            // already-mapped windows — so the client has to be restarted to pick it up. The inactive
+            // reason now reaches the log (CXRViewpointResource::invalidate), which is how a future
+            // session tells this apart from a compositor fault.
             viewpoint->invalidate(HYPXR_VIEWPOINT_V1_INACTIVE_REASON_NOT_AUTHORIZED);
             continue;
         }
