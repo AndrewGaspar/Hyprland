@@ -566,6 +566,12 @@ class COpenXRManager {
     // The XR frame thread body (owns the EGL context + XR frame loop while running).
     void frameThread();
 
+    // FRAME THREAD (doc 03 §8.1): re-express every anchor across a reference-space change, `m` being
+    // the new origin in the previous space. Takes m_layersMu itself, so it must NOT be called from
+    // inside that lock. Also drops the 2D-plane sync's latched desk frame, which was measured in the
+    // space that just went away; the main thread re-latches it against a fresh head pose.
+    void applyReferenceSpaceChange(const OpenXR::SXRPose& m);
+
     // --- layer management ---
     // Frame thread: (re)create a layer's swapchain at the given pixel size. Returns false on
     // failure (leaves m_swapchain == XR_NULL_HANDLE).

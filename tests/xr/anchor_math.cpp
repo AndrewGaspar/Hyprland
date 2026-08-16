@@ -662,3 +662,103 @@ TEST(XRAnchorRecenter, NonLocalModesUnaffected) {
     expectVecNear(a.state().anchorPose.pos, before.pos, 1e-6f);
     EXPECT_EQ(a.state().mode, XR_ANCHOR_HEAD);
 }
+
+// ---- research/22 §4.3: reconstructing a reference-space change the runtime refused to describe ----
+//
+// monado — so WiVRn, so every session on this machine — pushes
+// XrEventDataReferenceSpaceChangePending with pose_valid = false and an identity pose. The handler
+// used to drop exactly those, which left every anchor holding coordinates in a frame that no longer
+// existed and flung the monitors across the room by the whole frame shift. These pin the head-pair
+// reconstruction that recovers the delta, and the ladder deciding when it is trustworthy.
+
+TEST(XRAnchorRecenter, HeadPairReconstructsTheWithheldFrameChange) {
+    // Ground truth at the magnitude actually measured live: the latched head frame moved 8.25 m and
+    // ~155 deg of yaw across one recenter, inside a single session, with the user at the same desk.
+    const SXRPose M{{8.25f, 0.f, -0.42f}, qFromYaw(155.f * PI / 180.f)};
+
+    // One physical head, expressed on both sides of the swap.
+    const SXRPose headOld{{1.2f, 1.62f, -0.4f}, qFromYaw(20.f * PI / 180.f)};
+    const SXRPose headNew = poseCompose(poseInverse(M), headOld);
+
+    const SXRPose solved = solveReferenceSpaceChangeFromHead(headOld, headNew);
+    expectVecNear(solved.pos, M.pos, 1e-3f);
+    EXPECT_NEAR(qAngleBetween(solved.rot, M.rot), 0.f, 1e-4f);
+}
+
+TEST(XRAnchorRecenter, HeadPairSolveIgnoresPitchAndRoll) {
+    // The head keeps moving between the two samples; only its YAW may enter the solve, because both
+    // LOCAL_FLOOR frames are gravity-aligned and the true delta is 4-DoF. Pitch/roll leaking in would
+    // tilt the whole monitor group off the horizon.
+    const SXRPose M{{2.f, 0.f, -1.f}, qFromYaw(0.9f)};
+    const SXRPose headOld{{0.4f, 1.6f, 0.2f}, qMul(qFromYaw(0.3f), qFromPitch(0.4f))};
+    const SXRPose headNewTrue = poseCompose(poseInverse(M), headOld);
+    // Same position, but the head has pitched down and rolled since the pre-change sample.
+    const SXRPose headNew{headNewTrue.pos, qMul(qMul(qFromYaw(qYawOf(headNewTrue.rot, 0.f)), qFromPitch(-0.7f)), qFromAxisAngle(Vec3{0.f, 0.f, 1.f}, 0.25f))};
+
+    const SXRPose solved = solveReferenceSpaceChangeFromHead(headOld, headNew);
+    EXPECT_NEAR(qAngleBetween(solved.rot, M.rot), 0.f, 1e-4f);
+    expectVecNear(solved.pos, M.pos, 1e-4f);
+}
+
+TEST(XRAnchorRecenter, HeadPairSolveInventsNoYawWhenYawIsUnobservable) {
+    // A head staring straight up has no yaw to read (doc 03 §1.5). The solve must fall back to a pure
+    // translation rather than let qYawOf's fallback fabricate a rotation and spin the desktop.
+    const SXRPose up{{0.5f, 1.6f, 0.2f}, qFromPitch(PI / 2.f)};
+    const SXRPose upMoved{{-1.f, 1.6f, 3.f}, qFromPitch(PI / 2.f)};
+
+    const SXRPose solved = solveReferenceSpaceChangeFromHead(up, upMoved);
+    EXPECT_NEAR(qAngleBetween(solved.rot, Quat{}), 0.f, 1e-5f);
+    expectVecNear(solved.pos, up.pos - upMoved.pos, 1e-5f);
+}
+
+TEST(XRAnchorRecenter, ReconstructedChangeHoldsALocalMonitorWhereItIsInTheRoom) {
+    // End to end: the monitor must occupy the same physical spot after the recenter.
+    const auto    tune = defaultTuning();
+    const SXRPose M{{8.25f, 0.f, -0.42f}, qFromYaw(155.f * PI / 180.f)};
+    const SXRPose headOld{{1.2f, 1.62f, -0.4f}, qFromYaw(20.f * PI / 180.f)};
+    const SXRPose headNew = poseCompose(poseInverse(M), headOld);
+
+    CXRAnchor      a;
+    SXRAnchorState st;
+    st.mode           = XR_ANCHOR_LOCAL;
+    st.anchorPose.pos = Vec3{1.0f, 1.4f, -1.5f};
+    st.anchorPose.rot = qFromYaw(35.f * PI / 180.f);
+    a.initFromState(st);
+    const SXRPose oldWorld = a.solve(viewInput(headOld), tune).worldPose;
+
+    a.onReferenceSpaceChanged(solveReferenceSpaceChangeFromHead(headOld, headNew));
+    const SXRPose newWorld = a.solve(viewInput(headNew), tune).worldPose;
+
+    // Re-composing the new coordinates through the TRUE delta must land back on the old ones.
+    const SXRPose recomposed = poseCompose(M, newWorld);
+    expectVecNear(recomposed.pos, oldWorld.pos, 1e-3f);
+    EXPECT_NEAR(qAngleBetween(recomposed.rot, oldWorld.rot), 0.f, 1e-3f);
+
+    // And the numbers really did move: without the reconstruction the monitor would have stayed at
+    // `oldWorld`'s coordinates, which is now metres away in the room. That gap IS the reported bug.
+    EXPECT_GT((newWorld.pos - oldWorld.pos).length(), 5.f);
+}
+
+TEST(XRAnchorRecenter, FixLadderPicksTheOnlyTrustworthySource) {
+    // A runtime that actually fills poseInPreviousSpace always wins, however old the head sample is.
+    EXPECT_EQ(xrRecenterFix(true, false, 0), eXRRecenterFix::XR_RECENTER_APPLY_RUNTIME_POSE);
+    EXPECT_EQ(xrRecenterFix(true, true, 10'000'000'000), eXRRecenterFix::XR_RECENTER_APPLY_RUNTIME_POSE);
+
+    // No runtime pose: one frame of tracking (~11 ms at 90 Hz) straddling the change is the good case.
+    EXPECT_EQ(xrRecenterFix(false, true, 11'000'000), eXRRecenterFix::XR_RECENTER_SOLVE_FROM_HEAD);
+    EXPECT_EQ(xrRecenterFix(false, true, XR_RECENTER_HEAD_MAX_AGE_NS), eXRRecenterFix::XR_RECENTER_SOLVE_FROM_HEAD);
+
+    // Past the bound the head sample proves nothing about where the room went: the wearer may have
+    // taken the headset off and walked away, which is precisely the doff/re-don case.
+    EXPECT_EQ(xrRecenterFix(false, true, XR_RECENTER_HEAD_MAX_AGE_NS + 1), eXRRecenterFix::XR_RECENTER_RESEAT_TO_HEAD);
+    EXPECT_EQ(xrRecenterFix(false, false, 0), eXRRecenterFix::XR_RECENTER_RESEAT_TO_HEAD);
+    EXPECT_EQ(xrRecenterFix(false, true, -1), eXRRecenterFix::XR_RECENTER_RESEAT_TO_HEAD); // clock went backwards
+}
+
+TEST(XRAnchorRecenter, NoOpGuardSkipsAnUnchangedFrame) {
+    const SXRPose head{{1.f, 1.6f, -2.f}, qFromYaw(0.7f)};
+    EXPECT_TRUE(xrRecenterIsNoOp(SXRPose{}));
+    EXPECT_TRUE(xrRecenterIsNoOp(solveReferenceSpaceChangeFromHead(head, head)));
+    EXPECT_FALSE(xrRecenterIsNoOp(SXRPose{Vec3{0.f, 0.f, 0.05f}, Quat{}}));
+    EXPECT_FALSE(xrRecenterIsNoOp(SXRPose{Vec3{}, qFromYaw(0.1f)}));
+}

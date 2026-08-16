@@ -1377,6 +1377,21 @@ void COpenXRManager::onFrameChannelReadable() {
         g_pEventLoopManager->doLater([this] { stop(); });
 }
 
+void COpenXRManager::applyReferenceSpaceChange(const OpenXR::SXRPose& m) {
+    {
+        std::scoped_lock lock(m_layersMu);
+        for (auto& l : m_layers)
+            l->m_anchor.onReferenceSpaceChanged(m);
+    }
+    // report 12 §3a: the whole reference space moved under us, so the latched desk orientation the
+    // 2D projection measures world monitors against is now expressed in a space that no longer
+    // exists. A plain atomic store plus a wake is all the frame thread may do here
+    // (XRMonitorLayer.hpp: no refcounts, no strings, no config); onFrameChannelReadable consumes it
+    // on the main thread and re-latches.
+    m_l2dRefStale.store(true, std::memory_order_release);
+    wakeMain();
+}
+
 void COpenXRManager::frameThread() {
     // The frame thread exclusively owns the EGL context while running. It snapshots the
     // layer set once per frame, blits each layer's latest presented buffer into its
@@ -1384,6 +1399,17 @@ void COpenXRManager::frameThread() {
     eXRManagerState lastReported  = XR_STATE_RUNNING_IDLE;
     int64_t         lastPredicted = 0; // XrTime (ns) of the previous frame, for the solve dt
     int             frameFailStreak = 0; // consecutive xrWaitFrame/xrBeginFrame failures (loss backstop)
+
+    // Reference-space change reconstruction (doc 03 §8.1). Deliberately FUNCTION-LOCAL, not members:
+    // only this thread ever reads or writes them, and a session restart re-enters frameThread() with
+    // them already reset — no atomics, no lock, nothing for the main thread to get wrong.
+    OpenXR::SXRPose headLast;                    // newest valid head pose, in the CURRENT reference space
+    bool            headLastValid        = false;
+    int64_t         headLastTime         = 0;    // XrTime (ns) at which `headLast` was located
+    bool            recenterSolvePending = false; // a poseValid=false change is waiting for its head pair
+    OpenXR::SXRPose recenterHeadOld;             // `headLast` as it stood in the space that just died
+    bool            recenterHeadOldValid = false;
+    int64_t         recenterHeadOldTime  = 0;
 
     while (m_running.load()) {
         m_session->pollEvents();
@@ -1407,24 +1433,27 @@ void COpenXRManager::frameThread() {
             enqueue(ev);
         }
 
-        // Recenter (doc 03 §6): re-express every anchor across a reference-space change.
+        // Recenter (doc 03 §8.1): re-express every anchor across a reference-space change.
         if (m_session->m_recenterPending) {
             const OpenXR::SXRPose M      = m_session->m_recenterPose;
             const bool            valid  = m_session->m_recenterPoseValid;
             m_session->m_recenterPending = false;
-            if (valid) {
-                {
-                    std::scoped_lock lock(m_layersMu);
-                    for (auto& l : m_layers)
-                        l->m_anchor.onReferenceSpaceChanged(M);
-                }
-                // report 12 §3a: the whole reference space moved under us, so the latched desk
-                // orientation the 2D projection measures world monitors against is now expressed in
-                // a space that no longer exists. A plain atomic store plus a wake is all the frame
-                // thread may do here (XRMonitorLayer.hpp: no refcounts, no strings, no config);
-                // onFrameChannelReadable consumes it on the main thread and re-latches.
-                m_l2dRefStale.store(true, std::memory_order_release);
-                wakeMain();
+            if (valid)
+                applyReferenceSpaceChange(M);
+            else {
+                // monado — so WiVRn, so every session on this machine — pushes this event with
+                // pose_valid = false and an identity pose even though recenter_local_spaces just
+                // computed the exact delta (research/22 §4.3). That used to end the story here, and
+                // the consequence was the whole bug: the origin moved, every anchor kept coordinates
+                // in the space it had just left, and the monitors were flung across the room by the
+                // frame shift (one live session: 8.25 m and ~155 deg of yaw across a single
+                // recenter). Remember where the head was in the space that just died — the locate
+                // below catches the same head in the new one, and the pair reconstructs the delta.
+                recenterSolvePending = true;
+                recenterHeadOld      = headLast;
+                recenterHeadOldValid = headLastValid;
+                recenterHeadOldTime  = headLastTime;
+                Log::logger->log(Log::DEBUG, "[OPENXR] recenter carried no pose — reconstructing the frame change from the head across it");
             }
         }
 
@@ -1845,6 +1874,58 @@ void COpenXRManager::frameThread() {
             viewValid = true;
             if (!m_session->m_usingLocalFloor)
                 viewPose.pos.y += floorOffset;
+        }
+
+        // Reference-space change with no runtime delta (doc 03 §8.1). The head located just above is
+        // the same skull the pre-change sample caught one frame earlier, so the pair pins the
+        // transform the runtime withheld. Deliberately BEFORE the solve and OUTSIDE m_layersMu (which
+        // applyReferenceSpaceChange takes itself), so this very frame already renders corrected and
+        // the user never sees the wrong placement. Held pending while the view is invalid, exactly
+        // like the recenter-on-plug arming below, so a change during a tracking dropout still lands.
+        if (recenterSolvePending && viewValid) {
+            const int64_t AGE_NS = fs.predictedDisplayTime - recenterHeadOldTime;
+            switch (OpenXR::xrRecenterFix(false, recenterHeadOldValid, AGE_NS)) {
+                case OpenXR::eXRRecenterFix::XR_RECENTER_SOLVE_FROM_HEAD: {
+                    const auto M = OpenXR::solveReferenceSpaceChangeFromHead(recenterHeadOld, viewPose);
+                    if (OpenXR::xrRecenterIsNoOp(M))
+                        Log::logger->log(Log::DEBUG, "[OPENXR] recenter: the reconstructed frame change is the identity — nothing to re-express");
+                    else {
+                        applyReferenceSpaceChange(M);
+                        Log::logger->log(Log::DEBUG, "[OPENXR] recenter: reconstructed a {:.2f}m / {:.1f} deg frame change from the head — monitors held where they are in the room",
+                                         M.pos.length(), OpenXR::qYawOf(M.rot, 0.F) * 180.F / 3.14159265F);
+                    }
+                    break;
+                }
+                case OpenXR::eXRRecenterFix::XR_RECENTER_RESEAT_TO_HEAD: {
+                    // Nothing observed the old frame (the usual cause: the headset was off across the
+                    // change), so no correction is derivable — and the wearer may not even be standing
+                    // where they were. Leaving the anchors alone is what produced the reported
+                    // teleports, so re-seat the group to the head instead: the same rigid,
+                    // arrangement-preserving operation the first plug of a session performs, under the
+                    // same user permission.
+                    static auto PRECENTER = CConfigValue<Hyprlang::INT>("openxr:recenter_on_plug");
+                    if (*PRECENTER) {
+                        m_recenterArmed.store(true, std::memory_order_release);
+                        m_l2dRefStale.store(true, std::memory_order_release);
+                        wakeMain();
+                        Log::logger->log(Log::WARN, "[OPENXR] recenter: no head sample straddles the change (tracking gap {}ms) — re-seating the monitor group to the current head",
+                                         AGE_NS / 1'000'000);
+                    } else
+                        Log::logger->log(Log::WARN,
+                                         "[OPENXR] recenter: no head sample straddles the change (tracking gap {}ms) and recenter_on_plug is off — monitors keep coordinates from a "
+                                         "reference frame that no longer exists",
+                                         AGE_NS / 1'000'000);
+                    break;
+                }
+                case OpenXR::eXRRecenterFix::XR_RECENTER_APPLY_RUNTIME_POSE: break; // unreachable: poseValid was false
+            }
+            recenterSolvePending = false;
+        }
+
+        if (viewValid) {
+            headLast      = viewPose;
+            headLastValid = true;
+            headLastTime  = fs.predictedDisplayTime;
         }
 
         // dt from predicted display time deltas (monotone, no wall clock); clamped in solve().
