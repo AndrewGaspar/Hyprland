@@ -4950,7 +4950,10 @@ void COpenXRManager::reconcileDeclaredMonitors() {
             static auto PSIZE             = CConfigValue<Hyprlang::FLOAT>("openxr:default_size");
             const float wantSize          = d.m_sizeMeters.value_or((float)*PSIZE);
             const bool  anchorChanged     = !(existing->m_declaredAnchor == d.m_anchor);
-            const bool  sizeChanged       = existing->m_anchor.state().widthMeters != wantSize;
+            // Declared-vs-declared, like anchorChanged above: comparing the LIVE width here meant a
+            // grab-resized monitor re-entered this branch on every unrelated config reload, resetting
+            // its pose along with its size — a live-placement eraser on desktops that reload often.
+            const bool  sizeChanged       = existing->m_declaredAnchor.widthMeters != wantSize;
             const bool  anchorModeChanged = existing->m_declaredAnchor.mode != d.m_anchor.mode || existing->m_declaredAnchor.device != d.m_anchor.device;
             if (anchorChanged || sizeChanged) {
                 std::scoped_lock       lock(m_layersMu);
