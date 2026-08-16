@@ -60,7 +60,12 @@ cmake -S "$SRC" -B "$BUILD" -G Ninja \
 # (xr_idle_inhibit / xr_idle_inhibit_modes need `idle-notify`, xr_plugged_* need `pointer-scroll`).
 # Build them explicitly — this list must stay in sync with `clientNew()` in that CMakeLists, or
 # the missing ones go back to skipping silently.
-HYPRTESTER_CLIENTS=(pointer-warp surface-scale-transform pointer-scroll child-window xdg-interactive shortcut-inhibitor keyboard-modifiers idle-notify layer-surface output-info screencopy-crop screencopy-probe)
+#
+# The viewpoint pair was omitted when it was added and did NOT skip: xrViewpointInactiveLifecycle
+# asserts on the client's stdout unconditionally, so a missing binary failed every one of its five
+# cases with an empty haystack — the whole viewpoint protocol suite has been red in-container, for a
+# reason that reads nothing like "the binary was never built".
+HYPRTESTER_CLIENTS=(pointer-warp surface-scale-transform pointer-scroll child-window xdg-interactive shortcut-inhibitor keyboard-modifiers idle-notify layer-surface output-info screencopy-crop screencopy-probe viewpoint-inactive viewpoint-demo)
 
 echo "==> Building targets: Hyprland hyprtester ${HYPRTESTER_CLIENTS[*]}"
 cmake --build "$BUILD" --target Hyprland hyprtester "${HYPRTESTER_CLIENTS[@]}" -j"$JOBS"
