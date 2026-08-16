@@ -463,7 +463,49 @@ coordinates becomes `poseCompose(poseInverse(M), P_old)` in new coordinates. Per
 
 In every case the cached solver state (`m_lastWorld`, spring position/velocity, smoothed rotation)
 and the adaptive seat and any frozen transition pose are re-expressed too, so there is no one-frame
-pop. If the event's pose is invalid the stored pose is left untouched.
+pop.
+
+#### When the runtime withholds the delta
+
+`poseValid` is allowed to be false, and **monado always sets it false** — `u_space_overseer.c` pushes
+`pose_valid = false` with an identity pose even though `recenter_local_spaces` has just computed the
+exact delta (research/22 §4.3). So on WiVRn this is not an edge case: it is *every* recenter, and
+every re-don, since the Quest re-derives `LOCAL_FLOOR` when you put it back on.
+
+Leaving the stored poses untouched there — the old, conservative behavior — is what produced the
+"monitors thrown in a random direction across the room" report. One live session logged the latched
+head frame moving **8.25 m and ~155°** across a single mid-session recenter with nothing applied to
+any anchor.
+
+The head is the one physical object observable on both sides of the swap, and it does not move while
+the origin does, so the frame loop reconstructs what the runtime refused to send
+(`solveReferenceSpaceChangeFromHead`, `XRMath.hpp`):
+
+```
+headOld = M ∘ headNew   ⇒   M = headOld ∘ inv(headNew)
+```
+
+`headOld` is the last head pose located *before* `pollEvents` saw the event; `headNew` is the locate
+on the very next frame. Only the **yaw** of each is used — both frames are gravity-aligned, so the
+true delta is 4-DoF, and the head's real pitch/roll change between the two samples would otherwise
+tilt the whole monitor group. The reconstruction runs before the solve, so the corrected placement
+is what the frame actually renders; a delta that comes out as the identity is skipped rather than
+warping every spring for nothing.
+
+`xrRecenterFix` picks between three answers:
+
+| condition | action |
+|---|---|
+| `poseValid` | apply `poseInPreviousSpace` verbatim |
+| no pose, head sample ≤ `XR_RECENTER_HEAD_MAX_AGE_NS` (0.5 s) old | reconstruct `M` from the head pair — monitors stay where they are **in the room** |
+| no pose, no head sample that recent | re-seat the group to the head (§8.2), gated on `openxr:recenter_on_plug` |
+
+The third row is the doff case: tracking did not straddle the change because the headset was off, so
+nothing observed the old frame and the wearer may not even be standing where they were. Re-seating is
+the same rigid, arrangement-preserving operation the first plug of a session performs, and it asks
+the same permission. With `recenter_on_plug = false` the anchors are left alone and a WARN says so —
+that is a deliberate "don't move my monitors" choice, and its cost is that the coordinates are now
+expressed in a frame that no longer exists.
 
 ### 8.2 Recenter on plug
 

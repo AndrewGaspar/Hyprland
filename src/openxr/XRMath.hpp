@@ -238,6 +238,70 @@ namespace OpenXR {
         return {-qRotate(ci, p.pos), ci};
     }
 
+    // ---- reference-space change reconstruction (doc 03 §6, research/22 §4.3) ----
+    //
+    // XrEventDataReferenceSpaceChangePending MAY arrive with poseValid == XR_FALSE, and monado (so
+    // WiVRn, so every session on this box) ALWAYS does: u_space_overseer.c pushes pose_valid=false
+    // with an identity pose even though recenter_local_spaces just computed the exact delta. Without
+    // a reconstruction the old handling had nothing to apply, so every anchor kept coordinates in a
+    // frame that no longer exists and the monitors teleported by the whole frame shift — measured in
+    // one live session as 8.3 m and ~157 deg of yaw across a single recenter.
+    //
+    // The head is the one physical object observable on BOTH sides of the swap. The origin moves
+    // instantaneously and the skull does not, so the same head sampled just before the event
+    // (`headOld`, old space) and on the first frame after it (`headNew`, new space) pins the
+    // transform exactly:
+    //
+    //     headOld = M ∘ headNew   =>   M = headOld ∘ inv(headNew)
+    //
+    // which is precisely what `poseInPreviousSpace` would have carried: the new origin expressed in
+    // the old space, ready for CXRAnchor::onReferenceSpaceChanged.
+    //
+    // Both frames are gravity-aligned, so the true delta is 4-DoF — yaw and translation (research/22
+    // §2.2). Only the YAW of each head sample is used: the head's pitch and roll genuinely differ
+    // between the two samples (a real head keeps moving), and feeding that difference in would tilt
+    // the entire monitor group off the horizon rather than cancel.
+    inline SXRPose solveReferenceSpaceChangeFromHead(const SXRPose& headOld, const SXRPose& headNew) {
+        // A head staring straight up or down has no observable yaw (doc 03 §1.5). Rather than let
+        // qYawOf's fallback invent one, treat the rotation as unchanged and correct translation only.
+        const auto observable = [](const Quat& q) {
+            const Vec3 f = qRotate(q, Vec3{0.F, 0.F, -1.F});
+            return std::sqrt(f.x * f.x + f.z * f.z) >= 1e-4F;
+        };
+        const Quat R = observable(headOld.rot) && observable(headNew.rot) ? qFromYaw(qYawOf(headOld.rot, 0.F) - qYawOf(headNew.rot, 0.F)) : Quat{};
+        return SXRPose{headOld.pos - qRotate(R, headNew.pos), R};
+    }
+
+    // What to do about a reference-space change, decided from what is actually knowable.
+    enum class eXRRecenterFix : uint8_t {
+        XR_RECENTER_APPLY_RUNTIME_POSE = 0, // poseValid: the runtime told us the delta; use it verbatim
+        XR_RECENTER_SOLVE_FROM_HEAD,        // no delta, but a fresh head sample straddles the change
+        XR_RECENTER_RESEAT_TO_HEAD,         // no delta and no usable head: the old frame is unrecoverable
+    };
+
+    // `headOldAgeNs` is how long before the post-change head sample the last pre-change one was
+    // taken. One frame (~11 ms) is the normal case and the head cannot have moved meaningfully in
+    // it. A large age means tracking was lost across the change — typically the headset was off, and
+    // the wearer may be standing somewhere else entirely — so the old sample proves nothing about
+    // where the room went and the group has to be re-seated to the head instead of "corrected" onto
+    // a stale guess.
+    inline constexpr int64_t XR_RECENTER_HEAD_MAX_AGE_NS = 500'000'000; // 0.5 s
+
+    inline constexpr eXRRecenterFix xrRecenterFix(bool poseValid, bool headOldValid, int64_t headOldAgeNs, int64_t maxAgeNs = XR_RECENTER_HEAD_MAX_AGE_NS) {
+        if (poseValid)
+            return eXRRecenterFix::XR_RECENTER_APPLY_RUNTIME_POSE;
+        if (headOldValid && headOldAgeNs >= 0 && headOldAgeNs <= maxAgeNs)
+            return eXRRecenterFix::XR_RECENTER_SOLVE_FROM_HEAD;
+        return eXRRecenterFix::XR_RECENTER_RESEAT_TO_HEAD;
+    }
+
+    // A reconstructed delta this small is the runtime telling us the frame did not really move
+    // (or the solve landing on the identity it should). Applying it would still be correct, but it
+    // would warp every anchor's spring state for nothing, so the caller skips it.
+    inline bool xrRecenterIsNoOp(const SXRPose& m, float posEpsM = 1e-3F, float rotEpsRad = 1e-3F) {
+        return m.pos.length() <= posEpsM && qAngleBetween(m.rot, Quat{}) <= rotEpsRad;
+    }
+
     // hypxrvoice GAP 2: the LOCAL_FLOOR quad pose for `place <name> at x,y,z`. The quad center sits at
     // `point`; orientation faces the head (yaw+pitch toward `headPos`, no roll). When head tracking is
     // invalid, or the head is directly above/below `point` (degenerate lookAt), it keeps `fallbackRot`
