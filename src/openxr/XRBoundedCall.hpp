@@ -29,6 +29,13 @@
 // The `abandon` flag handed to the callable is how a late unblock stays safe: the worker must poll
 // it before touching any resource the caller may have torn down (an XrInstance, in practice) and
 // bail if it is set. Its result is discarded once abandoned.
+//
+// CAPTURE BY VALUE. This is the easy way to get it wrong: on a timeout the CALLER'S FRAME RETURNS
+// while the worker is still running, so a callable that captured a local by reference — a config
+// string, a node path — dangles the instant that frame unwinds. The timeout path is exactly the
+// path where the worker is still alive to trip over it, so the bug is invisible in every healthy
+// run and appears only against the sick driver this whole mechanism exists for. Capture by value,
+// or capture a shared_ptr.
 
 #include <atomic>
 #include <chrono>

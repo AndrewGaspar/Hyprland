@@ -199,7 +199,10 @@ bool CXRGraphics::selectDisplay(const std::string& gpuOverride) {
     // wedged one blocks forever — on the main thread that is a frozen desktop, not a failed XR
     // start. A timeout is treated exactly like an enumeration failure: refuse cleanly, let the
     // re-probe try again later.
-    const auto scanned = OpenXR::runBoundedProbe([&targetNode](const std::atomic<bool>& abandon) { return scanEglDevices(targetNode, abandon); });
+    // targetNode is captured BY VALUE, not by reference. On a timeout this frame returns while the
+    // worker is still running — a captured reference would dangle into a destroyed local the moment
+    // the abandoned thread unblocked and compared it against a device path.
+    const auto scanned = OpenXR::runBoundedProbe([targetNode](const std::atomic<bool>& abandon) { return scanEglDevices(targetNode, abandon); });
     if (!scanned.has_value()) {
         Log::logger->log(Log::ERR,
                          "[OPENXR] EGL device enumeration did not complete within {}ms — a GPU driver is not responding. Refusing to start XR (the desktop is unaffected; "
