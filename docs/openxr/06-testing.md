@@ -361,9 +361,17 @@ required). The cases, by file:
 - `xr_adaptive_geofence` — the adaptive dock↔follow behavior: walking the head out of the geofence
   undocks and follows, returning re-docks.
 - `xr_anchor_restore_across_session` — doc 03 §8.3. Stands the head 5 m off the origin, creates an
-  ad-hoc monitor there (no anchor spec, so its "declared" anchor is a raw world pose), nudges it, and
-  recycles the session with `openxr disable`/`enable`. The monitor must come back where it was left;
-  pre-fix the first plug re-seated it from those stale coordinates and it landed metres away.
+  ad-hoc monitor there (no anchor spec, so its "declared" anchor is a raw world pose), nudges it,
+  then recycles the session with `openxr disable`/`enable` — moving the user 5 m and 85° away *while
+  the session is down*, the way a person actually does it. The monitor must come back at that
+  placement relative to the new head. Pre-fix the first plug re-seated it from the stale creation
+  coordinates and it landed metres away.
+
+  Three things this test learned the hard way, all of them real: the re-seat is armed *by* the first
+  plug, so the head has to be moved before `enable`, not after; that plug is deferred behind
+  `monitor_plug_settle_ms` under the `visible` default, so the test pins `session` mode and waits for
+  `plugged` rather than sleeping; and if the user does not move between sessions, "restored correctly"
+  and "never re-seated at all" are the same number.
 
 **Monitor plug lifecycle** (`plugged.cpp`)
 - `xr_plugged_follow_session` — the monitor plug state follows the session per policy.
