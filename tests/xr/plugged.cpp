@@ -182,3 +182,44 @@ TEST(XRReprobeBackoff, DefensiveInputs) {
     EXPECT_EQ(xrReprobeBackoffMs(5, 5000, 1000), 5000);  // cap<base -> clamped to base
     EXPECT_EQ(xrReprobeBackoffMs(-1, 2000, 30000), 2000); // negative attempt behaves like 0
 }
+
+// ---- doc 03 §8.4: openxr:recenter — what the headset's own recenter button means ----
+//
+// The frame thread observes the reference-space change but may not read this STRING config, so it
+// is parsed on the main thread into an atomic (publishRecenterPolicy) exactly like the grab string
+// options. That makes the parse itself the whole policy surface — pinned here.
+
+TEST(XRRecenterPolicyParse, Spellings) {
+    EXPECT_EQ(parseRecenterPolicy("hold"), XR_RECENTER_HOLD);
+    EXPECT_EQ(parseRecenterPolicy("follow"), XR_RECENTER_FOLLOW);
+    // Two synonyms for the same intent, because "follow" reads ambiguously next to
+    // monitors_follow_session (which is about plugging, not about where monitors are).
+    EXPECT_EQ(parseRecenterPolicy("reseat"), XR_RECENTER_FOLLOW);
+    EXPECT_EQ(parseRecenterPolicy("me"), XR_RECENTER_FOLLOW);
+}
+
+TEST(XRRecenterPolicyParse, CaseAndWhitespaceInsensitive) {
+    EXPECT_EQ(parseRecenterPolicy("  FOLLOW "), XR_RECENTER_FOLLOW);
+    EXPECT_EQ(parseRecenterPolicy("Hold"), XR_RECENTER_HOLD);
+}
+
+TEST(XRRecenterPolicyParse, DefaultsToHoldAndTakesNoBooleans) {
+    // Unrecognized values keep the shipped behavior — a typo must never silently start moving
+    // someone's monitors on every re-don.
+    EXPECT_EQ(parseRecenterPolicy(""), XR_RECENTER_HOLD);
+    EXPECT_EQ(parseRecenterPolicy("nonsense"), XR_RECENTER_HOLD);
+    // Deliberately NOT boolean-compatible (unlike monitors_follow_session, which had a Bool past to
+    // honour): there is no old on/off spelling here, and reading a stray `1` as "follow" would hand
+    // someone the mode this option exists to make them opt into.
+    EXPECT_EQ(parseRecenterPolicy("1"), XR_RECENTER_HOLD);
+    EXPECT_EQ(parseRecenterPolicy("true"), XR_RECENTER_HOLD);
+    EXPECT_EQ(parseRecenterPolicy("yes"), XR_RECENTER_HOLD);
+}
+
+TEST(XRRecenterPolicyParse, NameRoundTrips) {
+    // `hyprctl openxr status` prints this; it must be the spelling the config accepts back.
+    EXPECT_EQ(parseRecenterPolicy(recenterPolicyName(XR_RECENTER_HOLD)), XR_RECENTER_HOLD);
+    EXPECT_EQ(parseRecenterPolicy(recenterPolicyName(XR_RECENTER_FOLLOW)), XR_RECENTER_FOLLOW);
+    EXPECT_STREQ(recenterPolicyName(XR_RECENTER_HOLD), "hold");
+    EXPECT_STREQ(recenterPolicyName(XR_RECENTER_FOLLOW), "follow");
+}

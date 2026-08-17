@@ -335,6 +335,7 @@ void COpenXRManager::start() {
     publishAdaptiveStringTuning();
     publishHandInputPolicy(); // research/16 Part A: seed the hand-input policy from openxr:hand_input
     publishGrabStringTuning(); // task #25: seed hand_grab / hand_grab_anywhere / grab_filter_scope enums
+    publishRecenterPolicy(); // doc 03 §8.4: seed openxr:recenter (hold|follow) before the frame thread launches
     publishBlackAlphaTuning(); // report 09: seed the luma key (re-published below once the blend mode is picked)
     publishCursorCrossingMode(); // task #139: seed openxr:cursor_crossing (raycast | layout)
     publishStereoPairTuning(); // WP X1: seed the stereo kill switch before any layer publishes a declaration
@@ -1247,6 +1248,20 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
             break;
         }
         case eXRStateEventType::TRACKING: Log::logger->log(Log::DEBUG, "[OPENXR] device-lock tracking {} (monitor {})", e.a ? "gained" : "lost", e.str); break;
+        case eXRStateEventType::RECENTERED: {
+            // doc 03 §8.4: the runtime moved LOCAL_FLOOR and openxr:recenter = follow, so the user's
+            // recenter button means "bring my monitors to me". Re-check the policy HERE (the frame
+            // thread's atomic could have been published a moment before a reload flipped it back)
+            // and run the identical operation the `reseat` verb runs — there is one re-seat.
+            if (recenterPolicy() != OpenXR::XR_RECENTER_FOLLOW)
+                break;
+            const auto r = requestReseatToHead("headset recenter (openxr:recenter = follow)");
+            // A recenter that cannot be followed is not an error the user asked a question about —
+            // typically there is simply nothing anchor:local to move. Log it and move on.
+            if (!r)
+                Log::logger->log(Log::DEBUG, "[OPENXR] recenter: follow policy did not re-seat — {}", r.error());
+            break;
+        }
         case eXRStateEventType::SCHEDULE_FRAMES: {
             // Pacing on behalf of the frame thread (see the frame loop): scheduleFrame() is
             // main-thread-only (aquamarine idle-callback list has no lock).
@@ -1438,9 +1453,13 @@ void COpenXRManager::frameThread() {
             const OpenXR::SXRPose M      = m_session->m_recenterPose;
             const bool            valid  = m_session->m_recenterPoseValid;
             m_session->m_recenterPending = false;
-            if (valid)
+            if (valid) {
                 applyReferenceSpaceChange(M);
-            else {
+                // doc 03 §8.4: the change is fully handled — hand the EDGE to the main thread, which
+                // owns the openxr:recenter policy. Under `hold` (the default) notifyRecentered() does
+                // nothing at all, so this path is byte-identical to what shipped.
+                notifyRecentered();
+            } else {
                 // monado — so WiVRn, so every session on this machine — pushes this event with
                 // pose_valid = false and an identity pose even though recenter_local_spaces just
                 // computed the exact delta (research/22 §4.3). That used to end the story here, and
@@ -1910,9 +1929,11 @@ void COpenXRManager::frameThread() {
                     // where they were. Leaving the anchors alone is what produced the reported
                     // teleports, so re-seat the group to the head instead: the same rigid,
                     // arrangement-preserving operation the first plug of a session performs, under the
-                    // same user permission.
+                    // same user permission — or under openxr:recenter = follow, which asks for that
+                    // very re-seat on EVERY reference-space change and so plainly covers this one.
                     static auto PRECENTER = CConfigValue<Hyprlang::INT>("openxr:recenter_on_plug");
-                    if (*PRECENTER) {
+                    const bool  follow    = m_recenterPolicy.load(std::memory_order_relaxed) == OpenXR::XR_RECENTER_FOLLOW;
+                    if (*PRECENTER || follow) {
                         m_recenterArmed.store(true, std::memory_order_release);
                         m_l2dRefStale.store(true, std::memory_order_release);
                         wakeMain();
@@ -1928,6 +1949,12 @@ void COpenXRManager::frameThread() {
                 case OpenXR::eXRRecenterFix::XR_RECENTER_APPLY_RUNTIME_POSE: break; // unreachable: poseValid was false
             }
             recenterSolvePending = false;
+            // doc 03 §8.4: whichever rung the ladder took, the change is now handled — hand the edge
+            // to the main thread so the openxr:recenter policy can act on it. A no-op under `hold`.
+            // The RESEAT rung above may have armed already; arming twice is idempotent (the frame
+            // thread clears the flag when it consumes it, and a re-seat from the same head plants the
+            // same pose), so no coordination between the two is needed.
+            notifyRecentered();
         }
 
         if (viewValid) {
@@ -2005,10 +2032,12 @@ void COpenXRManager::frameThread() {
                 m_recenterArmed.store(false, std::memory_order_release);
                 reseatRan = true;
                 for (auto& l : m_layers) {
-                    if (l->m_pendingRemoval.load(std::memory_order_acquire))
+                    // xrReseatEligible is the ONE definition of the set (doc 03 §8.4) — the same
+                    // predicate the main-thread `reseat` verb counts through, so the number it
+                    // reports and the number that actually move cannot drift apart.
+                    // recenterLocalToHead self-guards on mode too; skipping here keeps the tally honest.
+                    if (!OpenXR::xrReseatEligible(l->m_anchor.state().mode, l->m_pendingRemoval.load(std::memory_order_acquire)))
                         continue;
-                    if (l->m_anchor.state().mode != OpenXR::XR_ANCHOR_LOCAL)
-                        continue; // recenterLocalToHead self-guards; skipped here to keep the tally honest
                     OpenXR::SXRAnchorState seat = l->m_declaredAnchor;
                     if (OpenXR::xrReseatSource(l->m_anchor.state().mode, l->m_restoreValid) == OpenXR::XR_RESEAT_RESTORED) {
                         seat.anchorPose = l->m_restoreOffset;
@@ -3340,6 +3369,30 @@ std::string COpenXRManager::monitorFollowModeName() const {
     return "visible";
 }
 
+OpenXR::eXRRecenterPolicy COpenXRManager::recenterPolicy() const {
+    // MAIN THREAD (status + the RECENTERED dispatch). Reads the STRING config directly, which is
+    // legal here and forbidden on the frame thread — that side gets m_recenterPolicy instead.
+    static auto PRECENTER = CConfigValue<std::string>("openxr:recenter");
+    return OpenXR::parseRecenterPolicy(*PRECENTER);
+}
+
+std::string COpenXRManager::recenterPolicyName() const {
+    return OpenXR::recenterPolicyName(recenterPolicy());
+}
+
+void COpenXRManager::publishRecenterPolicy() {
+    // MAIN-THREAD ONLY. Same publish pattern (and the same reason) as publishGrabStringTuning:
+    // openxr:recenter is a STRING and the frame thread must never deref it. Called from start() +
+    // onConfigReload() (+ the legacy-keyword special-case in ConfigManager::parseKeyword, since a
+    // bare `hyprctl keyword openxr:recenter follow` fires neither reloaded nor props_refreshed —
+    // and being able to flip this from inside the headset is most of the point of having it).
+    static auto      PRECENTER = CConfigValue<std::string>("openxr:recenter");
+    const auto       policy    = OpenXR::parseRecenterPolicy(*PRECENTER);
+    const auto       prev      = (OpenXR::eXRRecenterPolicy)m_recenterPolicy.exchange((uint8_t)policy, std::memory_order_relaxed);
+    if (prev != policy)
+        Log::logger->log(Log::DEBUG, "[OPENXR] recenter policy: {} -> {}", OpenXR::recenterPolicyName(prev), OpenXR::recenterPolicyName(policy));
+}
+
 int COpenXRManager::monitorUnplugPendingMs() const {
     if (!m_unplugTimer || !m_unplugTimer->armed())
         return -1;
@@ -3986,6 +4039,76 @@ bool COpenXRManager::restoreCaptureActive() const {
     return m_restoreCapture.load(std::memory_order_relaxed);
 }
 
+std::expected<std::string, std::string> COpenXRManager::requestReseatToHead(const char* why) {
+    // MAIN THREAD. The deliberate re-seat (doc 03 §8.4). Everything here is bookkeeping + arming:
+    // the re-seat ITSELF is the frame thread's, because only it locates the head, and asking main to
+    // do the geometry would mean either duplicating recenterLocalToHead against a stale ring sample
+    // or reaching for a head pose from the wrong thread. So this arms exactly the flag the first
+    // plug arms, and the frame loop runs exactly the loop it already runs.
+    //
+    // The head sample the DECISION is made from is the ring's newest (newestPoseSample) — published
+    // by the frame thread once per frame, POD, no refcounts. It is not the pose that gets planted
+    // (the frame thread re-locates for that, a frame fresher); it is only the evidence that there
+    // IS a live head to re-seat to, which is what turns "nothing happened" into a sentence.
+    OpenXR::SXRPoseSample head{};
+    const bool            haveHead = newestPoseSample(head);
+    const int64_t         ageMs    = haveHead ? (int64_t)Time::millis(Time::steadyNow()) - head.timestampMs : -1;
+
+    // The eligible set, under the same lock every other main-thread anchor read uses, and through
+    // the same predicate the frame loop applies — one definition of "which monitors move".
+    int eligible = 0;
+    {
+        std::scoped_lock lock(m_layersMu);
+        for (auto& l : m_layers)
+            if (OpenXR::xrReseatEligible(l->m_anchor.state().mode, l->m_pendingRemoval.load(std::memory_order_acquire)))
+                ++eligible;
+    }
+
+    switch (OpenXR::xrReseatBlock(sessionExists(), haveHead, head.viewValid, ageMs, eligible)) {
+        case OpenXR::XR_RESEAT_NO_SESSION: return std::unexpected<std::string>("no OpenXR session — nothing to re-seat");
+        case OpenXR::XR_RESEAT_NO_HEAD:
+            return std::unexpected<std::string>(!haveHead ? "no head pose yet — the session has not rendered a frame" :
+                                                            std::format("no live head pose ({}, last sample {}ms old) — put the headset on and try again",
+                                                                        head.viewValid ? "tracking stale" : "tracking lost", ageMs));
+        case OpenXR::XR_RESEAT_NO_MONITORS: return std::unexpected<std::string>("no anchor:local monitors — head/body/device-anchored monitors already follow you");
+        case OpenXR::XR_RESEAT_READY: break;
+    }
+
+    // Arm the same one-shot the first plug arms. Not gated on openxr:recenter_on_plug: that option
+    // is permission for the compositor to move monitors on its OWN initiative, and this is the user
+    // asking. It also does not touch m_recenteredThisSession — that gate exists so a doff-and-don
+    // does not re-seat, and an explicit request is not a don.
+    m_recenterArmed.store(true, std::memory_order_release);
+
+    // report 12 §3a / doc 03 §8.2: the group is about to be replanted around a new head, so the
+    // latched desk orientation the 2D projection measures against describes an arrangement that is
+    // about to stop existing. Drop it rather than re-latch now — the next sync then captures the
+    // head pose AFTER the frame thread has actually applied the re-seat.
+    m_l2dRef = OpenXR::SXRLayout2DRef{};
+    m_l2dPrev.clear();
+    requestLayout2DSync();
+
+    Log::logger->log(Log::DEBUG, "[OPENXR] re-seat requested ({}) — {} anchor:local monitor(s) will be replanted around the current head", why, eligible);
+    return std::format("re-seated {} monitor{} to the current head", eligible, eligible == 1 ? "" : "s");
+}
+
+std::expected<std::string, std::string> COpenXRManager::cmdReseat() {
+    return requestReseatToHead("xrmonitor reseat");
+}
+
+void COpenXRManager::notifyRecentered() {
+    // FRAME THREAD (doc 03 §8.4). One atomic read and, under `follow`, one queue push — no refcount
+    // traffic, no string config, no head math. The policy DECISION is re-read on the main thread in
+    // dispatchStateEvent; this atomic only decides whether to bother it at all, so that the default
+    // `hold` costs a relaxed load per reference-space change (an event that fires seconds apart at
+    // worst) and nothing else.
+    if (m_recenterPolicy.load(std::memory_order_relaxed) != OpenXR::XR_RECENTER_FOLLOW)
+        return;
+    SXRStateEvent ev;
+    ev.type = eXRStateEventType::RECENTERED;
+    enqueue(ev);
+}
+
 void COpenXRManager::reportLayerRemoved(const std::string& name) {
     // Frame thread: enqueue the ack and wake the main thread (removal barrier step 2->3).
     SXRStateEvent ev;
@@ -4030,6 +4153,9 @@ void COpenXRManager::onConfigReload() {
     // task #25: re-parse hand_grab / hand_grab_anywhere / grab_filter_scope so a hot re-tune applies
     // live AND the frame thread never derefs the backing strings (the corrupted-heap-at-teardown crash).
     publishGrabStringTuning();
+    // doc 03 §8.4: re-parse openxr:recenter so the hold<->follow choice applies live (the frame
+    // thread reads the atomic; dereferencing the string there is the task #25 hazard).
+    publishRecenterPolicy();
     // task #139: re-parse openxr:cursor_crossing so a live raycast<->layout A/B applies immediately.
     publishCursorCrossingMode();
     // report 09: re-resolve the luma key (openxr:black_alpha / :black_alpha_knee) — clamped, gated on

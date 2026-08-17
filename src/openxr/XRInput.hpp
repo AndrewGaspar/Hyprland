@@ -62,6 +62,11 @@ enum class eXRStateEventType : uint8_t {
                      // aquamarine's idle-callback list is not thread-safe, so the frame thread
                      // may NOT call CMonitor::scheduleFrame() directly (heap corruption)
     VIEWPOINT_STATE, // subscribed layer stable-valid edge (a=1) or tracking/geometry loss (a=0)
+    RECENTERED,      // doc 03 §8.4: the runtime moved LOCAL_FLOOR (the headset's recenter button, a
+                     // re-don, a guardian re-derive) and openxr:recenter = follow. The frame thread
+                     // may NOT run the re-seat policy itself — deciding it reads a STRING config and
+                     // arming it is main-thread bookkeeping — so it hands the edge over and the main
+                     // thread runs the same requestReseatToHead() the `reseat` verb does
 };
 
 struct SXRStateEvent {

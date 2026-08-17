@@ -34,6 +34,10 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     // when no unplug is pending).
     const std::string FOLLOW      = g_pOpenXRManager->monitorFollowModeName();
     const int         UNPLUG_PEND = g_pOpenXRManager->monitorUnplugPendingMs();
+    // doc 03 §8.4: what the HEADSET's own recenter button currently does to the monitor group —
+    // "hold" (stay put in the room) or "follow" (come to me). The single most confusing thing about
+    // recentering is that pressing it can correctly do nothing, so say which contract is in force.
+    const std::string RECENTER = g_pOpenXRManager->recenterPolicyName();
     // report-19: the user-presence signal driving the `visible`-mode plug gate — "yes"/"no" when the
     // runtime exposes XR_EXT_user_presence, "unknown" before the first event, "unsupported" otherwise.
     const std::string PRESENCE = g_pOpenXRManager->presenceStatusString();
@@ -160,6 +164,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "selected": "{}",
     "monitorsFollowSession": "{}",
     "monitorUnplugPendingMs": {},
+    "recenterPolicy": "{}",
     "userPresence": "{}",
     "restoreCapture": {},
     "visible": "{}",
@@ -183,7 +188,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
 }}
 )#",
                            STATE, RUNTIME, SYSTEM, RTGPU, RTJSON, BLEND, BLACK.configured, BLACK.effective, BLACK.knee, BLACK.active ? "true" : "false",
-                           BLACK.gatedOff ? "true" : "false", OVERLAY ? "true" : "false", MONITOR_VIEW ? "shown" : "hidden", SELECTED, FOLLOW, UNPLUG_PEND, PRESENCE, RESTORE_CAPTURE ? "true" : "false", VISIBLE,
+                           BLACK.gatedOff ? "true" : "false", OVERLAY ? "true" : "false", MONITOR_VIEW ? "shown" : "hidden", SELECTED, FOLLOW, UNPLUG_PEND, RECENTER, PRESENCE, RESTORE_CAPTURE ? "true" : "false", VISIBLE,
                            REPROBE_WAIT, REPROBE_MS, REPROBE_WATCH ? "true" : "false", INHIBITING_IDLE ? "true" : "false", INHIBIT_MODE, HANDIN.mode, HANDIN.state, GAZE.source,
                            GAZE.hoveredMonitor, GAZE.hoveredName, GAZE.carrying ? "true" : "false", GAZE.carryMonitor, GAZE.dist, HANDS[0].hands ? "hands" : "controllers",
                            HANDS[0].gesture, HANDS[0].filtered ? "true" : "false", HANDS[1].hands ? "hands" : "controllers", HANDS[1].gesture, HANDS[1].filtered ? "true" : "false",
@@ -213,12 +218,12 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
                                              L2D.placed, L2D.rows, L2D.width, L2D.height, L2D.refYawDeg, L2D.pxPerDegree, L2D.vertical, L2D.attach);
     std::string       out =
         std::format("state: {}\nruntime: {}\nsystem: {}\nruntime gpu: {}\nruntime json: {}\nblend mode: {}\nblack alpha: {}\noverlay: {}\nmonitor view: {}\nselected: {}\nmonitors "
-                    "follow session: {}\nvisible: "
+                    "follow session: {}\nrecenter policy: {}\nvisible: "
                     "{}\npresence: {}\nidle "
                     "inhibited: {} (mode {})\nplacement capture: {}\nhand input: {} "
                     "({})\ngaze ({}): {}\ninput: left {}, right {}\n2d-plane sync: {}\n",
                     STATELINE, RUNTIME, SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, RTJSON.empty() ? "(loader default)" : RTJSON, BLEND, BLACKLINE, OVERLAY ? "yes" : "no",
-                    MONITOR_VIEW ? "shown" : "hidden", SELECTED.empty() ? "(none)" : SELECTED, FOLLOWLINE, VISIBLE, PRESENCE, INHIBITING_IDLE ? "yes" : "no", INHIBIT_MODE, RESTORE_CAPTURE ? "on" : "off",
+                    MONITOR_VIEW ? "shown" : "hidden", SELECTED.empty() ? "(none)" : SELECTED, FOLLOWLINE, RECENTER, VISIBLE, PRESENCE, INHIBITING_IDLE ? "yes" : "no", INHIBIT_MODE, RESTORE_CAPTURE ? "on" : "off",
                     HANDIN.state, HANDIN.mode, GAZE.source, GAZELINE, handLabel(HANDS[0]), handLabel(HANDS[1]), L2DLINE);
     for (const auto& m : MONS) {
         out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} ({}) hovered: {} ({}) plugged: {} content: {}{}", m.name,
@@ -405,6 +410,12 @@ static std::string openxrRequest(eHyprCtlOutputFormat format, std::string reques
         auto r = g_pOpenXRManager->cmdCenter();
         return r ? "ok" : r.error();
     }
+    // doc 03 §8.4: the deliberate "bring my monitors to me". Reports what it did (or why it did
+    // nothing) rather than "ok" — a re-seat that no-ops is invisible from inside the headset.
+    if (SUBCOMMAND == "reseat") {
+        auto r = g_pOpenXRManager->cmdReseat();
+        return r ? *r : r.error();
+    }
     // hypxrvoice GAP 2: drop a named monitor at a resolved LOCAL_FLOOR point (facing the headset).
     if (SUBCOMMAND == "place") {
         auto r = g_pOpenXRManager->cmdPlace(ARGS);
@@ -474,8 +485,8 @@ static std::string openxrRequest(eHyprCtlOutputFormat format, std::string reques
     if (SUBCOMMAND == "gaze")
         return openxrGaze(format, ARGS);
 
-    return std::format("unknown openxr subcommand '{}'. Valid: status, enable, disable, create, destroy, select, anchor, move, rotate, scale, distance, center, place, alpha, "
-                       "blackalpha, adaptive, dock, undock, roam, gazegrab, gazerelease, gazepush, handinput, view, gaze, layout, sync-layout",
+    return std::format("unknown openxr subcommand '{}'. Valid: status, enable, disable, create, destroy, select, anchor, move, rotate, scale, distance, center, reseat, place, "
+                       "alpha, blackalpha, adaptive, dock, undock, roam, gazegrab, gazerelease, gazepush, handinput, view, gaze, layout, sync-layout",
                        SUBCOMMAND);
 }
 

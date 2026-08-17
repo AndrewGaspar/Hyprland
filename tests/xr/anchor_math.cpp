@@ -1012,3 +1012,111 @@ TEST(XRAnchorRestore, UnrestorableMonitorLandsInFrontOfTheUserAnyway) {
     EXPECT_NEAR(std::sqrt(toW.x * toW.x + toW.z * toW.z), 1.5f, 1e-4f);
     EXPECT_NEAR(W.pos.y, 1.4f, 1e-4f);
 }
+
+// ---- doc 03 §8.4: the deliberate re-seat ("bring my monitors to me") ----
+//
+// The §8.1 ladder deliberately holds monitors still in the room across a reference-space change,
+// which is right — it is what ended the monitor lottery — and it left the user with no way to say
+// the other thing. Reported live 2026-08-17: pressing the Quest's recenter repeatedly, the monitors
+// correctly staying put, and physically turning 180 degrees before recentering as the only
+// workaround ("if I pivoted only slightly, everything would land exactly where it already was").
+// The answer is a one-shot verb (`xrmonitor reseat`) running the SAME rigid re-seat the first plug
+// of a session runs. These pin the two pure decisions that verb is made of — which monitors it
+// moves and when it must refuse — plus how it composes with the §8.3 capture.
+
+TEST(XRReseatSet, OnlyLocalMonitorsMove) {
+    // Same set as recenter-on-plug, and for the same reason: LOCAL is the only mode whose pose is
+    // named against the runtime's origin. A head/body/device-anchored monitor already rides the
+    // user, so re-seating it would be a no-op with extra steps (recenterLocalToHead self-guards too).
+    EXPECT_TRUE(xrReseatEligible(XR_ANCHOR_LOCAL, /*pendingRemoval=*/false));
+    EXPECT_FALSE(xrReseatEligible(XR_ANCHOR_HEAD, false));
+    EXPECT_FALSE(xrReseatEligible(XR_ANCHOR_BODY, false));
+    EXPECT_FALSE(xrReseatEligible(XR_ANCHOR_DEVICE, false));
+}
+
+TEST(XRReseatSet, PendingRemovalIsNeverEligible) {
+    // A layer mid-removal-barrier belongs to that path. Counting it would also make the verb's
+    // "re-seated N monitors" a claim about a monitor that is on its way out.
+    EXPECT_FALSE(xrReseatEligible(XR_ANCHOR_LOCAL, /*pendingRemoval=*/true));
+    EXPECT_FALSE(xrReseatEligible(XR_ANCHOR_HEAD, true));
+}
+
+TEST(XRReseatGate, ReadyNeedsSessionHeadAndMonitors) {
+    EXPECT_EQ(xrReseatBlock(/*sessionUp=*/true, /*haveHeadSample=*/true, /*headValid=*/true, /*headAgeMs=*/11, /*eligibleCount=*/1), XR_RESEAT_READY);
+    EXPECT_EQ(xrReseatBlock(true, true, true, 0, 6), XR_RESEAT_READY);
+    // Exactly at the limit still counts as fresh (inclusive bound, like xrRecenterFix's).
+    EXPECT_EQ(xrReseatBlock(true, true, true, XR_RESEAT_HEAD_MAX_AGE_MS, 1), XR_RESEAT_READY);
+}
+
+TEST(XRReseatGate, NoSessionOutranksEverything) {
+    // Asked with the session down, the answer is "there is no session", not "no monitors" — the
+    // message the user gets has to name the thing they can actually do something about.
+    EXPECT_EQ(xrReseatBlock(/*sessionUp=*/false, false, false, -1, 0), XR_RESEAT_NO_SESSION);
+    EXPECT_EQ(xrReseatBlock(false, true, true, 5, 3), XR_RESEAT_NO_SESSION);
+}
+
+TEST(XRReseatGate, RefusesWithoutALiveHead) {
+    // No frame rendered yet: the pose ring is empty.
+    EXPECT_EQ(xrReseatBlock(true, /*haveHeadSample=*/false, false, -1, 2), XR_RESEAT_NO_HEAD);
+    // The newest sample exists but the view was not locatable that frame (tracking lost / headset off).
+    EXPECT_EQ(xrReseatBlock(true, true, /*headValid=*/false, 5, 2), XR_RESEAT_NO_HEAD);
+    // Tracked, but nothing has been published for over a second — "the current head" would be a
+    // guess, and flinging the whole group at a guess is the class of bug this all exists to end.
+    EXPECT_EQ(xrReseatBlock(true, true, true, XR_RESEAT_HEAD_MAX_AGE_MS + 1, 2), XR_RESEAT_NO_HEAD);
+    // A sample stamped in the future proves nothing either (same treatment as xrRecenterFix).
+    EXPECT_EQ(xrReseatBlock(true, true, true, -1, 2), XR_RESEAT_NO_HEAD);
+}
+
+TEST(XRReseatGate, CleanNoOpWithNothingToMove) {
+    // A session whose monitors are all head-leashed is a legitimate configuration, not a failure —
+    // but the verb must say so rather than report success on zero monitors.
+    EXPECT_EQ(xrReseatBlock(true, true, true, 11, /*eligibleCount=*/0), XR_RESEAT_NO_MONITORS);
+}
+
+TEST(XRReseatRestore, ReseatThenCaptureIsAFixedPoint) {
+    // THE interaction between the deliberate re-seat and the §8.3 placement capture, which run in
+    // that order on the same frame. The re-seat plants headFrame(new) ∘ offset; the capture then
+    // measures inv(headFrame(new)) ∘ pose off the very same head. Those are exact inverses, so the
+    // stored placement comes back unchanged: a re-seat does not fight the capture, it hands the
+    // capture its own offset back. That is what makes the verb safe to bind to a key and mash, and
+    // what makes a `follow`-policy recenter idempotent instead of cumulative.
+    const SXRPose offset = xrPoseInHeadFrame(OLD_HEAD, SXRPose{{4.9f, 1.35f, 3.2f}, qFromYaw(0.6f)});
+
+    SXRPose       captured = offset;
+    for (int i = 0; i < 3; ++i) {
+        const SXRPose seated = reseatFrom(NEW_HEAD, captured);
+        captured             = xrPoseInHeadFrame(NEW_HEAD, seated); // the capture the frame loop takes right after
+        expectVecNear(captured.pos, offset.pos, 1e-4f);
+        EXPECT_NEAR(qAngleBetween(captured.rot, offset.rot), 0.f, 2e-3f);
+    }
+
+    // ...so re-seating from the re-captured offset lands the monitor in the same place every time,
+    // and mashing the keybind does not walk the group across the room.
+    expectVecNear(reseatFrom(NEW_HEAD, captured).pos, reseatFrom(NEW_HEAD, offset).pos, 1e-4f);
+}
+
+TEST(XRReseatRestore, GroupGeometrySurvivesADeliberateReseat) {
+    // The user's actual ask: bring the LAYOUT to my current facing — not three monitors piled on
+    // top of each other. The same head for every monitor makes it a rigid transform, so every
+    // pairwise separation is preserved. This is §8.2's property, asserted again for the on-demand
+    // path because that is the one a keybind fires dozens of times a day.
+    const SXRPose worlds[] = {
+        {{3.4f, 1.30f, 5.1f}, qFromYaw(0.10f)},
+        {{4.6f, 1.45f, 5.6f}, qFromYaw(-0.55f)},
+        {{2.2f, 0.95f, 6.0f}, qFromYaw(0.80f)},
+    };
+
+    SXRPose seated[3];
+    for (int i = 0; i < 3; ++i)
+        seated[i] = reseatFrom(NEW_HEAD, xrPoseInHeadFrame(OLD_HEAD, worlds[i]));
+
+    for (int i = 0; i < 3; ++i)
+        for (int j = i + 1; j < 3; ++j) {
+            const Vec3 before = worlds[j].pos - worlds[i].pos;
+            const Vec3 after  = seated[j].pos - seated[i].pos;
+            EXPECT_NEAR(after.length(), before.length(), 1e-4f);
+            // Heights are absolute (the head frame is built at y = 0), so the group keeps its
+            // vertical arrangement rather than being flattened onto the new eye height.
+            EXPECT_NEAR(after.y, before.y, 1e-4f);
+        }
+}

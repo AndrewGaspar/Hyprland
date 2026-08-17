@@ -177,6 +177,9 @@ class COpenXRManager {
     int  monitorUnplugPendingMs() const;
     // The active openxr:monitors_follow_session mode as "off"|"session"|"visible" (status).
     std::string monitorFollowModeName() const;
+    // The active openxr:recenter policy as "hold"|"follow" (status). Main thread — reads the STRING
+    // config, which is exactly why the frame thread gets the parsed atomic instead (doc 03 §8.4).
+    std::string recenterPolicyName() const;
     // `hyprctl openxr status` presence field (report-19): "unsupported" (no XR_EXT_user_presence /
     // device can't report it) | "unknown" (supported, no event yet) | "yes"/"no" (donned/doffed).
     std::string presenceStatusString() const;
@@ -208,6 +211,13 @@ class COpenXRManager {
     std::expected<void, std::string> cmdScale(const std::string& args);    // <f|+d|-d>
     std::expected<void, std::string> cmdDistance(const std::string& args); // <±m>
     std::expected<void, std::string> cmdCenter();                          // (none)
+
+    // --- the deliberate re-seat (doc 03 §8.4). "Bring my monitors to me": rigidly re-seat the whole
+    // anchor:local group around the current head, preserving its internal arrangement — the exact
+    // operation the first plug of a session and the §8.1 doff fallback perform, on demand. Returns
+    // the human-readable outcome ("re-seated 3 monitor(s)…") rather than a bare ok, because "it did
+    // nothing and here is why" is the answer a keybind most needs to be able to give. ---
+    std::expected<std::string, std::string> cmdReseat();                   // (none)
     // hypxrvoice GAP 2: place a named monitor at a resolved LOCAL_FLOOR point, re-anchoring to
     // `local` and MOVING the quad so its center sits at that point (facing the headset by default).
     // The point is exactly what `hyprctl openxr gaze` returns, so a voice daemon can drop a monitor
@@ -631,6 +641,10 @@ class COpenXRManager {
     void teardownLayers();
     // Frame thread: enqueue a "layer removed" ack + wake main (removal barrier step 2).
     void reportLayerRemoved(const std::string& name);
+    // Frame thread: a reference-space change has been fully handled (doc 03 §8.4). Under
+    // openxr:recenter = follow this hands the edge to the main thread, which runs the deliberate
+    // re-seat; under the default `hold` it returns immediately.
+    void notifyRecentered();
     // Main thread: erase the acked layer + destroy its output (removal barrier step 3).
     void finalizeLayerRemoval(const std::string& name);
     // Main thread: destroy a headless XR output while keeping it alive until aquamarine has
@@ -945,6 +959,25 @@ class COpenXRManager {
     // invalid still recenters on the next good frame). Atomic: main writes, frame reads/clears.
     bool                m_recenteredThisSession = false;
     std::atomic<bool>   m_recenterArmed{false};
+
+    // ---- the deliberate re-seat + openxr:recenter policy (doc 03 §8.4) ----
+    //
+    // requestReseatToHead() is the ONE main-thread implementation of "bring my monitors to me": it
+    // decides whether the request is answerable (xrReseatBlock), arms m_recenterArmed exactly like
+    // the first plug does, and drops the latched 2D reference so the plane re-derives against the
+    // head the group just landed in front of. `why` only colours the log. Both entry points — the
+    // `reseat` verb and the RECENTERED event under openxr:recenter = follow — go through it, so
+    // there is one re-seat operation in the compositor and not two that can drift apart.
+    std::expected<std::string, std::string> requestReseatToHead(const char* why);
+
+    // openxr:recenter is a STRING, and the frame thread is where a reference-space change is
+    // observed — the same hazard publishGrabStringTuning exists for (a reload frees the backing
+    // store under a frame-thread deref). Parsed on the main thread into this atomic, which the
+    // frame thread reads for one decision only: whether to hand the edge to main at all. Under the
+    // default `hold` it does not, so that path stays byte-identical to what shipped.
+    void                      publishRecenterPolicy(); // main thread only
+    OpenXR::eXRRecenterPolicy recenterPolicy() const;   // main thread only (reads the string config)
+    std::atomic<uint8_t>      m_recenterPolicy{OpenXR::XR_RECENTER_HOLD};
 
     // Cross-session restore capture gate (doc 03 §8.3). True while the user is demonstrably WEARING
     // the headset with the XR monitors plugged; the frame thread re-captures each anchor:local
