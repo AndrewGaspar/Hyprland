@@ -953,21 +953,27 @@ class COpenXRManager {
 
     // Recenter-on-plug (report-20 issue C). m_recenteredThisSession: gate so a session re-seats its
     // anchor:local monitors exactly once, on the FIRST presence-confirmed plug (a brief doff+don in
-    // the same session must NOT re-seat). Reset per session in resetPresenceState(). m_recenterArmed
+    // the same session must NOT re-seat). Reset per session in resetPresenceState(). m_reseatArmed
     // is set on that first plug (main thread) and consumed by the frame thread, which owns the head
     // pose — it re-seats when a valid view is available (so a plug while the view is momentarily
-    // invalid still recenters on the next good frame). Atomic: main writes, frame reads/clears.
-    bool                m_recenteredThisSession = false;
-    std::atomic<bool>   m_recenterArmed{false};
+    // invalid still recenters on the next good frame). Atomic: both threads arm, frame reads/clears.
+    bool                 m_recenteredThisSession = false;
+    std::atomic<uint8_t> m_reseatArmed{OpenXR::XR_RESEAT_ARM_NONE};
+
+    // Arm a pending re-seat. RESTORE outranks GROUP if both land before the frame thread consumes
+    // (doc 03 §8.4): a discontinuity has to be repaired from the stored offsets before "rigidly move
+    // the live arrangement" means anything, and the GROUP pass that follows is then the identity.
+    // Arming the same kind twice is idempotent. Callable from either thread.
+    void armReseat(OpenXR::eXRReseatKind kind);
 
     // ---- the deliberate re-seat + openxr:recenter policy (doc 03 §8.4) ----
     //
     // requestReseatToHead() is the ONE main-thread implementation of "bring my monitors to me": it
-    // decides whether the request is answerable (xrReseatBlock), arms m_recenterArmed exactly like
-    // the first plug does, and drops the latched 2D reference so the plane re-derives against the
-    // head the group just landed in front of. `why` only colours the log. Both entry points — the
-    // `reseat` verb and the RECENTERED event under openxr:recenter = follow — go through it, so
-    // there is one re-seat operation in the compositor and not two that can drift apart.
+    // decides whether the request is answerable (xrReseatBlock), arms the GROUP re-seat, and drops
+    // the latched 2D reference so the plane re-derives against the head the group just landed in
+    // front of. `why` only colours the log. Both entry points — the `reseat` verb and the RECENTERED
+    // event under openxr:recenter = follow — go through it, so there is one deliberate re-seat in
+    // the compositor and not two that can drift apart.
     std::expected<std::string, std::string> requestReseatToHead(const char* why);
 
     // openxr:recenter is a STRING, and the frame thread is where a reference-space change is
