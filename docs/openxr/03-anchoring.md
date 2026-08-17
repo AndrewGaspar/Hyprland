@@ -564,6 +564,14 @@ without `XR_EXT_user_presence` the plug state is the whole gate. Capture is also
 adaptive monitor is anything but `DOCKED`: its `anchorPose` is the saved desk pose while the user has
 walked away from it, so measuring that against their current head would remember the walk.
 
+It is skipped, too, while the live pose is still **bit-equal** to the declaration (`xrPoseIdentical`).
+A monitor that has not been re-seated or moved since its `xrmonitor` line was applied is literally
+sitting at "`pos:` relative to the runtime's origin" — the arbitrary spot §8.2 exists to rescue it
+from — and remembering that would defeat the rescue next session. The test is exact rather than
+epsilon'd on purpose: it asks about provenance ("is this pose still the copy it was assigned from"),
+not proximity. A config reload that changes a declared anchor re-seeds the live pose *and* clears the
+stored capture, so the new declaration wins over an older placement.
+
 **Restore.** `xrReseatSource(mode, restoreValid)` picks:
 
 | condition | offset planted |

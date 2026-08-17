@@ -360,6 +360,10 @@ required). The cases, by file:
   fires.
 - `xr_adaptive_geofence` — the adaptive dock↔follow behavior: walking the head out of the geofence
   undocks and follows, returning re-docks.
+- `xr_anchor_restore_across_session` — doc 03 §8.3. Stands the head 5 m off the origin, creates an
+  ad-hoc monitor there (no anchor spec, so its "declared" anchor is a raw world pose), nudges it, and
+  recycles the session with `openxr disable`/`enable`. The monitor must come back where it was left;
+  pre-fix the first plug re-seated it from those stale coordinates and it landed metres away.
 
 **Monitor plug lifecycle** (`plugged.cpp`)
 - `xr_plugged_follow_session` — the monitor plug state follows the session per policy.

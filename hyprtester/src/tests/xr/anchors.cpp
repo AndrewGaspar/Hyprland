@@ -322,9 +322,11 @@ TEST_CASE(xr_anchor_restore_across_session) {
     remote->pulse();
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-    // No anchor spec => the ad-hoc path (applyCenter from the live head), which is the case that
-    // used to carry raw world coordinates into the next session.
-    ASSERT(getFromSocket("/openxr create " + mon + " 1280x720 size:1.0"), std::string("ok"));
+    // No anchor spec at all => the ad-hoc path (applyCenter from the live head), which is the case
+    // that used to carry raw world coordinates into the next session. `size:` is deliberately absent:
+    // the create grammar only accepts kv tokens as part of an anchor spec, and supplying one would
+    // put us on the DECLARED path instead — the very path that already worked.
+    ASSERT(getFromSocket("/openxr create " + mon + " 1280x720"), std::string("ok"));
     guard.monitorName = mon;
     ASSERT(XR::waitForJson(
                "j/openxr", [&](const std::string& r) { return r.contains("\"name\": \"" + mon + "\""); }, std::chrono::milliseconds(10000)),

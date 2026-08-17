@@ -978,6 +978,26 @@ TEST(XRAnchorRestore, ReseatSourceLadderCoversTheDegenerateCases) {
     }
 }
 
+TEST(XRAnchorRestore, DeclaredRigIsRecognisedAsARigNotAPlacement) {
+    // The capture must not record a monitor that is still sitting at its raw `xrmonitor` pose: that
+    // pose is relative to the runtime's ARBITRARY origin (the thing §8.2 exists to rescue it from),
+    // so remembering it would defeat the rescue on the next session. "Still at its declaration" is a
+    // question about provenance — is this pose literally the copy it was assigned from — so the test
+    // is bit-equality, with no epsilon that would misjudge a monitor deliberately parked a
+    // millimetre away.
+    const SXRPose declared{{0.f, 1.5f, -1.5f}, qFromYaw(0.2f)};
+    EXPECT_TRUE(xrPoseIdentical(declared, declared));
+    EXPECT_TRUE(xrPoseIdentical(declared, SXRPose{{0.f, 1.5f, -1.5f}, qFromYaw(0.2f)}));
+
+    // A re-seat moves it out of the origin-relative rig and into the room, so capture resumes.
+    const SXRPose seated = reseatFrom(OLD_HEAD, declared);
+    EXPECT_FALSE(xrPoseIdentical(seated, declared));
+
+    // ...as does the smallest deliberate nudge.
+    EXPECT_FALSE(xrPoseIdentical(declared, SXRPose{{0.001f, 1.5f, -1.5f}, qFromYaw(0.2f)}));
+    EXPECT_FALSE(xrPoseIdentical(declared, SXRPose{{0.f, 1.5f, -1.5f}, qFromYaw(0.2001f)}));
+}
+
 TEST(XRAnchorRestore, UnrestorableMonitorLandsInFrontOfTheUserAnyway) {
     // The safe floor under the whole feature. A monitor created with no tracking gets the eye-height
     // default (0, 1.4, -default_distance) as its anchor and no capture; the declared fallback then

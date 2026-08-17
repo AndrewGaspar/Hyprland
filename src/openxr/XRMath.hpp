@@ -324,6 +324,15 @@ namespace OpenXR {
         return poseCompose(poseInverse(xrHeadFrame(head)), world);
     }
 
+    // Bit-equality of two poses. Deliberately EXACT, with no epsilon: its caller asks whether a live
+    // pose is still literally the copy it was assigned from — a question about provenance ("has
+    // anything placed this monitor since its declaration was applied"), not about proximity. An
+    // epsilon would answer a different question, and answer it wrong for a monitor the user has
+    // deliberately parked a millimetre from its declared spot.
+    inline bool xrPoseIdentical(const SXRPose& a, const SXRPose& b) {
+        return a.pos.x == b.pos.x && a.pos.y == b.pos.y && a.pos.z == b.pos.z && a.rot.x == b.rot.x && a.rot.y == b.rot.y && a.rot.z == b.rot.z && a.rot.w == b.rot.w;
+    }
+
     // hypxrvoice GAP 2: the LOCAL_FLOOR quad pose for `place <name> at x,y,z`. The quad center sits at
     // `point`; orientation faces the head (yaw+pitch toward `headPos`, no roll). When head tracking is
     // invalid, or the head is directly above/below `point` (degenerate lookAt), it keeps `fallbackRot`
