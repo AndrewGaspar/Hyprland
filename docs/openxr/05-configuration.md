@@ -1568,6 +1568,54 @@ horizontal samples. On an XREAL at 46°/eye that is ~21 px/degree horizontally a
 vertically, visibly soft, and the reason full SBS at the 3840 mode is worth the mode switch. The
 distinction still has to be *declared* because it decides the presented aspect on the XR quad tier.
 
+### The contract: the window's **surface** is the packed frame
+
+This is the one precondition the whole feature rests on, and it is invisible from the config file,
+so it is worth stating before the gate: **Hyprland halves the window's surface.** It has no idea
+where the picture is inside that surface — a client that scales the packed frame to fit and centres
+it has drawn black bars that the compositor cannot tell from content, and the crop lands half on a
+bar and half on the wrong part of the frame.
+
+Which axis the bars are on decides whether that matters:
+
+| The player's bars | With `sbs` / `hsbs` | With `tab` / `htab` |
+|---|---|---|
+| top and bottom (letterbox) | **harmless** — both eyes get the same bars in the same place | **fatal** |
+| left and right (pillarbox) | **fatal** | harmless |
+
+The fatal case is unmistakable and it is not subtle: the left eye's picture slides to the **right**
+of the window and the right eye's slides to the **left**, by the fraction of the window each bar
+takes. It will not fuse. If a tagged 3D file looks like two pictures pulling apart sideways, this
+is what you are looking at — not a compositor bug.
+
+So a `stereo sbs`/`hsbs` window has to be at (or narrower than) its content's packed aspect. For a
+player, either of these gets you there:
+
+```ini
+# a window at the file's own shape — no bars at all, the ideal
+[mpv]  --autofit / --geometry sized to the packed frame, floating
+
+# or make the player fill its window instead of fitting inside it
+mpv --keepaspect=no --fullscreen …
+```
+
+`--keepaspect=no` is the reliable one because it removes the bars entirely rather than moving them
+to the harmless axis, and it costs nothing on a correctly-tagged file: the packed frame's aspect
+*is* the window's, so nothing is stretched. It is also what `contrib/mpv-hypxr-stereo.lua`'s
+companion advice assumes.
+
+Two consequences worth knowing:
+
+- **The player's own chrome gets pane-split too.** Anything the player draws into the same surface —
+  an on-screen controller, a seek bar, a subtitle burned into the video's own pixels — is inside
+  the packed frame as far as the crop is concerned, so each eye sees its own half of it. mpv's OSC
+  is the usual offender; hide it (`--osc=no`, or just do not summon it) while a stereo file is up.
+  A *subsurface* OSD is safe: only the main surface is cropped (see "What it does not do").
+- **The compositor cannot warn you about this.** Everything it can see — the surface size, the
+  buffer size, the window box — takes exactly the same values whether the player filled the surface
+  or letterboxed inside it. There is no signal to test, which is why this is written down rather
+  than detected.
+
 ### The fullscreen gate — why a rule may look like it did nothing
 
 A rule that names a layout engages **only while the window is fullscreen and covering its
@@ -1648,7 +1696,21 @@ windowrule = stereo htab always, match:tag stereo-htab
 ```
 
 Now every 3D file that carries correct metadata engages by itself, and the tag is dropped when the
-next file is mono. Two caveats, both inherent: the containers do **not** record half-vs-full, so
+next file is mono.
+
+While a layout is tagged the script also holds up **mpv's** end of the contract above, because that
+half is invisible until you are wearing the headset: it turns `keepaspect` **off** so the packed
+frame fills the surface instead of being fitted and centred inside it, and it hides the **OSC**,
+which is drawn into that same surface and would otherwise be split half-per-eye. Both are restored
+the moment a mono file comes up. If you would rather manage those yourself:
+
+```ini
+# ~/.config/mpv/script-opts/hypxr-stereo.conf
+fill=no
+hide_osc=no
+```
+
+Two caveats, both inherent: the containers do **not** record half-vs-full, so
 the script infers it from the display aspect (a full frame is 2× wide or 2× tall) — if a file
 lands squeezed, say so with an explicit rule; and correct metadata is a known liability in the
 VR-video world, which is why the script only ever *adds* a tag and your own
@@ -2062,7 +2124,11 @@ a pair).
 - **Stereo content still works, windowed.** A `windowrule = stereo` window (§8.6) inside a depth
   desktop is un-packed per surface, per pane. It does not have to own the screen, and the rest of
   the desktop stays 2D around it. `hyprctl monitors` reports `stereoContent: true` when the crop
-  reached a drawn surface.
+  reached a drawn surface. The pack owns the pair here, so the window's declaration is **not**
+  consulted a second time at submission — the two eye quads stay the swapchain's two whole panes.
+  This path was first looked at in a headset on **2026-08-17**; what it needs from you is §8.6's
+  contract — the player must **fill** the window, not fit inside it (`mpv --keepaspect=no`), or the
+  two eyes pull apart sideways.
 
 ### What you can inspect
 
