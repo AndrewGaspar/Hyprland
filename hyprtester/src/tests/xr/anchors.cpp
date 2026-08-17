@@ -7,10 +7,13 @@
 #include "../../xr/xr_helpers.hpp"
 #include "../../xr/RemoteClient.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace {
     bool gateUp() {
@@ -518,13 +521,35 @@ TEST_CASE(xr_reseat_verb) {
         return p == std::string::npos ? std::vector<float>{} : posOf(st, p);
     };
 
-    std::vector<float> beforeL, beforeR;
+    // EVERY anchor:local monitor in the session, not just ours — the re-seat is a group operation and
+    // the shared test session carries the config fixture XR-conf-a as well, so the group's derived
+    // seat frame (and therefore the transform) depends on it. Reading the whole set is what lets the
+    // expected landing spot below be computed exactly instead of guessed at.
+    auto localGroup = [](const std::string& st) {
+        std::vector<std::pair<std::vector<float>, std::vector<float>>> out;
+        size_t                                                         p = 0;
+        while ((p = st.find("\"name\": \"", p)) != std::string::npos) {
+            const size_t block = p;
+            p += 9;
+            if (XR::fieldAfter(st, block, "mode") != "local")
+                continue;
+            const auto pos = posOf(st, block), quat = quatOf(st, block);
+            if (pos.size() == 3 && quat.size() == 4)
+                out.emplace_back(pos, quat);
+        }
+        return out;
+    };
+
+    std::vector<float>                                             beforeL, beforeR;
+    std::vector<std::pair<std::vector<float>, std::vector<float>>> group;
     {
         const std::string st = getFromSocket("j/openxr");
         beforeL              = poseOf(st, monL);
         beforeR              = poseOf(st, monR);
+        group                = localGroup(st);
         ASSERT(beforeL.size(), (size_t)3);
         ASSERT(beforeR.size(), (size_t)3);
+        ASSERT(group.size() >= 2, true);
         // They really are where they were declared — otherwise the arithmetic below proves nothing.
         EXPECT_MAX_DELTA(beforeL[0], -0.6, 0.05);
         EXPECT_MAX_DELTA(beforeL[2], -1.5, 0.05);
@@ -539,19 +564,49 @@ TEST_CASE(xr_reseat_verb) {
     remote->pulse();
     std::this_thread::sleep_for(std::chrono::milliseconds(400));
 
-    // THE verb. Its reply is the user-facing sentence, so check it says what it did.
+    // THE verb. Its reply is the user-facing sentence, so check it says what it did. The COUNT is
+    // deliberately not pinned: the shared session's monitor population is not this test's business.
     const std::string reply = getFromSocket("/openxr reseat");
-    ASSERT_CONTAINS(reply, std::string("re-seated 2 monitors"));
+    ASSERT_STARTS_WITH(reply, std::string("re-seated "));
+    ASSERT_CONTAINS(reply, std::string("to the current head"));
     NLog::log("xr_reseat_verb: reseat replied '{}'", reply);
     std::this_thread::sleep_for(std::chrono::milliseconds(600)); // the frame thread consumes on its next valid-view frame
 
-    // The head did not move, so the whole group is rotated about the origin by exactly the swivel.
-    // Written out longhand (like the restore test) so this would catch the engine and the doc
-    // disagreeing rather than following the engine into the same mistake.
-    const float        c = std::cos(YAW), s = std::sin(YAW);
-    auto               rotated = [&](const std::vector<float>& p) {
-        return std::vector<float>{p[0] * c + p[2] * s, p[1], -p[0] * s + p[2] * c};
+    // Where doc 03 §8.4 says the group must land, re-derived here from the observed arrangement
+    // rather than borrowed from the engine — the same discipline the restore test uses, so this
+    // would notice the engine and the doc disagreeing instead of following one into the other's
+    // mistake. Seat frame: the group's centroid pushed back along its mean facing normal by the
+    // perpendicular viewing distance; the transform maps that frame onto the head's.
+    float cx = 0.f, cz = 0.f, nx = 0.f, nz = 0.f;
+    for (const auto& [pos, quat] : group) {
+        cx += pos[0];
+        cz += pos[2];
+        // +Z column of the rotation matrix: the quad's normal, the direction its viewer sits in.
+        const float qx = quat[0], qy = quat[1], qz = quat[2], qw = quat[3];
+        const float ex = 2.f * (qx * qz + qw * qy), ez = 1.f - 2.f * (qx * qx + qy * qy);
+        const float el = std::sqrt(ex * ex + ez * ez);
+        if (el < 1e-4f)
+            continue;
+        nx += ex / el;
+        nz += ez / el;
+    }
+    cx /= (float)group.size();
+    cz /= (float)group.size();
+    const float nl = std::sqrt(nx * nx + nz * nz);
+    ASSERT(nl > 1e-3f, true); // a group with no common facing has no seat frame; this one has
+    nx /= nl;
+    nz /= nl;
+    // The head stands at the origin, so `head - centroid` is just -centroid. Clamped 0.3..5 m.
+    const float dist = std::clamp(std::fabs(-cx * nx + -cz * nz), 0.3f, 5.f);
+    const float vx = cx + nx * dist, vz = cz + nz * dist, vYaw = std::atan2(nx, nz);
+    // headFrame ∘ inv(seat): rotate about the seat frame's origin by (headYaw - seatYaw), then put
+    // that origin at the head's floor position (the origin).
+    const float th = YAW - vYaw, c = std::cos(th), s = std::sin(th);
+    auto        expected = [&](const std::vector<float>& p) {
+        const float px = p[0] - vx, pz = p[2] - vz;
+        return std::vector<float>{px * c + pz * s, p[1], -px * s + pz * c};
     };
+
     std::vector<float> afterL, afterR;
     {
         const std::string st = getFromSocket("j/openxr");
@@ -560,14 +615,14 @@ TEST_CASE(xr_reseat_verb) {
         ASSERT(afterL.size(), (size_t)3);
         ASSERT(afterR.size(), (size_t)3);
 
-        const auto wantL = rotated(beforeL), wantR = rotated(beforeR);
-        NLog::log("xr_reseat_verb: {} [{:.3f}, {:.3f}, {:.3f}] -> [{:.3f}, {:.3f}, {:.3f}], expected [{:.3f}, {:.3f}, {:.3f}]", monL, beforeL[0], beforeL[1], beforeL[2], afterL[0],
-                  afterL[1], afterL[2], wantL[0], wantL[1], wantL[2]);
+        const auto wantL = expected(beforeL), wantR = expected(beforeR);
+        NLog::log("xr_reseat_verb: seat frame [{:.3f}, {:.3f}] yaw {:.1f} deg; {} [{:.3f}, {:.3f}, {:.3f}] -> [{:.3f}, {:.3f}, {:.3f}], expected [{:.3f}, {:.3f}, {:.3f}]", vx, vz,
+                  vYaw * 180.f / (float)M_PI, monL, beforeL[0], beforeL[1], beforeL[2], afterL[0], afterL[1], afterL[2], wantL[0], wantL[1], wantL[2]);
         EXPECT_MAX_DELTA(dist3(afterL, wantL), 0.0, 0.1);
         EXPECT_MAX_DELTA(dist3(afterR, wantR), 0.0, 0.1);
 
-        // THE assertion the no-op regression fails: they moved, and by the amount a 75-degree swivel
-        // at 1.6 m implies (~2 m), not by the millimetre of head jitter a stored-offset replant gives.
+        // THE assertion the no-op regression fails: they moved, and by the metres a 75-degree swivel
+        // implies, not by the millimetre of head jitter a stored-offset replant would give.
         EXPECT(dist3(afterL, beforeL) > 1.f, true);
         EXPECT(dist3(afterR, beforeR) > 1.f, true);
         // ...and it is the LAYOUT that arrived, not two monitors piled up: the separation is intact.
@@ -576,7 +631,7 @@ TEST_CASE(xr_reseat_verb) {
 
     // Mash it: a second press from the same spot is the identity. (The seat frame is derived from
     // the arrangement, and after the first press the head IS that frame.)
-    ASSERT_CONTAINS(getFromSocket("/openxr reseat"), std::string("re-seated 2 monitors"));
+    ASSERT_STARTS_WITH(getFromSocket("/openxr reseat"), std::string("re-seated "));
     std::this_thread::sleep_for(std::chrono::milliseconds(600));
     {
         const std::string st = getFromSocket("j/openxr");
