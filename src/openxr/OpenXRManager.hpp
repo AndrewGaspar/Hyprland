@@ -84,6 +84,13 @@ class COpenXRManager {
     // set (the loader default / active_runtime.json is used). Surfaced in `hyprctl openxr status` so
     // the XREAL flat/XR toggle can confirm which runtime the session handshook against.
     const std::string& runtimeJson() const;
+    // Why XR bring-up is being REFUSED outright, or empty when nothing is blocking it. Currently
+    // set only by the kernel-taint tripwire (doc 01): the kernel oopsed this boot, so entering the
+    // GPU driver stack is unsafe and start() will not try. Distinct from the ordinary UNAVAILABLE
+    // reasons (no runtime, no headset), which are transient and self-heal — this one needs a
+    // reboot, so it gets its own line in `hyprctl openxr status` rather than being folded into the
+    // state string. Re-evaluated on every start() attempt, including re-probe retries.
+    const std::string& blockedReason() const;
     // Currently-active environment blend mode as "opaque"|"alpha"|"additive" (doc 05 §4.3). The
     // selected mode while a session exists; "opaque" (the default) otherwise.
     std::string        blendModeName() const;
@@ -1030,6 +1037,13 @@ class COpenXRManager {
     std::string       m_runtimeGpu;
     // The openxr:runtime_json override active for this session (see runtimeJson()); empty = none.
     std::string       m_runtimeJson;
+    // Set by the kernel-taint tripwire in start() when it refuses bring-up (see blockedReason());
+    // empty whenever nothing is blocking. Cleared on stop()/disable.
+    std::string       m_blockedReason;
+    // Has the current block already been logged at ERR? Keeps the every-few-seconds re-probe from
+    // spamming an identical error forever, while still shouting the first time and again after any
+    // disable/enable cycle (stop() clears it).
+    bool              m_taintBlockLogged = false;
 
     UP<CXRIpc>        m_ipc;
     UP<CXRSession>    m_session;
