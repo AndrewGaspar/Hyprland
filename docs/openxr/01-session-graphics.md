@@ -58,20 +58,23 @@ for the other components to read.
 All creation runs on the **main thread** inside `COpenXRManager::start()` (state
 `XR_STATE_STARTING`), before the frame thread exists:
 
-1. **Overlay probe.** `openxr:overlay` / `openxr:overlay_z` are read once, before
+1. **Kernel-taint tripwire.** `/proc/sys/kernel/tainted` is checked *first*, before the runtime
+   handshake and before any GPU enumeration — a kernel that has already oopsed means the GPU
+   driver stack may be corrupt, and enumeration is the point of no return (below).
+2. **Overlay probe.** `openxr:overlay` / `openxr:overlay_z` are read once, before
    `createInstance()` (see "Overlay sessions" below).
-2. `createInstance()` — extension checks; `XrApplicationInfo` names the app `Hyprland`,
+3. `createInstance()` — extension checks; `XrApplicationInfo` names the app `Hyprland`,
    `apiVersion = XR_API_VERSION_1_0`. A missing runtime (loader returns
    `XR_ERROR_RUNTIME_UNAVAILABLE`/`_FAILURE`/`_INSTANCE_LOST` or file-not-found) →
    `XR_STATE_UNAVAILABLE`.
-3. `getSystem()` — `xrGetSystem` with a head-mounted form factor
+4. `getSystem()` — `xrGetSystem` with a head-mounted form factor
    (`XR_ERROR_FORM_FACTOR_UNAVAILABLE` → UNAVAILABLE, the dormant "waiting for the headset"
    case), then `xrGetSystemProperties` records `maxLayerCount` (spec floor 16), and
    `xrEnumerateEnvironmentBlendModes` records the runtime's blend modes preferred-first.
-4. **Blend-mode selection** from `openxr:blend_mode` against the enumerated list (below).
-5. `gfx.initEGL(openxr:gpu)` — GPU selection (below).
-6. **Cross-GPU safety check** — refuse to start on a GPU mismatch (below).
-7. `createSession(gfx)` — `xrGetOpenGLESGraphicsRequirementsKHR` first (mandatory before
+5. **Blend-mode selection** from `openxr:blend_mode` against the enumerated list (below).
+6. `gfx.initEGL(openxr:gpu)` — GPU selection (below).
+7. **Cross-GPU safety check** — refuse to start on a GPU mismatch (below).
+8. `createSession(gfx)` — `xrGetOpenGLESGraphicsRequirementsKHR` first (mandatory before
    session creation), then `xrCreateSession` with the EGL binding:
 
    ```cpp
@@ -82,14 +85,14 @@ All creation runs on the **main thread** inside `COpenXRManager::start()` (state
    binding.context        = gfx.m_xrContext;
    ```
 
-8. `createSpaces()` — the reference space and the view space (below).
-9. `initBlitGL()` — compile the blit program, still on the main thread while the context is
+9. `createSpaces()` — the reference space and the view space (below).
+10. `initBlitGL()` — compile the blit program, still on the main thread while the context is
    free.
-10. Choose the swapchain format once (below).
-11. **Action system** (doc 04): build the action set, suggest bindings for every interaction
+11. Choose the swapchain format once (below).
+12. **Action system** (doc 04): build the action set, suggest bindings for every interaction
     profile, create the aim/grip action spaces, and `xrAttachSessionActionSets`. This is
     eager — there is no lazy/first-use deferral.
-12. Bind any existing `CXRMonitorLayer`s (monitors created while disabled — doc 02), spawn the
+13. Bind any existing `CXRMonitorLayer`s (monitors created while disabled — doc 02), spawn the
     frame thread (`m_running = true`), state → `XR_STATE_RUNNING_IDLE`.
 
 **No swapchains are created here.** Per-layer swapchains are created by the frame thread once
@@ -141,9 +144,14 @@ meant to build its context on, which is the compositor's device by construction 
 renders through the runtime's GL client compositor, which imports the compositor's swapchain
 images by an opaque fd, valid only on the device that exported them. It is answered in-process
 (the runtime enumerates our EGL devices through the `getProcAddress` we hand it and matches by
-UUID), so it needs no thread and no timeout, and its `EGLDeviceEXT` maps to a DRM node with
+UUID) with no IPC and no Vulkan, and its `EGLDeviceEXT` maps to a DRM node with
 `eglQueryDeviceStringEXT` — the same render-node-then-primary order `selectDisplay()` used to
 choose the context's device.
+
+In-process is not the same as safe on the main thread, though: that `getProcAddress` callback is a
+full glvnd EGL device enumeration, so the query reaches into every installed vendor driver exactly
+like our own enumeration does (see the next subsection). It therefore runs on the same bounded
+throwaway thread as the Vulkan fallback below.
 
 `XR_KHR_vulkan_enable2` remains as the **fallback** for a runtime without the EGL query.
 `xrGetVulkanGraphicsDevice2KHR` answers a different question — which GPU a *Vulkan application*
@@ -156,6 +164,70 @@ touching any XR handle) and bring-up continues unverified.
 
 The resolved runtime GPU, and which of the two queries answered, are surfaced as `runtimeGpu` in
 `hyprctl openxr status`.
+
+### Sick-driver refusal (kernel taint tripwire)
+
+The cross-GPU check above assumes the drivers it is asking are *working*. This one covers the case
+where they are not.
+
+**What a pin cannot do.** It is tempting to think `openxr:gpu` keeps XR away from a GPU it is not
+pinned to. It does not, and cannot. Measured on a dual-vendor box (NVIDIA RTX 5070 + AMD 890M,
+glvnd with `10_nvidia.json` and `50_mesa.json`), instrumenting `/proc/self/maps` and
+`/proc/self/fd` around each call:
+
+```
+after eglGetProcAddress("eglQueryDevicesEXT")   libEGL_nvidia LOADED, libnvidia-eglcore LOADED, mesa LOADED
+after eglQueryDevicesEXT(0, nullptr, &n)        /dev/nvidiactl, /dev/nvidia0 OPEN
+after the per-device eglQueryDeviceStringEXT    /dev/dri/renderD128 OPEN
+```
+
+Every vendor library is loaded by the **first `eglGetProcAddress`**, and the NVIDIA **kernel
+driver** is contacted by the **count-only** enumeration call — both before a single `EGLDeviceEXT`
+handle exists for a pin to filter on. libglvnd has to work this way: `eglQueryDevicesEXT` is not
+tied to a display, so `libEGL` must ask every vendor and merge the answers, and `eglGetProcAddress`
+must load every vendor to discover who implements the extension at all. There is no EGL API for
+"only this vendor". The only lever is the `__EGL_VENDOR_LIBRARY_FILENAMES` environment variable,
+which is deliberately **not** used: it is session-scoped and would be inherited by every client app
+the compositor spawns, a far larger blast radius than the problem.
+
+So bring-up cannot avoid entering a sick GPU driver. It can only decline to start.
+
+**The tripwire.** Before the runtime handshake and before any GPU enumeration, `start()` reads
+`/proc/sys/kernel/tainted` and checks bit 7, `TAINT_DIE` — "kernel has oopsed before". It is set
+for the whole boot and never cleared, which is exactly right: once any kernel oops has happened, no
+amount of waiting makes the driver stack trustworthy again.
+
+- **`TAINT_DIE` set** → bring-up is refused outright, before touching EGL. The state goes
+  UNAVAILABLE and the reason appears as a `blocked:` line in `hyprctl openxr status`.
+- **Anything else** → proceed. The check is deliberately narrow: the everyday taint bits
+  (proprietary / out-of-tree / unsigned modules — `12288` on a stock NVIDIA box, every boot) say
+  nothing about driver health, and blocking on them would fire permanently on exactly the machines
+  XR runs on.
+- **Unreadable or unparsable** → proceed. The tripwire **fails open**; a missing `/proc` entry must
+  never cost a working setup its session.
+
+It is re-evaluated on **every** attempt, re-probe retries included, so ignoring it does not make it
+go quiet — the `blocked:` line stays up and the state keeps returning to UNAVAILABLE. The error is
+logged loudly once and at DEBUG thereafter (a retry every few seconds would otherwise bury the
+log); a `hyprctl openxr disable && hyprctl openxr enable` cycle re-arms the loud version.
+
+`openxr:ignore_kernel_taint = 1` overrides the refusal for development. It still warns each start,
+because a hatch set months ago should not be silent.
+
+**Why this is here at all.** Hard reboot #6: an NVIDIA driver use-after-free cascaded through the
+kernel, which printed `Fixing recursive fault but reboot is needed!` 29 minutes before the machine
+died. The compositor was a bystander — but it had a bring-up path that would have walked into the
+already-corrupt driver seconds later, with a pin that could not have helped. This check refuses that
+session outright.
+
+**And when a driver is sick but the kernel has not oopsed yet**, the second guard applies: every
+call that enters a GPU driver or the runtime during bring-up — the EGL device enumeration in
+`selectDisplay()`, `xrGetSystemEGLDeviceMND`, and the Vulkan probe — runs on a bounded throwaway
+thread (`OpenXR::runBoundedProbe`, 3s). A driver that never returns costs XR, not the desktop: the
+thread is abandoned, the enumeration is treated as a failure, and bring-up refuses cleanly. The
+accepted cost is that an abandoned thread leaks for the life of the process — there is no safe way
+to cancel a thread stuck inside a driver, and one leaked thread beats a frozen desktop (2026-07-15,
+when a stalled leased DP link froze the whole desktop until a power cycle).
 
 ## EGL context ownership — the critical invariant
 
