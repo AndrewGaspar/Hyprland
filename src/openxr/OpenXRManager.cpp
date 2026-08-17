@@ -3967,7 +3967,18 @@ void COpenXRManager::publishRestoreCapture() {
     // refusing to capture until the first don event would leave a freshly plugged session with no
     // durable placement at all.
     const bool wearing = !m_userPresenceSupported || !m_presenceKnown || m_userPresent;
-    m_restoreCapture.store(m_monitorsPlugged && wearing, std::memory_order_relaxed);
+    const bool want    = m_monitorsPlugged && wearing;
+    if (m_restoreCapture.exchange(want, std::memory_order_relaxed) == want)
+        return;
+    // Worth a line: this gate is the difference between "your layout will come back" and "it will be
+    // re-seated from the config", and `hyprctl openxr status` only shows the resulting per-monitor
+    // state. Say which of the two inputs closed it.
+    Log::logger->log(Log::DEBUG, "[OPENXR] cross-session placement capture {} (monitors {}, user {})", want ? "ON" : "OFF", m_monitorsPlugged ? "plugged" : "unplugged",
+                     !m_userPresenceSupported ? "presence unsupported" : (!m_presenceKnown ? "presence unknown" : (m_userPresent ? "present" : "absent")));
+}
+
+bool COpenXRManager::restoreCaptureActive() const {
+    return m_restoreCapture.load(std::memory_order_relaxed);
 }
 
 void COpenXRManager::reportLayerRemoved(const std::string& name) {

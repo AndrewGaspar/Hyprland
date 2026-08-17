@@ -70,6 +70,8 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     // which latched reference frame? `hyprctl openxr layout` is deliberately NOT affected by any of
     // this: it still dumps paste-ready `xrmonitor =` lines describing the 3D arrangement.
     const auto        L2D   = g_pOpenXRManager->layout2DStatus();
+    // doc 03 §8.3: is the compositor currently remembering where the user has put their monitors.
+    const bool        RESTORE_CAPTURE = g_pOpenXRManager->restoreCaptureActive();
     auto              handLabel = [](const COpenXRManager::SXRHandInputInfo& hi) -> std::string {
         if (!hi.hands)
             return "controllers";
@@ -159,6 +161,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "monitorsFollowSession": "{}",
     "monitorUnplugPendingMs": {},
     "userPresence": "{}",
+    "restoreCapture": {},
     "visible": "{}",
     "reprobeWaiting": "{}",
     "reprobePendingMs": {},
@@ -180,7 +183,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
 }}
 )#",
                            STATE, RUNTIME, SYSTEM, RTGPU, RTJSON, BLEND, BLACK.configured, BLACK.effective, BLACK.knee, BLACK.active ? "true" : "false",
-                           BLACK.gatedOff ? "true" : "false", OVERLAY ? "true" : "false", MONITOR_VIEW ? "shown" : "hidden", SELECTED, FOLLOW, UNPLUG_PEND, PRESENCE, VISIBLE,
+                           BLACK.gatedOff ? "true" : "false", OVERLAY ? "true" : "false", MONITOR_VIEW ? "shown" : "hidden", SELECTED, FOLLOW, UNPLUG_PEND, PRESENCE, RESTORE_CAPTURE ? "true" : "false", VISIBLE,
                            REPROBE_WAIT, REPROBE_MS, REPROBE_WATCH ? "true" : "false", INHIBITING_IDLE ? "true" : "false", INHIBIT_MODE, HANDIN.mode, HANDIN.state, GAZE.source,
                            GAZE.hoveredMonitor, GAZE.hoveredName, GAZE.carrying ? "true" : "false", GAZE.carryMonitor, GAZE.dist, HANDS[0].hands ? "hands" : "controllers",
                            HANDS[0].gesture, HANDS[0].filtered ? "true" : "false", HANDS[1].hands ? "hands" : "controllers", HANDS[1].gesture, HANDS[1].filtered ? "true" : "false",
@@ -212,10 +215,10 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
         std::format("state: {}\nruntime: {}\nsystem: {}\nruntime gpu: {}\nruntime json: {}\nblend mode: {}\nblack alpha: {}\noverlay: {}\nmonitor view: {}\nselected: {}\nmonitors "
                     "follow session: {}\nvisible: "
                     "{}\npresence: {}\nidle "
-                    "inhibited: {} (mode {})\nhand input: {} "
+                    "inhibited: {} (mode {})\nplacement capture: {}\nhand input: {} "
                     "({})\ngaze ({}): {}\ninput: left {}, right {}\n2d-plane sync: {}\n",
                     STATELINE, RUNTIME, SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, RTJSON.empty() ? "(loader default)" : RTJSON, BLEND, BLACKLINE, OVERLAY ? "yes" : "no",
-                    MONITOR_VIEW ? "shown" : "hidden", SELECTED.empty() ? "(none)" : SELECTED, FOLLOWLINE, VISIBLE, PRESENCE, INHIBITING_IDLE ? "yes" : "no", INHIBIT_MODE,
+                    MONITOR_VIEW ? "shown" : "hidden", SELECTED.empty() ? "(none)" : SELECTED, FOLLOWLINE, VISIBLE, PRESENCE, INHIBITING_IDLE ? "yes" : "no", INHIBIT_MODE, RESTORE_CAPTURE ? "on" : "off",
                     HANDIN.state, HANDIN.mode, GAZE.source, GAZELINE, handLabel(HANDS[0]), handLabel(HANDS[1]), L2DLINE);
     for (const auto& m : MONS) {
         out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} ({}) hovered: {} ({}) plugged: {} content: {}{}", m.name,

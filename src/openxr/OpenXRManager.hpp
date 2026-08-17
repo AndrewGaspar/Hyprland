@@ -167,6 +167,11 @@ class COpenXRManager {
     // Main thread only.
     void publishRestoreCapture();
 
+    // Is the compositor currently remembering where you have put your monitors (doc 03 §8.3)? Shown
+    // in `hyprctl openxr status`, because "will my room come back" is otherwise only answerable after
+    // restarting the thing you were asking about.
+    bool restoreCaptureActive() const;
+
     // Milliseconds until the pending grace-period unplug fires, or -1 when none is armed. Cheap
     // read of the timer for `hyprctl openxr status` observability. Main thread only.
     int  monitorUnplugPendingMs() const;
