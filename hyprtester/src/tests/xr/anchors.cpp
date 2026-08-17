@@ -335,7 +335,7 @@ TEST_CASE(xr_anchor_restore_across_session) {
 
     // It really was placed out where the user is standing, not near the origin — otherwise the stale
     // composition below would be harmless and this test would prove nothing.
-    std::vector<float> placed;
+    std::vector<float> placed, relPlaced;
     {
         const std::string st = getFromSocket("j/openxr");
         const auto        p  = XR::findAfter(st, "\"name\": \"" + mon + "\"");
@@ -345,6 +345,8 @@ TEST_CASE(xr_anchor_restore_across_session) {
         EXPECT(dist3(placed, std::vector<float>{0.f, 0.f, 0.f}) > 2.f, true);
         // The create-time seed makes it restorable straight away (doc 03 §8.3).
         EXPECT(XR::fieldAfter(st, p, "restorable"), std::string("true"));
+        relPlaced = XR::parseFloatArray(XR::fieldAfter(st, p, "offset"));
+        ASSERT(relPlaced.size(), (size_t)3);
     }
 
     // Nudge it so the restored pose is provably the USER'S placement, not the creation pose.
@@ -358,6 +360,18 @@ TEST_CASE(xr_anchor_restore_across_session) {
         left = posOf(st, p);
         ASSERT(left.size(), (size_t)3);
         EXPECT(dist3(left, placed) > 0.2f, true);
+        // The capture must have TRACKED the move — this is the mechanism the restore below rides on,
+        // and asserting it here says "the capture is not running" rather than leaving that to be
+        // inferred from a pose landing somewhere unexpected two session transitions later.
+        // If the gate is shut nothing is being remembered, and the restore below would silently
+        // replay the create-time seed instead — say so here rather than leaving it to be inferred
+        // from a pose landing somewhere unexpected two session transitions later.
+        EXPECT(XR::fieldAfter(st, size_t{0}, "restoreCapture"), std::string("true"));
+        const auto relLeft = XR::parseFloatArray(XR::fieldAfter(st, p, "offset"));
+        ASSERT(relLeft.size(), (size_t)3);
+        NLog::log("xr_anchor_restore_across_session: placed [{:.3f}, {:.3f}, {:.3f}] -> left [{:.3f}, {:.3f}, {:.3f}], capture offset [{:.3f}, {:.3f}, {:.3f}]", placed[0], placed[1],
+                  placed[2], left[0], left[1], left[2], relLeft[0], relLeft[1], relLeft[2]);
+        EXPECT(dist3(relLeft, relPlaced) > 0.2f, true);
     }
 
     // Recycle the session: new session, new first plug, new re-seat.
