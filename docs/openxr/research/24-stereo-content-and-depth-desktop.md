@@ -1998,6 +1998,78 @@ foreground elements.** Our "stereo window" is the quad's content rect; our float
 budget is the transparent chrome margin. v1: clamp each element's per-pane shift to
 `≤ margin_px`, and prefer reducing depth near edges over clipping.
 
+### 8.4 The packed frame must FILL the surface — the player's half of the contract
+
+*Live finding, 2026-08-17. The first time a tagged stereo window was looked at on the OpenXR quad
+pair rather than on the flat XREAL output — Phase S/X shipped and were validated on the flat
+presenter (physical side-by-side panel packing), and the quad-pair mapping of a tagged window's
+panes had never been eyeballed until this session.*
+
+**The report.** A `stereo sbs`-tagged mpv window on a `sbs/depth (2 quads)` XR monitor: the right
+eye showed the picture occupying roughly the left 60 % of the window, the left eye the right 60 %.
+Unfusable. A synthetic **zero-disparity** file (both panes pixel-identical, `~/Videos/sbs-reference-zero.mkv`,
+2880×1440, `stereo_mode=left_right`) reproduced it exactly, which exonerated the content and pointed
+at the presentation path. Ordinary depth-ruled windows on the same monitors were correct throughout.
+
+**The cause was not in the compositor.** `mpv --keepaspect=no --fullscreen` on the same reference
+file read correctly, which localises it precisely: mpv was **fitting** the packed frame inside its
+window and centring it, so the surface the compositor halves was *the packed frame plus a bar on
+each side*. The crop takes half of the SURFACE, so each eye got half a bar plus the wrong part of
+the frame.
+
+**The arithmetic, because it explains the "60 %" exactly.** With a fraction `i` of the surface width
+lost to a bar on each side, the pane-local point the two eyes show at the same place in the window
+differs by a constant
+
+```
+        2i / (1 − 2i)     of a pane, with opposite sign in the two eyes
+```
+
+— the left eye's picture slides right, the right eye's left, by `i` of the window each. Zero only at
+`i = 0`. That is a *divergent* disparity of a large fraction of the screen, i.e. §8.2's comfort
+budget exceeded by two orders of magnitude, which is why it does not merely look soft: it does not
+fuse at all.
+
+**Which axis the bars sit on decides everything**, and this is why the flat XREAL validation passed:
+
+| player's bars | `sbs` / `hsbs` | `tab` / `htab` |
+|---|---|---|
+| top and bottom (letterbox) | **harmless** — identical in both eyes | fatal |
+| left and right (pillarbox) | **fatal** | harmless |
+
+A 2:1 film in a 16:9 fullscreen window letterboxes, which the horizontal crop never touches — so the
+XREAL flat-path validation was correct *and* incomplete. The failing window was **wider** than its
+content's packed aspect (a short, wide tile), which moved the bars onto the axis the crop splits.
+
+**The contract, stated once:** *for a `stereo`-declared window, the window's SURFACE is the packed
+frame.* Hyprland halves the surface because the surface is all it can see. The supported flows are
+(a) a floating window at the packed frame's own aspect — no bars at all — or (b) fill-mode playback
+(`--keepaspect=no`), which trades a stretch for a picture that fuses. `contrib/mpv-hypxr-stereo.lua`
+now does (b) itself while a layout is tagged, and restores the user's setting on a mono file.
+
+**This is not detectable in the compositor, and that is a conclusion rather than an omission.**
+Every quantity the compositor can observe — the surface size, the buffer size, the window box, and
+therefore every aspect derivable from them — takes *identical* values whether the player filled the
+surface or letterboxed inside it. The legitimate range of packed-surface aspects (1.78 for a
+fullscreen window on a 16:9 pane, 2.0 for the reference file, 3.56 for a 3840×1080 film) fully
+overlaps the broken one, so a "surface aspect looks wrong" heuristic would fire on correct setups.
+It was designed, costed and rejected on that ground; the documentation is the mitigation.
+
+**The UI wart that comes with it.** Anything the player draws into the same surface is inside the
+packed frame as far as the crop is concerned, so it is pane-split too — mpv's OSC becomes half a
+seek bar per eye. A *subsurface* OSD is unaffected (§5.3 confines the crop to the main surface).
+The mpv script hides the OSC while a layout is tagged for this reason.
+
+**What the pane math turned out to be.** Correct, end to end, and now pinned:
+`tests/render/StereoContent.cpp` asserts the **zero-disparity invariant** (identical panes ⇒
+identical eye images, i.e. the two eyes' sample rects are congruent and exactly one pane apart) and
+the precondition above as its own test with the `2i/(1−2i)` divergence spelled out;
+`tests/xr/StereoDepthPair.cpp` asserts that a depth-packed monitor does **not** consult the window's
+content declaration a second time at submission (halving an already-halved buffer would give each
+eye a quarter of the desktop) and that **pane 0 means LEFT at all four seams it crosses** — the
+per-surface crop, `Desktop::Depth::eyeSign`, the scanout pack's destination box, and the OpenXR
+`paneFullRect`/`eyeVisibility` pairing.
+
 ---
 
 ## 9. The full-XR upgrade path
@@ -2290,6 +2362,12 @@ optional; it is now Phase F.
 > terminal, and the tagged full-SBS viewpoint demo resolved correctly through the per-eye path.
 > XREAL validation remains open, including §14's question 1 about its scanline split interacting
 > with a half-covering quad.
+>
+> An ordinary **tagged player window** on the quad pair was first looked at on **2026-08-17**, and
+> it read as broken until the cause was localised outside the compositor: the player had fitted the
+> packed frame inside its window rather than filling it. **§8.4** has the whole finding, the
+> arithmetic of the artifact, why no compositor-side heuristic can detect it, and the invariants it
+> is now pinned with.
 
 > **STATUS (WP X3 + X4): IMPLEMENTED**, shipped together because splitting them would have shipped
 > a regression — see point 3. `openxr:depth_desktop`, default ON.
