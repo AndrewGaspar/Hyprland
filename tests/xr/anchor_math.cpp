@@ -4,6 +4,8 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <initializer_list>
+#include <vector>
 
 using namespace OpenXR;
 
@@ -1119,4 +1121,215 @@ TEST(XRReseatRestore, GroupGeometrySurvivesADeliberateReseat) {
             // vertical arrangement rather than being flattened onto the new eye height.
             EXPECT_NEAR(after.y, before.y, 1e-4f);
         }
+}
+
+// ---- doc 03 §8.4: the group seat frame ----
+//
+// THE reason the deliberate re-seat cannot be the §8.2 one. The §8.3 capture re-derives every stored
+// offset every frame while the headset is worn, so "replant the stored offset around the current
+// head" is hf(H) ∘ inv(hf(H)) ∘ pose — the monitor's own pose, back. A verb built on that would land
+// everything exactly where it already was, which is the complaint that asked for the feature.
+//
+// So the deliberate re-seat derives its reference from the ARRANGEMENT: the frame a viewer would
+// have to occupy to see the group head-on. Move that frame onto the head and the whole group comes
+// with it, rigidly. These pin the derivation, and the round trip through recenterLocalToHead that
+// the frame loop actually performs.
+
+namespace {
+    // Exactly what the frame loop's GROUP branch does: derive the seat frame, then re-express every
+    // monitor in it and re-plant that in the head's frame.
+    std::vector<SXRPose> groupReseat(const std::vector<SXRPose>& worlds, const SXRPose& head) {
+        const auto           seat = xrGroupSeatFrame(worlds.data(), worlds.size(), head);
+        std::vector<SXRPose> out;
+        if (!seat.valid)
+            return worlds; // the frame loop leaves the group alone
+        for (const auto& W : worlds) {
+            SXRAnchorState live;
+            live.mode       = XR_ANCHOR_LOCAL;
+            live.anchorPose = W;
+            CXRAnchor a;
+            a.initFromState(live);
+
+            SXRAnchorState replant;
+            replant.mode       = XR_ANCHOR_LOCAL;
+            replant.anchorPose = xrPoseInHeadFrame(seat.frame, W);
+            a.recenterLocalToHead(head, replant);
+            out.push_back(a.state().anchorPose);
+        }
+        return out;
+    }
+
+    // A flat row of three monitors 1.5 m in front of a viewer at the origin facing -Z, all facing
+    // back at them (+Z normal, identity rotation). The layout `append right` produces.
+    std::vector<SXRPose> wallAt(float z, float y = 1.4f) {
+        return {
+            {{-1.f, y, z}, Quat{}},
+            {{0.f, y, z}, Quat{}},
+            {{1.f, y, z}, Quat{}},
+        };
+    }
+
+    // A toed-in arc of radius r: each monitor sits at yaw a from the viewer's forward and faces back.
+    std::vector<SXRPose> arcAt(float r, std::initializer_list<float> anglesDeg) {
+        std::vector<SXRPose> out;
+        for (const float deg : anglesDeg) {
+            const float a = deg * PI / 180.f;
+            out.push_back(SXRPose{{-r * std::sin(a), 1.4f, -r * std::cos(a)}, qFromYaw(a)});
+        }
+        return out;
+    }
+}
+
+TEST(XRGroupSeat, WallSeatIsWhereItsViewerStands) {
+    // The seat frame of a wall is dead in front of it, at the distance the viewer is currently
+    // viewing it from — so a user already sitting square to their monitors gets the identity, and
+    // the verb honestly reports "re-seated 3 monitors" that did not need to move.
+    const auto    monitors = wallAt(-1.5f);
+    const SXRPose head{{0.f, 1.6f, 0.f}, Quat{}};
+
+    const auto    seat = xrGroupSeatFrame(monitors.data(), monitors.size(), head);
+    ASSERT_TRUE(seat.valid);
+    expectVecNear(seat.frame.pos, Vec3{0.f, 0.f, 0.f}, 1e-4f);
+    EXPECT_NEAR(qYawOf(seat.frame.rot, 999.f), 0.f, 1e-4f);
+
+    const auto after = groupReseat(monitors, head);
+    for (size_t i = 0; i < monitors.size(); ++i)
+        expectVecNear(after[i].pos, monitors[i].pos, 1e-4f);
+}
+
+TEST(XRGroupSeat, ArcSeatIsItsFocus) {
+    // A toed-in arc names its own viewing point exactly: the mean normal points at the focus and
+    // the perpendicular distance is the radius. This is the arrangement a HypXRland desk actually
+    // ends up in after a few grab-moves.
+    const auto    monitors = arcAt(1.5f, {-30.f, 0.f, 30.f});
+    const SXRPose head{{0.f, 1.62f, 0.f}, Quat{}};
+
+    const auto    seat = xrGroupSeatFrame(monitors.data(), monitors.size(), head);
+    ASSERT_TRUE(seat.valid);
+    expectVecNear(seat.frame.pos, Vec3{0.f, 0.f, 0.f}, 1e-3f);
+    EXPECT_NEAR(qYawOf(seat.frame.rot, 999.f), 0.f, 1e-3f);
+}
+
+TEST(XRGroupSeat, PivotInPlaceBringsTheGroupToTheNewFacing) {
+    // THE reported case, in its mild form: the user swivels their chair and wants the layout to
+    // come round. Note what the §8.2 re-seat would have done here — nothing, because the capture had
+    // already re-measured every offset against this very head.
+    const auto    monitors = arcAt(1.5f, {-25.f, 0.f, 25.f});
+    const float   pivot    = 90.f * PI / 180.f;
+    const SXRPose head{{0.f, 1.6f, 0.f}, qFromYaw(pivot)};
+
+    const auto    after = groupReseat(monitors, head);
+    ASSERT_EQ(after.size(), monitors.size());
+
+    // Each monitor is now the same distance from the head as before (the head did not move, and the
+    // transform is a rotation about it)...
+    for (size_t i = 0; i < after.size(); ++i) {
+        const Vec3 b = monitors[i].pos - head.pos, a = after[i].pos - head.pos;
+        EXPECT_NEAR(std::sqrt(a.x * a.x + a.z * a.z), std::sqrt(b.x * b.x + b.z * b.z), 1e-3f);
+    }
+    // ...and the middle one now sits along the head's new forward, which is what "bring it to my
+    // current facing" means. Forward at yaw 90 deg is -X. Compared horizontally: the group keeps its
+    // absolute heights (the seat frame is on the floor), so the monitor is below eye level and a 3D
+    // direction would carry that tilt.
+    const Vec3 toMiddle = Vec3{after[1].pos.x - head.pos.x, 0.f, after[1].pos.z - head.pos.z}.normalized();
+    EXPECT_NEAR(toMiddle.x, -1.f, 1e-3f);
+    EXPECT_NEAR(toMiddle.z, 0.f, 1e-3f);
+    // The relative layout is untouched: separations are preserved exactly.
+    for (size_t i = 0; i < after.size(); ++i)
+        for (size_t j = i + 1; j < after.size(); ++j)
+            EXPECT_NEAR((after[j].pos - after[i].pos).length(), (monitors[j].pos - monitors[i].pos).length(), 1e-3f);
+}
+
+TEST(XRGroupSeat, ReseatIsAFixedPoint) {
+    // Mash the keybind: the second press must be the identity. After a re-seat the head IS the
+    // group's seat frame, so the derivation returns it and the transform collapses. Without the
+    // perpendicular projection this would creep on every press.
+    const auto    monitors = arcAt(1.6f, {-40.f, -10.f, 20.f});
+    const SXRPose head{{2.f, 1.55f, -3.f}, qFromYaw(1.1f)};
+
+    const auto    once  = groupReseat(monitors, head);
+    const auto    twice = groupReseat(once, head);
+    for (size_t i = 0; i < once.size(); ++i) {
+        expectVecNear(twice[i].pos, once[i].pos, 1e-3f);
+        EXPECT_NEAR(qAngleBetween(twice[i].rot, once[i].rot), 0.f, 2e-3f);
+    }
+}
+
+TEST(XRGroupSeat, SlidingAlongAWallIsNotWalkingAwayFromIt) {
+    // The viewing distance is measured PERPENDICULARLY to the group's facing. Standing 3 m to one
+    // side of a wall you are 1.5 m from is still a 1.5 m viewing distance, so the wall comes round
+    // to 1.5 m in front of you rather than being flung 3.4 m away.
+    const auto    monitors = wallAt(-1.5f);
+    const SXRPose head{{3.f, 1.6f, 0.f}, qFromYaw(0.3f)};
+
+    const auto    seat = xrGroupSeatFrame(monitors.data(), monitors.size(), head);
+    ASSERT_TRUE(seat.valid);
+    EXPECT_NEAR(seat.frame.pos.z, 0.f, 1e-4f); // 1.5 m out from the wall, not 3.4 m
+
+    const auto after = groupReseat(monitors, head);
+    const Vec3 toMid{after[1].pos.x - head.pos.x, 0.f, after[1].pos.z - head.pos.z};
+    EXPECT_NEAR(toMid.length(), 1.5f, 1e-3f);
+}
+
+TEST(XRGroupSeat, ViewingDistanceIsClamped) {
+    // Re-seating from across the room must not park the group across the room. Same clamp every
+    // other placement verb uses.
+    const auto    monitors = wallAt(-1.5f);
+    const SXRPose faraway{{0.f, 1.6f, 20.f}, Quat{}};
+    const auto    seat = xrGroupSeatFrame(monitors.data(), monitors.size(), faraway);
+    ASSERT_TRUE(seat.valid);
+    EXPECT_NEAR(seat.frame.pos.z, -1.5f + XR_DISTANCE_MAX, 1e-4f);
+
+    // ...and standing inside them does not put them on the tip of your nose.
+    const SXRPose inside{{0.f, 1.6f, -1.55f}, Quat{}};
+    const auto    close = xrGroupSeatFrame(monitors.data(), monitors.size(), inside);
+    ASSERT_TRUE(close.valid);
+    EXPECT_NEAR(std::fabs(close.frame.pos.z + 1.5f), XR_DISTANCE_MIN, 1e-4f);
+}
+
+TEST(XRGroupSeat, SingleMonitorWorks) {
+    // The most common arrangement of all. One monitor 2 m to the user's left, facing them; a re-seat
+    // puts it 2 m dead ahead, still facing them.
+    const std::vector<SXRPose> one{{{-2.f, 1.4f, 0.f}, qFromYaw(-90.f * PI / 180.f)}};
+    const SXRPose              head{{0.f, 1.6f, 0.f}, Quat{}};
+
+    const auto                 after = groupReseat(one, head);
+    ASSERT_EQ(after.size(), size_t{1});
+    expectVecNear(after[0].pos, Vec3{0.f, 1.4f, -2.f}, 1e-3f);
+    // Its normal points back at the head (+Z of the quad toward the viewer).
+    const Vec3 normal = qRotate(after[0].rot, Vec3{0.f, 0.f, 1.f});
+    EXPECT_NEAR(normal.z, 1.f, 1e-3f);
+}
+
+TEST(XRGroupSeat, NoCommonFacingHasNoSeat) {
+    // A ring of monitors surrounding the user has no "in front of" to be brought around to — their
+    // normals cancel. The frame loop must leave the group alone rather than invent a frame, and the
+    // status line has to be able to say so.
+    const std::vector<SXRPose> ring{
+        {{0.f, 1.4f, -1.5f}, Quat{}},
+        {{0.f, 1.4f, 1.5f}, qFromYaw(PI)},
+    };
+    const SXRPose head{{0.f, 1.6f, 0.f}, Quat{}};
+    EXPECT_FALSE(xrGroupSeatFrame(ring.data(), ring.size(), head).valid);
+
+    // An empty group is likewise unanswerable (the verb's own gate catches this first).
+    EXPECT_FALSE(xrGroupSeatFrame(nullptr, 0, head).valid);
+}
+
+TEST(XRGroupSeat, MonitorsLyingFlatDoNotVoteOnFacing) {
+    // A quad pitched to face the ceiling has no horizontal normal; letting its degenerate direction
+    // into the mean would swing the whole group somewhere arbitrary. It still MOVES with the group
+    // (it is in the rigid transform), it just does not get a say in where the front is.
+    std::vector<SXRPose> monitors = wallAt(-1.5f);
+    monitors.push_back(SXRPose{{0.f, 2.4f, -1.f}, qFromPitch(-90.f * PI / 180.f)}); // a ceiling panel
+
+    const SXRPose head{{0.f, 1.6f, 0.f}, Quat{}};
+    const auto    seat = xrGroupSeatFrame(monitors.data(), monitors.size(), head);
+    ASSERT_TRUE(seat.valid);
+    EXPECT_NEAR(qYawOf(seat.frame.rot, 999.f), 0.f, 1e-4f);
+
+    const auto after = groupReseat(monitors, head);
+    ASSERT_EQ(after.size(), monitors.size());
+    // The ceiling panel travelled with everything else, keeping its offset from the wall.
+    EXPECT_NEAR((after[3].pos - after[1].pos).length(), (monitors[3].pos - monitors[1].pos).length(), 1e-3f);
 }

@@ -272,6 +272,92 @@ namespace OpenXR {
         return !pendingRemoval && mode == XR_ANCHOR_LOCAL;
     }
 
+    // ---- the two kinds of re-seat, and why there have to be two (doc 03 §8.4) ----
+    //
+    // §8.2's re-seat plants each monitor's stored head-relative offset around the current head. That
+    // is exactly right ACROSS A DISCONTINUITY — a new session, or a change nothing observed — because
+    // the §8.3 capture was frozen throughout it, so the stored offset still describes the arrangement
+    // as the user left it.
+    //
+    // It is useless while the user is simply WEARING the headset, and this is not obvious enough to
+    // leave unwritten. The capture re-derives every offset EVERY FRAME (§8.3), so the stored offset
+    // is always "where this monitor is relative to where I am right now". Re-planting it around the
+    // current head therefore composes hf(H) ∘ inv(hf(H)) ∘ pose — the monitor's own pose back, to
+    // within one frame of head motion. A deliberate "bring my monitors to me" built on it would land
+    // everything exactly where it already was, which is the literal complaint that asked for this
+    // feature ("if I pivoted only slightly, everything would land exactly where it already was").
+    //
+    // So the deliberate re-seat needs a reference that is NOT the live head. It uses the arrangement
+    // itself: a monitor group implies the frame of the viewer it was arranged for — stand there and
+    // you see it head-on — and re-seating means rigidly moving the group so that implied viewer
+    // becomes the actual one. No stored state, nothing to go stale, and it is a fixed point (re-seat
+    // twice from the same spot and the second is the identity).
+    enum eXRReseatKind : uint8_t {
+        XR_RESEAT_ARM_NONE = 0, // nothing pending
+        XR_RESEAT_ARM_GROUP,    // deliberate: rigidly move the live arrangement onto the current head
+        XR_RESEAT_ARM_RESTORE,  // discontinuity: replant each monitor's stored offset (§8.2/§8.3)
+    };
+
+    // The frame a monitor group is arranged FOR: where a viewer would have to stand, and which way
+    // face, to see the whole arrangement head-on. Yaw-only and on the floor (y = 0), i.e. the same
+    // shape xrHeadFrame produces, so it drops straight into xrPoseInHeadFrame / recenterLocalToHead.
+    //
+    // Position: the group's centroid pushed back along its mean facing normal by the distance the
+    // user is currently viewing it from, measured PERPENDICULARLY to that normal. The perpendicular
+    // component is what makes the operation idempotent — after a re-seat the head sits exactly at
+    // the frame this returns, so asking again yields the identity — and it is also what makes
+    // sliding along a wall of monitors not count as "moving away from" them.
+    // Orientation: facing the group (forward = -normal).
+    //
+    // `valid` is false when the group says nothing about a facing: no monitors, or normals that
+    // cancel (a ring of monitors surrounding the user — there is no "in front of" to bring them to).
+    // The caller must leave the group alone in that case rather than invent a frame.
+    struct SXRGroupSeat {
+        SXRPose frame;
+        bool    valid = false;
+    };
+
+    inline SXRGroupSeat xrGroupSeatFrame(const SXRPose* group, size_t n, const SXRPose& head, float minDist = XR_DISTANCE_MIN, float maxDist = XR_DISTANCE_MAX) {
+        SXRGroupSeat out;
+        if (!group || n == 0)
+            return out;
+
+        Vec3 centroid{};
+        Vec3 normalSum{};
+        for (size_t i = 0; i < n; ++i) {
+            centroid += group[i].pos;
+            // A quad's +Z is the normal pointing at its viewer (the same convention placeAtFacing
+            // and lookAtNoRoll use). Only its horizontal part matters: a monitor's pitch says
+            // nothing about where the user stands, and letting it in would tilt the whole group.
+            const Vec3  nq  = qRotate(group[i].rot, Vec3{0.F, 0.F, 1.F});
+            const float len = std::sqrt(nq.x * nq.x + nq.z * nq.z);
+            if (len < 1e-4F)
+                continue; // a monitor lying flat (facing straight up/down) has no opinion about yaw
+            normalSum += Vec3{nq.x / len, 0.F, nq.z / len};
+        }
+        centroid   = centroid * (1.F / (float)n);
+        centroid.y = 0.F;
+
+        const float nl = std::sqrt(normalSum.x * normalSum.x + normalSum.z * normalSum.z);
+        if (nl < 1e-3F)
+            return out; // the normals cancel: no common front to bring the group around to
+        const Vec3 normal{normalSum.x / nl, 0.F, normalSum.z / nl};
+
+        // How far the user currently views the group from, along its normal. Absolute value so
+        // standing BEHIND the group (you walked around it) still yields a sane viewing distance
+        // rather than a clamp to arm's length; clamped to the range every other placement verb
+        // clamps to, so a re-seat from across the room does not park the group across the room.
+        const Vec3  toHead{head.pos.x - centroid.x, 0.F, head.pos.z - centroid.z};
+        const float dist = std::clamp(std::fabs(toHead.x * normal.x + toHead.z * normal.z), minDist, maxDist);
+
+        out.frame.pos = Vec3{centroid.x + normal.x * dist, 0.F, centroid.z + normal.z * dist};
+        // Face the group: forward (-Z) must be -normal, and qYawOf's convention makes that
+        // atan2(normal.x, normal.z).
+        out.frame.rot = qFromYaw(std::atan2(normal.x, normal.z));
+        out.valid     = true;
+        return out;
+    }
+
     // Why a requested re-seat did (not) happen. The re-seat itself runs on the frame thread — it
     // needs the head pose, which only that thread locates — so a request is an ARMING, and the
     // caller's answer to the user has to be decided from what the main thread can see: whether a
