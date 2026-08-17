@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cmath>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -21,6 +22,9 @@
 //      it, or a stereo video in a player that crops its source would sample the wrong pixels.
 //   4. the tag grammar is exactly `stereo:<layout>` — this is the string the Dead Space mod emits,
 //      so it is a compatibility contract, not an implementation detail.
+//   5. the ZERO-DISPARITY invariant (bottom of the file, research/24 §8.4): identical panes must
+//      give the two eyes identical images — and the precondition that buys it is that the client's
+//      packed frame FILLS the surface, which is what the first live quad-pair test broke on.
 
 using namespace Render::Stereo;
 
@@ -443,5 +447,150 @@ TEST(StereoContent, thePaneMappingAgreesWithTheCropTheRendererUses) {
             EXPECT_EQ(paneUVToContentUV({0, 0}, layout, eye), CROP.tl) << layoutToString(layout);
             EXPECT_EQ(paneUVToContentUV({1, 1}, layout, eye), CROP.br) << layoutToString(layout);
         }
+    }
+}
+
+// --- THE ZERO-DISPARITY INVARIANT, and the one precondition it rests on (research/24 §8.4) ---
+//
+// 2026-08-17 was the first time a tagged stereo window was looked at on the OpenXR quad pair rather
+// than on the flat XREAL output, and it read as broken: each eye showed the picture displaced to
+// the opposite side of the window. The pane math below turned out to be right and the artifact was
+// upstream of it — mpv had scaled the packed frame to fit its window and CENTRED it, so the surface
+// the compositor halves was not the packed frame but a packed frame with a bar either side.
+//
+// Both halves of that are pinned here, because the second half is the part a reader will otherwise
+// re-derive at the headset:
+//
+//   * with the frame filling the surface, the two eyes' sample rects are PANE-CORRESPONDING, so
+//     identical panes produce identical eye images — a zero-disparity file looks like an ordinary
+//     flat window, which is the acceptance test the contract is written against.
+//   * with an inset, they are not, and the eyes diverge in OPPOSITE directions. That is not a
+//     softening or a blur, it is the unfusable double image the session saw.
+
+namespace {
+    // Where the client's packed frame actually sits inside the surface the compositor crops.
+    // `inset` is the fraction of the surface WASTED ON EACH BAR on the split axis: 0 for a frame
+    // that fills its surface, > 0 for a player that fit-and-centred it.
+    //
+    // Returns the PANE-LOCAL coordinate (0..1 across one eye's picture) the frame carries at
+    // surface coordinate `surfaceCoord`, or NaN inside a bar — where there is no pane coordinate
+    // at all, which is exactly what the eye sees there: black.
+    //
+    // The frame's exact midpoint is deliberately NOT special-cased: it is the seam, the one
+    // coordinate that belongs to both panes at once (it is pane 0's right edge and pane 1's left
+    // edge), so a pane-agnostic sampler cannot name one answer there. The tests scan the interior
+    // and assert the endpoints in rect terms instead.
+    double paneLocalAt(double surfaceCoord, double inset) {
+        const double SPAN = 1.0 - 2.0 * inset;
+        if (SPAN <= 0 || surfaceCoord < inset || surfaceCoord > 1.0 - inset)
+            return std::numeric_limits<double>::quiet_NaN();
+
+        const double FRAME = (surfaceCoord - inset) / SPAN; // 0..1 across the packed frame
+        return FRAME < 0.5 ? FRAME * 2.0 : (FRAME - 0.5) * 2.0;
+    }
+}
+
+TEST(StereoContent, identicalPanesGiveTheTwoEyesIdenticalImages) {
+    // THE contract. Walk the window from edge to edge and ask each eye which pane-local point it is
+    // showing there; with a frame that fills its surface the two answers are the same number, so a
+    // file whose two panes are pixel-identical fuses at screen depth and looks flat and boring.
+    for (int step = 0; step <= 20; ++step) {
+        const double T = step / 20.0; // 0..1 across the window box the crop is stretched over
+
+        const double LEFTU  = paneUVToContentUV({T, 0.5}, CONTENT_SBS, 0).x;
+        const double RIGHTU = paneUVToContentUV({T, 0.5}, CONTENT_SBS, 1).x;
+
+        // in rect terms, and true right out to both edges: the eyes' rects differ by exactly one
+        // pane width, so nothing but the pane index changes between them.
+        EXPECT_NEAR(RIGHTU - LEFTU, 0.5, 1e-12) << "window x " << T;
+
+        // ...and in sampled terms, over the interior (step 0 and step 20 land the two eyes on the
+        // pane seam, which belongs to both panes — see paneLocalAt).
+        if (step > 0 && step < 20)
+            EXPECT_NEAR(paneLocalAt(LEFTU, 0.0), paneLocalAt(RIGHTU, 0.0), 1e-12) << "window x " << T;
+    }
+
+    // over-under is the identical statement on the other axis — and the axis it does NOT split must
+    // come through untouched, or a tab file would be displaced sideways instead.
+    for (int step = 0; step <= 20; ++step) {
+        const double T = step / 20.0;
+
+        const auto   TOP    = paneUVToContentUV({0.5, T}, CONTENT_TAB, 0);
+        const auto   BOTTOM = paneUVToContentUV({0.5, T}, CONTENT_TAB, 1);
+
+        EXPECT_NEAR(BOTTOM.y - TOP.y, 0.5, 1e-12) << "window y " << T;
+        EXPECT_EQ(TOP.x, BOTTOM.x) << "window y " << T;
+
+        if (step > 0 && step < 20)
+            EXPECT_NEAR(paneLocalAt(TOP.y, 0.0), paneLocalAt(BOTTOM.y, 0.0), 1e-12) << "window y " << T;
+    }
+}
+
+TEST(StereoContent, theTwoEyesSampleRectsAreCongruentAndOnePaneApart) {
+    // the rect-space form of the invariant above, for every packed layout: same size, offset by
+    // exactly one pane on exactly one axis. A crop that got the sign, the axis or the width wrong
+    // fails here rather than in a headset.
+    for (const auto& layout : PACKED_LAYOUTS) {
+        const auto     LEFT  = cropForEye(fullRange(), layout, 0);
+        const auto     RIGHT = cropForEye(fullRange(), layout, 1);
+
+        const Vector2D LSPAN = LEFT.br - LEFT.tl;
+        const Vector2D RSPAN = RIGHT.br - RIGHT.tl;
+        EXPECT_EQ(LSPAN, RSPAN) << layoutToString(layout);
+
+        const Vector2D OFFSET = RIGHT.tl - LEFT.tl;
+        EXPECT_EQ(OFFSET, splitsHorizontally(layout) ? Vector2D(0.5, 0.0) : Vector2D(0.0, 0.5)) << layoutToString(layout);
+        EXPECT_EQ(RIGHT.br - LEFT.br, OFFSET) << layoutToString(layout);
+    }
+}
+
+TEST(StereoContent, aFrameThatDoesNotFillItsSurfaceBreaksTheInvariant) {
+    // THE PRECONDITION, and the live artifact of 2026-08-17 in one number.
+    //
+    // The compositor halves the SURFACE, because the surface is all it can see — a player that
+    // letterboxes inside its own pixels is invisible to it. With `inset` of the surface width lost
+    // to a bar on each side, the pane-local point the two eyes show at the same place in the window
+    // differs by a constant 2·inset/(1 − 2·inset) of a pane, and the sign is opposite in the two
+    // eyes: the left eye's picture slides right, the right eye's slides left. Unfusable, which is
+    // what the wearer reported.
+    //
+    // Zero inset is the supported flow (a window at the packed frame's aspect, or fill-mode
+    // playback), and it is the only value at which the divergence vanishes.
+    for (const double INSET : {0.0, 0.05, 0.2}) {
+        const double EXPECTED = 2.0 * INSET / (1.0 - 2.0 * INSET);
+
+        for (int step = 1; step < 20; ++step) {
+            const double T      = step / 20.0;
+            const double LEFTU  = paneUVToContentUV({T, 0.5}, CONTENT_SBS, 0).x;
+            const double RIGHTU = paneUVToContentUV({T, 0.5}, CONTENT_SBS, 1).x;
+
+            const double L = paneLocalAt(LEFTU, INSET);
+            const double R = paneLocalAt(RIGHTU, INSET);
+            if (std::isnan(L) || std::isnan(R))
+                continue; // this part of the window is a bar in one eye — black, and not comparable
+
+            EXPECT_NEAR(R - L, EXPECTED, 1e-9) << "inset " << INSET << " window x " << T;
+        }
+
+        if (INSET == 0.0)
+            EXPECT_DOUBLE_EQ(EXPECTED, 0.0);
+        else
+            EXPECT_GT(EXPECTED, 0.0);
+    }
+}
+
+TEST(StereoContent, aLetterboxOnTheUNSPLITAxisIsHarmless) {
+    // ...and the half of the story that keeps the flat XREAL validation honest. A 2:1 film in a 16:9
+    // window gets bars TOP AND BOTTOM, and a side-by-side crop never touches v — so both eyes get
+    // the same bars in the same place and the picture still fuses (just letterboxed). That is why
+    // the tagged-window flow passed on the XREAL and only failed here: the failing window was WIDER
+    // than its content, so the bars moved onto the axis the crop splits.
+    for (int step = 0; step <= 20; ++step) {
+        const double T = step / 20.0;
+
+        // the crop leaves v alone for sbs/hsbs...
+        EXPECT_EQ(paneUVToContentUV({0.5, T}, CONTENT_SBS, 0).y, paneUVToContentUV({0.5, T}, CONTENT_SBS, 1).y);
+        // ...and u alone for tab/htab, which is the same statement with the axes swapped.
+        EXPECT_EQ(paneUVToContentUV({T, 0.5}, CONTENT_TAB, 0).x, paneUVToContentUV({T, 0.5}, CONTENT_TAB, 1).x);
     }
 }
