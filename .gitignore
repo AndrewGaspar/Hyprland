@@ -13,6 +13,9 @@ hyprland.pc
 _deps
 
 build/
+# Out-of-tree build dirs (build-debug, build-rel, build-asan, ...). These are hundreds of MB of
+# binaries and a stray `git add -A` will happily commit them.
+build-*/
 result*
 /.pre-commit-config.yaml
 /.vscode/

@@ -754,6 +754,11 @@ std::vector<SP<IValue>> Values::getConfigValues() {
                    "runtime does not say which kind it was. Prefer hold plus a keybind on `xrmonitor reseat`, which re-seats only when you ask (doc 03 §8.4)",
                    "hold"),
         MS<String>("openxr:gpu", "DRM render node to use for XR (e.g. /dev/dri/renderD128). Empty = follow Hyprland's primary GPU", ""),
+        MS<Bool>("openxr:ignore_kernel_taint",
+                 "start XR even when the kernel has already taken an oops this boot (/proc/sys/kernel/tainted bit 7, TAINT_DIE). By default XR refuses to start in that state, "
+                 "because bring-up unavoidably initializes every installed GPU vendor driver and entering an already-corrupt one can take the whole machine down. Development "
+                 "escape hatch only — the correct fix is to reboot",
+                 false),
         MS<String>("openxr:runtime_json",
                    "path to the OpenXR runtime manifest (openxr_*.json) the session should use, overriding XR_RUNTIME_JSON / active_runtime.json for THIS compositor's XR "
                    "session. Empty (default) = leave the login environment untouched (loader default / active_runtime.json). Read on the main thread at each session start; set "

@@ -6,9 +6,12 @@
 #include <EGL/eglext.h>
 #include <GLES3/gl32.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <string>
 #include <vector>
 #include <fcntl.h>
 #include <unistd.h>
@@ -24,6 +27,7 @@
 #include "../config/ConfigValue.hpp"
 #include "XRMonitorLayer.hpp"
 #include "XRDmabufImport.hpp"
+#include "XRBoundedCall.hpp" // OpenXR::runBoundedProbe — the throwaway-thread pattern for driver calls
 #include "XRMath.hpp" // OpenXR::xrLumaKeyAlpha / xrLumaKeyPremultiplied (the luma-key reference curve)
 #include <aquamarine/buffer/Buffer.hpp>
 
@@ -74,13 +78,100 @@ CXRGraphics::~CXRGraphics() {
     destroyEGL();
 }
 
-bool CXRGraphics::selectDisplay(const std::string& gpuOverride) {
+// Result of the BOUNDED EGL device scan below. Plain data only — it crosses a thread boundary and
+// may be discarded wholesale if that thread is abandoned, so it owns everything it names (the node
+// paths are copied out of the driver-owned strings on the worker).
+namespace {
+    struct SEglDeviceScan {
+        bool                     entryPoints = false; // the three EXT entry points resolved
+        void*                    getPlatformDisplay = nullptr; // PFNEGLGETPLATFORMDISPLAYEXTPROC, resolved on the worker
+        size_t                   deviceCount = 0;     // how many devices the driver reported
+        std::vector<std::string> nodePaths;           // DRM node per device we actually queried, in order
+        bool                     pinShortCircuit = false; // stopped early because the pin matched
+    };
+}
+
+/*
+ * WHAT A PIN CAN AND CANNOT AVOID — measured on a dual-vendor box (NVIDIA RTX 5070 + AMD 890M,
+ * glvnd with 10_nvidia.json + 50_mesa.json), instrumenting /proc/self/maps and /proc/self/fd:
+ *
+ *   after eglGetProcAddress   libEGL_nvidia LOADED, libnvidia-eglcore LOADED, mesa LOADED
+ *   after eglQueryDevicesEXT(0, nullptr, &n)   -> /dev/nvidiactl, /dev/nvidia0 OPEN (x3)
+ *   after the per-device string queries        -> /dev/dri/renderD128 OPEN
+ *
+ * Read that top line again: the vendor libraries are all loaded by the FIRST eglGetProcAddress, and
+ * the NVIDIA KERNEL DRIVER is contacted by the COUNT-ONLY enumeration call — before a single
+ * EGLDeviceEXT handle exists for us to filter on. libglvnd has to do this: eglQueryDevicesEXT is not
+ * tied to a display, so libEGL must ask every vendor and merge the answers, and eglGetProcAddress
+ * must load every vendor to discover who implements the extension at all.
+ *
+ * THEREFORE: openxr:gpu cannot keep us out of a wedged vendor's driver. There is no EGL API to say
+ * "only this vendor" — the sole lever is the __EGL_VENDOR_LIBRARY_FILENAMES environment variable,
+ * which is deliberately NOT used here (it is session-scoped and would be inherited by every client
+ * app the compositor spawns — a much larger blast radius than the problem).
+ *
+ * What the pin CAN do, and does below, is bound the damage after that point: stop the per-device
+ * string queries as soon as the pinned node is found, so a non-matching vendor is asked for as
+ * little as possible, as late as possible. And what actually protects the user is the other two
+ * guards: the kernel-taint tripwire refuses bring-up BEFORE any of this runs (doc 01), and this
+ * whole scan is bounded on a throwaway thread so a driver that never returns costs XR, not the
+ * desktop.
+ */
+static SEglDeviceScan scanEglDevices(const std::string& targetNode, const std::atomic<bool>& abandon) {
     using PFNEGLGETPLATFORMDISPLAYEXTPROC_t = EGLDisplay (*)(EGLenum, void*, const EGLint*);
     using PFNEGLQUERYDEVICESEXTPROC_t       = EGLBoolean (*)(EGLint, EGLDeviceEXT*, EGLint*);
     using PFNEGLQUERYDEVICESTRINGEXTPROC_t  = const char* (*)(EGLDeviceEXT, EGLint);
-    auto eglGetPlatformDisplayEXT_fn = (PFNEGLGETPLATFORMDISPLAYEXTPROC_t)eglGetProcAddress("eglGetPlatformDisplayEXT");
-    auto eglQueryDevicesEXT_fn       = (PFNEGLQUERYDEVICESEXTPROC_t)eglGetProcAddress("eglQueryDevicesEXT");
-    auto eglQueryDeviceStringEXT_fn  = (PFNEGLQUERYDEVICESTRINGEXTPROC_t)eglGetProcAddress("eglQueryDeviceStringEXT");
+
+    SEglDeviceScan out;
+
+    // This is the call that loads every glvnd vendor. It is the first thing on the worker, and
+    // nothing on the main thread resolves these entry points, so a vendor that hangs here hangs
+    // only this abandonable thread.
+    auto getPlatformDisplay = (PFNEGLGETPLATFORMDISPLAYEXTPROC_t)eglGetProcAddress("eglGetPlatformDisplayEXT");
+    auto queryDevices       = (PFNEGLQUERYDEVICESEXTPROC_t)eglGetProcAddress("eglQueryDevicesEXT");
+    auto queryDeviceString  = (PFNEGLQUERYDEVICESTRINGEXTPROC_t)eglGetProcAddress("eglQueryDeviceStringEXT");
+    if (!getPlatformDisplay || !queryDevices || !queryDeviceString)
+        return out;
+
+    out.entryPoints        = true;
+    out.getPlatformDisplay = (void*)getPlatformDisplay;
+    if (abandon.load(std::memory_order_acquire))
+        return out;
+
+    EGLint numDevs = 0;
+    queryDevices(0, nullptr, &numDevs); // contacts every vendor's kernel driver — see above
+    if (numDevs <= 0 || abandon.load(std::memory_order_acquire))
+        return out;
+
+    std::vector<EGLDeviceEXT> devs(numDevs);
+    queryDevices(numDevs, devs.data(), &numDevs);
+    out.deviceCount = (size_t)std::max(0, numDevs);
+    devs.resize(out.deviceCount);
+
+    for (auto dev : devs) {
+        if (abandon.load(std::memory_order_acquire))
+            return out;
+
+        // Prefer the render-node path, fall back to the primary/card path. No eglGetError() dance:
+        // the EGL error latch is PER-THREAD and this thread is thrown away, so a failed query
+        // cannot leave anything behind for the main thread's EGL bookkeeping to trip over.
+        const char* path = queryDeviceString(dev, EGL_DRM_RENDER_NODE_FILE_EXT);
+        if (!path)
+            path = queryDeviceString(dev, EGL_DRM_DEVICE_FILE_EXT);
+        out.nodePaths.emplace_back(path ? path : "");
+
+        // Pin-aware: the caller wants exactly this node, so stop touching further devices.
+        if (path && !targetNode.empty() && targetNode == path) {
+            out.pinShortCircuit = true;
+            break;
+        }
+    }
+
+    return out;
+}
+
+bool CXRGraphics::selectDisplay(const std::string& gpuOverride) {
+    using PFNEGLGETPLATFORMDISPLAYEXTPROC_t = EGLDisplay (*)(EGLenum, void*, const EGLint*);
 
     // Determine the DRM render-node path we want to open an EGL display on.
     //
@@ -104,20 +195,30 @@ bool CXRGraphics::selectDisplay(const std::string& gpuOverride) {
     else
         Log::logger->log(Log::DEBUG, "[OPENXR] target XR render node: {}{}", targetNode, overridden ? " (openxr:gpu override)" : " (Hyprland primary)");
 
-    if (eglGetPlatformDisplayEXT_fn && eglQueryDevicesEXT_fn && eglQueryDeviceStringEXT_fn) {
-        EGLint numDevs = 0;
-        eglQueryDevicesEXT_fn(0, nullptr, &numDevs);
-        std::vector<EGLDeviceEXT> devs(numDevs);
-        eglQueryDevicesEXT_fn(numDevs, devs.data(), &numDevs);
-        Log::logger->log(Log::DEBUG, "[OPENXR] found {} EGL devices", numDevs);
+    // BOUNDED. Enumeration enters every installed GPU vendor driver (see scanEglDevices), and a
+    // wedged one blocks forever — on the main thread that is a frozen desktop, not a failed XR
+    // start. A timeout is treated exactly like an enumeration failure: refuse cleanly, let the
+    // re-probe try again later.
+    const auto scanned = OpenXR::runBoundedProbe([&targetNode](const std::atomic<bool>& abandon) { return scanEglDevices(targetNode, abandon); });
+    if (!scanned.has_value()) {
+        Log::logger->log(Log::ERR,
+                         "[OPENXR] EGL device enumeration did not complete within {}ms — a GPU driver is not responding. Refusing to start XR (the desktop is unaffected; "
+                         "the enumeration thread is abandoned). If the kernel has oopsed this boot, reboot.",
+                         OpenXR::XR_PROBE_TIMEOUT_MS);
+        return false;
+    }
+    const auto& scan = *scanned;
 
-        for (auto dev : devs) {
-            // Prefer the render-node path, fall back to the primary/card path.
-            const char* path = eglQueryDeviceStringEXT_fn(dev, EGL_DRM_RENDER_NODE_FILE_EXT);
-            if (!path)
-                path = eglQueryDeviceStringEXT_fn(dev, EGL_DRM_DEVICE_FILE_EXT);
-            if (!path)
+    if (scan.entryPoints && scan.deviceCount > 0) {
+        Log::logger->log(Log::DEBUG, "[OPENXR] found {} EGL devices; queried {}{}", scan.deviceCount, scan.nodePaths.size(),
+                         scan.pinShortCircuit ? " (stopped at the pinned node)" : "");
+
+        auto eglGetPlatformDisplayEXT_fn = (PFNEGLGETPLATFORMDISPLAYEXTPROC_t)scan.getPlatformDisplay;
+
+        for (const auto& node : scan.nodePaths) {
+            if (node.empty())
                 continue;
+            const char* path = node.c_str();
 
             // If we have a target node, only accept the device that matches it.
             if (!targetNode.empty() && targetNode != path)

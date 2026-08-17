@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <optional>
 #include <expected>
 #include <vector>
@@ -109,6 +110,60 @@ namespace OpenXR {
     // was the NVIDIA all-black root cause. No OpenXR/aquamarine types so hyprland_gtests can exercise
     // it without a runtime.
     bool shouldForceLinear(eForceLinearMode mode, bool gpusKnown, bool sameGpu);
+
+    // ---- Kernel-taint tripwire (doc 01, "Sick-driver refusal") -------------------------------
+    // The forensic case (hard reboot #6): an NVIDIA driver use-after-free cascaded through the
+    // kernel, which printed "Fixing recursive fault but reboot is needed!" 29 minutes before the
+    // machine died. The compositor was a bystander — but XR bring-up would have walked straight
+    // into that already-corrupt GPU driver seconds later, because it CANNOT avoid it: libglvnd's
+    // very first eglGetProcAddress loads every installed vendor library, and the count-only
+    // eglQueryDevicesEXT then opens /dev/nvidiactl + /dev/nvidia0 before a single device handle
+    // exists to filter on (measured; see doc 01). No pin, no ordering and no lazy query can dodge
+    // a wedged vendor driver once we start enumerating. The only move that actually protects the
+    // user is to not start at all — which is what this tripwire does.
+    //
+    // The signal is /proc/sys/kernel/tainted bit 7, TAINT_DIE ('D'): "kernel has oopsed before".
+    // It is set for the whole boot and is never cleared, which is exactly the semantics wanted —
+    // once any kernel oops has happened, no amount of waiting makes the driver trustworthy again.
+    // Deliberately NARROW: the everyday taint bits (proprietary/out-of-tree/unsigned modules —
+    // 12288 on a stock NVIDIA box) say nothing about driver health and must never block XR.
+    inline constexpr uint32_t XR_TAINT_DIE_BIT  = 7;
+    inline constexpr uint64_t XR_TAINT_DIE_MASK = 1ull << XR_TAINT_DIE_BIT; // 128
+
+    // Where the kernel publishes it. A constant so tests can name it without hardcoding a path.
+    inline constexpr const char* XR_TAINT_PROC_PATH = "/proc/sys/kernel/tainted";
+
+    struct SKernelTaintVerdict {
+        bool        oopsed  = false; // TAINT_DIE is set — the kernel has taken an oops this boot
+        bool        blocked = false; // refuse bring-up (oopsed AND the escape hatch is off)
+        std::string reason;          // the message for the log AND the `blocked:` status line
+        bool        operator==(const SKernelTaintVerdict&) const = default;
+    };
+
+    // Parse the contents of /proc/sys/kernel/tainted: a single unsigned decimal, usually with a
+    // trailing newline. std::nullopt when it does not parse (or the file was unreadable, which the
+    // caller signals by passing an empty string). Pure, so the truth table is unit-testable
+    // (tests/xr/kernel_taint.cpp) without a tainted kernel, matching resolveRuntimeJsonEnv's split.
+    std::optional<uint64_t> parseKernelTaint(std::string_view contents);
+
+    // Read + parse in one go. Lives here rather than in the (HAVE_OPENXR-guarded) manager purely so
+    // the tests can exercise the SAME read the manager performs — against the real /proc file and
+    // against temp files — instead of a copy of it that is free to drift. A read that silently
+    // returned nullopt would disable the tripwire forever without a single symptom, which is
+    // exactly the kind of bug that has to be covered rather than eyeballed. Never throws; any I/O
+    // failure is nullopt (fail open, see evaluateKernelTaint).
+    std::optional<uint64_t> readKernelTaint(const std::string& path = XR_TAINT_PROC_PATH);
+
+    // Decide whether XR bring-up may proceed. `taint` is parseKernelTaint's result; `ignore` is
+    // openxr:ignore_kernel_taint.
+    //   nullopt (unreadable/unparsable) => FAIL OPEN. A missing /proc entry (container, exotic
+    //     kernel) must never cost the user their XR session — the tripwire is a safety net over a
+    //     rare event, not a precondition we can prove.
+    //   TAINT_DIE clear                 => proceed silently.
+    //   TAINT_DIE set, ignore=false     => BLOCKED, with the reason string below.
+    //   TAINT_DIE set, ignore=true      => proceed, oopsed=true and a reason saying it was
+    //     overridden, so the caller can still WARN rather than going quiet.
+    SKernelTaintVerdict evaluateKernelTaint(std::optional<uint64_t> taint, bool ignore);
 
     // openxr:runtime_json plumbing (WP-XR1). The compositor may override which OpenXR runtime the
     // session handshakes against by pointing the loader at a specific manifest — the loader ONLY reads

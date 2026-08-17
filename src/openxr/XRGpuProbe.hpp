@@ -27,7 +27,8 @@ namespace OpenXR {
         std::string probe;      // which query answered, for the log/status line
     };
 
-    // ASK THIS ONE. The compositor's own device, asked as an EGL question:
+    // ASK THIS ONE (on a bounded throwaway thread — see the note on the declaration). The
+    // compositor's own device, asked as an EGL question:
     // XR_MND_query_egl_device's xrGetSystemEGLDeviceMND returns the EGLDeviceEXT an EGL client is
     // meant to build its context on, which is by construction the device the runtime's compositor
     // renders on — a GL/EGL client wraps the native compositor and imports its swapchain images by
@@ -37,10 +38,15 @@ namespace OpenXR {
     // (WiVRn's cross-GPU `client-gpu` mode: game on the dGPU, composite+encode on the iGPU).
     //
     // The instance must have been created with XR_MND_query_egl_device enabled (the entry point is
-    // otherwise XR_ERROR_FUNCTION_UNSUPPORTED). Safe on the main thread: the runtime answers it
-    // in-process from data it already has (it enumerates EGL devices through the getProcAddress we
-    // hand it and matches by UUID) — no IPC round-trip, no Vulkan, nothing that can deadlock.
-    SRuntimeGpu probeRuntimeEglDevice(XrInstance instance, XrSystemId systemId);
+    // otherwise XR_ERROR_FUNCTION_UNSUPPORTED). The runtime answers it in-process — no IPC
+    // round-trip, no Vulkan — but it does so by calling back through the getProcAddress WE hand it
+    // to enumerate OUR EGL devices, which means it inherits the full glvnd exposure: every vendor
+    // library, every vendor's kernel driver (see the measurements in XRGraphics.cpp). A wedged
+    // driver therefore hangs this call too, so like the Vulkan probe below it MUST run on a
+    // throwaway thread the caller abandons on a timeout, NEVER on the compositor main thread.
+    // `abandon` is polled before each XrInstance/EGL call so a late unblock cannot touch a
+    // torn-down instance; pass nullptr only if you can guarantee the instance outlives the call.
+    SRuntimeGpu probeRuntimeEglDevice(XrInstance instance, XrSystemId systemId, const std::atomic<bool>* abandon);
 
     // FALLBACK ONLY. xrGetVulkanGraphicsDevice2KHR — "which GPU should a VULKAN APPLICATION
     // render on". On a stock single-GPU runtime that is also the compositor's GPU, which is why

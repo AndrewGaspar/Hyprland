@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cmath>
 #include <format>
+#include <fstream>
 #include <sstream>
 #include <vector>
 
@@ -566,6 +567,68 @@ bool OpenXR::shouldForceLinear(eForceLinearMode mode, bool gpusKnown, bool sameG
                 return false;
             return !sameGpu;
     }
+}
+
+std::optional<uint64_t> OpenXR::parseKernelTaint(std::string_view contents) {
+    // Trim ASCII whitespace both ends — the file is "<decimal>\n", but be liberal.
+    const auto isWs = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'; };
+    while (!contents.empty() && isWs(contents.front()))
+        contents.remove_prefix(1);
+    while (!contents.empty() && isWs(contents.back()))
+        contents.remove_suffix(1);
+    if (contents.empty())
+        return std::nullopt;
+
+    // Strictly unsigned decimal, and the WHOLE remaining token must be consumed: a value we do not
+    // fully understand is treated as unreadable (fail open) rather than silently masked, so a
+    // future kernel format change can never invent a TAINT_DIE bit that is not there.
+    uint64_t   value = 0;
+    const auto res   = std::from_chars(contents.data(), contents.data() + contents.size(), value, 10);
+    if (res.ec != std::errc{} || res.ptr != contents.data() + contents.size())
+        return std::nullopt;
+    return value;
+}
+
+std::optional<uint64_t> OpenXR::readKernelTaint(const std::string& path) {
+    // procfs entries are generated on read and report st_size 0, so read the first LINE rather than
+    // sizing the file. Text mode, one getline: the content is "<decimal>\n" and nothing else.
+    std::ifstream f(path);
+    if (!f.is_open())
+        return std::nullopt;
+    std::string line;
+    if (!std::getline(f, line))
+        return std::nullopt;
+    return parseKernelTaint(line);
+}
+
+OpenXR::SKernelTaintVerdict OpenXR::evaluateKernelTaint(std::optional<uint64_t> taint, bool ignore) {
+    // Fail OPEN when we could not read/parse it — see the header. A tripwire that turns an
+    // unreadable proc file into "no XR for you" would be a worse bug than the one it guards.
+    if (!taint.has_value())
+        return {};
+
+    if ((*taint & XR_TAINT_DIE_MASK) == 0)
+        return {};
+
+    SKernelTaintVerdict out;
+    out.oopsed = true;
+
+    // One sentence of WHAT, one of WHY IT MATTERS HERE, one of WHAT TO DO. This exact string is
+    // both the ERR log line and the `blocked:` line in `hyprctl openxr status`, so it has to stand
+    // alone without the surrounding log context.
+    out.reason = std::format("the kernel has taken an oops this boot (/proc/sys/kernel/tainted = {}, TAINT_DIE set); XR bring-up would enter a possibly-corrupt GPU driver "
+                             "— reboot before using XR",
+                             *taint);
+
+    if (ignore) {
+        out.blocked = false;
+        out.reason += " [proceeding anyway: openxr:ignore_kernel_taint = 1]";
+        return out;
+    }
+
+    out.blocked = true;
+    out.reason += " (set openxr:ignore_kernel_taint = 1 to override)";
+    return out;
 }
 
 OpenXR::SRuntimeJsonEnvAction OpenXR::resolveRuntimeJsonEnv(const std::string& configValue, bool originalPresent, const std::string& originalValue, bool currentPresent,
