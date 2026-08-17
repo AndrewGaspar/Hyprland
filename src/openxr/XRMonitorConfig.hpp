@@ -65,6 +65,23 @@ namespace OpenXR {
     // unrecognized (including empty) -> VISIBLE (the default). Case/whitespace-insensitive. Pure.
     eXRMonitorFollowMode parseMonitorFollowMode(const std::string& v);
 
+    // openxr:recenter — what the HEADSET's own recenter button means for the monitor group
+    // (doc 03 §8.4). The ladder in §8.1 exists to hold monitors still in the room across a
+    // reference-space change, which is right for an involuntary one (a re-don, a guardian
+    // re-derive) and wrong for the deliberate press of a user who wants the room brought to them.
+    // This is that choice, and it is a choice: `follow` cannot distinguish a deliberate recenter
+    // from an involuntary one, because the runtime does not tell us which it was.
+    enum eXRRecenterPolicy : uint8_t {
+        XR_RECENTER_HOLD = 0, // the shipped behavior: re-express anchors, monitors stay in the room
+        XR_RECENTER_FOLLOW,   // a reference-space change ALSO re-seats the group to the current head
+    };
+
+    // "hold" (or anything unrecognized, including empty) -> HOLD; "follow"/"reseat"/"me" -> FOLLOW.
+    // Case/whitespace-insensitive. Pure.
+    eXRRecenterPolicy parseRecenterPolicy(const std::string& v);
+    // The canonical spelling, for `hyprctl openxr status`.
+    const char*       recenterPolicyName(eXRRecenterPolicy p);
+
     // Cross-GPU linear-buffer policy (research/17 addendum). When the XR EGL context lives on a
     // DIFFERENT physical GPU than the one the compositor allocates the headless output's buffers on
     // (hybrid: desktop on the AMD iGPU, WiVRn/runtime on the NVIDIA dGPU via openxr:gpu), the XR

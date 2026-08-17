@@ -747,6 +747,12 @@ std::vector<SP<IValue>> Values::getConfigValues() {
                  "arbitrary, under boundaryless/standby) LOCAL_FLOOR origin — the monitors appear in front of you at their configured height/distance. Multi-monitor layouts "
                  "are recentered rigidly (relative arrangement preserved). A brief doff-and-don within the same session does NOT re-seat (report-20)",
                  true),
+        MS<String>("openxr:recenter",
+                   "what the HEADSET's own recenter button does to your monitors: hold (default) = the monitors stay where they are IN THE ROOM, so recentering only moves the "
+                   "runtime's origin; follow = a runtime reference-space change ALSO re-seats the anchor:local group rigidly to your current head, i.e. the recenter button "
+                   "becomes 'bring my monitors to me'. Under follow, INVOLUNTARY reference-space changes (putting the headset back on, a guardian re-derive) re-seat too — the "
+                   "runtime does not say which kind it was. Prefer hold plus a keybind on `xrmonitor reseat`, which re-seats only when you ask (doc 03 §8.4)",
+                   "hold"),
         MS<String>("openxr:gpu", "DRM render node to use for XR (e.g. /dev/dri/renderD128). Empty = follow Hyprland's primary GPU", ""),
         MS<String>("openxr:runtime_json",
                    "path to the OpenXR runtime manifest (openxr_*.json) the session should use, overriding XR_RUNTIME_JSON / active_runtime.json for THIS compositor's XR "

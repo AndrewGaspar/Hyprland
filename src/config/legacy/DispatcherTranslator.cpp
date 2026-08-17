@@ -842,6 +842,15 @@ static SDispatchResult xrmonitorDispatch(const std::string& args) {
         return wrapExp(g_pOpenXRManager->cmdDistance(rest));
     if (verb == "center")
         return wrapExp(g_pOpenXRManager->cmdCenter());
+    // doc 03 §8.4: "bring my monitors to me" — rigidly re-seat the whole anchor:local group around
+    // the current head. cmdReseat returns a message rather than void (the hyprctl transport prints
+    // it); a dispatcher has nowhere to put a success string, so it is logged there and dropped here.
+    if (verb == "reseat") {
+        auto r = g_pOpenXRManager->cmdReseat();
+        if (r)
+            return {};
+        return {.success = false, .error = r.error()};
+    }
     // hypxrvoice GAP 2: drop a named monitor at a resolved LOCAL_FLOOR point (facing the headset).
     if (verb == "place")
         return wrapExp(g_pOpenXRManager->cmdPlace(rest));

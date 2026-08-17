@@ -342,6 +342,26 @@ OpenXR::eXRMonitorFollowMode OpenXR::parseMonitorFollowMode(const std::string& v
     return XR_FOLLOW_VISIBLE; // default (report-18 addendum: doffed/standby headset reads as unplugged)
 }
 
+OpenXR::eXRRecenterPolicy OpenXR::parseRecenterPolicy(const std::string& v) {
+    // Same normalization as parseMonitorFollowMode: lower-case, strip whitespace.
+    std::string s;
+    s.reserve(v.size());
+    for (const unsigned char c : v)
+        if (!std::isspace(c))
+            s += (char)std::tolower(c);
+
+    // Deliberately NO boolean spellings: there is no "recenter on/off" to be compatible with, and
+    // reading a stray `1` as "follow" would silently hand someone the mode this option exists to
+    // make them opt into. Anything unrecognized keeps today's behavior.
+    if (s == "follow" || s == "reseat" || s == "me")
+        return XR_RECENTER_FOLLOW;
+    return XR_RECENTER_HOLD;
+}
+
+const char* OpenXR::recenterPolicyName(eXRRecenterPolicy p) {
+    return p == XR_RECENTER_FOLLOW ? "follow" : "hold";
+}
+
 bool OpenXR::wantXRMonitorsPlugged(eXRMonitorFollowMode mode, bool sessionUp, bool sessionVisible, bool presenceSupported, bool presenceKnown, bool userPresent) {
     // research/18 + report-18/19/20 addenda: instantaneous plugged predicate. See the header for the
     // full contract. OFF keeps XR monitors always plugged (pre-feature); SESSION plugs while a session
