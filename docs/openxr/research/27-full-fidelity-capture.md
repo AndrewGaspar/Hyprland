@@ -151,6 +151,22 @@ Output-framing menu enabled by the pose record: wearer's view (as-lived), *stabi
 view (low-pass the head track — the single biggest watchability win for filmed VR), fixed tripod,
 or orbit. None of these are capture-time decisions.
 
+### 5.1 Stereo output is native to this design
+
+Unlike the on-device tier — where stereo hangs on Meta's undocumented `screenCaptureEye` sysprop —
+every source here is inherently per-eye: S1 records *both* passthrough cameras, S2 records *both*
+composited eye buffers (or re-renders both views from telemetry). Stereo output is therefore just
+the compositor rendering twice, into SBS (immediately shareable, plays on the Quest itself) or
+MV-HEVC (spatial-video containers) at mux time. The take does not decide; the compose does — the
+same bundle yields the mono social cut and the stereo headset cut.
+
+One honest caveat: the passthrough cameras sit near, but not at, the wearer's eyes. Using each
+camera directly as its output eye (v1, exactly what Meta's own capture does) carries a small
+scale/parallax error that Meta's live passthrough corrects with depth-assisted reprojection. v1
+accepts it — it is the artifact every Quest recording already has; the v2 path (coarse depth from
+the stereo camera pair, reproject to true eye positions) is the same machinery rolling-shutter
+correction wants, and both live in the compositor, upgradeable against old takes.
+
 ## 6. Phasing (held — no implementation yet)
 
 - **Phase 1 — host taps (S2 Grade A + S3 + telemetry).** No APK change, no protocol change, no
