@@ -377,18 +377,24 @@ TEST_CASE(xr_anchor_restore_across_session) {
     // Recycle the session: new session, new first plug, new re-seat.
     ASSERT(getFromSocket("/openxr disable"), std::string("ok"));
     ASSERT(XR::waitForXrState("disabled", std::chrono::milliseconds(10000)), true);
-    remote->pulse();
-    ASSERT(getFromSocket("/openxr enable"), std::string("ok"));
-    ASSERT(XR::waitForXrState("focused", std::chrono::milliseconds(15000)) || XR::waitForXrState("visible", std::chrono::milliseconds(2000)), true);
 
-    // Come back somewhere ELSE, facing another way — 5 m and 85 deg from where the session died.
-    // Leaving the head put would let this test pass without the re-seat ever firing (the anchor would
-    // simply still hold its old coordinates, which in this container are also the right ones). Moving
-    // the user makes the two outcomes numerically distinct, and asserts the actual promise: the
-    // constellation follows you to wherever you are when you come back.
+    // Come back somewhere ELSE, facing another way — 5 m and 85 deg from where the session died —
+    // and move there WHILE THE SESSION IS DOWN, the way a person actually does it. Two reasons this
+    // has to happen before the enable: it is the realistic sequence, and the re-seat fires on the
+    // first plug of the new session, which lands the moment that session becomes visible. Moving the
+    // head afterwards would measure a LOCAL anchor that has already been correctly seated to the old
+    // spot — indistinguishable from a compositor that had quietly stopped re-seating anything.
     constexpr float NEW_YAW = -60.f * (float)M_PI / 180.f;
     const xrt_vec3  newHead{0.5f, 0.f, -2.f};
-    remote->setHeadPose(newHead, xrt_quat{0.f, std::sin(NEW_YAW / 2.f), 0.f, std::cos(NEW_YAW / 2.f)});
+    const xrt_quat  newRot{0.f, std::sin(NEW_YAW / 2.f), 0.f, std::cos(NEW_YAW / 2.f)};
+    remote->setHeadPose(newHead, newRot);
+    remote->pulse();
+
+    ASSERT(getFromSocket("/openxr enable"), std::string("ok"));
+    ASSERT(XR::waitForXrState("focused", std::chrono::milliseconds(15000)) || XR::waitForXrState("visible", std::chrono::milliseconds(2000)), true);
+    // Hold the user there and give the frame thread time to consume the armed re-seat on a valid-view
+    // frame (it holds the arming until one arrives, so this is a budget, not a race).
+    remote->setHeadPose(newHead, newRot);
     remote->pulse();
     std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
