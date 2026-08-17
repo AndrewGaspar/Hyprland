@@ -1214,6 +1214,15 @@ std::string CConfigManager::parseKeyword(const std::string& COMMAND, const std::
     if ((COMMAND == "openxr:hand_grab" || COMMAND == "openxr:hand_grab_anywhere" || COMMAND == "openxr:grab_filter_scope") && g_pOpenXRManager)
         g_pOpenXRManager->onConfigReload();
 
+    // openxr:recenter (doc 03 §8.4) is a STRING policy parsed to an atomic enum on the main thread in
+    // onConfigReload()->publishRecenterPolicy(); the frame thread reads the atomic to decide whether a
+    // reference-space change is worth handing to main at all. Same legacy-keyword gap as the vars
+    // above — and it is the point of the option that "make the recenter button bring my monitors to
+    // me" can be flipped from a keybind, without a reload, from inside the headset. The exact compare
+    // deliberately does NOT match openxr:recenter_on_plug, which is a plain Bool nobody publishes.
+    if (COMMAND == "openxr:recenter" && g_pOpenXRManager)
+        g_pOpenXRManager->onConfigReload();
+
     // openxr:black_alpha / :black_alpha_knee (report 09 luma key) are numeric, but their EFFECTIVE
     // values are resolved on the main thread (clamp + blend-mode gate) in
     // onConfigReload()->publishBlackAlphaTuning(), which also damages the XR monitors so a static

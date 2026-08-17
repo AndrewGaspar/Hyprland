@@ -261,6 +261,49 @@ namespace OpenXR {
         return (mode == XR_ANCHOR_LOCAL && restoreValid) ? XR_RESEAT_RESTORED : XR_RESEAT_DECLARED;
     }
 
+    // ---- the deliberate re-seat (doc 03 §8.4) ----
+    //
+    // WHICH monitors a re-seat moves — the one definition every re-seat path shares (the first plug
+    // of a session, the §8.1 doff fallback, and the on-demand `xrmonitor reseat`). `LOCAL` is the
+    // only mode whose pose is named against the runtime's origin and therefore the only one a
+    // re-seat has anything to say about; head/body/device offsets already ride the user, and a
+    // layer mid-removal-barrier belongs to that path, not to this one.
+    inline constexpr bool xrReseatEligible(eXRAnchorMode mode, bool pendingRemoval) {
+        return !pendingRemoval && mode == XR_ANCHOR_LOCAL;
+    }
+
+    // Why a requested re-seat did (not) happen. The re-seat itself runs on the frame thread — it
+    // needs the head pose, which only that thread locates — so a request is an ARMING, and the
+    // caller's answer to the user has to be decided from what the main thread can see: whether a
+    // session exists, whether the newest published head sample is a real tracked one, and whether
+    // there is anything eligible to move. Pure, so it is gtested rather than inferred from a live
+    // headset (tests/xr/anchor_math.cpp).
+    enum eXRReseatBlock : uint8_t {
+        XR_RESEAT_READY = 0,   // arm it: a live session, a fresh head sample, at least one local monitor
+        XR_RESEAT_NO_SESSION,  // no OpenXR session at all — nothing to re-seat against
+        XR_RESEAT_NO_HEAD,     // no head sample, or the newest one is untracked/stale
+        XR_RESEAT_NO_MONITORS, // session + head fine, but no anchor:local monitor is eligible
+    };
+
+    // How old the newest published head sample may be and still describe where the user IS. A frame
+    // is ~11 ms at 90 Hz; a second means the frame loop has stalled or tracking has been gone long
+    // enough that "the current head" is a guess, and a deliberate "bring my monitors to me" must
+    // refuse rather than fling the group at a stale pose.
+    inline constexpr int64_t XR_RESEAT_HEAD_MAX_AGE_MS = 1000;
+
+    inline constexpr eXRReseatBlock xrReseatBlock(bool sessionUp, bool haveHeadSample, bool headValid, int64_t headAgeMs, int eligibleCount,
+                                                  int64_t maxAgeMs = XR_RESEAT_HEAD_MAX_AGE_MS) {
+        if (!sessionUp)
+            return XR_RESEAT_NO_SESSION;
+        // A negative age is a sample stamped in the future — the same "this clock reading proves
+        // nothing" case xrRecenterFix rejects, treated identically here rather than trusted.
+        if (!haveHeadSample || !headValid || headAgeMs < 0 || headAgeMs > maxAgeMs)
+            return XR_RESEAT_NO_HEAD;
+        if (eligibleCount <= 0)
+            return XR_RESEAT_NO_MONITORS;
+        return XR_RESEAT_READY;
+    }
+
     // ---- solve API (doc 03 §2.3) ----
     struct SXRAnchorTuning {
         float leashResponse    = 0.35F;   // openxr:leash_response          (s)
