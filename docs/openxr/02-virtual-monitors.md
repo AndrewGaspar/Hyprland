@@ -312,6 +312,14 @@ so a multi-monitor layout is transformed **rigidly** (relative arrangement prese
 A brief doff-and-don within the same session does **not** re-seat — the head-relative
 pose from the first don is kept.
 
+*Which* offset each monitor is re-seated from is doc 03 §8.3. A config-declared rig
+re-seats to itself; anything the user actually placed — an `openxr create` monitor, or a
+declared one they grab-moved — re-seats to the head-relative offset captured while they
+were last wearing the headset, so a session restart brings the room back the way they
+left it instead of replaying coordinates from a reference space that no longer exists.
+Those offsets live on the layer and therefore survive the XR session, but not a
+compositor restart.
+
 ## Declared vs runtime monitors
 
 Monitors declared with the `xrmonitor=` config keyword are tagged `m_declaredByConfig`

@@ -302,6 +302,28 @@ namespace OpenXR {
         return m.pos.length() <= posEpsM && qAngleBetween(m.rot, Quat{}) <= rotEpsRad;
     }
 
+    // ---- the wearer's frame (doc 03 §8.2, §8.3) ----
+    //
+    // The yaw-only frame standing on the floor under a head pose. Everything that re-seats a monitor
+    // group "to the user" composes into THIS frame: building it at y = 0 keeps a pose's y a
+    // floor-relative height, and taking yaw only keeps the group level however the head is tilted.
+    inline SXRPose xrHeadFrame(const SXRPose& head) {
+        return SXRPose{Vec3{head.pos.x, 0.F, head.pos.z}, qFromYaw(qYawOf(head.rot, 0.F))};
+    }
+
+    // A world (LOCAL_FLOOR) pose re-expressed in that frame — the exact inverse of the composition
+    // recenterLocalToHead performs, so the two round-trip to the float.
+    //
+    // This is the DURABLE form of a monitor's placement. A LOCAL anchor pose names a point relative
+    // to the runtime's origin, and that origin does not outlive the session (nor even survive a
+    // mid-session recenter, §8.1); the same placement named relative to the WEARER means the same
+    // thing in any reference space, because the wearer is the same person in all of them. Capturing
+    // it while the user is actually wearing the headset is what lets a NEW session put the room back
+    // the way they left it rather than replay coordinates from a frame that no longer exists.
+    inline SXRPose xrPoseInHeadFrame(const SXRPose& head, const SXRPose& world) {
+        return poseCompose(poseInverse(xrHeadFrame(head)), world);
+    }
+
     // hypxrvoice GAP 2: the LOCAL_FLOOR quad pose for `place <name> at x,y,z`. The quad center sits at
     // `point`; orientation faces the head (yaw+pitch toward `headPos`, no roll). When head tracking is
     // invalid, or the head is directly above/below `point` (degenerate lookAt), it keeps `fallbackRot`

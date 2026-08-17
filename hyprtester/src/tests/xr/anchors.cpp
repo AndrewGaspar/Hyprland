@@ -259,4 +259,129 @@ TEST_CASE(xr_anchor_transitions) {
     NLog::green("xr_anchor_transitions: mode transitions + verbs (move/rotate/scale/distance/center) verified");
 }
 
+// xr_anchor_restore_across_session — doc 03 §8.3, the cross-session monitor lottery.
+//
+// An AD-HOC monitor (`openxr create` with no anchor spec) has no head-relative declaration: the
+// pose stored as its "declared" anchor is the LOCAL_FLOOR pose `applyCenter` derived from wherever
+// the head stood at creation. The first plug of a NEW session re-seats anchor:local monitors into
+// the wearer's frame — and re-seating from THAT composes a dead frame's coordinates into the head
+// frame, throwing the monitor as far as the head was from the origin. Live report 2026-08-16:
+// monitors "spun way off, outside my house", from a session whose origin sat ~7 m from the user.
+//
+// `openxr disable` + `openxr enable` is a genuine session recycle (same vehicle
+// xr_plugged_follow_session uses), and the remote driver lets us stand the head well away from the
+// origin so the stale-coordinate composition has something to go wrong with. Pre-fix, the monitor
+// lands metres from where it was left; post-fix it comes back where the user put it.
+TEST_CASE(xr_anchor_restore_across_session) {
+    XR_SKIP_IF_UNAVAILABLE();
+
+    const std::string mon = XR::monitorName(17);
+
+    struct SRestoreGuard {
+        const bool& failed;
+        std::string testName;
+        std::string monitorName;
+        ~SRestoreGuard() {
+            // Always leave a running session, an identity head and the shipped recenter default for
+            // whatever runs next in this shared instance.
+            getFromSocket("/openxr enable");
+            XR::waitForXrState("focused", std::chrono::milliseconds(15000));
+            if (!monitorName.empty())
+                getFromSocket("/openxr destroy " + monitorName);
+            getFromSocket("/keyword openxr:recenter_on_plug 1");
+            if (XR::g_ctx.remote) {
+                using namespace MonadoWire;
+                XR::g_ctx.remote->setHeadPose(xrt_vec3{0.f, 0.f, 0.f}, xrt_quat{0.f, 0.f, 0.f, 1.f});
+                XR::g_ctx.remote->setControllerActive(CRemoteClient::SIDE_LEFT, false);
+                XR::g_ctx.remote->pulse();
+            }
+            if (failed)
+                XR::dumpXrArtifacts(testName);
+        }
+    };
+    SRestoreGuard guard{this->failed, name(), ""};
+
+    if (!gateUp()) {
+        XR::logSkip(name(), "session never reached focused/visible (known env instability)");
+        return;
+    }
+
+    using namespace MonadoWire;
+    auto* remote = XR::g_ctx.remote;
+    if (!remote) {
+        XR::logSkip(name(), "no remote client available");
+        return;
+    }
+
+    ASSERT(getFromSocket("/keyword openxr:recenter_on_plug 1"), std::string("ok"));
+
+    // Stand the user 5 m from the runtime's origin, facing 25 deg off it — the geometry that makes a
+    // stale LOCAL pose dangerous. yaw 25 deg about +Y.
+    remote->setHeadPose(xrt_vec3{3.f, 0.f, 4.f}, xrt_quat{0.f, 0.2164f, 0.f, 0.9763f});
+    remote->setControllerActive(CRemoteClient::SIDE_LEFT, false);
+    remote->pulse();
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    // No anchor spec => the ad-hoc path (applyCenter from the live head), which is the case that
+    // used to carry raw world coordinates into the next session.
+    ASSERT(getFromSocket("/openxr create " + mon + " 1280x720 size:1.0"), std::string("ok"));
+    guard.monitorName = mon;
+    ASSERT(XR::waitForJson(
+               "j/openxr", [&](const std::string& r) { return r.contains("\"name\": \"" + mon + "\""); }, std::chrono::milliseconds(10000)),
+           true);
+    ASSERT(getFromSocket("/openxr select " + mon), std::string("ok"));
+
+    // It really was placed out where the user is standing, not near the origin — otherwise the stale
+    // composition below would be harmless and this test would prove nothing.
+    std::vector<float> placed;
+    {
+        const std::string st = getFromSocket("j/openxr");
+        const auto        p  = XR::findAfter(st, "\"name\": \"" + mon + "\"");
+        ASSERT_NOT(p, std::string::npos);
+        placed = posOf(st, p);
+        ASSERT(placed.size(), (size_t)3);
+        EXPECT(dist3(placed, std::vector<float>{0.f, 0.f, 0.f}) > 2.f, true);
+        // The create-time seed makes it restorable straight away (doc 03 §8.3).
+        EXPECT(XR::fieldAfter(st, p, "restorable"), std::string("true"));
+    }
+
+    // Nudge it so the restored pose is provably the USER'S placement, not the creation pose.
+    ASSERT(getFromSocket("/openxr move 0.4 0 0"), std::string("ok"));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    std::vector<float> left;
+    {
+        const std::string st = getFromSocket("j/openxr");
+        const auto        p  = XR::findAfter(st, "\"name\": \"" + mon + "\"");
+        ASSERT_NOT(p, std::string::npos);
+        left = posOf(st, p);
+        ASSERT(left.size(), (size_t)3);
+        EXPECT(dist3(left, placed) > 0.2f, true);
+    }
+
+    // Recycle the session: new session, new first plug, new re-seat.
+    ASSERT(getFromSocket("/openxr disable"), std::string("ok"));
+    ASSERT(XR::waitForXrState("disabled", std::chrono::milliseconds(10000)), true);
+    remote->pulse();
+    ASSERT(getFromSocket("/openxr enable"), std::string("ok"));
+    ASSERT(XR::waitForXrState("focused", std::chrono::milliseconds(15000)) || XR::waitForXrState("visible", std::chrono::milliseconds(2000)), true);
+    // Keep the head where the user is standing and give the frame thread time to consume the armed
+    // re-seat on a valid-view frame.
+    remote->setHeadPose(xrt_vec3{3.f, 0.f, 4.f}, xrt_quat{0.f, 0.2164f, 0.f, 0.9763f});
+    remote->pulse();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+
+    {
+        const std::string st = getFromSocket("j/openxr");
+        const auto        p  = XR::findAfter(st, "\"name\": \"" + mon + "\"");
+        ASSERT_NOT(p, std::string::npos);
+        const auto back = posOf(st, p);
+        ASSERT(back.size(), (size_t)3);
+        // THE assertion: the room came back the way it was left. Pre-fix this re-seated from the
+        // stale creation-time world pose and landed several metres out.
+        EXPECT_MAX_DELTA(dist3(back, left), 0.0, 0.35);
+    }
+
+    NLog::green("xr_anchor_restore_across_session: ad-hoc monitor placement survived a session recycle");
+}
+
 #endif // WITH_XR_TESTS

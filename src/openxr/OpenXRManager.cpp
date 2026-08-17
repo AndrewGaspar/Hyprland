@@ -1183,6 +1183,10 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
             m_presenceKnown = true;
             m_userPresent   = e.a != 0;
             Log::logger->log(Log::DEBUG, "[OPENXR] user {} — re-evaluating monitor plug state", m_userPresent ? "present (donned)" : "absent (doffed)");
+            // doc 03 §8.3: close the cross-session restore capture gate on the DOFF edge itself, not
+            // on the plug edge the grace timer defers by seconds. The last captured placement must be
+            // one the user's head produced, not one a headset on a desk did.
+            publishRestoreCapture();
             updateMonitorsPlugged(/*allowGrace=*/true);
             // research/20 phase 2: presence is now an INPUT to shouldInhibitIdle() under
             // openxr:inhibit_idle = present, so the don/doff edge must re-fold the Wayland
@@ -1979,6 +1983,9 @@ void COpenXRManager::frameThread() {
         std::vector<OpenXR::SXRSolveResult> results(active.size());
         std::vector<bool>                   solved(active.size(), false);
         bool                                anyRoaming = false; // research/16 Part A: AUTO gate OR-term
+        // Re-seat tally, logged after the lock is dropped (doc 03 §8.3).
+        int  reseatRestored = 0, reseatDeclared = 0;
+        bool reseatRan = false;
         {
             std::scoped_lock lock(m_layersMu);
             m_lastVerbCtx = OpenXR::SXRVerbContext{viewPose, viewValid, gripLeft, gripRight};
@@ -1986,16 +1993,61 @@ void COpenXRManager::frameThread() {
             // report-20 issue C: consume a pending recenter-on-plug now that a valid head pose exists.
             // Armed by the main thread on the first plug of a session; the frame thread owns the head
             // pose, so it re-seats every anchor:local monitor to the CURRENT head (yaw-only, floor XZ),
-            // reinterpreting each monitor's DECLARED offset as head-relative. Passing the same viewPose
-            // to every layer transforms the group rigidly (relative arrangement preserved). Held armed
-            // while the view is invalid so a plug during momentary tracking loss still recenters on the
-            // next good frame. onReferenceSpaceChanged already ran above (this overrides it for LOCAL).
+            // reinterpreting each monitor's offset as head-relative. Passing the same viewPose to every
+            // layer transforms the group rigidly (relative arrangement preserved). Held armed while the
+            // view is invalid so a plug during momentary tracking loss still recenters on the next good
+            // frame. onReferenceSpaceChanged already ran above (this overrides it for LOCAL).
+            //
+            // WHICH offset gets planted is doc 03 §8.3 (xrReseatSource). A config-declared rig is
+            // head-relative by construction and re-seats to itself; anything the user actually placed —
+            // an `openxr create` monitor, or a declared one they grab-moved — re-seats to the offset
+            // captured while they were wearing the headset, which is the only form of its placement
+            // that outlives the reference space it was measured in. Planting the raw LOCAL pose (what
+            // an ad-hoc monitor's "declared" anchor holds) throws it as far as the old and new origins
+            // differ: 7.13 m in the session that produced this fix.
             if (viewValid && m_recenterArmed.load(std::memory_order_acquire)) {
                 m_recenterArmed.store(false, std::memory_order_release);
+                reseatRan = true;
                 for (auto& l : m_layers) {
                     if (l->m_pendingRemoval.load(std::memory_order_acquire))
                         continue;
-                    l->m_anchor.recenterLocalToHead(viewPose, l->m_declaredAnchor);
+                    if (l->m_anchor.state().mode != OpenXR::XR_ANCHOR_LOCAL)
+                        continue; // recenterLocalToHead self-guards; skipped here to keep the tally honest
+                    OpenXR::SXRAnchorState seat = l->m_declaredAnchor;
+                    if (OpenXR::xrReseatSource(l->m_anchor.state().mode, l->m_restoreValid) == OpenXR::XR_RESEAT_RESTORED) {
+                        seat.anchorPose = l->m_restoreOffset;
+                        ++reseatRestored;
+                    } else
+                        ++reseatDeclared;
+                    l->m_anchor.recenterLocalToHead(viewPose, seat);
+                }
+            }
+
+            // doc 03 §8.3: re-capture every anchor:local monitor's DURABLE placement — its desk pose
+            // expressed in the wearer's yaw-only floor frame. Deliberately AFTER the re-seat above, so
+            // the first plug's capture reads the freshly seated pose rather than clobbering a good
+            // stored offset with the dead-frame coordinates it is in the middle of replacing.
+            //
+            // Gated on m_restoreCapture (plugged AND wearing, publishRestoreCapture) so a headset on a
+            // desk never gets to define "the room". Skipped while an adaptive monitor is anything but
+            // DOCKED: its anchorPose is the saved desk pose while the user has walked away from it, so
+            // measuring that against their current head would remember the walk, not the desk.
+            if (viewValid && m_restoreCapture.load(std::memory_order_relaxed)) {
+                const OpenXR::SXRPose headFrameInv = OpenXR::poseInverse(OpenXR::xrHeadFrame(viewPose));
+                for (auto& l : m_layers) {
+                    if (l->m_pendingRemoval.load(std::memory_order_acquire))
+                        continue;
+                    if (l->m_anchor.state().mode != OpenXR::XR_ANCHOR_LOCAL) {
+                        // A non-LOCAL anchorPose is an offset in view/body/grip space, not a world
+                        // pose; keeping a stale LOCAL capture around would be a lie if the monitor is
+                        // ever switched back. The re-seat is a no-op for these modes either way.
+                        l->m_restoreValid = false;
+                        continue;
+                    }
+                    if (l->m_anchor.adaptiveEnabled() && l->m_anchor.adaptivePhase() != OpenXR::XRAD_DOCKED)
+                        continue;
+                    l->m_restoreOffset = OpenXR::poseCompose(headFrameInv, l->m_anchor.state().anchorPose);
+                    l->m_restoreValid  = true;
                 }
             }
 
@@ -2067,6 +2119,14 @@ void COpenXRManager::frameThread() {
         // research/16 Part A: publish "any monitor roaming" for the AUTO hand-input gate (main-thread
         // status reads it too). Plain atomic — never a refcount op.
         m_anyRoaming.store(anyRoaming, std::memory_order_release);
+
+        // doc 03 §8.3: say which way each anchor:local monitor was re-seated. `restored` is the
+        // placement the user left, replayed around their current head; `declared` is the config rig
+        // (or the fallback for a monitor that has never been placed under tracking). Outside the
+        // layer lock, POD counters only.
+        if (reseatRan)
+            Log::logger->log(Log::DEBUG, "[OPENXR] re-seated {} anchor:local monitor(s) to the head: {} restored from the last wearing, {} from their declared rig", reseatRestored + reseatDeclared,
+                             reseatRestored, reseatDeclared);
 
         std::vector<XrCompositionLayerQuad>              quads;
         std::vector<const XrCompositionLayerBaseHeader*> layerPtrs;
@@ -2572,11 +2632,21 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
         static auto       PDEFDIST = CConfigValue<Hyprlang::FLOAT>("openxr:default_distance");
         const float       dist     = (float)*PDEFDIST;
         OpenXR::CXRAnchor tmp;
-        st.mode = OpenXR::XR_ANCHOR_LOCAL;
+        st.mode        = OpenXR::XR_ANCHOR_LOCAL;
+        const auto ctx = currentVerbContext();
         tmp.initFromState(st);
-        if (tmp.applyCenter(currentVerbContext(), dist))
+        if (tmp.applyCenter(ctx, dist)) {
             st = tmp.m_state;
-        else
+            // doc 03 §8.3: this pose was DERIVED from the head, so its durable head-relative form is
+            // known right now — seed it, and an ad-hoc monitor is restorable from its very first
+            // frame, even if the session dies before the monitors are ever plugged (the frame-thread
+            // capture would never have run). An EXPLICIT anchor is deliberately left unseeded: a
+            // caller-supplied `pos:` is a declared rig, and the declared path already reinterprets it
+            // as head-relative — measuring where it currently sits would instead make a monitor the
+            // user cannot see (declared into an arbitrary origin) permanently unreachable.
+            layer->m_restoreOffset = OpenXR::xrPoseInHeadFrame(ctx.view, st.anchorPose);
+            layer->m_restoreValid  = true;
+        } else
             st.anchorPose = OpenXR::SXRPose{OpenXR::Vec3{0.f, 1.4f, -dist}, OpenXR::Quat{}}; // no tracking yet
     }
     layer->m_anchor.initFromState(st);
@@ -3363,6 +3433,9 @@ void COpenXRManager::resetPresenceState() {
     // is cleared too so a stale arm from a prior session cannot re-seat the next one.
     m_recenteredThisSession = false;
     m_recenterArmed.store(false, std::memory_order_release);
+    // doc 03 §8.3: no session, nothing to capture from. The per-layer offsets themselves deliberately
+    // survive — they are what the NEXT session restores the room from.
+    publishRestoreCapture();
 }
 
 // ---- dormant re-probe (report-17 WP-L3 / report-20 issue B1). Main thread only. ----
@@ -3867,6 +3940,25 @@ void COpenXRManager::setMonitorsPlugged(bool plugged) {
         // one relayout.
         requestLayout2DSync();
     }
+
+    // doc 03 §8.3: the plug edge moves the cross-session restore capture gate. Unplugged monitors are
+    // not being looked at, so their placement relative to the head means nothing worth remembering.
+    publishRestoreCapture();
+}
+
+void COpenXRManager::publishRestoreCapture() {
+    // doc 03 §8.3. Capture only from frames the user is really WEARING the headset with the monitors
+    // plugged — the frames after a doff come from a headset lying on a desk, and preserving THAT
+    // arrangement into the next session would be worse than the stale-coordinate bug this fixes.
+    //
+    // A runtime without XR_EXT_user_presence has no doff edge to close the gate on; there the plug
+    // state is the whole gate (the `visible`-mode unplug grace still closes it a beat later, which
+    // costs a couple of seconds of desk-height samples in the worst case). Presence SUPPORTED but not
+    // yet KNOWN counts as wearing: the plug decision that got us here was made on visibility, and
+    // refusing to capture until the first don event would leave a freshly plugged session with no
+    // durable placement at all.
+    const bool wearing = !m_userPresenceSupported || !m_presenceKnown || m_userPresent;
+    m_restoreCapture.store(m_monitorsPlugged && wearing, std::memory_order_relaxed);
 }
 
 void COpenXRManager::reportLayerRemoved(const std::string& name) {
@@ -5142,6 +5234,11 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
         info.hovered                     = l->m_hovered;          // WP7
         info.region                      = OpenXR::xrRegionName((OpenXR::eXRQuadRegion)l->m_hoverRegion.load(std::memory_order_relaxed)); // report 14
         info.contentPath                 = OpenXR::xrContentPathName(l->m_contentPath.load(std::memory_order_relaxed)); // WP-L2
+        // Cross-session restore (doc 03 §8.3): answers "will this monitor come back where I left it".
+        info.restorable                  = l->m_restoreValid;
+        info.restoreX                    = l->m_restoreOffset.pos.x;
+        info.restoreY                    = l->m_restoreOffset.pos.y;
+        info.restoreZ                    = l->m_restoreOffset.pos.z;
         // Adaptive anchoring (research/13 §6.4).
         info.adaptiveEnabled  = l->m_anchor.adaptiveEnabled();
         info.adaptivePhase    = OpenXR::xrAdaptivePhaseName(l->m_anchor.adaptivePhase());

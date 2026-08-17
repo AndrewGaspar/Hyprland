@@ -762,3 +762,233 @@ TEST(XRAnchorRecenter, NoOpGuardSkipsAnUnchangedFrame) {
     EXPECT_FALSE(xrRecenterIsNoOp(SXRPose{Vec3{0.f, 0.f, 0.05f}, Quat{}}));
     EXPECT_FALSE(xrRecenterIsNoOp(SXRPose{Vec3{}, qFromYaw(0.1f)}));
 }
+
+// ---- doc 03 §8.3: cross-session restore ----
+//
+// The remaining monitor lottery, reported live 2026-08-16. A wivrn-server restart recycles the XR
+// session and the new one gets a brand-new LOCAL_FLOOR origin. Config-DECLARED monitors survived it,
+// because a declared `pos:` is head-relative by construction and the first plug re-seats it around
+// the wearer. AD-HOC monitors (`hyprctl openxr create XR-3`) did not: what got stored as their
+// "declared" anchor was the world pose the create-time head happened to occupy, so the first plug of
+// the new session composed a dead frame's coordinates into the head frame and threw them across the
+// room — the user's words were "spun way off, outside my house".
+//
+// The evidence log names the exact arithmetic. Session one latched its head frame at
+// eye [4.23, 1.04, 5.75]; XR-3 and XR-4 were created in that frame at 10:00:25/10:00:30; at 10:01:40
+// a recenter moved the origin ("reconstructed a 7.13m / 14.7 deg frame change from the head"), which
+// re-expressed every LIVE anchor but not the frozen declared ones. Session two came up at 20:43 with
+// eye [4.41, 1.00, 6.11] and re-seated the ad-hoc monitors from those 7-metre stale offsets.
+//
+// The fix names each monitor's placement relative to the WEARER instead of the origin. These pin
+// that form's two load-bearing properties — it is reference-space independent, and re-planting it
+// rigidly preserves the constellation — plus the fallback ladder for everything degenerate.
+
+namespace {
+    // The wearer's frame in the old (now dead) session, from the live log.
+    const SXRPose OLD_HEAD{{4.23f, 1.04f, 5.75f}, qFromYaw(-7.9f * PI / 180.f)};
+    // The next session's origin lands somewhere else entirely, and so does the user.
+    const SXRPose NEW_HEAD{{-3.10f, 0.98f, 11.40f}, qFromYaw(137.f * PI / 180.f)};
+
+    // Re-seat an anchor the way the frame loop does, from an offset in the wearer's frame.
+    SXRPose reseatFrom(const SXRPose& head, const SXRPose& offset) {
+        SXRAnchorState seat;
+        seat.mode       = XR_ANCHOR_LOCAL;
+        seat.anchorPose = offset;
+        CXRAnchor a;
+        a.initFromState(seat);
+        a.recenterLocalToHead(head, seat);
+        return a.state().anchorPose;
+    }
+}
+
+TEST(XRAnchorRestore, HeadFrameCaptureRoundTripsExactly) {
+    // xrPoseInHeadFrame is the inverse of the composition recenterLocalToHead performs. If those two
+    // ever drift the restore would nudge every monitor a little on each session, so pin the identity
+    // on poses with real rotation and off-axis positions.
+    const SXRPose worlds[] = {
+        {{4.1f, 1.2f, 4.3f}, qFromYaw(0.4f)},
+        {{-2.f, 0.35f, 0.f}, qMul(qFromYaw(-2.2f), qFromPitch(0.3f))},
+        {{0.f, 2.6f, -9.f}, Quat{}},
+    };
+    // 2e-3 rad (~0.1 deg) on the angle for the reason MathComposeInverseIdentity gives: qAngleBetween
+    // of a near-identity quat is 2*acos(|dot|), whose derivative blows up there, so float noise lands
+    // around 6e-4. The positions below are held to a tenth of a millimetre.
+    for (const auto& W : worlds) {
+        const SXRPose rel = xrPoseInHeadFrame(OLD_HEAD, W);
+        const SXRPose back = reseatFrom(OLD_HEAD, rel);
+        expectVecNear(back.pos, W.pos, 1e-4f);
+        EXPECT_NEAR(qAngleBetween(back.rot, W.rot), 0.f, 2e-3f);
+    }
+}
+
+TEST(XRAnchorRestore, CaptureIsReferenceSpaceIndependent) {
+    // THE property that makes the captured offset durable: it names the monitor relative to the
+    // wearer, and both of them move together when the origin does. Take a capture, then apply the
+    // exact frame change the live log recorded (7.13 m / 14.7 deg) to BOTH the head and the monitor,
+    // and re-capture — the offset must not have budged. A LOCAL anchorPose, by contrast, is 7 m
+    // different, which is precisely why replaying one into a new session is the bug.
+    const SXRPose M{{7.13f, 0.f, 0.4f}, qFromYaw(14.7f * PI / 180.f)};
+
+    CXRAnchor      a;
+    SXRAnchorState st;
+    st.mode           = XR_ANCHOR_LOCAL;
+    st.anchorPose.pos = {4.1f, 1.2f, 4.25f};
+    st.anchorPose.rot = qFromYaw(0.6f);
+    a.initFromState(st);
+
+    const SXRPose relBefore = xrPoseInHeadFrame(OLD_HEAD, a.state().anchorPose);
+
+    a.onReferenceSpaceChanged(M);
+    const SXRPose headAfter = poseCompose(poseInverse(M), OLD_HEAD);
+    const SXRPose relAfter  = xrPoseInHeadFrame(headAfter, a.state().anchorPose);
+
+    expectVecNear(relAfter.pos, relBefore.pos, 1e-3f);
+    EXPECT_NEAR(qAngleBetween(relAfter.rot, relBefore.rot), 0.f, 2e-3f);
+    // ...while the raw LOCAL coordinates moved by the whole frame change.
+    EXPECT_GT((a.state().anchorPose.pos - st.anchorPose.pos).length(), 5.f);
+}
+
+TEST(XRAnchorRestore, ConstellationSurvivesASessionRestart) {
+    // The reported case, end to end. Two monitors in the old session: a config-DECLARED one 1.5 m in
+    // front at 1.2 m height, and an AD-HOC one the user placed 2 m to its right. A wivrn restart
+    // gives a new origin AND finds the user standing somewhere else facing another way.
+    SXRAnchorState declA;
+    declA.mode           = XR_ANCHOR_LOCAL;
+    declA.anchorPose.pos = {0.f, 1.2f, -1.5f};
+    declA.anchorPose.rot = Quat{};
+
+    // Where they actually sat in the old session's LOCAL_FLOOR.
+    const SXRPose worldA = reseatFrom(OLD_HEAD, declA.anchorPose);
+    const SXRPose worldB = reseatFrom(OLD_HEAD, SXRPose{Vec3{2.f, 1.2f, -1.5f}, Quat{}});
+    // Sanity: they really are 2 m apart, and really are metres from the runtime's origin.
+    EXPECT_NEAR((worldB.pos - worldA.pos).length(), 2.f, 1e-4f);
+    EXPECT_GT(worldA.pos.length(), 5.f);
+
+    // Capture (what the frame loop does on every frame the user is wearing the headset).
+    const SXRPose relA = xrPoseInHeadFrame(OLD_HEAD, worldA);
+    const SXRPose relB = xrPoseInHeadFrame(OLD_HEAD, worldB);
+
+    // New session, new origin, new head: restore the constellation.
+    const SXRPose newA = reseatFrom(NEW_HEAD, relA);
+    const SXRPose newB = reseatFrom(NEW_HEAD, relB);
+
+    // 1. B is still exactly 2 m to A's right — along the NEW head's right axis, because the whole
+    //    group was replanted rigidly rather than each monitor re-derived on its own.
+    const Vec3 sep = newB.pos - newA.pos;
+    EXPECT_NEAR(sep.length(), 2.f, 1e-4f);
+    expectVecNear(sep, qRotate(qFromYaw(137.f * PI / 180.f), Vec3{2.f, 0.f, 0.f}), 1e-4f);
+
+    // 2. The group faces the user: A sits 1.5 m in front of the new head at its configured 1.2 m
+    //    height, with its normal (+Z) pointing back at them.
+    const Vec3 toA = newA.pos - NEW_HEAD.pos;
+    EXPECT_NEAR(newA.pos.y, 1.2f, 1e-4f);
+    EXPECT_NEAR(std::sqrt(toA.x * toA.x + toA.z * toA.z), 1.5f, 1e-4f);
+    const Vec3 normalA = qRotate(newA.rot, Vec3{0.f, 0.f, 1.f});
+    const Vec3 fwdNew  = qRotate(NEW_HEAD.rot, Vec3{0.f, 0.f, -1.f});
+    expectVecNear(normalA, Vec3{-fwdNew.x, 0.f, -fwdNew.z}, 1e-4f);
+
+    // 3. And the whole head-relative geometry is bit-preserved: every monitor sits where it sat
+    //    relative to the wearer, which is the user-visible promise.
+    expectVecNear(xrPoseInHeadFrame(NEW_HEAD, newA).pos, relA.pos, 1e-4f);
+    expectVecNear(xrPoseInHeadFrame(NEW_HEAD, newB).pos, relB.pos, 1e-4f);
+
+    // 4. The counterfactual that IS the bug: the ad-hoc monitor's "declared" anchor is its raw old
+    //    world pose, and re-seating from that composes a dead frame's coordinates into the new head
+    //    frame — putting it metres away instead of the 2.5 m it belongs at.
+    const SXRPose bugB = reseatFrom(NEW_HEAD, worldB);
+    EXPECT_GT((bugB.pos - NEW_HEAD.pos).length(), 5.f);
+    EXPECT_LT((newB.pos - NEW_HEAD.pos).length(), 3.f);
+}
+
+TEST(XRAnchorRestore, UntouchedDeclaredMonitorRestoresToItsDeclaredRig) {
+    // The strict-generalization pin: for a declared monitor the user never moved, the captured offset
+    // IS the declared offset, so the restore path and the legacy declared path agree to the float.
+    // That is what keeps the behavior doc 03 §8.2 promises for `xrmonitor` lines intact.
+    SXRAnchorState decl;
+    decl.mode           = XR_ANCHOR_LOCAL;
+    decl.anchorPose.pos = {0.6f, 1.35f, -1.8f};
+    decl.anchorPose.rot = qFromYaw(-0.35f);
+
+    const SXRPose world = reseatFrom(OLD_HEAD, decl.anchorPose);
+    const SXRPose rel   = xrPoseInHeadFrame(OLD_HEAD, world);
+    expectVecNear(rel.pos, decl.anchorPose.pos, 1e-4f);
+    EXPECT_NEAR(qAngleBetween(rel.rot, decl.anchorPose.rot), 0.f, 2e-3f);
+
+    const SXRPose viaRestore  = reseatFrom(NEW_HEAD, rel);
+    const SXRPose viaDeclared = reseatFrom(NEW_HEAD, decl.anchorPose);
+    expectVecNear(viaRestore.pos, viaDeclared.pos, 1e-4f);
+    EXPECT_NEAR(qAngleBetween(viaRestore.rot, viaDeclared.rot), 0.f, 2e-3f);
+}
+
+TEST(XRAnchorRestore, GrabMovedDeclaredMonitorKeepsThePlacementAcrossASession) {
+    // Docs are silent on whether a grab-moved DECLARED monitor resets to its config rig across a
+    // session restart. It does not, deliberately: the within-session ladder (§8.1) already holds a
+    // moved monitor where the user put it, and a reload does not clobber live geometry either. So the
+    // moved offset — not the declared one — is what comes back.
+    SXRAnchorState decl;
+    decl.mode           = XR_ANCHOR_LOCAL;
+    decl.anchorPose.pos = {0.f, 1.2f, -1.5f};
+
+    CXRAnchor a;
+    a.initFromState(decl);
+    a.recenterLocalToHead(OLD_HEAD, decl);
+
+    // The user grabs it and parks it up and to the left (a completed grab lands in anchorPose).
+    const SXRPose moved = reseatFrom(OLD_HEAD, SXRPose{Vec3{-1.1f, 1.7f, -2.2f}, qFromYaw(0.5f)});
+    a.placeLocalAt(moved);
+
+    const SXRPose rel = xrPoseInHeadFrame(OLD_HEAD, a.state().anchorPose);
+    expectVecNear(rel.pos, Vec3{-1.1f, 1.7f, -2.2f}, 1e-4f);
+
+    const SXRPose restored = reseatFrom(NEW_HEAD, rel);
+    expectVecNear(xrPoseInHeadFrame(NEW_HEAD, restored).pos, Vec3{-1.1f, 1.7f, -2.2f}, 1e-4f);
+    // Not the declared rig it started from.
+    EXPECT_GT((restored.pos - reseatFrom(NEW_HEAD, decl.anchorPose).pos).length(), 0.5f);
+}
+
+TEST(XRAnchorRestore, CaptureIgnoresHeadPitchAndRoll) {
+    // The capture frame is yaw-only, so what the user happened to be looking at when the session died
+    // — the floor, the ceiling, head tilted — must not tip the whole room on restore.
+    const SXRPose world{{4.1f, 1.2f, 4.25f}, qFromYaw(0.6f)};
+    const SXRPose level = xrPoseInHeadFrame(OLD_HEAD, world);
+
+    const SXRPose tilted{OLD_HEAD.pos, qMul(qMul(qFromYaw(qYawOf(OLD_HEAD.rot, 0.f)), qFromPitch(-1.1f)), qFromAxisAngle(Vec3{0.f, 0.f, 1.f}, 0.4f))};
+    const SXRPose fromTilted = xrPoseInHeadFrame(tilted, world);
+
+    expectVecNear(fromTilted.pos, level.pos, 1e-4f);
+    EXPECT_NEAR(qAngleBetween(fromTilted.rot, level.rot), 0.f, 2e-3f);
+}
+
+TEST(XRAnchorRestore, ReseatSourceLadderCoversTheDegenerateCases) {
+    // A monitor that has been placed under real tracking replays that placement...
+    EXPECT_EQ(xrReseatSource(XR_ANCHOR_LOCAL, true), XR_RESEAT_RESTORED);
+    // ...and one that has not falls back to its declared rig. That covers a session that was never
+    // donned, a session with no head sample by the time it ended, and a monitor created while the
+    // headset was off — in all three the config/creation-time rig is the only honest answer, and it
+    // is exactly what shipped before this change.
+    EXPECT_EQ(xrReseatSource(XR_ANCHOR_LOCAL, false), XR_RESEAT_DECLARED);
+
+    // head/body/device anchors are already expressed against the user's moving frames. A re-seat is a
+    // no-op for them (NonLocalModesUnaffected), so they never consult a captured offset even if one
+    // is somehow left over from a period when the monitor was local.
+    for (const bool valid : {false, true}) {
+        EXPECT_EQ(xrReseatSource(XR_ANCHOR_HEAD, valid), XR_RESEAT_DECLARED);
+        EXPECT_EQ(xrReseatSource(XR_ANCHOR_BODY, valid), XR_RESEAT_DECLARED);
+        EXPECT_EQ(xrReseatSource(XR_ANCHOR_DEVICE, valid), XR_RESEAT_DECLARED);
+    }
+}
+
+TEST(XRAnchorRestore, UnrestorableMonitorLandsInFrontOfTheUserAnyway) {
+    // The safe floor under the whole feature. A monitor created with no tracking gets the eye-height
+    // default (0, 1.4, -default_distance) as its anchor and no capture; the declared fallback then
+    // reads that as head-relative and puts it 1.5 m in front of whoever plugs in — never metres away.
+    SXRAnchorState untracked;
+    untracked.mode           = XR_ANCHOR_LOCAL;
+    untracked.anchorPose.pos = {0.f, 1.4f, -1.5f};
+
+    ASSERT_EQ(xrReseatSource(untracked.mode, /*restoreValid=*/false), XR_RESEAT_DECLARED);
+    const SXRPose W    = reseatFrom(NEW_HEAD, untracked.anchorPose);
+    const Vec3    toW  = W.pos - NEW_HEAD.pos;
+    EXPECT_NEAR(std::sqrt(toW.x * toW.x + toW.z * toW.z), 1.5f, 1e-4f);
+    EXPECT_NEAR(W.pos.y, 1.4f, 1e-4f);
+}
