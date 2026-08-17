@@ -289,6 +289,7 @@ TEST_CASE(xr_anchor_restore_across_session) {
             if (!monitorName.empty())
                 getFromSocket("/openxr destroy " + monitorName);
             getFromSocket("/keyword openxr:recenter_on_plug 1");
+            getFromSocket("/keyword openxr:monitors_follow_session visible");
             if (XR::g_ctx.remote) {
                 using namespace MonadoWire;
                 XR::g_ctx.remote->setHeadPose(xrt_vec3{0.f, 0.f, 0.f}, xrt_quat{0.f, 0.f, 0.f, 1.f});
@@ -314,6 +315,14 @@ TEST_CASE(xr_anchor_restore_across_session) {
     }
 
     ASSERT(getFromSocket("/keyword openxr:recenter_on_plug 1"), std::string("ok"));
+    // Pin the plug policy the way xr_plugged_follow_session does. Under the shipped `visible` default
+    // on a runtime without XR_EXT_user_presence, the FIRST plug of a session is deferred behind
+    // openxr:monitor_plug_settle_ms of sustained visibility — and the re-seat is armed by that plug,
+    // so the whole thing under test would land a second and a half after a fixed wait. `session`
+    // plugs on session existence, which makes the edge prompt and the test about anchoring rather
+    // than about the blip guard. The capture gate keys on visibility, not on plugging (doc 03 §8.3),
+    // so this does not change what is being exercised.
+    ASSERT(getFromSocket("/keyword openxr:monitors_follow_session session"), std::string("ok"));
 
     // Stand the user 5 m from the runtime's origin, facing 25 deg off it — the geometry that makes a
     // stale LOCAL pose dangerous. yaw 25 deg about +Y.
@@ -392,11 +401,22 @@ TEST_CASE(xr_anchor_restore_across_session) {
 
     ASSERT(getFromSocket("/openxr enable"), std::string("ok"));
     ASSERT(XR::waitForXrState("focused", std::chrono::milliseconds(15000)) || XR::waitForXrState("visible", std::chrono::milliseconds(2000)), true);
-    // Hold the user there and give the frame thread time to consume the armed re-seat on a valid-view
-    // frame (it holds the arming until one arrives, so this is a budget, not a race).
+    // Hold the user there, then wait for the PLUG rather than a wall-clock guess: the plug edge is
+    // what arms the re-seat, so anything sooner reads a monitor that has not been re-seated yet and
+    // anything later is dead time.
     remote->setHeadPose(newHead, newRot);
     remote->pulse();
-    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    ASSERT(XR::waitForJson(
+               "j/openxr",
+               [&](const std::string& r) {
+                   const auto q = XR::findAfter(r, "\"name\": \"" + mon + "\"");
+                   return q != std::string::npos && XR::fieldAfter(r, q, "plugged") == "true";
+               },
+               std::chrono::milliseconds(20000)),
+           true);
+    // ...then a beat for the frame thread to consume the arming on its next valid-view frame.
+    remote->pulse();
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
 
     {
         const std::string st = getFromSocket("j/openxr");
