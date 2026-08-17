@@ -372,6 +372,18 @@ required). The cases, by file:
   `monitor_plug_settle_ms` under the `visible` default, so the test pins `session` mode and waits for
   `plugged` rather than sleeping; and if the user does not move between sessions, "restored correctly"
   and "never re-seated at all" are the same number.
+- `xr_reseat_verb` — doc 03 §8.4, the deliberate "bring my monitors to me". Builds a two-monitor wall
+  1.5 m in front of a user at the origin, swivels the head 75° in place, runs `openxr reseat`, and
+  requires the group to have arrived in front of the new facing — at exactly the rotation a rigid
+  transform about the head implies, with its separation intact. Then presses it again and requires
+  the identity.
+
+  This is where the feature's real hazard is caught, and it is not catchable anywhere else. The
+  obvious implementation — replant each monitor's stored head-relative offset, exactly what the first
+  plug does — is a **no-op** while the headset is worn, because the §8.3 capture has been re-deriving
+  those offsets against this very head every frame. `ok` comes back either way; only "the monitors
+  moved, by ~2 m, and by the right 2 m" separates them. Hence the `> 1 m` assertion sitting next to
+  the exact-position one.
 
 **Monitor plug lifecycle** (`plugged.cpp`)
 - `xr_plugged_follow_session` — the monitor plug state follows the session per policy.
