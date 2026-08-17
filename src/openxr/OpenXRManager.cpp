@@ -2046,6 +2046,15 @@ void COpenXRManager::frameThread() {
                     }
                     if (l->m_anchor.adaptiveEnabled() && l->m_anchor.adaptivePhase() != OpenXR::XRAD_DOCKED)
                         continue;
+                    // A pose still bit-equal to the declaration is a RIG, not a placement: nothing has
+                    // re-seated or moved this monitor since its `xrmonitor` line was applied, so it is
+                    // literally sitting at "pos: relative to the runtime's origin" — the arbitrary spot
+                    // §8.2 exists to rescue it from. Capturing that would remember the arbitrary spot
+                    // and defeat the rescue next session. Skipping leaves whatever is already stored:
+                    // an ad-hoc monitor's create-time seed (which IS head-derived), or nothing, in
+                    // which case the re-seat falls back to the declared rig exactly as it should.
+                    if (OpenXR::xrPoseIdentical(l->m_anchor.state().anchorPose, l->m_declaredAnchor.anchorPose))
+                        continue;
                     l->m_restoreOffset = OpenXR::poseCompose(headFrameInv, l->m_anchor.state().anchorPose);
                     l->m_restoreValid  = true;
                 }
@@ -5054,6 +5063,11 @@ void COpenXRManager::reconcileDeclaredMonitors() {
                 existing->m_anchor.initFromState(st);
                 existing->m_declaredAnchor = st;
                 existing->m_sizeMeters     = wantSize;
+                // doc 03 §8.3: the user just re-declared where this monitor goes, so any placement
+                // captured before that is superseded — the next session must re-seat from the NEW rig,
+                // not replay the old arrangement. The frame-thread capture will not re-validate while
+                // the live pose is still the declaration it was just seeded from.
+                existing->m_restoreValid = false;
                 if (anchorChanged && g_pEventManager && anchorModeChanged)
                     g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitoranchor", d.m_name + "," + OpenXR::anchorModeToString(d.m_anchor)});
             }
