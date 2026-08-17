@@ -1,5 +1,6 @@
 #include <openxr/XRStereoPair.hpp>
 #include <output/StereoPacking.hpp>
+#include <desktop/DepthTiers.hpp>
 
 #include <gtest/gtest.h>
 
@@ -207,6 +208,77 @@ TEST(XRDepthPair, AnOrdinaryModeStillUsesTheFullscreenContentDeclaration) {
     EXPECT_EQ(DECL.layout, CONTENT_TAB);
     EXPECT_TRUE(DECL.submit);
     EXPECT_EQ(quadsFor(DECL), 2u);
+}
+
+// ...and the other order, which is the one a live session actually runs and which nothing pinned
+// until a tagged window was first looked at on the quad pair (research/24 §8.4, 2026-08-17).
+//
+// A DEPTH-packed monitor has ALREADY un-packed every stereo window on it: the per-surface UV crop
+// (Phase S) ran inside each of the two composites, so pane 0 holds the desktop with that window's
+// LEFT half in it and pane 1 the same desktop with its RIGHT half. Consulting the window's content
+// declaration again at submission time would split the already-split buffer a second time and hand
+// each eye a QUARTER of the desktop — the "halve it twice" failure the submission suspects list
+// opened with. The pack owns the pair; the content query is not even asked.
+TEST(XRDepthPair, ADepthPackedMonitorIgnoresTheWindowsContentDeclaration) {
+    for (const auto DECLARED : {CONTENT_SBS, CONTENT_HSBS, CONTENT_TAB, CONTENT_HTAB}) {
+        const auto DECL = resolvePublishedDecl(depthDecl(), SPairQuery{.declared = DECLARED, .coversOutput = true, .enabled = true});
+
+        EXPECT_EQ(DECL.producer, PRODUCER_DEPTH) << layoutToString(DECLARED);
+        // ...including a TAB-declared window, which must NOT turn the monitor's side-by-side pack
+        // into an over-under one: the pack is how the BUFFER is laid out, not what is inside it.
+        EXPECT_EQ(DECL.layout, CONTENT_SBS) << layoutToString(DECLARED);
+        EXPECT_TRUE(DECL.submit) << layoutToString(DECLARED);
+        EXPECT_EQ(quadsFor(DECL), 2u) << layoutToString(DECLARED);
+
+        // the eye rects stay the swapchain's two whole panes — half of the image each, never a
+        // quarter — and the un-map stays the identity, so the cursor does not move half a screen
+        // the moment a video is tagged.
+        EXPECT_EQ(paneFullRect(packed(), 0), (SImageRect{0, 0, 2688, 1536})) << layoutToString(DECLARED);
+        EXPECT_EQ(paneFullRect(packed(), 1), (SImageRect{2688, 0, 2688, 1536})) << layoutToString(DECLARED);
+        EXPECT_EQ(paneUVToMonitorUV({0.5, 0.5}, DECL, 0), (Vector2D{0.5, 0.5})) << layoutToString(DECLARED);
+        EXPECT_EQ(paneUVToMonitorUV({0.5, 0.5}, DECL, 1), (Vector2D{0.5, 0.5})) << layoutToString(DECLARED);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pane 0 means LEFT at every seam it crosses
+// ---------------------------------------------------------------------------------------------
+
+// A tagged window's picture crosses FOUR independent index conventions between the client's buffer
+// and the wearer's left eye, and each one was written in a different file:
+//
+//   1. the per-surface crop      — cropForEye(_, layout, pane)      : which half of the buffer
+//   2. the depth shift's sign    — Desktop::Depth::eyeSign(pane)    : which way a raised thing moves
+//   3. the scanout pack          — Monitor::Stereo::paneDestBox     : where the composite lands
+//   4. the OpenXR submission     — paneFullRect(geom, eye)          : which half the eye quad shows
+//
+// Any ONE of them disagreeing swaps the eyes, which is the failure that reads as eye strain rather
+// than as a broken picture — so it is the sort of thing a live session does not diagnose. They are
+// asserted together, in the order the pixels travel, so a future edit to any single file that flips
+// a convention fails here.
+TEST(XRDepthPair, PaneZeroIsTheLeftEyeAtEverySeam) {
+    // 1. the crop takes the LEFT half of the packed buffer for pane 0
+    const auto CROP0 = cropForEye({}, CONTENT_SBS, 0);
+    const auto CROP1 = cropForEye({}, CONTENT_SBS, 1);
+    EXPECT_EQ(CROP0.tl.x, 0.0);
+    EXPECT_EQ(CROP0.br.x, 0.5);
+    EXPECT_EQ(CROP1.tl.x, 0.5);
+    EXPECT_EQ(CROP1.br.x, 1.0);
+
+    // 2. ...and the pane that gets the left half is the one a raised window moves RIGHT in
+    EXPECT_FLOAT_EQ(Desktop::Depth::eyeSign(0), 1.F);
+    EXPECT_FLOAT_EQ(Desktop::Depth::eyeSign(1), -1.F);
+
+    // 3. ...and that composite is packed into the LEFT half of the scanout buffer
+    const Vector2D MODE{PANEW * 2, PANEH};
+    EXPECT_EQ(Monitor::Stereo::paneDestBox(MODE, Config::STEREO_SBS, 0).pos(), (Vector2D{0.0, 0.0}));
+    EXPECT_EQ(Monitor::Stereo::paneDestBox(MODE, Config::STEREO_SBS, 1).pos(), (Vector2D{PANEW, 0.0}));
+
+    // 4. ...which the blit lands in swapchain pane 0, and pane 0 is the quad submitted with
+    //    XR_EYE_VISIBILITY_LEFT (OpenXRManager's `eye == 0 ? LEFT : RIGHT`).
+    EXPECT_EQ(paneContentDestGL(packed(), 0).x, 64); // pane 0's content, inside its own margin
+    EXPECT_LT(paneFullRect(packed(), 0).x, paneFullRect(packed(), 1).x);
+    EXPECT_EQ(paneFullRect(packed(), 0).x, 0);
 }
 
 // ---------------------------------------------------------------------------------------------
