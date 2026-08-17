@@ -4124,14 +4124,16 @@ std::expected<std::string, std::string> COpenXRManager::requestReseatToHead(cons
     const int64_t         ageMs    = haveHead ? (int64_t)Time::millis(Time::steadyNow()) - head.timestampMs : -1;
 
     // The eligible set, under the same lock every other main-thread anchor read uses, and through
-    // the same predicate the frame loop applies — one definition of "which monitors move".
-    int eligible = 0;
+    // the same predicate the frame loop applies — one definition of "which monitors move". The
+    // world poses come along so the answer below can be exact rather than optimistic.
+    std::vector<OpenXR::SXRPose> worlds;
     {
         std::scoped_lock lock(m_layersMu);
         for (auto& l : m_layers)
             if (OpenXR::xrReseatEligible(l->m_anchor.state().mode, l->m_pendingRemoval.load(std::memory_order_acquire)))
-                ++eligible;
+                worlds.push_back(l->m_anchor.state().anchorPose);
     }
+    const int eligible = (int)worlds.size();
 
     switch (OpenXR::xrReseatBlock(sessionExists(), haveHead, head.viewValid, ageMs, eligible)) {
         case OpenXR::XR_RESEAT_NO_SESSION: return std::unexpected<std::string>("no OpenXR session — nothing to re-seat");
@@ -4142,6 +4144,13 @@ std::expected<std::string, std::string> COpenXRManager::requestReseatToHead(cons
         case OpenXR::XR_RESEAT_NO_MONITORS: return std::unexpected<std::string>("no anchor:local monitors — head/body/device-anchored monitors already follow you");
         case OpenXR::XR_RESEAT_READY: break;
     }
+
+    // Answer the degenerate arrangement HERE rather than letting the user press a key, see nothing
+    // happen, and go looking in the log for the frame thread's WARN. Validity depends only on the
+    // monitors' normals, not on the head, so this verdict is exactly the one the frame thread will
+    // reach with its own (fresher) head pose a frame from now.
+    if (!OpenXR::xrGroupSeatFrame(worlds.data(), worlds.size(), OpenXR::SXRPose{head.headPos, head.headRot}).valid)
+        return std::unexpected<std::string>("your monitors have no common facing (they surround you) — there is no 'in front of' to bring them round to");
 
     // Arm the GROUP re-seat (doc 03 §8.4) — NOT the RESTORE one the first plug arms. Everything here
     // is live and continuous: the §8.3 capture has been re-deriving every stored offset against the
