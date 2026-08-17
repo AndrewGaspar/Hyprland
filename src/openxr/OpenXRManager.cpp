@@ -1183,10 +1183,6 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
             m_presenceKnown = true;
             m_userPresent   = e.a != 0;
             Log::logger->log(Log::DEBUG, "[OPENXR] user {} — re-evaluating monitor plug state", m_userPresent ? "present (donned)" : "absent (doffed)");
-            // doc 03 §8.3: close the cross-session restore capture gate on the DOFF edge itself, not
-            // on the plug edge the grace timer defers by seconds. The last captured placement must be
-            // one the user's head produced, not one a headset on a desk did.
-            publishRestoreCapture();
             updateMonitorsPlugged(/*allowGrace=*/true);
             // research/20 phase 2: presence is now an INPUT to shouldInhibitIdle() under
             // openxr:inhibit_idle = present, so the don/doff edge must re-fold the Wayland
@@ -3822,6 +3818,13 @@ void COpenXRManager::updateMonitorsPlugged(bool allowGrace) {
     if (!up)
         resetPresenceState(); // session gone — forget presence + first-plug bookkeeping
 
+    // doc 03 §8.3: re-derive the cross-session placement capture gate here, because this funnel is
+    // where every input to it lands — the session-state edge (visibility), the don/doff edge, and
+    // start/stop/reload. Deliberately BEFORE the plug decision below and independent of it: whether
+    // the headless outputs follow the session is a policy the user can turn off, while whether they
+    // are wearing the headset is not.
+    publishRestoreCapture();
+
     const bool want      = monitorsShouldBePluggedNow();
     const bool firstPlug = !m_everPlugged;
 
@@ -3950,30 +3953,32 @@ void COpenXRManager::setMonitorsPlugged(bool plugged) {
         requestLayout2DSync();
     }
 
-    // doc 03 §8.3: the plug edge moves the cross-session restore capture gate. Unplugged monitors are
-    // not being looked at, so their placement relative to the head means nothing worth remembering.
-    publishRestoreCapture();
 }
 
 void COpenXRManager::publishRestoreCapture() {
-    // doc 03 §8.3. Capture only from frames the user is really WEARING the headset with the monitors
-    // plugged — the frames after a doff come from a headset lying on a desk, and preserving THAT
-    // arrangement into the next session would be worse than the stale-coordinate bug this fixes.
+    // doc 03 §8.3. Capture only from frames the user is really WEARING the headset — the frames after
+    // a doff come from a headset lying on a desk, and preserving THAT arrangement into the next
+    // session would be worse than the stale-coordinate bug this fixes.
     //
-    // A runtime without XR_EXT_user_presence has no doff edge to close the gate on; there the plug
-    // state is the whole gate (the `visible`-mode unplug grace still closes it a beat later, which
-    // costs a couple of seconds of desk-height samples in the worst case). Presence SUPPORTED but not
-    // yet KNOWN counts as wearing: the plug decision that got us here was made on visibility, and
-    // refusing to capture until the first don event would leave a freshly plugged session with no
-    // durable placement at all.
+    // VISIBILITY is the signal, not the monitor plug state. Plugging is a policy
+    // (openxr:monitors_follow_session) that the user may switch off entirely, and m_monitorsPlugged
+    // then stays false forever while the headset is worn and the quads are perfectly visible — gating
+    // on it disabled this whole feature under `off`, silently, which is how the container caught it.
+    // VISIBLE/FOCUSED means the runtime is compositing our frames, which is exactly the condition
+    // `visible` mode itself keys the plug on, and it drops on doff before the unplug grace does.
+    //
+    // Presence refines it when the runtime has XR_EXT_user_presence: a doff is reported the moment the
+    // proximity sensor opens, ahead of the visibility drop. Presence SUPPORTED but not yet KNOWN
+    // counts as wearing — refusing to capture until the first don event would leave a freshly visible
+    // session with no durable placement at all.
     const bool wearing = !m_userPresenceSupported || !m_presenceKnown || m_userPresent;
-    const bool want    = m_monitorsPlugged && wearing;
+    const bool want    = sessionVisible() && wearing;
     if (m_restoreCapture.exchange(want, std::memory_order_relaxed) == want)
         return;
     // Worth a line: this gate is the difference between "your layout will come back" and "it will be
     // re-seated from the config", and `hyprctl openxr status` only shows the resulting per-monitor
     // state. Say which of the two inputs closed it.
-    Log::logger->log(Log::DEBUG, "[OPENXR] cross-session placement capture {} (monitors {}, user {})", want ? "ON" : "OFF", m_monitorsPlugged ? "plugged" : "unplugged",
+    Log::logger->log(Log::DEBUG, "[OPENXR] cross-session placement capture {} (session {}, user {})", want ? "ON" : "OFF", sessionVisible() ? "visible" : "not visible",
                      !m_userPresenceSupported ? "presence unsupported" : (!m_presenceKnown ? "presence unknown" : (m_userPresent ? "present" : "absent")));
 }
 
