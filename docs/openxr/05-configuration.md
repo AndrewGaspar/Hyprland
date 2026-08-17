@@ -54,6 +54,7 @@ Every variable, grouped by area. The "applies" column notes when a change takes 
 | `reprobe_interval_ms` | int | `2000` | Base interval for the reprobe backoff. "Waiting for the runtime" grows the delay from this base up to 30s; "waiting for the headset" (runtime up, not donned) polls at this fixed cadence. | hot |
 | `reprobe_watch` | bool | `true` | While dormant in `unavailable`, also **inotify-watch** `$XDG_RUNTIME_DIR` for the runtime materializing and probe **immediately** when it does — instead of waiting out the backoff. Triggers: the IPC socket appearing (`monado_comp_ipc`, `wivrn/comp_ipc`) **and the pid file being created or rewritten** (`monado.pid`, `wivrn.pid`) — the latter is WiVRn's only don-time filesystem signal (its socket is pre-created at service start and inherited by the compositor server forked at headset-connect). A trigger also resets the backoff to the base interval, and any relevant watched-dir activity keeps it capped at base for the next 60s (the runtime is materializing — poll hard). The `reprobe`/`reprobe_interval_ms` timer stays as the fallback (inotify can miss across mount namespaces, and needs `$XDG_RUNTIME_DIR` set); each timer probe also stats the trigger paths and logs once per dormant period if one exists that the watch never saw (silent-miss guard). | hot (next reprobe cycle) |
 | `gpu` | string | `""` | DRM render node for the XR EGL context (e.g. `/dev/dri/renderD128`). Empty = follow Hyprland's primary GPU. Set it on hybrid/multi-GPU machines where the runtime composites on a different GPU than Hyprland — a detected mismatch is refused at startup rather than crashing the graphics driver (see the session/graphics doc). | start |
+| `ignore_kernel_taint` | bool | `false` | Start XR even when the kernel has **already taken an oops this boot** (`/proc/sys/kernel/tainted` bit 7, `TAINT_DIE`). By default bring-up is refused in that state, because it unavoidably initializes *every* installed GPU vendor driver — a pin cannot prevent it — and entering an already-corrupt one can take the machine down. Development escape hatch only; it still warns at each start, and the real fix is a reboot. See the "sick driver" note below and the session/graphics doc. | start |
 | `runtime_json` | string | `""` | Path to the OpenXR runtime manifest (`openxr_*.json`) the session should handshake against, overriding `XR_RUNTIME_JSON` / `active_runtime.json` **for this compositor's XR session only**. Empty = leave the login environment untouched (loader default). Read on the **main thread** at each session start and applied to the loader's `XR_RUNTIME_JSON` before the handshake; clearing it back to empty restores the runtime the process launched with, so it round-trips cleanly. This is how the XREAL flat↔XR toggle (`scripts/xreal-mode.sh`) selects the xreal-flavor Monado without disturbing a WiVRn `active_runtime`. Set live with `hyprctl keyword openxr:runtime_json <path>` then `hyprctl openxr disable && hyprctl openxr enable` to re-handshake. Surfaced in `status` as `runtime json:`. See the XREAL rig doc (07). | start |
 | `force_linear` | string | `auto` | Allocate LINEAR (cross-GPU-importable) buffers for XR monitors: `auto` (only when a cross-GPU split is detected) / `on` / `off`. Needed together with `gpu` when the runtime GPU differs from the desktop's render GPU. Linear costs some compositing throughput. | start (applied at monitor bind) |
 | `blend_mode` | string | `auto` | Environment blend mode: `auto` (runtime's preferred) / `opaque` (monitors over a black void) / `alpha` (**passthrough** — monitors over your real room, on runtimes that support it, e.g. WiVRn on Quest 3) / `additive` (optical see-through). An explicit mode the runtime doesn't advertise falls back to the preferred one with a warning. | start |
@@ -61,6 +62,34 @@ Every variable, grouped by area. The "applies" column notes when a change takes 
 | `overlay_z` | int | `1` | Overlay stacking order (`sessionLayersPlacement`); higher composites later / on top. The primary app is always beneath. Only meaningful with `overlay = true`. | start |
 | `inhibit_idle` | string | `present` | **When** a live session inhibits idle (hypridle etc.) — `off` \| `focused` \| `present` (§7). `focused` = the session has input focus (the pre-research/20 behavior). `present` = the headset is actually **worn**, which also covers worn-but-not-focused (runtime dashboard in front, overlay mode). Legacy values still parse: `0`/`false` → `off`, `1`/`true` → **`focused`** (an existing explicit opt-in keeps its exact old meaning). | hot |
 | `floor_offset` | float (m) | `1.5` | Fallback eye height, used only when the runtime lacks `XR_EXT_local_floor`. | start |
+
+**The sick-driver refusal (why XR sometimes will not start at all).** If the kernel has already
+taken an oops this boot, XR refuses to come up and says so:
+
+```
+state: unavailable (waiting for runtime, retrying in 2400ms)
+blocked: the kernel has taken an oops this boot (/proc/sys/kernel/tainted = 12416, TAINT_DIE set); XR bring-up would enter a possibly-corrupt GPU driver — reboot before using XR (set openxr:ignore_kernel_taint = 1 to override)
+```
+
+The reasoning is short: bring-up **cannot** avoid initializing every installed GPU vendor driver.
+libglvnd loads them all on the first `eglGetProcAddress` and contacts their kernel drivers on the
+count-only `eglQueryDevicesEXT`, before any device handle exists for `gpu` to filter on — so
+pinning a GPU does not keep XR away from the other one. Once the kernel has oopsed, the only thing
+that actually protects you is not starting. (The full measurements are in the session/graphics doc.)
+
+Caveats:
+
+- It keys on `TAINT_DIE` (bit 7) **only**. The everyday taint bits — proprietary, out-of-tree or
+  unsigned modules, which read `12288` on a stock NVIDIA box every boot — never block XR.
+- It **fails open**: an unreadable or unparsable `/proc/sys/kernel/tainted` proceeds normally.
+- It is re-checked on every retry, so the `blocked:` line stays up until you reboot. The log shouts
+  once and then goes quiet, so the retry loop cannot bury it; `hyprctl openxr disable && hyprctl
+  openxr enable` shouts again.
+- `ignore_kernel_taint = 1` overrides it (and still warns). Reboot instead, unless you are actively
+  developing against this code path.
+- A driver can of course be sick *without* the kernel having oopsed. That case is covered
+  separately: every bring-up call that enters a GPU driver runs on a 3-second bounded thread, so a
+  driver that stops answering costs XR rather than freezing the desktop.
 
 ### Monitors & plug lifecycle
 
@@ -981,6 +1010,7 @@ JSON (`hyprctl -j openxr`) — all keys always present:
     "systemName": "Simulated HMD",
     "runtimeGpu": "AMD Radeon Graphics (drm 226:128, via EGL device query (XR_MND_query_egl_device))",
     "runtimeJson": "",
+    "blocked": "",
     "blendMode": "opaque",
     "blackAlpha": { "configured": 1.000, "effective": 1.000, "knee": 0.100, "active": false, "gatedOff": false },
     "overlay": false,
@@ -1030,6 +1060,12 @@ Field notes:
 - `state` — `disabled` | `unavailable` | `starting` | `idle` | `visible` | `focused` |
   `stopping`.
 - `runtimeName` / `systemName` — from the runtime; empty when there is no session.
+- `blocked` — why bring-up is being **refused outright**, or empty (the normal case). Currently set
+  only by the kernel-taint tripwire: the kernel oopsed this boot, so entering the GPU driver stack
+  is unsafe and `start()` will not try (see `ignore_kernel_taint` in §2 and the session/graphics
+  doc). In the text form the `blocked:` line is emitted **only when set**, directly under `state:`,
+  so a healthy session's output is unchanged; in JSON the key is always present. Unlike the ordinary
+  `unavailable` reasons — no runtime, no headset — this one does not self-heal: it needs a reboot.
 - `runtimeGpu` — the GPU the runtime composites on, resolved by the cross-GPU probe, followed by
   which query answered (`via EGL device query (XR_MND_query_egl_device)` normally, `via Vulkan
   device query (XR_KHR_vulkan_enable2)` on a runtime without the EGL query — see the
