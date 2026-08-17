@@ -21,6 +21,11 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     // WP-XR1: the openxr:runtime_json override forced into XR_RUNTIME_JSON for this session (empty =
     // loader default / active_runtime.json). Lets the XREAL flat/XR toggle confirm the active runtime.
     const std::string RTJSON  = g_pOpenXRManager->runtimeJson();
+    // Kernel-taint tripwire (doc 01): why bring-up is being REFUSED, empty when nothing is. The
+    // ordinary UNAVAILABLE reasons are transient and already covered by the state line's "waiting
+    // for ..." hint; this one needs a reboot, so it gets its own line — and only when it applies,
+    // so a healthy session's status is byte-identical to before.
+    const std::string BLOCKED = g_pOpenXRManager->blockedReason();
     const std::string BLEND   = g_pOpenXRManager->blendModeName();
     const bool        OVERLAY = g_pOpenXRManager->isOverlay();
     const bool        MONITOR_VIEW = g_pOpenXRManager->monitorViewVisible();
@@ -157,6 +162,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "systemName": "{}",
     "runtimeGpu": "{}",
     "runtimeJson": "{}",
+    "blocked": "{}",
     "blendMode": "{}",
     "blackAlpha": {{ "configured": {:.3f}, "effective": {:.3f}, "knee": {:.3f}, "active": {}, "gatedOff": {} }},
     "overlay": {},
@@ -187,7 +193,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "monitors": [{}{}]
 }}
 )#",
-                           STATE, RUNTIME, SYSTEM, RTGPU, RTJSON, BLEND, BLACK.configured, BLACK.effective, BLACK.knee, BLACK.active ? "true" : "false",
+                           STATE, RUNTIME, SYSTEM, RTGPU, RTJSON, BLOCKED, BLEND, BLACK.configured, BLACK.effective, BLACK.knee, BLACK.active ? "true" : "false",
                            BLACK.gatedOff ? "true" : "false", OVERLAY ? "true" : "false", MONITOR_VIEW ? "shown" : "hidden", SELECTED, FOLLOW, UNPLUG_PEND, RECENTER, PRESENCE, RESTORE_CAPTURE ? "true" : "false", VISIBLE,
                            REPROBE_WAIT, REPROBE_MS, REPROBE_WATCH ? "true" : "false", INHIBITING_IDLE ? "true" : "false", INHIBIT_MODE, HANDIN.mode, HANDIN.state, GAZE.source,
                            GAZE.hoveredMonitor, GAZE.hoveredName, GAZE.carrying ? "true" : "false", GAZE.carryMonitor, GAZE.dist, HANDS[0].hands ? "hands" : "controllers",
@@ -216,13 +222,17 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
         : !L2D.refValid        ? "on (waiting for tracking)"
                                : std::format("{}{} monitor(s) in {} row(s), block {}x{}, ref yaw {:.0f} deg, {} px/deg, vertical {}, attach {}", L2D.frozen ? "frozen — " : "",
                                              L2D.placed, L2D.rows, L2D.width, L2D.height, L2D.refYawDeg, L2D.pxPerDegree, L2D.vertical, L2D.attach);
+    // Emitted directly UNDER the state line (which stays first, as bar scripts expect) and only
+    // when something is actually blocking — a healthy session's status is byte-identical to before.
+    // It sits above the runtime details because when it is set those are all empty and meaningless.
+    const std::string BLOCKEDLINE = BLOCKED.empty() ? "" : std::format("blocked: {}\n", BLOCKED);
     std::string       out =
-        std::format("state: {}\nruntime: {}\nsystem: {}\nruntime gpu: {}\nruntime json: {}\nblend mode: {}\nblack alpha: {}\noverlay: {}\nmonitor view: {}\nselected: {}\nmonitors "
+        std::format("state: {}\n{}runtime: {}\nsystem: {}\nruntime gpu: {}\nruntime json: {}\nblend mode: {}\nblack alpha: {}\noverlay: {}\nmonitor view: {}\nselected: {}\nmonitors "
                     "follow session: {}\nrecenter policy: {}\nvisible: "
                     "{}\npresence: {}\nidle "
                     "inhibited: {} (mode {})\nplacement capture: {}\nhand input: {} "
                     "({})\ngaze ({}): {}\ninput: left {}, right {}\n2d-plane sync: {}\n",
-                    STATELINE, RUNTIME, SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, RTJSON.empty() ? "(loader default)" : RTJSON, BLEND, BLACKLINE, OVERLAY ? "yes" : "no",
+                    STATELINE, BLOCKEDLINE, RUNTIME, SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, RTJSON.empty() ? "(loader default)" : RTJSON, BLEND, BLACKLINE, OVERLAY ? "yes" : "no",
                     MONITOR_VIEW ? "shown" : "hidden", SELECTED.empty() ? "(none)" : SELECTED, FOLLOWLINE, RECENTER, VISIBLE, PRESENCE, INHIBITING_IDLE ? "yes" : "no", INHIBIT_MODE, RESTORE_CAPTURE ? "on" : "off",
                     HANDIN.state, HANDIN.mode, GAZE.source, GAZELINE, handLabel(HANDS[0]), handLabel(HANDS[1]), L2DLINE);
     for (const auto& m : MONS) {

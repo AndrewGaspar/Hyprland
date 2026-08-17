@@ -65,9 +65,10 @@ struct SXrSystemEGLDeviceMND {
 using PFN_xrGetSystemEGLDeviceMND_t = XrResult(XRAPI_PTR*)(XrInstance, const SXrSystemEGLDeviceGetInfoMND*, SXrSystemEGLDeviceMND*);
 using PFNEGLQUERYDEVICESTRINGEXTPROC_t = const char* (*)(EGLDeviceEXT, EGLint);
 
-SRuntimeGpu probeRuntimeEglDevice(XrInstance instance, XrSystemId systemId) {
+SRuntimeGpu probeRuntimeEglDevice(XrInstance instance, XrSystemId systemId, const std::atomic<bool>* abandon) {
     SRuntimeGpu out;
-    out.probe = "EGL device query (XR_MND_query_egl_device)";
+    out.probe      = "EGL device query (XR_MND_query_egl_device)";
+    auto abandoned = [&] { return abandon && abandon->load(std::memory_order_acquire); };
 
     // The instance must have enabled XR_MND_query_egl_device; the loader/runtime otherwise answers
     // XR_ERROR_FUNCTION_UNSUPPORTED and we fall back to the Vulkan probe.
@@ -77,9 +78,15 @@ SRuntimeGpu probeRuntimeEglDevice(XrInstance instance, XrSystemId systemId) {
         return out;
     }
 
+    if (abandoned()) {
+        out.note = "probe abandoned (timed out)";
+        return out;
+    }
+
     // Answered in-process: the runtime calls back through `getProcAddress` to enumerate OUR EGL
-    // devices and hands back the one whose UUID matches its compositor's. No IPC, no Vulkan — safe
-    // to call straight from the main thread, unlike the Vulkan probe below.
+    // devices and hands back the one whose UUID matches its compositor's. No IPC, no Vulkan — but
+    // that callback is a full glvnd EGL device enumeration, which touches every installed vendor
+    // driver, so this runs on the caller's throwaway thread all the same.
     SXrSystemEGLDeviceGetInfoMND info = {XR_TYPE_SYSTEM_EGL_DEVICE_GET_INFO_MND_, nullptr, systemId, eglGetProcAddress};
     SXrSystemEGLDeviceMND       dev   = {XR_TYPE_SYSTEM_EGL_DEVICE_MND_, nullptr, EGL_NO_DEVICE_EXT};
 
@@ -97,17 +104,19 @@ SRuntimeGpu probeRuntimeEglDevice(XrInstance instance, XrSystemId systemId) {
 
     // Prefer the render node, fall back to the primary/card node — the same order (and the same
     // DRM major:minor identity) CXRGraphics::selectDisplay used to pick the XR context's device,
-    // so the two are directly comparable. A failed query latches an EGL error on this thread;
-    // clear it so the main thread's own EGL bookkeeping is not left holding our EGL_BAD_ATTRIBUTE.
+    // so the two are directly comparable.
+    //
+    // No eglGetError() clearing here any more: the EGL error latch is PER-THREAD, and this function
+    // now always runs on a throwaway thread that is about to exit, so a latched EGL_BAD_ATTRIBUTE
+    // from a failed query dies with the thread. It never was the main thread's error to inherit —
+    // it only looked that way while this ran on the main thread.
     bool        primaryOnly = false;
     const char* nodePath    = eglQueryDeviceStringEXT_fn(dev.eglDevice, EGL_DRM_RENDER_NODE_FILE_EXT);
     if (!nodePath) {
-        eglGetError();
         nodePath    = eglQueryDeviceStringEXT_fn(dev.eglDevice, EGL_DRM_DEVICE_FILE_EXT);
         primaryOnly = nodePath != nullptr;
     }
     if (!nodePath) {
-        eglGetError();
         out.note = "the runtime's EGL device reports no DRM node (EGL_EXT_device_drm unsupported)";
         return out;
     }
@@ -120,8 +129,6 @@ SRuntimeGpu probeRuntimeEglDevice(XrInstance instance, XrSystemId systemId) {
 
     // EGL_EXT_device_query_name is optional; the node path is a perfectly good name without it.
     const char* renderer = eglQueryDeviceStringEXT_fn(dev.eglDevice, EGL_RENDERER_EXT);
-    if (!renderer)
-        eglGetError();
 
     out.determined = true;
     out.drmMajor   = (int64_t)major(st.st_rdev);

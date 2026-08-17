@@ -47,6 +47,7 @@
 #include "XRMonitorLayer.hpp"
 #include "XRDmabufImport.hpp" // OpenXR::xrContentPathName (status contentPath)
 #include "XRStereoPair.hpp" // WP X1: the stereo quad-pair policy + pane rect math (pure)
+#include "XRBoundedCall.hpp" // OpenXR::runBoundedProbe — the throwaway-thread pattern for driver/runtime calls
 #include "XRInput.hpp"
 #include "XRPointerDevice.hpp"
 #include "XRViewpointEligibility.hpp"
@@ -219,6 +220,10 @@ const std::string& COpenXRManager::runtimeJson() const {
     return m_runtimeJson;
 }
 
+const std::string& COpenXRManager::blockedReason() const {
+    return m_blockedReason;
+}
+
 std::string COpenXRManager::blendModeName() const {
     // Reflect the mode the frame loop actually submits while a session exists; the OPAQUE default
     // otherwise (nothing composited).
@@ -329,6 +334,48 @@ void COpenXRManager::start() {
     m_systemName.clear();
     m_runtimeGpu.clear();
     m_frameRequestedTeardown = false;
+
+    // ---- KERNEL-TAINT TRIPWIRE (doc 01, "Sick-driver refusal") --------------------------------
+    // FIRST thing in bring-up, before the runtime handshake and before ANY GPU enumeration —
+    // because once enumeration starts there is no way back. libglvnd's first eglGetProcAddress
+    // loads every installed vendor library and the count-only eglQueryDevicesEXT contacts every
+    // vendor's kernel driver, before a single device handle exists for openxr:gpu to filter on
+    // (measured; see the comment block above scanEglDevices in XRGraphics.cpp). So "don't touch the
+    // sick driver" is not implementable as a pin or an ordering — the only version of it that
+    // works is not starting.
+    //
+    // Forensics (hard reboot #6): an NVIDIA driver use-after-free cascaded through the kernel,
+    // which printed "Fixing recursive fault but reboot is needed!" 29 minutes before the machine
+    // died. The compositor was a bystander that boot. This check would have refused the session
+    // outright rather than walking into the corrupt driver seconds later.
+    //
+    // Re-checked on EVERY attempt (this is the retry entry point too), so a user who ignores it
+    // keeps being told why instead of silently getting nothing.
+    {
+        static auto PIGNORETAINT = CConfigValue<Hyprlang::INT>("openxr:ignore_kernel_taint");
+
+        // An unreadable/unparsable file yields nullopt, which evaluateKernelTaint deliberately
+        // treats as "proceed" — see its header comment on failing open.
+        const auto verdict = OpenXR::evaluateKernelTaint(OpenXR::readKernelTaint(), *PIGNORETAINT != 0);
+
+        // Published for `hyprctl openxr status` — the same sentence the log carries, so the user
+        // who never reads the log still finds out why XR will not come up.
+        m_blockedReason = verdict.blocked ? verdict.reason : "";
+
+        if (verdict.blocked) {
+            // Loud ONCE per block, then quiet: the re-probe retries this every few seconds and an
+            // ERR per retry would bury the rest of the log. A disable/enable cycle clears the latch
+            // (see stop()), so asking again explicitly always gets a fresh, loud answer.
+            Log::logger->log(m_taintBlockLogged ? Log::DEBUG : Log::ERR, "[OPENXR] refusing XR bring-up: {}. The desktop session is unaffected.", verdict.reason);
+            m_taintBlockLogged = true;
+            setState(XR_STATE_UNAVAILABLE);
+            return;
+        }
+
+        if (verdict.oopsed)
+            Log::logger->log(Log::WARN, "[OPENXR] {}", verdict.reason);
+        m_taintBlockLogged = false;
+    }
 
     // Parse the adaptive STRING options to enums up front (main thread) so the frame thread never
     // reads a CConfigValue<const char*>. Must happen before the frame thread launches below.
@@ -668,12 +715,26 @@ void COpenXRManager::continueBringup(CXRSession* sess) {
         const auto&         node = gfx->selectedRenderNode();
         OpenXR::SRuntimeGpu rt;
 
-        // The EGL device query is answered in-process (the runtime enumerates our EGL devices via
-        // the getProcAddress we hand it and matches by UUID) — no IPC, no Vulkan, nothing that can
-        // deadlock, so unlike the Vulkan probe it runs straight on this thread.
-        if (sess->m_hasEglDeviceQuery)
-            rt = OpenXR::probeRuntimeEglDevice(sess->m_instance, sess->m_systemId);
-        else
+        // The EGL device query is answered in-process (no IPC, no Vulkan) — but the runtime answers
+        // it by calling back through the getProcAddress we hand it, i.e. by doing a full glvnd EGL
+        // device enumeration inside our process. That touches every installed vendor driver, so a
+        // wedged one hangs this call exactly like the Vulkan probe. It therefore gets the SAME
+        // bounded throwaway thread rather than running on the main thread as it used to: a hang
+        // here would freeze the desktop, and "could not verify the GPU" is a survivable outcome
+        // while a frozen desktop is not.
+        if (sess->m_hasEglDeviceQuery) {
+            const XrInstance inst = sess->m_instance;
+            const XrSystemId sys  = sess->m_systemId;
+            const auto       eglProbe =
+                OpenXR::runBoundedProbe([inst, sys](const std::atomic<bool>& abandon) { return OpenXR::probeRuntimeEglDevice(inst, sys, &abandon); });
+            if (eglProbe.has_value())
+                rt = *eglProbe;
+            else {
+                rt.probe = "EGL device query (XR_MND_query_egl_device)";
+                rt.note  = "EGL device query timed out";
+                Log::logger->log(Log::WARN, "[OPENXR] the runtime's EGL device query did not respond within {}ms; falling back", OpenXR::XR_PROBE_TIMEOUT_MS);
+            }
+        } else
             rt.note = "runtime does not advertise XR_MND_query_egl_device";
 
         if (!rt.determined && sess->m_hasVulkanEnable2) {
@@ -685,29 +746,17 @@ void COpenXRManager::continueBringup(CXRSession* sess) {
             // a late unblock can't touch a torn-down instance) and proceed UNVERIFIED — strictly no
             // worse than before this guard existed. When the probe does answer (the common case on
             // a healthy runtime) we get a reliable cross-GPU verdict.
-            auto             result  = std::make_shared<OpenXR::SRuntimeGpu>();
-            auto             done    = std::make_shared<std::atomic<bool>>(false);
-            auto             abandon = std::make_shared<std::atomic<bool>>(false);
-            const XrInstance inst    = sess->m_instance;
-            const XrSystemId sys     = sess->m_systemId;
-            std::thread([result, done, abandon, inst, sys]() {
-                auto r = OpenXR::probeRuntimeRenderNode(inst, sys, abandon.get());
-                if (!abandon->load(std::memory_order_acquire))
-                    *result = r;
-                done->store(true, std::memory_order_release);
-            }).detach();
+            const XrInstance inst = sess->m_instance;
+            const XrSystemId sys  = sess->m_systemId;
+            const auto       vkProbe =
+                OpenXR::runBoundedProbe([inst, sys](const std::atomic<bool>& abandon) { return OpenXR::probeRuntimeRenderNode(inst, sys, &abandon); });
 
-            constexpr int kProbeTimeoutMs = 3000;
-            for (int waited = 0; waited < kProbeTimeoutMs && !done->load(std::memory_order_acquire); waited += 25)
-                std::this_thread::sleep_for(std::chrono::milliseconds(25));
-
-            if (done->load(std::memory_order_acquire))
-                rt = *result;
+            if (vkProbe.has_value())
+                rt = *vkProbe;
             else {
-                abandon->store(true, std::memory_order_release);
                 rt.probe = "Vulkan device query (XR_KHR_vulkan_enable2)";
                 rt.note  = "GPU probe timed out";
-                Log::logger->log(Log::WARN, "[OPENXR] runtime GPU probe did not respond within {}ms; proceeding without GPU verification", kProbeTimeoutMs);
+                Log::logger->log(Log::WARN, "[OPENXR] runtime GPU probe did not respond within {}ms; proceeding without GPU verification", OpenXR::XR_PROBE_TIMEOUT_MS);
             }
 
             // Both questions went unanswered — carry both reasons into the "could not verify" WARN.
@@ -1080,6 +1129,10 @@ void COpenXRManager::stop() {
     m_runtimeName.clear();
     m_systemName.clear();
     m_runtimeGpu.clear();
+    // Nothing is blocking a stopped session — and dropping the "already logged" latch means an
+    // explicit re-enable gets the taint refusal shouted at it again rather than only whispered.
+    m_blockedReason.clear();
+    m_taintBlockLogged = false;
 
     setState(lost ? XR_STATE_UNAVAILABLE : XR_STATE_DISABLED);
 }
