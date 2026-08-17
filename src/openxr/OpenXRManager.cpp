@@ -2025,15 +2025,8 @@ void COpenXRManager::frameThread() {
             // reinterpreting each monitor's offset as head-relative. Passing the same viewPose to every
             // layer transforms the group rigidly (relative arrangement preserved). Held armed while the
             // view is invalid so a plug during momentary tracking loss still recenters on the next good
-            // frame. onReferenceSpaceChanged already ran above (this overrides it for LOCAL).
-            //
-            // WHICH offset gets planted is doc 03 §8.3 (xrReseatSource). A config-declared rig is
-            // head-relative by construction and re-seats to itself; anything the user actually placed —
-            // an `openxr create` monitor, or a declared one they grab-moved — re-seats to the offset
-            // captured while they were wearing the headset, which is the only form of its placement
-            // that outlives the reference space it was measured in. Planting the raw LOCAL pose (what
-            // an ad-hoc monitor's "declared" anchor holds) throws it as far as the old and new origins
-            // differ: 7.13 m in the session that produced this fix.
+            // frame. onReferenceSpaceChanged already ran above (this overrides it for LOCAL). WHICH
+            // offset it plants is doc 03 §8.3 (xrReseatSource) — see the RESTORE branch below.
             //
             // The DELIBERATE re-seat (doc 03 §8.4, XR_RESEAT_ARM_GROUP) takes the other branch, and
             // must: the capture below re-derives every stored offset EVERY FRAME while the headset is
