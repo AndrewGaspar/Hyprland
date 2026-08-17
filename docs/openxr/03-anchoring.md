@@ -503,9 +503,34 @@ warping every spring for nothing.
 The third row is the doff case: tracking did not straddle the change because the headset was off, so
 nothing observed the old frame and the wearer may not even be standing where they were. Re-seating is
 the same rigid, arrangement-preserving operation the first plug of a session performs, and it asks
-the same permission. With `recenter_on_plug = false` the anchors are left alone and a WARN says so —
-that is a deliberate "don't move my monitors" choice, and its cost is that the coordinates are now
-expressed in a frame that no longer exists.
+the same permission (or `openxr:recenter = follow`, §8.4, which asks for that re-seat on every
+reference-space change anyway). With `recenter_on_plug = false` the anchors are left alone and a WARN
+says so — that is a deliberate "don't move my monitors" choice, and its cost is that the coordinates
+are now expressed in a frame that no longer exists.
+
+#### Deliberate vs involuntary
+
+Everything above answers *"the origin moved; where do the monitors belong?"* with **the room** —
+they stay physically where they are. That is right, and it is what ended the teleports. But it makes
+the runtime's recenter button, under monado, a control that **correctly does nothing** to the
+monitors: it moves an origin the user cannot see.
+
+That is a real gap, not a subtlety, and it was reported as one (2026-08-17): the Quest's recenter
+pressed over and over with the monitors staying put, and physically turning 180° before recentering
+as the only workaround. *"If I pivoted only slightly, everything would land exactly where it already
+was… we really need a better approach here."*
+
+The compositor cannot tell the two intents apart from the event, because the runtime does not say
+which it was — a deliberate press, a re-don, and a guardian re-derive arrive identically. So the
+distinction is drawn where it is knowable:
+
+- **Deliberate** = the user ran `xrmonitor reseat` / `hyprctl openxr reseat`. Unambiguous, so it
+  always re-seats (§8.4).
+- **Involuntary** = an `XrEventDataReferenceSpaceChangePending`. Handled by the ladder above, which
+  holds the room — unless `openxr:recenter = follow` says to treat every one of them as deliberate.
+
+`hold` plus a keybind is the recommended shape. `follow` is for someone who genuinely wants the
+recenter button to mean "bring my monitors to me" and accepts that a re-don means it too.
 
 ### 8.2 Recenter on plug
 
@@ -560,6 +585,13 @@ plug reads the freshly seated pose rather than clobbering a good offset with the
 the middle of replacing). It is gated on `m_restoreCapture`, because frames keep arriving after a doff
 from a headset lying on a desk, and remembering *that* arrangement would be worse than the bug.
 
+**"Every frame" has a consequence worth stating here** rather than leaving it to be discovered: while
+the user is wearing the headset, a monitor's stored offset is not a memory of where they *put* it, it
+is a live measurement of where it *is relative to them*. It becomes a memory only when the gate shuts
+(doff, session end) and freezes the last such measurement — which is exactly the state §8.2's re-seat
+is designed to consume. Replanting a stored offset while the gate is OPEN is the identity, and §8.4
+exists because of it.
+
 The gate is **session visibility**, refined by presence — *not* the monitor plug state.
 `VISIBLE`/`FOCUSED` means the runtime is compositing our frames, which is the same condition `visible`
 mode keys the plug on, and it drops on doff ahead of the unplug grace. Plugging itself is a policy
@@ -611,6 +643,105 @@ it currently sits would make a monitor the user cannot see permanently unreachab
 
 `hyprctl openxr status` reports this per monitor (`restore [x, y, z] (head-relative)`, or `restore
 none`), so "will my room come back" is answerable before restarting anything.
+
+### 8.4 The deliberate re-seat — `xrmonitor reseat`
+
+One verb, three transports (`bind = SUPER CTRL, Home, xrmonitor, reseat`, `hyprctl openxr reseat`,
+`hyprctl dispatch xrmonitor reseat`). It rigidly moves the whole `anchor:local` group so it sits in
+front of the head **as it is now arranged** — the layout arrives, not a reset. `head`/`body`/`device`
+monitors are excluded, the same set §8.2 uses (`xrReseatEligible`).
+
+Mechanically it is an **arming**, not a computation: the frame thread owns the head pose, so
+`requestReseatToHead()` (main) decides and arms, and the frame loop performs the re-seat on its next
+valid-view frame against a pose it locates itself. `xrReseatBlock` is what the main thread can decide
+from — session up, the newest published head sample tracked and under
+`XR_RESEAT_HEAD_MAX_AGE_MS` (1 s) old, at least one eligible monitor — so the verb can answer
+"re-seated 3 monitors to the current head" or say exactly why it did nothing.
+
+#### Why it is not §8.2's re-seat
+
+This is the part that is not obvious, and skipping it produces a verb that silently does nothing.
+
+§8.2 replants each monitor's **stored** head-relative offset. That is exactly right across a
+**discontinuity** — a new session, or a change nothing observed — because §8.3's capture was *gated
+off* throughout it, so the stored offset still describes the arrangement as the user left it.
+
+Nothing is gated off while the user is simply sitting there wearing the headset. §8.3 re-derives
+every offset **every frame**, so the stored offset always means "where this monitor is relative to
+where I am *right now*". Replanting it around the current head is
+
+```
+hf(H) ∘ inv(hf(H)) ∘ pose  =  pose
+```
+
+— the monitor's own pose, back, to within one frame of head motion. A deliberate re-seat built on it
+lands everything exactly where it already was, which is the verbatim complaint above.
+
+So there are two re-seats, and `eXRReseatKind` says which is armed:
+
+| kind | armed by | plants |
+|---|---|---|
+| `RESTORE` | first plug of a session; the §8.1 tracking-gap fallback | each monitor's stored offset (§8.3) — the arrangement as last left |
+| `GROUP` | `xrmonitor reseat`; a reference-space change under `recenter = follow` | the **live** arrangement, moved rigidly onto the current head |
+
+`RESTORE` outranks `GROUP` when both land before the frame thread consumes: a discontinuity has to
+be repaired from the stored offsets before "move the live arrangement" means anything, and the
+`GROUP` pass that follows is then the identity.
+
+#### The group's seat frame
+
+`GROUP` needs a reference that is not the live head, and takes it from the arrangement itself. A
+monitor group implies the frame of the viewer it was arranged **for** — stand there and you see it
+head-on — and re-seating means moving that implied viewer onto the actual one
+(`xrGroupSeatFrame`, `XRAnchor.hpp`):
+
+- **position** = the group's centroid, pushed back along its **mean facing normal** by the distance
+  the user is currently viewing it from, measured **perpendicularly** to that normal;
+- **orientation** = facing the group (forward = −normal);
+- yaw-only, on the floor (`y = 0`) — the same shape `xrHeadFrame` produces, so it drops straight
+  into `xrPoseInHeadFrame` / `recenterLocalToHead`.
+
+Every monitor is then re-expressed in that one frame and replanted in the head's, so the transform
+is rigid: **relative layout preserved exactly**, only the group as a whole travels.
+
+Three properties earn their design:
+
+- **It is a fixed point.** After a re-seat the head *is* the group's seat frame, so pressing again is
+  the identity. The perpendicular projection is what buys this; a plain head-distance would creep the
+  group outward on every press.
+- **Sliding along a wall is not walking away from it.** Standing 3 m to one side of monitors you sit
+  1.5 m from is still a 1.5 m viewing distance, so they come round to 1.5 m in front of you.
+- **The distance is clamped** to `XR_DISTANCE_MIN`…`XR_DISTANCE_MAX` (0.3–5 m), the same clamp every
+  placement verb uses, so re-seating from across the room does not park the group across the room.
+
+Degenerate groups are refused rather than guessed at. Normals that cancel — a ring of monitors
+surrounding the user — have no "in front of" to be brought around to, so the frame loop leaves the
+group alone and WARNs. A monitor lying flat (no horizontal normal, e.g. a ceiling panel) travels
+with the group but gets no vote on where its front is.
+
+#### It does not fight the capture
+
+§8.3's capture runs immediately after the re-seat, on the same frame, off the same head — and
+`xrPoseInHeadFrame` is the exact inverse of the composition `recenterLocalToHead` performs. So the
+capture re-measures the very offset the re-seat just planted: the stored placement comes back
+unchanged, and a monitor that was `restorable` before a re-seat is still `restorable` after it, with
+the same meaning. That is what makes the verb safe to bind to a key and mash, and what makes a
+`follow`-policy recenter idempotent instead of cumulative
+(gtest: `ReseatThenCaptureIsAFixedPoint`).
+
+A re-seat also drops the 2D-plane sync's latched reference (report 12 §3a) and requests a re-sync,
+so the mouse/workspace projection is re-derived against the head the group just landed in front of
+— the same follow-up the first-plug re-seat performs.
+
+#### Threading
+
+`follow` does **not** re-implement any of this on the frame thread. `openxr:recenter` is a STRING, so
+it is parsed on the main thread into an atomic (`publishRecenterPolicy`, the task #25 pattern) and
+the frame thread reads that for one decision only: whether to hand the edge to main at all. Under the
+default `hold` it does not, so that path is byte-identical to what shipped. Under `follow` it enqueues
+`RECENTERED` on the existing frame→main queue and the main thread runs the identical
+`requestReseatToHead()` the verb runs.
+
 
 ## 9. Layout persistence — `hyprctl openxr layout`
 

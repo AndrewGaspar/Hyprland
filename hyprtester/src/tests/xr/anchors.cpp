@@ -443,4 +443,157 @@ TEST_CASE(xr_anchor_restore_across_session) {
     NLog::green("xr_anchor_restore_across_session: ad-hoc monitor placement followed the user across a session recycle");
 }
 
+// xr_reseat_verb — doc 03 §8.4, the deliberate "bring my monitors to me".
+//
+// The §8.1 ladder holds monitors still in the room across a recenter, on purpose. Reported live
+// 2026-08-17: the Quest's recenter pressed repeatedly, the monitors correctly staying put, and
+// physically turning 180 degrees before recentering as the only workaround. `xrmonitor reseat` is
+// the missing sentence.
+//
+// This test is where the design's real hazard is caught. The obvious implementation — replant each
+// monitor's stored head-relative offset, exactly what the first plug does — is a NO-OP while the
+// headset is worn, because the §8.3 capture has been re-deriving those offsets against this very
+// head every frame. So the assertion that matters is not "the verb returned ok": it is that the
+// monitors ACTUALLY MOVED, to the place a rigid transform onto the new facing puts them, with their
+// relative layout intact. A regression to the stored-offset form fails here and nowhere else.
+TEST_CASE(xr_reseat_verb) {
+    XR_SKIP_IF_UNAVAILABLE();
+
+    const std::string monL = XR::monitorName(50);
+    const std::string monR = XR::monitorName(51);
+
+    struct SReseatGuard {
+        const bool& failed;
+        std::string testName;
+        std::string a, b;
+        ~SReseatGuard() {
+            if (!a.empty())
+                getFromSocket("/openxr destroy " + a);
+            if (!b.empty())
+                getFromSocket("/openxr destroy " + b);
+            getFromSocket("/keyword openxr:recenter hold");
+            if (XR::g_ctx.remote) {
+                using namespace MonadoWire;
+                XR::g_ctx.remote->setHeadPose(xrt_vec3{0.f, 0.f, 0.f}, xrt_quat{0.f, 0.f, 0.f, 1.f});
+                XR::g_ctx.remote->setControllerActive(CRemoteClient::SIDE_LEFT, false);
+                XR::g_ctx.remote->pulse();
+            }
+            if (failed)
+                XR::dumpXrArtifacts(testName);
+        }
+    };
+    SReseatGuard guard{this->failed, name(), "", ""};
+
+    if (!gateUp()) {
+        XR::logSkip(name(), "session never reached focused/visible (known env instability)");
+        return;
+    }
+
+    using namespace MonadoWire;
+    auto* remote = XR::g_ctx.remote;
+    if (!remote) {
+        XR::logSkip(name(), "no remote client available");
+        return;
+    }
+
+    // The user sits at the origin looking down -Z, with a two-monitor wall 1.5 m in front. Declared
+    // poses (not ad-hoc) so the starting geometry is exact and this test is about the re-seat rather
+    // than about where `create` happened to drop things.
+    remote->setHeadPose(xrt_vec3{0.f, 0.f, 0.f}, xrt_quat{0.f, 0.f, 0.f, 1.f});
+    remote->setControllerActive(CRemoteClient::SIDE_LEFT, false);
+    remote->pulse();
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    ASSERT(getFromSocket("/openxr create " + monL + " 1280x720 anchor:local pos:-0.6,1.4,-1.5 yaw:0 size:1.0"), std::string("ok"));
+    guard.a = monL;
+    ASSERT(getFromSocket("/openxr create " + monR + " 1280x720 anchor:local pos:0.6,1.4,-1.5 yaw:0 size:1.0"), std::string("ok"));
+    guard.b = monR;
+    ASSERT(XR::waitForJson(
+               "j/openxr", [&](const std::string& r) { return r.contains("\"name\": \"" + monL + "\"") && r.contains("\"name\": \"" + monR + "\""); },
+               std::chrono::milliseconds(10000)),
+           true);
+
+    auto poseOf = [](const std::string& st, const std::string& mon) {
+        const auto p = XR::findAfter(st, "\"name\": \"" + mon + "\"");
+        return p == std::string::npos ? std::vector<float>{} : posOf(st, p);
+    };
+
+    std::vector<float> beforeL, beforeR;
+    {
+        const std::string st = getFromSocket("j/openxr");
+        beforeL              = poseOf(st, monL);
+        beforeR              = poseOf(st, monR);
+        ASSERT(beforeL.size(), (size_t)3);
+        ASSERT(beforeR.size(), (size_t)3);
+        // They really are where they were declared — otherwise the arithmetic below proves nothing.
+        EXPECT_MAX_DELTA(beforeL[0], -0.6, 0.05);
+        EXPECT_MAX_DELTA(beforeL[2], -1.5, 0.05);
+        EXPECT_MAX_DELTA(beforeR[0], 0.6, 0.05);
+    }
+
+    // Swivel the chair: same spot, facing 75 degrees round. Everything the user owns is now off to
+    // one side, and pressing the headset's recenter would (correctly, under the default `hold`) do
+    // nothing about that.
+    constexpr float YAW = 75.f * (float)M_PI / 180.f;
+    remote->setHeadPose(xrt_vec3{0.f, 0.f, 0.f}, xrt_quat{0.f, std::sin(YAW / 2.f), 0.f, std::cos(YAW / 2.f)});
+    remote->pulse();
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+
+    // THE verb. Its reply is the user-facing sentence, so check it says what it did.
+    const std::string reply = getFromSocket("/openxr reseat");
+    ASSERT_CONTAINS(reply, std::string("re-seated 2 monitors"));
+    NLog::log("xr_reseat_verb: reseat replied '{}'", reply);
+    std::this_thread::sleep_for(std::chrono::milliseconds(600)); // the frame thread consumes on its next valid-view frame
+
+    // The head did not move, so the whole group is rotated about the origin by exactly the swivel.
+    // Written out longhand (like the restore test) so this would catch the engine and the doc
+    // disagreeing rather than following the engine into the same mistake.
+    const float        c = std::cos(YAW), s = std::sin(YAW);
+    auto               rotated = [&](const std::vector<float>& p) {
+        return std::vector<float>{p[0] * c + p[2] * s, p[1], -p[0] * s + p[2] * c};
+    };
+    std::vector<float> afterL, afterR;
+    {
+        const std::string st = getFromSocket("j/openxr");
+        afterL               = poseOf(st, monL);
+        afterR               = poseOf(st, monR);
+        ASSERT(afterL.size(), (size_t)3);
+        ASSERT(afterR.size(), (size_t)3);
+
+        const auto wantL = rotated(beforeL), wantR = rotated(beforeR);
+        NLog::log("xr_reseat_verb: {} [{:.3f}, {:.3f}, {:.3f}] -> [{:.3f}, {:.3f}, {:.3f}], expected [{:.3f}, {:.3f}, {:.3f}]", monL, beforeL[0], beforeL[1], beforeL[2], afterL[0],
+                  afterL[1], afterL[2], wantL[0], wantL[1], wantL[2]);
+        EXPECT_MAX_DELTA(dist3(afterL, wantL), 0.0, 0.1);
+        EXPECT_MAX_DELTA(dist3(afterR, wantR), 0.0, 0.1);
+
+        // THE assertion the no-op regression fails: they moved, and by the amount a 75-degree swivel
+        // at 1.6 m implies (~2 m), not by the millimetre of head jitter a stored-offset replant gives.
+        EXPECT(dist3(afterL, beforeL) > 1.f, true);
+        EXPECT(dist3(afterR, beforeR) > 1.f, true);
+        // ...and it is the LAYOUT that arrived, not two monitors piled up: the separation is intact.
+        EXPECT_MAX_DELTA(dist3(afterL, afterR), dist3(beforeL, beforeR), 0.05);
+    }
+
+    // Mash it: a second press from the same spot is the identity. (The seat frame is derived from
+    // the arrangement, and after the first press the head IS that frame.)
+    ASSERT_CONTAINS(getFromSocket("/openxr reseat"), std::string("re-seated 2 monitors"));
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    {
+        const std::string st = getFromSocket("j/openxr");
+        const auto        againL = poseOf(st, monL), againR = poseOf(st, monR);
+        ASSERT(againL.size(), (size_t)3);
+        ASSERT(againR.size(), (size_t)3);
+        EXPECT_MAX_DELTA(dist3(againL, afterL), 0.0, 0.05);
+        EXPECT_MAX_DELTA(dist3(againR, afterR), 0.0, 0.05);
+    }
+
+    // The policy the status line reports, and the one that makes the headset's own recenter do this.
+    EXPECT_CONTAINS(getFromSocket("/openxr"), std::string("recenter policy: hold"));
+    ASSERT(getFromSocket("/keyword openxr:recenter follow"), std::string("ok"));
+    EXPECT_CONTAINS(getFromSocket("/openxr"), std::string("recenter policy: follow"));
+    ASSERT(getFromSocket("/keyword openxr:recenter hold"), std::string("ok"));
+
+    NLog::green("xr_reseat_verb: the deliberate re-seat brought the layout to the user's new facing, rigidly and idempotently");
+}
+
 #endif // WITH_XR_TESTS

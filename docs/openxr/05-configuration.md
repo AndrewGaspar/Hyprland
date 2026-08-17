@@ -70,6 +70,7 @@ Every variable, grouped by area. The "applies" column notes when a change takes 
 | `default_distance` | float (m) | `1.5` | Default placement distance for a new / re-centered monitor. | hot |
 | `default_monitor_scale` | float | `1.25` | Scale given to an **XR-created** monitor that has no explicit scale of its own. A headless output has no EDID, so Hyprland's PPI heuristic reads a 1920x1080 quad as a tiny dense panel and picks `2.0` — cramped through a headset. An explicit `monitor = <name>, …, <scale>` still wins (§3.1); `0` opts out and restores the PPI guess. Applies to the next monitor created — and, on a config reload, to existing XR monitors whose scale nobody else owns. Your real monitors are never touched. | hot |
 | `recenter_on_plug` | bool | `true` | On the **first** don of a session, re-seat `anchor:local` monitors relative to your current head pose instead of the runtime's (often arbitrary) `LOCAL_FLOOR` origin. A monitor you have placed comes back where you left it *relative to you*; one that has never been placed under tracking lands at its configured height/distance (doc 03 §8.3). Multi-monitor layouts are recentered rigidly (relative arrangement preserved). A brief doff-and-don within the same session does not re-seat. It is also the permission for the recenter fallback: when the runtime reports a reference-space change it refuses to describe *and* tracking did not straddle it (doc 03 §8.1), the group is re-seated the same way rather than left holding coordinates in a dead frame. | hot |
+| `recenter` | string | `hold` | What the **headset's own recenter button** does to your monitors (doc 03 §8.4). `hold` (default) = they stay where they are **in the room**; recentering moves the runtime's origin, which you cannot see, so the monitors correctly do not move. `follow` = a runtime reference-space change **also** re-seats the whole `anchor:local` group rigidly onto your current head — the recenter button becomes "bring my monitors to me". **The tradeoff:** the runtime does not say whether a reference-space change was deliberate, so under `follow` an *involuntary* one re-seats too — putting the headset back on, a guardian re-derive. If that is unwelcome, keep `hold` and bind `xrmonitor reseat` (§4), which re-seats only when you ask. Accepts `reseat`/`me` as synonyms for `follow`; anything unrecognized is `hold`. | hot |
 | `monitors_follow_session` | string | `visible` | When XR monitors behave like **unplugged external monitors** (held disabled — workspaces evacuate to your remaining monitors, then return by name on replug, exactly like a physical display): `off` = never; `session` = while no OpenXR session exists; `visible` (default) = while the headset is not actually **worn**. The `visible` plug gate needs BOTH session visibility AND — when the runtime exposes `XR_EXT_user_presence` (e.g. WiVRn) — user presence, so a session created with the headset on the shelf never plugs. Legacy values parse: `false/0` → `off`, `true/1` → `session`. | hot |
 | `monitor_unplug_grace_ms` | int | `20000` | Under `visible`: how long the headset must stay doffed before its monitors unplug and workspaces evacuate — anti-flap so a quick doff-and-don or proximity-sensor churn never rearranges workspaces. Donning re-plugs immediately regardless. | hot |
 | `monitor_plug_settle_ms` | int | `1500` | Under `visible` on a runtime **without** `XR_EXT_user_presence`: how long the session must stay continuously visible before the **first** plug of a session — suppresses the session-create visibility blip (some runtimes sprint to `focused` at startup while still doffed). Ignored once presence is available and after the first plug. | hot |
@@ -737,7 +738,8 @@ transports, one implementation.
 | `rotate` | `<dyaw> [dpitch]` | Rotate, degrees (pitch clamped ±85°). |
 | `scale` | `<f\|+d\|-d>` | Bare number multiplies the width; signed number adds/subtracts meters. Clamped 0.2–4.0 m. |
 | `distance` | `<±m>` | Push/pull along the view ray. Clamped 0.3–5.0 m. |
-| `center` | *(none)* | Re-place centered in view at `openxr:default_distance` (anchor mode preserved). |
+| `center` | *(none)* | Re-place centered in view at `openxr:default_distance` (anchor mode preserved). Acts on the **selected** monitor only. |
+| `reseat` | *(none)* | **Bring my monitors to me.** Rigidly move the whole `anchor:local` group so it sits in front of you *as it is currently arranged* — your layout arrives, with its relative geometry intact; nothing is reset to its config line. `head`/`body`/`device`-anchored monitors are skipped (they already ride you). Idempotent: pressing it again from the same spot does nothing. A clean no-op with a reason when there is no session, no live head pose, or nothing `anchor:local` to move. Bind it (see below) — this is the answer to "I swivelled my chair and my monitors are behind me". |
 | `place` | `<name\|active> at <x>,<y>,<z>` | Re-anchor `<name>` to `local`, **moving** its center to the given `LOCAL_FLOOR` point (meters), facing the headset. Unlike `anchor local` (which freezes the quad at its current pose), `place` teleports it to a supplied point — exactly the point `hyprctl openxr gaze` returns, so a voice/script layer can drop a monitor where the user was looking. |
 | `adaptive` | `on\|off\|toggle` | Enable/disable the adaptive decorator on the selected monitor (recaptures the desk seat on enable). |
 | `undock` | *(none)* | Force the selected adaptive monitor to pick up and follow now (skips the geofence dwell). |
@@ -753,21 +755,35 @@ transports, one implementation.
 | `blackalpha` | `<name\|active> <0..1\|off\|auto>` | Manual luma-key override (§3.5). `off` disables keying on that monitor; `auto` hands it back to the rules. |
 | `sync` | *(none)* \| `freeze` \| `thaw` | 2D-plane sync. Bare: re-latch the desk orientation and re-derive the 2D layout **now**. `freeze` pauses the automatic recompute (rearrange quads without your mouse mapping moving under you); `thaw` resumes it and catches up. Same implementation as `hyprctl openxr sync-layout`. |
 
-**“Center” has three different meanings.** `xrmonitor center` moves only the currently selected
-monitor; it is not an all-monitor recenter. `xrmonitor sync` / `hyprctl openxr sync-layout`
-re-latches the 2D mouse/workspace projection around the current head pose but does not move any
-quad. `openxr:recenter_on_plug = true` is the operation that re-seats every
-`anchor:local` monitor as one rigid arrangement around the current head pose, and it runs only on
-the first plug/don of a newly started OpenXR session. There is currently no one-shot dispatcher
-that performs that all-local-monitor re-seat without restarting the session.
+**Four things sound like "recenter" and are not the same.**
 
-That re-seat restores **the arrangement you left**, not just the declared one (doc 03 §8.3): a
-monitor you created with `openxr create`, or a declared one you grab-moved, comes back at the same
-place relative to you rather than snapping to its config line or to stale coordinates from the
-previous session's reference space. `hyprctl openxr status` shows each local monitor's stored
-`restore [x, y, z] (head-relative)` — or `restore none` if it has never been placed under tracking,
-in which case its declared rig is used. The stored placements survive an XR-session restart but not
-a compositor restart; `hyprctl openxr layout` is still how you make a layout permanent.
+| | moves quads? | scope | when |
+|---|---|---|---|
+| `xrmonitor center` | yes | the **selected** monitor only | on demand |
+| `xrmonitor sync` / `openxr sync-layout` | **no** — re-latches the 2D mouse/workspace projection | all | on demand |
+| `xrmonitor reseat` / `openxr reseat` | yes, the whole group **rigidly** | all `anchor:local` | on demand |
+| `openxr:recenter_on_plug = true` | yes, the whole group rigidly | all `anchor:local` | first plug/don of a **new** session only |
+| the headset's own recenter button | per `openxr:recenter` — `hold` (no) / `follow` (yes, as `reseat`) | all `anchor:local` | whenever the runtime recenters |
+
+`reseat` and `recenter_on_plug` are the same *shape* of operation — one rigid, arrangement-preserving
+move of the whole group onto your head — but they take their reference from different places, because
+they run in different circumstances (doc 03 §8.4):
+
+- **`recenter_on_plug`** (and the doc 03 §8.1 tracking-gap fallback) fires across a **discontinuity**,
+  where the only surviving description of your layout is the stored head-relative placement of each
+  monitor. It restores **the arrangement you left**, not just the declared one (doc 03 §8.3): a
+  monitor you created with `openxr create`, or a declared one you grab-moved, comes back at the same
+  place relative to you rather than snapping to its config line or to stale coordinates from the
+  previous session's reference space.
+- **`reseat`** fires while everything is live, where those stored placements are being re-measured
+  against your head every frame and so describe where things already are. It moves the **live**
+  arrangement instead, taking its reference from the layout itself — the spot you would have to sit
+  in to see it head-on — and putting that spot where your head is now.
+
+`hyprctl openxr status` shows each local monitor's stored `restore [x, y, z] (head-relative)` — or
+`restore none` if it has never been placed under tracking, in which case its declared rig is used —
+and the active `recenter policy:` line. The stored placements survive an XR-session restart but not a
+compositor restart; `hyprctl openxr layout` is still how you make a layout permanent.
 
 **Selected-target resolution** (for `active` / omitted targets): explicit `select` > last
 ray-hovered monitor > focused-monitor-if-XR — else the verb errors with "no XR monitor
@@ -779,6 +795,7 @@ bind  = SUPER SHIFT, X,            xrmonitor, destroy active
 bind  = SUPER,       bracketright, xrmonitor, select next
 bind  = SUPER,       bracketleft,  xrmonitor, select prev
 bind  = SUPER,       Home,         xrmonitor, center
+bind  = SUPER CTRL,  Home,         xrmonitor, reseat        # bring the whole layout to my facing
 binde = SUPER,       equal,        xrmonitor, distance -0.25
 binde = SUPER,       minus,        xrmonitor, distance +0.25
 bind  = SUPER,       H,            xrmonitor, anchor active head
@@ -799,8 +816,11 @@ hyprctl openxr [status]        # default subcommand
 hyprctl -j openxr              # JSON
 hyprctl openxr enable|disable  # start/stop the session (does not touch openxr:enabled)
 hyprctl openxr <verb> …        # the §4 verbs: create destroy select anchor move rotate
-                               #   scale distance center place alpha blackalpha adaptive
+                               #   scale distance center reseat place alpha blackalpha adaptive
                                #   dock undock roam gazegrab gazerelease gazepush handinput
+hyprctl openxr reseat          # bring the whole anchor:local group to your current head;
+                               #   prints what it did ("re-seated 3 monitors to the current
+                               #   head") or why it did not
 hyprctl openxr gaze [at <ms>]  # read-only head ray + timestamped gaze history (see below)
 hyprctl openxr layout          # dump the CURRENT live 3D layout as paste-ready xrmonitor= lines
 hyprctl openxr sync-layout [freeze|thaw]
@@ -928,6 +948,7 @@ overlay: no
 monitor view: shown
 selected: XR-code
 monitors follow session: visible
+recenter policy: hold
 visible: yes
 presence: yes
 idle inhibited: yes
@@ -946,6 +967,11 @@ headset undonned reads as `waiting for headset` (its degraded pre-don IPC answer
 required extensions — classified as a headset wait, fixed base cadence). While a grace-period
 unplug is pending, the follow line reads e.g. `visible (unplug in 12000ms)`.
 
+`recenter policy:` is `hold` or `follow` (`openxr:recenter`, doc 03 §8.4). It is on the status page
+because the single most confusing thing about recentering is that pressing the headset's button can
+*correctly* do nothing to your monitors — this line says which contract is in force before you go
+looking for a bug.
+
 JSON (`hyprctl -j openxr`) — all keys always present:
 
 ```json
@@ -962,6 +988,7 @@ JSON (`hyprctl -j openxr`) — all keys always present:
     "selected": "XR-code",
     "monitorsFollowSession": "visible",
     "monitorUnplugPendingMs": -1,
+    "recenterPolicy": "hold",
     "userPresence": "yes",
     "visible": "yes",
     "reprobeWaiting": "",
