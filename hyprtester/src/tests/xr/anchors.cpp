@@ -352,7 +352,7 @@ TEST_CASE(xr_anchor_restore_across_session) {
     // Nudge it so the restored pose is provably the USER'S placement, not the creation pose.
     ASSERT(getFromSocket("/openxr move 0.4 0 0"), std::string("ok"));
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    std::vector<float> left;
+    std::vector<float> left, relLeft;
     {
         const std::string st = getFromSocket("j/openxr");
         const auto        p  = XR::findAfter(st, "\"name\": \"" + mon + "\"");
@@ -367,7 +367,7 @@ TEST_CASE(xr_anchor_restore_across_session) {
         // replay the create-time seed instead — say so here rather than leaving it to be inferred
         // from a pose landing somewhere unexpected two session transitions later.
         EXPECT(XR::fieldAfter(st, size_t{0}, "restoreCapture"), std::string("true"));
-        const auto relLeft = XR::parseFloatArray(XR::fieldAfter(st, p, "offset"));
+        relLeft = XR::parseFloatArray(XR::fieldAfter(st, p, "offset"));
         ASSERT(relLeft.size(), (size_t)3);
         NLog::log("xr_anchor_restore_across_session: placed [{:.3f}, {:.3f}, {:.3f}] -> left [{:.3f}, {:.3f}, {:.3f}], capture offset [{:.3f}, {:.3f}, {:.3f}]", placed[0], placed[1],
                   placed[2], left[0], left[1], left[2], relLeft[0], relLeft[1], relLeft[2]);
@@ -380,9 +380,15 @@ TEST_CASE(xr_anchor_restore_across_session) {
     remote->pulse();
     ASSERT(getFromSocket("/openxr enable"), std::string("ok"));
     ASSERT(XR::waitForXrState("focused", std::chrono::milliseconds(15000)) || XR::waitForXrState("visible", std::chrono::milliseconds(2000)), true);
-    // Keep the head where the user is standing and give the frame thread time to consume the armed
-    // re-seat on a valid-view frame.
-    remote->setHeadPose(xrt_vec3{3.f, 0.f, 4.f}, xrt_quat{0.f, 0.2164f, 0.f, 0.9763f});
+
+    // Come back somewhere ELSE, facing another way — 5 m and 85 deg from where the session died.
+    // Leaving the head put would let this test pass without the re-seat ever firing (the anchor would
+    // simply still hold its old coordinates, which in this container are also the right ones). Moving
+    // the user makes the two outcomes numerically distinct, and asserts the actual promise: the
+    // constellation follows you to wherever you are when you come back.
+    constexpr float NEW_YAW = -60.f * (float)M_PI / 180.f;
+    const xrt_vec3  newHead{0.5f, 0.f, -2.f};
+    remote->setHeadPose(newHead, xrt_quat{0.f, std::sin(NEW_YAW / 2.f), 0.f, std::cos(NEW_YAW / 2.f)});
     remote->pulse();
     std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
@@ -392,12 +398,23 @@ TEST_CASE(xr_anchor_restore_across_session) {
         ASSERT_NOT(p, std::string::npos);
         const auto back = posOf(st, p);
         ASSERT(back.size(), (size_t)3);
-        // THE assertion: the room came back the way it was left. Pre-fix this re-seated from the
-        // stale creation-time world pose and landed several metres out.
-        EXPECT_MAX_DELTA(dist3(back, left), 0.0, 0.35);
+
+        // Where the captured offset SHOULD land in the new head's yaw-only floor frame — the same
+        // composition recenterLocalToHead performs, written out longhand so this test would notice the
+        // engine and the doc disagreeing rather than following it into the same mistake.
+        const float c = std::cos(NEW_YAW), sn = std::sin(NEW_YAW);
+        const std::vector<float> expected{newHead.x + relLeft[0] * c + relLeft[2] * sn, relLeft[1], newHead.z - relLeft[0] * sn + relLeft[2] * c};
+
+        // THE assertion: the room came back the way it was left, rigidly re-seated to the user.
+        // Pre-fix this re-seated from the stale creation-time world pose instead.
+        EXPECT_MAX_DELTA(dist3(back, expected), 0.0, 0.1);
+        // ...and it really did move with them, so the re-seat demonstrably ran.
+        EXPECT(dist3(back, left) > 1.f, true);
+        NLog::log("xr_anchor_restore_across_session: came back at [{:.3f}, {:.3f}, {:.3f}], expected [{:.3f}, {:.3f}, {:.3f}]", back[0], back[1], back[2], expected[0], expected[1],
+                  expected[2]);
     }
 
-    NLog::green("xr_anchor_restore_across_session: ad-hoc monitor placement survived a session recycle");
+    NLog::green("xr_anchor_restore_across_session: ad-hoc monitor placement followed the user across a session recycle");
 }
 
 #endif // WITH_XR_TESTS
