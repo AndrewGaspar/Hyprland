@@ -1934,7 +1934,12 @@ void COpenXRManager::frameThread() {
                     static auto PRECENTER = CConfigValue<Hyprlang::INT>("openxr:recenter_on_plug");
                     const bool  follow    = m_recenterPolicy.load(std::memory_order_relaxed) == OpenXR::XR_RECENTER_FOLLOW;
                     if (*PRECENTER || follow) {
-                        m_recenterArmed.store(true, std::memory_order_release);
+                        // RESTORE, not GROUP: nothing observed the old frame, so the LIVE arrangement
+                        // is expressed in coordinates that no longer mean anything and deriving a
+                        // seat frame from it would be deriving one from noise. The stored offsets are
+                        // the only description of the arrangement that survived, and the §8.3 capture
+                        // was gated off across the tracking gap, so they still describe it.
+                        armReseat(OpenXR::XR_RESEAT_ARM_RESTORE);
                         m_l2dRefStale.store(true, std::memory_order_release);
                         wakeMain();
                         Log::logger->log(Log::WARN, "[OPENXR] recenter: no head sample straddles the change (tracking gap {}ms) — re-seating the monitor group to the current head",
@@ -2006,9 +2011,10 @@ void COpenXRManager::frameThread() {
         std::vector<OpenXR::SXRSolveResult> results(active.size());
         std::vector<bool>                   solved(active.size(), false);
         bool                                anyRoaming = false; // research/16 Part A: AUTO gate OR-term
-        // Re-seat tally, logged after the lock is dropped (doc 03 §8.3).
-        int  reseatRestored = 0, reseatDeclared = 0;
-        bool reseatRan = false;
+        // Re-seat tally, logged after the lock is dropped (doc 03 §8.3/§8.4). The RESTORE kind splits
+        // its count by offset source; the GROUP kind moves the whole arrangement at once, or refuses.
+        int  reseatRestored = 0, reseatDeclared = 0, reseatGrouped = 0;
+        bool reseatRan = false, reseatUnseatable = false;
         {
             std::scoped_lock lock(m_layersMu);
             m_lastVerbCtx = OpenXR::SXRVerbContext{viewPose, viewValid, gripLeft, gripRight};
@@ -2028,23 +2034,67 @@ void COpenXRManager::frameThread() {
             // that outlives the reference space it was measured in. Planting the raw LOCAL pose (what
             // an ad-hoc monitor's "declared" anchor holds) throws it as far as the old and new origins
             // differ: 7.13 m in the session that produced this fix.
-            if (viewValid && m_recenterArmed.load(std::memory_order_acquire)) {
-                m_recenterArmed.store(false, std::memory_order_release);
+            //
+            // The DELIBERATE re-seat (doc 03 §8.4, XR_RESEAT_ARM_GROUP) takes the other branch, and
+            // must: the capture below re-derives every stored offset EVERY FRAME while the headset is
+            // worn, so replanting one around the current head gives the monitor its own pose back.
+            // It re-seats the LIVE arrangement instead, rigidly, onto the current head.
+            const auto reseatKind = (OpenXR::eXRReseatKind)m_reseatArmed.load(std::memory_order_acquire);
+            if (viewValid && reseatKind != OpenXR::XR_RESEAT_ARM_NONE) {
+                m_reseatArmed.store(OpenXR::XR_RESEAT_ARM_NONE, std::memory_order_release);
                 reseatRan = true;
+
+                // The eligible set, gathered once. xrReseatEligible is the ONE definition of it (doc
+                // 03 §8.4) — the same predicate the main-thread `reseat` verb counts through, so the
+                // number it reports and the number that actually move cannot drift apart.
+                // recenterLocalToHead self-guards on mode too; filtering here keeps the tally honest.
+                // Raw pointers deliberately: a PXRLAYER copy is a shared_ptr refcount op, and this is
+                // the frame thread (XRMonitorLayer.hpp). Both vectors die inside this locked scope.
+                std::vector<CXRMonitorLayer*> targets;
+                std::vector<OpenXR::SXRPose>  worlds;
                 for (auto& l : m_layers) {
-                    // xrReseatEligible is the ONE definition of the set (doc 03 §8.4) — the same
-                    // predicate the main-thread `reseat` verb counts through, so the number it
-                    // reports and the number that actually move cannot drift apart.
-                    // recenterLocalToHead self-guards on mode too; skipping here keeps the tally honest.
                     if (!OpenXR::xrReseatEligible(l->m_anchor.state().mode, l->m_pendingRemoval.load(std::memory_order_acquire)))
                         continue;
-                    OpenXR::SXRAnchorState seat = l->m_declaredAnchor;
-                    if (OpenXR::xrReseatSource(l->m_anchor.state().mode, l->m_restoreValid) == OpenXR::XR_RESEAT_RESTORED) {
-                        seat.anchorPose = l->m_restoreOffset;
-                        ++reseatRestored;
-                    } else
-                        ++reseatDeclared;
-                    l->m_anchor.recenterLocalToHead(viewPose, seat);
+                    targets.push_back(l.get());
+                    worlds.push_back(l->m_anchor.state().anchorPose);
+                }
+
+                if (reseatKind == OpenXR::XR_RESEAT_ARM_GROUP) {
+                    // Derive the frame this arrangement was arranged FOR and move it onto the head.
+                    // Every monitor is re-expressed in the SAME derived frame, so the transform is
+                    // rigid: the relative layout is preserved exactly and only the group as a whole
+                    // travels. A group with no common facing (normals cancelling) yields no frame —
+                    // leave it alone rather than invent one.
+                    const auto seatFrame = OpenXR::xrGroupSeatFrame(worlds.data(), worlds.size(), viewPose);
+                    if (!seatFrame.valid)
+                        reseatUnseatable = true;
+                    else {
+                        for (size_t i = 0; i < targets.size(); ++i) {
+                            OpenXR::SXRAnchorState seat;
+                            seat.mode       = OpenXR::XR_ANCHOR_LOCAL;
+                            seat.anchorPose = OpenXR::xrPoseInHeadFrame(seatFrame.frame, worlds[i]);
+                            targets[i]->m_anchor.recenterLocalToHead(viewPose, seat);
+                        }
+                        reseatGrouped = (int)targets.size();
+                    }
+                } else {
+                    // WHICH offset gets planted is doc 03 §8.3 (xrReseatSource). A config-declared rig
+                    // is head-relative by construction and re-seats to itself; anything the user
+                    // actually placed — an `openxr create` monitor, or a declared one they grab-moved
+                    // — re-seats to the offset captured while they were wearing the headset, which is
+                    // the only form of its placement that outlives the reference space it was measured
+                    // in. Planting the raw LOCAL pose (what an ad-hoc monitor's "declared" anchor
+                    // holds) throws it as far as the old and new origins differ: 7.13 m in the session
+                    // that produced this fix.
+                    for (auto* l : targets) {
+                        OpenXR::SXRAnchorState seat = l->m_declaredAnchor;
+                        if (OpenXR::xrReseatSource(l->m_anchor.state().mode, l->m_restoreValid) == OpenXR::XR_RESEAT_RESTORED) {
+                            seat.anchorPose = l->m_restoreOffset;
+                            ++reseatRestored;
+                        } else
+                            ++reseatDeclared;
+                        l->m_anchor.recenterLocalToHead(viewPose, seat);
+                    }
                 }
             }
 
@@ -2158,7 +2208,12 @@ void COpenXRManager::frameThread() {
         // placement the user left, replayed around their current head; `declared` is the config rig
         // (or the fallback for a monitor that has never been placed under tracking). Outside the
         // layer lock, POD counters only.
-        if (reseatRan)
+        if (reseatUnseatable)
+            Log::logger->log(Log::WARN,
+                             "[OPENXR] re-seat: the monitor group has no common facing (their normals cancel) — there is no 'in front of' to bring it around to, so nothing moved");
+        else if (reseatGrouped)
+            Log::logger->log(Log::DEBUG, "[OPENXR] re-seated the arrangement of {} anchor:local monitor(s) onto the current head (rigid; relative layout preserved)", reseatGrouped);
+        else if (reseatRan)
             Log::logger->log(Log::DEBUG, "[OPENXR] re-seated {} anchor:local monitor(s) to the head: {} restored from the last wearing, {} from their declared rig", reseatRestored + reseatDeclared,
                              reseatRestored, reseatDeclared);
 
@@ -3490,7 +3545,7 @@ void COpenXRManager::resetPresenceState() {
     // report-20 issue C: a fresh session re-earns its recenter-on-plug. The frame thread's armed flag
     // is cleared too so a stale arm from a prior session cannot re-seat the next one.
     m_recenteredThisSession = false;
-    m_recenterArmed.store(false, std::memory_order_release);
+    m_reseatArmed.store(OpenXR::XR_RESEAT_ARM_NONE, std::memory_order_release);
     // doc 03 §8.3: no session, nothing to capture from. The per-layer offsets themselves deliberately
     // survive — they are what the NEXT session restores the room from.
     publishRestoreCapture();
@@ -3894,7 +3949,10 @@ void COpenXRManager::updateMonitorsPlugged(bool allowGrace) {
             static auto PRECENTER = CConfigValue<Hyprlang::INT>("openxr:recenter_on_plug");
             if (*PRECENTER) {
                 m_recenteredThisSession = true;
-                m_recenterArmed.store(true, std::memory_order_release);
+                // RESTORE (doc 03 §8.4): this is the discontinuity case — a brand-new session whose
+                // LOCAL_FLOOR is a frame nothing in the room has ever been measured against, so the
+                // stored head-relative offsets are the only usable description of the arrangement.
+                armReseat(OpenXR::XR_RESEAT_ARM_RESTORE);
                 // report 12 §3a: a recenter re-seats every anchor:local monitor around the current
                 // head, so the desk orientation the 2D projection measures against must be re-taken
                 // too — otherwise the plane would describe the arrangement that existed before the
@@ -4039,6 +4097,17 @@ bool COpenXRManager::restoreCaptureActive() const {
     return m_restoreCapture.load(std::memory_order_relaxed);
 }
 
+void COpenXRManager::armReseat(OpenXR::eXRReseatKind kind) {
+    // Either thread. The enum is ordered by precedence (NONE < GROUP < RESTORE) so "the stronger
+    // pending kind wins" is a max, done with a CAS loop because std::atomic::fetch_max is C++26.
+    // Both producers are rare events (a plug, a recenter, a keypress), so the loop cannot spin.
+    if (kind == OpenXR::XR_RESEAT_ARM_NONE)
+        return;
+    uint8_t cur = m_reseatArmed.load(std::memory_order_acquire);
+    while (cur < (uint8_t)kind && !m_reseatArmed.compare_exchange_weak(cur, (uint8_t)kind, std::memory_order_acq_rel, std::memory_order_acquire))
+        ; // cur is reloaded by the failed exchange
+}
+
 std::expected<std::string, std::string> COpenXRManager::requestReseatToHead(const char* why) {
     // MAIN THREAD. The deliberate re-seat (doc 03 §8.4). Everything here is bookkeeping + arming:
     // the re-seat ITSELF is the frame thread's, because only it locates the head, and asking main to
@@ -4074,11 +4143,17 @@ std::expected<std::string, std::string> COpenXRManager::requestReseatToHead(cons
         case OpenXR::XR_RESEAT_READY: break;
     }
 
-    // Arm the same one-shot the first plug arms. Not gated on openxr:recenter_on_plug: that option
-    // is permission for the compositor to move monitors on its OWN initiative, and this is the user
-    // asking. It also does not touch m_recenteredThisSession — that gate exists so a doff-and-don
-    // does not re-seat, and an explicit request is not a don.
-    m_recenterArmed.store(true, std::memory_order_release);
+    // Arm the GROUP re-seat (doc 03 §8.4) — NOT the RESTORE one the first plug arms. Everything here
+    // is live and continuous: the §8.3 capture has been re-deriving every stored offset against the
+    // current head all along, so replanting one around that same head would hand each monitor its own
+    // pose straight back. The live arrangement is the description that means something, and moving it
+    // rigidly onto the head is the operation the user is asking for.
+    //
+    // Not gated on openxr:recenter_on_plug: that option is permission for the compositor to move
+    // monitors on its OWN initiative, and this is the user asking. It also does not touch
+    // m_recenteredThisSession — that gate exists so a doff-and-don does not re-seat, and an explicit
+    // request is not a don.
+    armReseat(OpenXR::XR_RESEAT_ARM_GROUP);
 
     // report 12 §3a / doc 03 §8.2: the group is about to be replanted around a new head, so the
     // latched desk orientation the 2D projection measures against describes an arrangement that is
