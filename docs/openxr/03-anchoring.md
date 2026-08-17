@@ -557,12 +557,24 @@ of the composition §8.2 performs, so the two round-trip.
 **Capture.** The frame loop re-derives each `anchor:local` monitor's offset into
 `CXRMonitorLayer::m_restoreOffset` every frame, immediately after the re-seat consumption (so a first
 plug reads the freshly seated pose rather than clobbering a good offset with the coordinates it is in
-the middle of replacing). It is gated on `m_restoreCapture` — plugged **and** wearing — because frames
-keep arriving after a doff from a headset lying on a desk, and remembering *that* arrangement would be
-worse than the bug. `publishRestoreCapture()` folds the plug state and the presence edge; on a runtime
-without `XR_EXT_user_presence` the plug state is the whole gate. Capture is also skipped while an
-adaptive monitor is anything but `DOCKED`: its `anchorPose` is the saved desk pose while the user has
-walked away from it, so measuring that against their current head would remember the walk.
+the middle of replacing). It is gated on `m_restoreCapture`, because frames keep arriving after a doff
+from a headset lying on a desk, and remembering *that* arrangement would be worse than the bug.
+
+The gate is **session visibility**, refined by presence — *not* the monitor plug state.
+`VISIBLE`/`FOCUSED` means the runtime is compositing our frames, which is the same condition `visible`
+mode keys the plug on, and it drops on doff ahead of the unplug grace. Plugging itself is a policy
+(`openxr:monitors_follow_session`) the user can turn off entirely, and `m_monitorsPlugged` then stays
+false forever while the headset is worn and the quads are perfectly visible; an earlier draft gated on
+it and silently disabled this whole feature under `off` — the container caught it. Where
+`XR_EXT_user_presence` exists, a doff is reported the moment the proximity sensor opens, ahead of the
+visibility drop, so presence closes the gate first; presence supported-but-not-yet-known counts as
+wearing, since refusing to capture until the first don event would leave a freshly visible session
+with no durable placement at all. `publishRestoreCapture()` folds both, from the
+`updateMonitorsPlugged()` funnel every relevant edge already passes through, and logs its transitions.
+
+Capture is also skipped while an adaptive monitor is anything but `DOCKED`: its `anchorPose` is the
+saved desk pose while the user has walked away from it, so measuring that against their current head
+would remember the walk.
 
 It is skipped, too, while the live pose is still **bit-equal** to the declaration (`xrPoseIdentical`).
 A monitor that has not been re-seated or moved since its `xrmonitor` line was applied is literally
