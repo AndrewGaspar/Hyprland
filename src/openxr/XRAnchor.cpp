@@ -1112,7 +1112,7 @@ void CXRAnchor::onReferenceSpaceChanged(const SXRPose& M) {
         m_adFrom = poseCompose(invM, m_adFrom);
 }
 
-void CXRAnchor::recenterLocalToHead(const SXRPose& view, const SXRAnchorState& declared) {
+void CXRAnchor::recenterLocalToHead(const SXRPose& view, const SXRAnchorState& seat) {
     // report-20 issue C. Only LOCAL monitors need re-seating; head/body/device offsets are already
     // expressed relative to the user's moving frames, so they land correctly on their own.
     if (m_state.mode != XR_ANCHOR_LOCAL)
@@ -1121,15 +1121,16 @@ void CXRAnchor::recenterLocalToHead(const SXRPose& view, const SXRAnchorState& d
     // Yaw-only head frame at the floor-projected head position. Building the frame at y=0 keeps the
     // declared offset's y as a floor-relative height (declared `pos:0,1.5,-1.5` -> still 1.5m above
     // the floor), while its XZ + facing are re-planted relative to where the user is now looking.
-    const float   yaw = qYawOf(view.rot, 0.F);
-    const SXRPose frame{Vec3{view.pos.x, 0.F, view.pos.z}, qFromYaw(yaw)};
+    // Shared with xrPoseInHeadFrame so a captured head-relative offset (§8.3) round-trips exactly.
+    const SXRPose frame = xrHeadFrame(view);
 
-    // Compose the ENTIRE declared rig (offset position AND orientation) into that frame. Because the
-    // declared pose already encodes "in front of, and facing, a user at the origin looking down -Z",
-    // the result is the monitor at the configured distance/height, in front of and facing the current
-    // head. Passing the same `frame`-defining `view` for every monitor transforms the whole group
-    // rigidly, so their relative arrangement is preserved.
-    const SXRPose W    = poseCompose(frame, declared.anchorPose);
+    // Compose the ENTIRE rig (offset position AND orientation) into that frame. Because the seat pose
+    // encodes "in front of, and facing, a user at the origin looking down -Z" — which is what a
+    // declared `pos:`/`yaw:` means, and equally what xrPoseInHeadFrame measured off the live wearer —
+    // the result is the monitor at the same height/distance/facing relative to the current head.
+    // Passing the same `frame`-defining `view` for every monitor transforms the whole group rigidly,
+    // so their relative arrangement is preserved.
+    const SXRPose W    = poseCompose(frame, seat.anchorPose);
     m_state.anchorPose = W;
 
     // Warp there (this is a deliberate re-seat, not a glide): reseed the spring + last-world so the

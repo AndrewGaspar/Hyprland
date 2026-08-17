@@ -234,6 +234,33 @@ namespace OpenXR {
         }
     };
 
+    // ---- cross-session restore (doc 03 §8.3) ----
+    //
+    // A re-seat (first plug of a session, or the doff fallback of §8.1) plants an offset in the
+    // wearer's yaw-only frame. WHICH offset is the whole question, and getting it wrong is the
+    // "monitor lottery": a monitor's live LOCAL anchorPose is expressed in a reference space that
+    // does not outlive the session, so replaying it verbatim into a new one throws the monitor as
+    // far as the two origins happen to differ (measured live at 7.13 m).
+    //
+    // The declared rig is the right offset only for a monitor whose declaration IS head-relative by
+    // construction — an `xrmonitor = …, pos:0,1.5,-1.5` line means "1.5 m in front of me". A monitor
+    // created at runtime by `openxr create` has no such declaration: what got stored as its
+    // "declared" anchor is wherever the head happened to be standing in the dead frame, which is
+    // exactly the coordinates we must NOT replay. For those — and for any monitor the user has since
+    // grab-moved — the durable answer is the offset captured while they were wearing the headset
+    // (xrPoseInHeadFrame): the arrangement they actually left, replanted rigidly around the head
+    // they come back with.
+    enum eXRReseatSource : uint8_t {
+        XR_RESEAT_DECLARED = 0, // no durable capture: fall back to the config/creation-time rig
+        XR_RESEAT_RESTORED,     // replay the placement the user left, relative to their head
+    };
+
+    inline constexpr eXRReseatSource xrReseatSource(eXRAnchorMode mode, bool restoreValid) {
+        // head/body/device offsets are already user-relative and a re-seat does not touch them; the
+        // question only arises for LOCAL, whose pose is named against the runtime's origin.
+        return (mode == XR_ANCHOR_LOCAL && restoreValid) ? XR_RESEAT_RESTORED : XR_RESEAT_DECLARED;
+    }
+
     // ---- solve API (doc 03 §2.3) ----
     struct SXRAnchorTuning {
         float leashResponse    = 0.35F;   // openxr:leash_response          (s)
@@ -413,15 +440,16 @@ namespace OpenXR {
         // Re-seat an anchor:local monitor on the first PLUG of a session (report-20 issue C). Under
         // WiVRn boundaryless/standby the runtime's LOCAL_FLOOR origin is arbitrary, so a monitor
         // declared at e.g. `pos:0,1.5,-1.5` lands wherever that origin happens to be — often far from
-        // the user. This re-interprets the DECLARED local offset as HEAD-RELATIVE: it plants the whole
-        // declared rig (position + facing) in a yaw-only frame at the current head's XZ, keeping the
-        // configured height (declared y = floor height) and distance. `view` is the head pose in
-        // LOCAL_FLOOR; `declared` is the layer's config-declared anchor state. A no-op for non-LOCAL
+        // the user. This re-interprets the given local offset as HEAD-RELATIVE: it plants the whole
+        // rig (position + facing) in a yaw-only frame at the current head's XZ, keeping the
+        // configured height (y = floor height) and distance. `view` is the head pose in LOCAL_FLOOR;
+        // `seat` carries the offset to plant — the config-declared rig, or (doc 03 §8.3) the offset
+        // captured while the user was wearing the headset, per xrReseatSource. A no-op for non-LOCAL
         // modes (head/body/device are already user-relative). Multi-monitor: pass the SAME `view` for
-        // every monitor and each re-seats to its own declared offset in that shared frame, so the
-        // group is transformed rigidly (relative arrangement preserved). Warps (no glide). For an
-        // adaptive monitor it also re-docks the desk seat here (recaptured at the current head).
-        void recenterLocalToHead(const SXRPose& view, const SXRAnchorState& declared);
+        // every monitor and each re-seats to its own offset in that shared frame, so the group is
+        // transformed rigidly (relative arrangement preserved). Warps (no glide). For an adaptive
+        // monitor it also re-docks the desk seat here (recaptured at the current head).
+        void recenterLocalToHead(const SXRPose& view, const SXRAnchorState& seat);
 
         // ---- adaptive anchoring verbs (research/13 §6.3) — main thread, under the layer mutex ----
         // Enable/disable the decorator; recaptures the desk seat on enable and resets the machine.

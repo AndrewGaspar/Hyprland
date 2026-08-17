@@ -69,7 +69,7 @@ Every variable, grouped by area. The "applies" column notes when a change takes 
 | `default_size` | float (m) | `1.6` | Default quad width for a new XR monitor with no explicit `size:`. | hot |
 | `default_distance` | float (m) | `1.5` | Default placement distance for a new / re-centered monitor. | hot |
 | `default_monitor_scale` | float | `1.25` | Scale given to an **XR-created** monitor that has no explicit scale of its own. A headless output has no EDID, so Hyprland's PPI heuristic reads a 1920x1080 quad as a tiny dense panel and picks `2.0` — cramped through a headset. An explicit `monitor = <name>, …, <scale>` still wins (§3.1); `0` opts out and restores the PPI guess. Applies to the next monitor created — and, on a config reload, to existing XR monitors whose scale nobody else owns. Your real monitors are never touched. | hot |
-| `recenter_on_plug` | bool | `true` | On the **first** don of a session, re-seat `anchor:local` monitors relative to your current head pose instead of the runtime's (often arbitrary) `LOCAL_FLOOR` origin — they land in front of you at their configured height/distance. Multi-monitor layouts are recentered rigidly (relative arrangement preserved). A brief doff-and-don within the same session does not re-seat. It is also the permission for the recenter fallback: when the runtime reports a reference-space change it refuses to describe *and* tracking did not straddle it (doc 03 §8.1), the group is re-seated the same way rather than left holding coordinates in a dead frame. | hot |
+| `recenter_on_plug` | bool | `true` | On the **first** don of a session, re-seat `anchor:local` monitors relative to your current head pose instead of the runtime's (often arbitrary) `LOCAL_FLOOR` origin. A monitor you have placed comes back where you left it *relative to you*; one that has never been placed under tracking lands at its configured height/distance (doc 03 §8.3). Multi-monitor layouts are recentered rigidly (relative arrangement preserved). A brief doff-and-don within the same session does not re-seat. It is also the permission for the recenter fallback: when the runtime reports a reference-space change it refuses to describe *and* tracking did not straddle it (doc 03 §8.1), the group is re-seated the same way rather than left holding coordinates in a dead frame. | hot |
 | `monitors_follow_session` | string | `visible` | When XR monitors behave like **unplugged external monitors** (held disabled — workspaces evacuate to your remaining monitors, then return by name on replug, exactly like a physical display): `off` = never; `session` = while no OpenXR session exists; `visible` (default) = while the headset is not actually **worn**. The `visible` plug gate needs BOTH session visibility AND — when the runtime exposes `XR_EXT_user_presence` (e.g. WiVRn) — user presence, so a session created with the headset on the shelf never plugs. Legacy values parse: `false/0` → `off`, `true/1` → `session`. | hot |
 | `monitor_unplug_grace_ms` | int | `20000` | Under `visible`: how long the headset must stay doffed before its monitors unplug and workspaces evacuate — anti-flap so a quick doff-and-don or proximity-sensor churn never rearranges workspaces. Donning re-plugs immediately regardless. | hot |
 | `monitor_plug_settle_ms` | int | `1500` | Under `visible` on a runtime **without** `XR_EXT_user_presence`: how long the session must stay continuously visible before the **first** plug of a session — suppresses the session-create visibility blip (some runtimes sprint to `focused` at startup while still doffed). Ignored once presence is available and after the first plug. | hot |
@@ -756,10 +756,18 @@ transports, one implementation.
 **“Center” has three different meanings.** `xrmonitor center` moves only the currently selected
 monitor; it is not an all-monitor recenter. `xrmonitor sync` / `hyprctl openxr sync-layout`
 re-latches the 2D mouse/workspace projection around the current head pose but does not move any
-quad. `openxr:recenter_on_plug = true` is the operation that re-seats every declared
+quad. `openxr:recenter_on_plug = true` is the operation that re-seats every
 `anchor:local` monitor as one rigid arrangement around the current head pose, and it runs only on
 the first plug/don of a newly started OpenXR session. There is currently no one-shot dispatcher
 that performs that all-local-monitor re-seat without restarting the session.
+
+That re-seat restores **the arrangement you left**, not just the declared one (doc 03 §8.3): a
+monitor you created with `openxr create`, or a declared one you grab-moved, comes back at the same
+place relative to you rather than snapping to its config line or to stale coordinates from the
+previous session's reference space. `hyprctl openxr status` shows each local monitor's stored
+`restore [x, y, z] (head-relative)` — or `restore none` if it has never been placed under tracking,
+in which case its declared rig is used. The stored placements survive an XR-session restart but not
+a compositor restart; `hyprctl openxr layout` is still how you make a layout permanent.
 
 **Selected-target resolution** (for `active` / omitted targets): explicit `select` > last
 ray-hovered monitor > focused-monitor-if-XR — else the verb errors with "no XR monitor

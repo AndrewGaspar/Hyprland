@@ -513,12 +513,84 @@ Separately, `openxr:recenter_on_plug` re-seats `anchor:local` monitors relative 
 **first don of a session**. Under a boundaryless/standby runtime the `LOCAL_FLOOR` origin is arbitrary,
 so a monitor declared at e.g. `pos:0,1.5,-1.5` would land wherever that origin happens to be, often
 far from the user. On the first plug the main thread arms the frame thread, which on its next
-valid-view frame calls `recenterLocalToHead(view, declared)` on each local monitor. This reinterprets
-the monitor's *declared* offset as head-relative: it plants the whole declared rig (position and
-facing) in a yaw-only frame at the current head's floor XZ, preserving the configured height and
-distance. Passing the same view to every monitor transforms the group rigidly, so the relative
-arrangement is preserved. It warps (no glide), and for an adaptive monitor it re-docks the desk seat at
-the current head. A re-plug after a brief doff does not re-arm — the first-don placement is kept.
+valid-view frame calls `recenterLocalToHead(view, seat)` on each local monitor. This reinterprets the
+given offset as head-relative: it plants the whole rig (position and facing) in a yaw-only frame at
+the current head's floor XZ (`xrHeadFrame`), preserving the configured height and distance. Passing
+the same view to every monitor transforms the group rigidly, so the relative arrangement is preserved.
+It warps (no glide), and for an adaptive monitor it re-docks the desk seat at the current head. A
+re-plug after a brief doff does not re-arm — the first-don placement is kept.
+
+Which offset gets planted is §8.3.
+
+### 8.3 Cross-session restore — what "seat" holds
+
+§8.1 fixed recentering *within* a session. Across a **session restart** (a `wivrn-server` restart, the
+compositor recycling its XR session) there is no delta to reconstruct at all: the new session's
+`LOCAL_FLOOR` is simply a different frame, and every stored `LOCAL` coordinate is a number about a
+space that no longer exists. §8.2's re-seat is the answer to that — but only if the offset it plants
+means "relative to the wearer".
+
+For a config-declared monitor it does by construction: `pos:0,1.5,-1.5` on an `xrmonitor` line is a
+sentence about the user, not about the runtime's origin. That is why declared monitors always came
+back correctly.
+
+A monitor created at runtime (`hyprctl openxr create XR-3`) has no such declaration. What
+`createXRMonitor` stores as its "declared" anchor is the pose `applyCenter` derived from wherever the
+head was standing at the time — a `LOCAL_FLOOR` world pose. Re-seating from *that* composes a dead
+frame's coordinates into the head frame, and the monitor lands as far away as the two origins happen
+to differ. Reported live 2026-08-16 as monitors "spun way off, outside my house"; the log arithmetic:
+session one latched at eye `[4.23, 1.04, 5.75]`, XR-3/XR-4 were created in that frame, a mid-session
+recenter then moved the origin (`reconstructed a 7.13m / 14.7 deg frame change from the head`) which
+re-expressed the live anchors but not the frozen declared copies, and session two re-seated the ad-hoc
+monitors from those 7-metre stale offsets.
+
+The durable form of a placement is the same pose named against the **wearer** instead of the origin:
+
+```
+offset = inv(xrHeadFrame(head)) ∘ anchorPose      // xrPoseInHeadFrame, XRMath.hpp
+```
+
+That is reference-space independent — when the origin moves, the head and the monitor move with it,
+and the offset does not change (gtest: `CaptureIsReferenceSpaceIndependent`). It is the exact inverse
+of the composition §8.2 performs, so the two round-trip.
+
+**Capture.** The frame loop re-derives each `anchor:local` monitor's offset into
+`CXRMonitorLayer::m_restoreOffset` every frame, immediately after the re-seat consumption (so a first
+plug reads the freshly seated pose rather than clobbering a good offset with the coordinates it is in
+the middle of replacing). It is gated on `m_restoreCapture` — plugged **and** wearing — because frames
+keep arriving after a doff from a headset lying on a desk, and remembering *that* arrangement would be
+worse than the bug. `publishRestoreCapture()` folds the plug state and the presence edge; on a runtime
+without `XR_EXT_user_presence` the plug state is the whole gate. Capture is also skipped while an
+adaptive monitor is anything but `DOCKED`: its `anchorPose` is the saved desk pose while the user has
+walked away from it, so measuring that against their current head would remember the walk.
+
+**Restore.** `xrReseatSource(mode, restoreValid)` picks:
+
+| condition | offset planted |
+|---|---|
+| `LOCAL` with a captured offset | the placement the user left, replanted rigidly around the current head |
+| `LOCAL`, never placed under tracking | the declared/creation-time rig (pre-existing behavior) |
+| `HEAD` / `BODY` / `DEVICE` | n/a — the re-seat is a no-op, these ride the user already |
+
+The offsets live on the layer, which outlives the XR session in-process, so the constellation survives
+a session restart. **Limitation:** they do not survive a compositor restart. `hyprctl openxr layout`
+remains the way to make a layout permanent.
+
+**A grab-moved declared monitor keeps its moved pose** across a session restart, rather than snapping
+back to its `xrmonitor` line. This page had been silent on the question; the choice matches the
+within-session ladder (§8.1 holds a moved monitor where the user put it) and the reload behavior
+(a config reload does not clobber live geometry). Editing the `pos:` in the config still wins — reload
+reconciliation compares against `m_declaredAnchor` and re-applies a changed declaration.
+
+**Degenerate cases** all fall through to the declared rig, which is what shipped before: a session that
+was never donned, a session with no head sample by the time it ended, and a monitor created while the
+headset was off (its untracked default is `(0, 1.4, -default_distance)`, read as head-relative, so it
+lands in front of whoever plugs in). `openxr create` with a caller-supplied `pos:` is deliberately left
+uncaptured at creation for the same reason — an explicit `pos:` is a declared rig, and measuring where
+it currently sits would make a monitor the user cannot see permanently unreachable.
+
+`hyprctl openxr status` reports this per monitor (`restore [x, y, z] (head-relative)`, or `restore
+none`), so "will my room come back" is answerable before restarting anything.
 
 ## 9. Layout persistence — `hyprctl openxr layout`
 

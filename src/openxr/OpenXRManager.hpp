@@ -162,6 +162,11 @@ class COpenXRManager {
     // frame->main session-state dispatch all funnel here.
     void updateMonitorsPlugged(bool allowGrace);
 
+    // Re-derive m_restoreCapture (doc 03 §8.3) from the plug + presence facts. Called from every site
+    // that can move either one: the plug applicator, the don/doff event, and the per-session reset.
+    // Main thread only.
+    void publishRestoreCapture();
+
     // Milliseconds until the pending grace-period unplug fires, or -1 when none is armed. Cheap
     // read of the timer for `hyprctl openxr status` observability. Main thread only.
     int  monitorUnplugPendingMs() const;
@@ -250,6 +255,13 @@ class COpenXRManager {
         // Cross-GPU: true iff this output's buffers are allocated LINEAR so the XR GPU can import
         // them (set when the XR runtime GPU differs from the buffer allocator; openxr:force_linear).
         bool        linear = false;
+        // Cross-session restore (doc 03 §8.3): does this monitor hold a durable head-relative
+        // placement, and what is it. `restorable` false means the next session's first plug will
+        // re-seat it from its declared rig instead (it has never been placed under real tracking, or
+        // it is not anchor:local). The offset is what a re-seat would plant in the wearer's frame:
+        // -z is in front of you, +x to your right, y is height above the floor.
+        bool        restorable = false;
+        float       restoreX = 0.f, restoreY = 0.f, restoreZ = 0.f;
         // Adaptive anchoring (research/13 §6.4).
         bool        adaptiveEnabled  = false;
         std::string adaptivePhase    = "docked"; // docked | undocking | roaming | redocking
@@ -928,6 +940,17 @@ class COpenXRManager {
     // invalid still recenters on the next good frame). Atomic: main writes, frame reads/clears.
     bool                m_recenteredThisSession = false;
     std::atomic<bool>   m_recenterArmed{false};
+
+    // Cross-session restore capture gate (doc 03 §8.3). True while the user is demonstrably WEARING
+    // the headset with the XR monitors plugged; the frame thread re-captures each anchor:local
+    // monitor's head-relative offset (CXRMonitorLayer::m_restoreOffset) only on those frames.
+    //
+    // The gate is the whole point. Frames keep arriving after a doff — from a headset lying on a
+    // desk, at desk height, facing a wall — and capturing one of those would hand the next session a
+    // "room layout" describing where the desk was, which is a worse bug than the one this fixes. The
+    // presence edge (or, on a runtime without XR_EXT_user_presence, the plug edge) closes the gate
+    // while the last sample is still one the user's actual head produced. Main writes, frame reads.
+    std::atomic<bool>   m_restoreCapture{false};
 
     // Dormant re-probe timer (report-17 WP-L3 / report-20 issue B1). m_reprobeTimer re-attempts
     // start() while UNAVAILABLE; m_reprobeAttempt counts consecutive failures (drives the backoff);

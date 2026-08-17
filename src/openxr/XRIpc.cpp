@@ -110,6 +110,10 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
                 "transitionT": {:.3f}
             }},
             "anchorState": "{}",
+            "restore": {{
+                "restorable": {},
+                "offset": [{:.3f}, {:.3f}, {:.3f}]
+            }},
             "layout2d": {{
                 "source": "{}",
                 "col": {},
@@ -133,7 +137,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
         }})#",
                                 m.name, m.id, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.quatX, m.quatY, m.quatZ, m.quatW, m.grabbed ? "true" : "false",
                                 m.grabKind, m.hovered ? "true" : "false", m.region, m.plugged ? "true" : "false", m.contentPath, m.linear ? "true" : "false", m.stereo, m.producer, m.chrome ? "true" : "false", m.quads, m.adaptiveEnabled ? "true" : "false", m.adaptivePhase,
-                                m.adaptiveRoamMode, m.adaptiveSeatDist, m.adaptiveT, m.anchorState, m.l2dSource, m.l2dCol, m.l2dRow, m.l2dX, m.l2dY, m.l2dAzDeg, m.l2dElDeg, m.fxAlpha, m.fxAlphaTarget, m.fxAlphaSrc, m.fxBlackAlpha, m.fxBlackAlphaTarget,
+                                m.adaptiveRoamMode, m.adaptiveSeatDist, m.adaptiveT, m.anchorState, m.restorable ? "true" : "false", m.restoreX, m.restoreY, m.restoreZ, m.l2dSource, m.l2dCol, m.l2dRow, m.l2dX, m.l2dY, m.l2dAzDeg, m.l2dElDeg, m.fxAlpha, m.fxAlphaTarget, m.fxAlphaSrc, m.fxBlackAlpha, m.fxBlackAlphaTarget,
                                 m.fxBlackAlphaSrc, m.fxKnee, m.fxKneeSrc, m.fxTransitioning ? "true" : "false");
             if (i + 1 < MONS.size())
                 mons += ",\n";
@@ -232,6 +236,11 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
             : (m.fxTransitioning && m.fxBlackAlpha != m.fxBlackAlphaTarget ? std::format("{:.2f} -> {:.2f}", m.fxBlackAlpha, m.fxBlackAlphaTarget)
                                                                           : std::format("{:.2f}", m.fxBlackAlpha));
         out += std::format("  {}: alpha {} ({}), blackalpha {} ({}, knee {:.2f}), anchorstate {}\n", m.name, ALINE, m.fxAlphaSrc, BLINE, m.fxBlackAlphaSrc, m.fxKnee, m.anchorState);
+        // doc 03 §8.3: will this monitor come back where the user left it after a session restart, and
+        // from what offset. Only meaningful for anchor:local — the leashed modes ride the user anyway.
+        if (m.anchorMode == "local")
+            out += m.restorable ? std::format("  {}: restore [{:.2f}, {:.2f}, {:.2f}] (head-relative)\n", m.name, m.restoreX, m.restoreY, m.restoreZ)
+                                : std::format("  {}: restore none — a new session re-seats it from its declared rig\n", m.name);
         // report 12: where the 2D plane put it, and from what angles — "auto" = the projection owns
         // it, "pinned" = an explicit user monitor= offset does, "off" = append-right as before.
         if (L2D.enabled && m.l2dSource != "off")

@@ -122,6 +122,20 @@ class CXRMonitorLayer {
     // config keyword, kept separate from the live (spring-mutating) engine for reconcile diffs.
     OpenXR::CXRAnchor       m_anchor;
     OpenXR::SXRAnchorState  m_declaredAnchor;
+    // ---- cross-session restore (doc 03 §8.3) ----
+    // This monitor's anchor:local desk pose expressed in the WEARER's yaw-only floor frame
+    // (xrPoseInHeadFrame), recaptured by the frame thread on every frame the user is actually
+    // wearing the headset with the monitors plugged, and seeded at `openxr create` when the placement
+    // came from the head. Unlike m_anchor's LOCAL pose this survives the death of the reference space
+    // it was measured in, so the first plug of a NEXT session can put the whole constellation back
+    // around the user instead of replaying coordinates from a frame that no longer exists.
+    //
+    // Written on the FRAME thread and on main, both under COpenXRManager::m_layersMu. Plain POD
+    // (SXRPose is 7 floats) — no refcounts, no allocation, nothing the frame-thread rule above
+    // forbids. m_restoreValid stays false until a placement has been observed under real tracking;
+    // the re-seat then falls back to m_declaredAnchor (xrReseatSource).
+    OpenXR::SXRPose         m_restoreOffset;
+    bool                    m_restoreValid = false;
     std::optional<Vector2D> m_reqResolution;   // last requested pixel mode (for reconcile diff)
     std::optional<float>    m_reqRefresh;      // last requested refresh (for reconcile diff)
     // report-20 issue E: true iff an explicit user `monitor=NAME,...` rule set this output's
