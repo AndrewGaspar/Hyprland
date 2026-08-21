@@ -81,9 +81,24 @@ gen_session() {
     # terminals all see the fishfood bin dir first.
     cat >"$launcher" <<EOF
 #!/bin/sh
+BIN=$BUILD/Hyprland
+# Fail LOUDLY instead of bouncing silently back to the greeter. A system upgrade
+# that bumps a shared-library soname (aquamarine 0.13 -> 0.14 on 2026-08-21)
+# leaves this binary unable to load at all; the greeter just shows the login
+# screen again with no diagnostics. Detect it here, log it, start the STOCK
+# session so the box stays usable, and say what happened once a notifier is up.
+if missing=\$(ldd "\$BIN" 2>&1 | grep 'not found'); then
+    log=\$HOME/.local/state/hypxrland/launch-failure.log
+    mkdir -p "\$(dirname "\$log")"
+    { echo "=== \$(date -Is) fishfood binary cannot load:"; echo "\$missing"; echo "fix: $REPO/scripts/fishfood.sh update"; } >>"\$log"
+    ( for _ in 1 2 3 4 5 6; do sleep 10; notify-send -u critical -t 0 "HypXRland fishfood build is broken" \\
+        "\$(echo "\$missing" | head -3)
+Started the STOCK session instead. Fix: $REPO/scripts/fishfood.sh update  (log: \$log)" && break; done ) &
+    exec uwsm start -e -D Hyprland -- /usr/bin/Hyprland
+fi
 export PATH="$BUILD/bin:\$PATH"
 export HYPXRLAND_SESSION=1
-exec uwsm start -e -D Hyprland -- $BUILD/Hyprland --config $CONF
+exec uwsm start -e -D Hyprland -- \$BIN --config $CONF
 EOF
     chmod +x "$launcher"
     # DesktopNames stays "Hyprland" so portals/theming/apps treat the session
