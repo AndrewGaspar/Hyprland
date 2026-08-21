@@ -95,7 +95,8 @@ SResponse CSocket1::dispatchSingle(std::string request, pid_t pid) {
     // grep from attributable. Runs per batch element (dispatchBatch splits before calling us) and
     // after the flags prefix is stripped.
     {
-        static constexpr std::string_view RELOAD_CLASS[] = {"reload", "eval", "repl", "keyword"};
+        // systeminfo: a known main-thread-stall vector (2026-08-21), log its callers too
+        static constexpr std::string_view RELOAD_CLASS[] = {"reload", "eval", "repl", "keyword", "systeminfo"};
         const std::string_view            probe          = parsed.command;
         for (const auto& verb : RELOAD_CLASS) {
             if (!probe.starts_with(verb))
