@@ -87,7 +87,13 @@ BIN=$BUILD/Hyprland
 # leaves this binary unable to load at all; the greeter just shows the login
 # screen again with no diagnostics. Detect it here, log it, start the STOCK
 # session so the box stays usable, and say what happened once a notifier is up.
-if missing=\$(ldd "\$BIN" 2>&1 | grep 'not found'); then
+# Two checks: ldd catches a soname bump; --version catches a binary truncated by
+# a reboot or crash mid-link (ldd happily resolves a half-written file).
+missing=\$(ldd "\$BIN" 2>&1 | grep 'not found')
+if [ -z "\$missing" ] && ! "\$BIN" --version >/dev/null 2>&1; then
+    missing="\$BIN --version failed (truncated or corrupt binary?)"
+fi
+if [ -n "\$missing" ]; then
     log=\$HOME/.local/state/hypxrland/launch-failure.log
     mkdir -p "\$(dirname "\$log")"
     { echo "=== \$(date -Is) fishfood binary cannot load:"; echo "\$missing"; echo "fix: $REPO/scripts/fishfood.sh update"; } >>"\$log"
