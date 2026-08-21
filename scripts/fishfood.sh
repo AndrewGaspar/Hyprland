@@ -31,7 +31,7 @@ BRANCH=${HYPXRLAND_FISHFOOD_BRANCH:-fishfood}
 TRACK=${HYPXRLAND_FISHFOOD_TRACK:-hypxrland}
 CONF=${HYPXRLAND_FISHFOOD_CONF:-$HOME/.config/hypr/hyprland-xr.conf}
 BUILD=$WORKTREE/build
-DESKTOP_OUT=${XDG_DATA_HOME:-$HOME/.local/share}/hypxrland/hypxrland-fishfood.desktop
+DESKTOP_OUT=${XDG_DATA_HOME:-$HOME/.local/share}/hypxrland/omarchy-xr-fishfood.desktop
 JOBS=${HYPXRLAND_FISHFOOD_JOBS:-8} # deliberately modest: this box has frozen twice under heavy parallel builds
 
 build() {
@@ -119,7 +119,7 @@ EOF
     echo "==> session launcher generated at $launcher"
     echo "==> session file generated at $DESKTOP_OUT"
     echo "    Install it (needs root):"
-    echo "      sudo install -m644 $DESKTOP_OUT /usr/share/wayland-sessions/hypxrland-fishfood.desktop"
+    echo "      sudo install -m644 $DESKTOP_OUT /usr/share/wayland-sessions/omarchy-xr-fishfood.desktop"
     echo "    Then pick 'Omarchy XR (fishfood)' from the session menu at the SDDM login screen."
 }
 
