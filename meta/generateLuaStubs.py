@@ -341,13 +341,26 @@ def extract_initializer_body(source: str, array_name: str) -> str:
 
 
 def parse_descriptor_fields(root: Path) -> dict[str, dict[str, str]]:
-    source = read_text(root / "src/config/lua/bindings/LuaBindingsConfigRules.cpp")
+    # WINDOW_RULE_EFFECT_DESCS lives in the header, not the .cpp, so scanning only the .cpp emitted
+    # an HL.WindowRuleSpec with nothing in it but name/enabled/match — every window-rule effect,
+    # upstream's and the fork's stereo/viewpoint/depth alike, was invisible to the LSP.
+    source = "\n".join(
+        read_text(root / p)
+        for p in (
+            "src/config/lua/bindings/LuaBindingsConfigRules.cpp",
+            "src/config/lua/bindings/LuaBindingsInternal.hpp",
+        )
+    )
     arrays = {
         "MONITOR_FIELDS": "HL.MonitorSpec",
         "DEVICE_FIELDS": "HL.DeviceSpec",
         "WORKSPACE_RULE_FIELDS": "HL.WorkspaceRuleSpec",
         "WINDOW_RULE_EFFECT_DESCS": "HL.WindowRuleSpec",
         "LAYER_RULE_EFFECT_DESCS": "HL.LayerRuleSpec",
+        # fork: the XR keywords (docs/openxr/05 §3 / §3.5)
+        "XR_MONITOR_FIELDS": "HL.XRMonitorSpec",
+        "XR_RULE_EFFECT_FIELDS": "HL.XRRuleSpec",
+        "XR_RULE_MATCH_FIELDS": "HL.XRRuleMatch",
     }
 
     entry_regex = re.compile(
@@ -378,6 +391,20 @@ def parse_descriptor_fields(root: Path) -> dict[str, dict[str, str]]:
     out["HL.LayerRuleSpec"]["name"] = "string"
     out["HL.LayerRuleSpec"]["enabled"] = "boolean"
     out["HL.LayerRuleSpec"]["match"] = "table<string, string|boolean>"
+
+    # fork, XR. `name` / `mode` / `anchor` are positional in the classic `xrmonitor =` line, so they
+    # are handled outside the descriptor array — the same reason hl.monitor's `output` is listed
+    # here by hand. The vec3 fields accept the grammar's "x,y,z" or a Lua {x, y, z}.
+    out["HL.XRMonitorSpec"]["name"] = "string"
+    out["HL.XRMonitorSpec"]["mode"] = "string"
+    out["HL.XRMonitorSpec"]["anchor"] = "HL.XRAnchorMode"
+    for vec3 in ("pos", "offset", "roam_offset"):
+        out["HL.XRMonitorSpec"][vec3] = "string|number[]"
+    # `return` is accepted at runtime but is a Lua keyword, so only the writable spelling is
+    # declared — a stub field named `return` is not something LuaLS can offer as a completion.
+    out["HL.XRMonitorSpec"].pop("return", None)
+    out["HL.XRRuleSpec"]["blackalpha"] = "number|'off'"
+    out["HL.XRRuleSpec"]["match"] = "HL.XRRuleMatch"
 
     return out
 
@@ -528,6 +555,12 @@ def generate_stub(root: Path) -> str:
         "hl.get_config": "fun(key: HL.ConfigKey|string): any, string?",
         "hl.device": "fun(spec: HL.DeviceSpec): nil",
         "hl.monitor": "fun(spec: HL.MonitorSpec): nil",
+        # fork, XR. The string overload takes the value half of a classic `xrmonitor =` /
+        # `xrrule =` line, which is what `hyprctl openxr layout` prints for pasting back.
+        "hl.xr_monitor": "fun(spec: HL.XRMonitorSpec|string): nil",
+        "hl.xr_rule": "fun(spec: HL.XRRuleSpec|string): nil",
+        # the verb + its arguments, exactly the text that follows `xrmonitor,` in a classic bind
+        "hl.dsp.xrmonitor": "fun(verb_and_args: string): HL.Dispatcher",
         "hl.window_rule": "fun(spec: HL.WindowRuleSpec): HL.WindowRule",
         "hl.layer_rule": "fun(spec: HL.LayerRuleSpec): HL.LayerRule",
         "hl.workspace_rule": "fun(spec: HL.WorkspaceRuleSpec): HL.WorkspaceRule",
@@ -586,6 +619,7 @@ def generate_stub(root: Path) -> str:
     lines.append("---@alias HL.Vec2Like HL.Vec2|{x:number, y:number}|{number, number}|string")
     lines.append("---@alias HL.CssGap integer|{top?:integer, right?:integer, bottom?:integer, left?:integer}")
     lines.append("---@alias HL.Gradient string|{colors:string[], angle?:number}")
+    lines.append("---@alias HL.XRAnchorMode \"local\"|\"head\"|\"body\"|\"device:left\"|\"device:right\"")
     lines.append("")
     lines.append("---@class HL.Dispatcher")
     lines.append("local __HL_Dispatcher = {}")
@@ -757,6 +791,8 @@ def generate_stub(root: Path) -> str:
             ("HL.MonitorSpec", "output"),
             ("HL.DeviceSpec", "name"),
             ("HL.WorkspaceRuleSpec", "workspace"),
+            ("HL.XRMonitorSpec", "name"),
+            ("HL.XRMonitorSpec", "anchor"),
         }
         fields: list[tuple[str, str, bool]] = []
         for key, typ in sorted(descriptor_classes[class_name].items()):
