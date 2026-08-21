@@ -52,6 +52,10 @@ namespace OpenXR {
     // knob, and 3s is already an eternity for what are supposed to be local queries.
     inline constexpr int XR_PROBE_TIMEOUT_MS = 3000;
 
+    // Above this, a main-thread probe has cost the user a visible hitch (a dropped frame is 8-16ms;
+    // 100ms is several, and unmistakable). Main-thread callers log at WARN past it.
+    inline constexpr int XR_MAIN_THREAD_STALL_WARN_MS = 100;
+
     // Run `fn` on a detached throwaway thread and wait at most `timeoutMs` for it.
     //   returns the value  — the probe completed within the budget.
     //   returns nullopt    — TIMED OUT. The thread was abandoned (see above) and `abandon` is set,
@@ -62,9 +66,27 @@ namespace OpenXR {
     // the worker signals, not on a poll tick. That matters because bring-up now makes three of
     // these calls back to back, and a poll-granularity floor would be pure added latency on the
     // path a user waits through every time they put the headset on.
+    //
+    // BLOCKED-TIME ACCOUNTING (`blockedMsOut`, reload-storm investigation 2026-08-21). Say plainly
+    // what this primitive does and does not buy: the WORKER is what gets abandoned, but the CALLER
+    // parks on the condvar for as long as the probe takes, up to `timeoutMs`. On the main thread
+    // that is a compositor stall of exactly that length — the bound caps a HANG, it does not make
+    // the call asynchronous. Every main-thread caller passes this out-param and logs when the stall
+    // is user-visible, so "the desktop hitched" is attributable to the probe that did it instead of
+    // being invisible in a log that only ever showed the probe's RESULT.
     template <typename Fn>
-    auto runBoundedProbe(Fn&& fn, int timeoutMs = XR_PROBE_TIMEOUT_MS) -> std::optional<decltype(fn(std::declval<const std::atomic<bool>&>()))> {
+    auto runBoundedProbe(Fn&& fn, int timeoutMs = XR_PROBE_TIMEOUT_MS, int* blockedMsOut = nullptr) -> std::optional<decltype(fn(std::declval<const std::atomic<bool>&>()))> {
         using T = decltype(fn(std::declval<const std::atomic<bool>&>()));
+
+        const auto callerStart = std::chrono::steady_clock::now();
+        struct SBlockedStamp {
+            const std::chrono::steady_clock::time_point& start;
+            int*                                         out;
+            ~SBlockedStamp() {
+                if (out)
+                    *out = (int)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+            }
+        } blockedStamp{callerStart, blockedMsOut};
 
         // All shared state lives behind shared_ptrs precisely BECAUSE the worker may outlive this
         // frame: an abandoned thread keeps its own references alive, so nothing here dangles once

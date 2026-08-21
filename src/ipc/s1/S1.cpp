@@ -85,6 +85,28 @@ SRequest CSocket1::parseRequest(std::string request, pid_t pid) const {
 SResponse CSocket1::dispatchSingle(std::string request, pid_t pid) {
     const auto   parsed = parseRequest(std::move(request), pid);
 
+    // RELOAD-CLASS COMMAND ATTRIBUTION (live evidence 2026-08-21). A ~1 Hz storm of config refreshes
+    // ran for ten minutes and could not be traced to a caller, because "new connection from pid N"
+    // is all the compositor has ever logged — the command text was never written down, so a log with
+    // 2585 connections in it named 2585 anonymous pids and nothing else. These verbs are the ones that
+    // can re-apply config and so reach every config.reloaded / props_refreshed listener (reload, the
+    // Lua eval bindings' scheduleRefresh); no other command can start a storm. Cost is one prefix
+    // compare per request on the commands that are rare by nature, and it makes the next storm one
+    // grep from attributable. Runs per batch element (dispatchBatch splits before calling us) and
+    // after the flags prefix is stripped.
+    {
+        static constexpr std::string_view RELOAD_CLASS[] = {"reload", "eval", "repl", "keyword"};
+        const std::string_view            probe          = parsed.command;
+        for (const auto& verb : RELOAD_CLASS) {
+            if (!probe.starts_with(verb))
+                continue;
+            // Enough of the argument to tell `eval hl.monitor{...}` from `eval hl.config{...}` —
+            // which is exactly the distinction that would have named the culprit — and no more.
+            LOG(Log::DEBUG, "Hyprctl: reload-class command from pid {}: {}{}", pid, probe.substr(0, std::min<size_t>(probe.size(), 96)), probe.size() > 96 ? "..." : "");
+            break;
+        }
+    }
+
     SP<SCommand> matched;
 
     for (const auto& command : m_commands) {
