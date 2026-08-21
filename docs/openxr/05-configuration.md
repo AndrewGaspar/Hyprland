@@ -6,8 +6,81 @@ socket2 events, idle integration, and consumer recipes (waybar, hypridle, shell)
 config with every variable and example binds lives at `example/openxr.conf`; run
 `hyprctl descriptions | grep openxr` for the live descriptions including min/max clamps.
 
-`openxr { }`, `xrmonitor =` and `xrrule =` are classic-hyprlang config keywords; there is no Lua
-config binding for them.
+Every keyword here has a Lua form too — `hl.config`, `hl.xr_monitor`, `hl.xr_rule` — sharing one
+parser with the classic form; see §0 for the mapping, and for the one real difference (`hyprctl
+keyword` does not exist under a Lua config).
+
+---
+
+## 0. Two config front ends: classic and Lua
+
+Everything in this document has both a classic hyprlang form and a Lua form, and they are the same
+declaration: each Lua binding reads named fields, emits the tokens of the **same** grammar, and
+hands them to the **same** parser the classic keyword uses. There is one grammar, so there is
+nothing that parses in one front end and not the other.
+
+| Classic | Lua |
+|---|---|
+| `openxr { enabled = true }` | `hl.config({ openxr = { enabled = true } })` |
+| `xrmonitor = XR-main, 2560x1440@90, anchor:local pos:0,1.4,-1.5` | `hl.xr_monitor({ name = "XR-main", mode = "2560x1440@90", anchor = "local", pos = { 0, 1.4, -1.5 } })` |
+| `xrrule = alpha 0.55, anchorstate:follow` | `hl.xr_rule({ alpha = 0.55, match = { anchorstate = "follow" } })` |
+| `monitor = …, stereo:sbs` | `hl.monitor({ …, stereo = "sbs" })` |
+| `windowrule = stereo hsbs always, match:tag stereo-hsbs` | `hl.window_rule({ stereo = "hsbs always", match = { tag = "stereo-hsbs" } })` |
+| `windowrule = viewpoint on, match:class ^(demo)$` | `hl.window_rule({ viewpoint = true, match = { class = "^(demo)$" } })` |
+| `bind = SUPER SHIFT, G, xrmonitor, gazegrab` | `hl.bind("SUPER + SHIFT + G", hl.dsp.xrmonitor("gazegrab"))` |
+
+A **worked translation of a complete XR session config** — the real one, line for line — is at
+[`contrib/hyprland-xr.lua`](../../contrib/hyprland-xr.lua). It is loaded by the test suite, so it
+cannot silently rot.
+
+### Pick one; you cannot mix them
+
+A session has exactly **one** config manager, chosen by the extension of the main config file:
+`.lua` gets the Lua manager, anything else gets classic hyprlang. There is no bridge in either
+direction — `source =` only ever parses hyprlang, and Lua's `require` only ever resolves `.lua` /
+`init.lua`. **A `.lua` cannot source a `.conf`, and a `.conf` cannot source a `.lua`.**
+
+So the classic split of "desktop config + XR config on top":
+
+```ini
+# ~/.config/hypr/hyprland-xr.conf
+source = ~/.config/hypr/hyprland.conf
+```
+
+becomes, with both files ported to Lua:
+
+```lua
+-- ~/.config/hypr/hyprland-xr.lua
+require("hyprland")
+```
+
+`require` resolves against the **main** config file's directory and the required file is tracked by
+the config watcher exactly as a sourced file is, so editing either half still triggers a reload.
+Note that if both `hyprland.lua` and `hyprland.conf` exist, the `.lua` wins for a default launch —
+during a migration keep the `.conf` as the fallback and launch the Lua session explicitly with
+`--config ~/.config/hypr/hyprland-xr.lua`.
+
+### `hyprctl keyword` does not exist under a Lua config
+
+This is the one real behavioral difference, and it affects every "hot" toggle in §2.
+`hyprctl keyword` refuses anything but the classic parser (*"keyword can't work with non-legacy
+parsers. Use eval."*). The Lua equivalent is `hyprctl eval` running the same `hl.config` call:
+
+```bash
+# classic
+hyprctl keyword openxr:black_alpha 0.35
+# lua
+hyprctl eval 'hl.config({ openxr = { black_alpha = 0.35 } })'
+```
+
+Both are equally hot. In fact the Lua path needs no special-casing at all: `hl.config` schedules a
+prop refresh, which the XR manager already listens for — whereas under the classic parser a bare
+`hyprctl keyword` emits no reload event, which is why `ConfigManager::parseKeyword` carries an
+explicit special-case for each hot `openxr:*` key.
+
+`hyprctl openxr …` (§5) and `hyprctl dispatch` are unaffected by the choice of front end, with one
+wrinkle: under a Lua config `hyprctl dispatch` is a shorthand for `hl.dispatch(...)`, so a classic
+`hyprctl dispatch xrmonitor gazegrab` must be written `hyprctl dispatch hl.dsp.xrmonitor("gazegrab")`.
 
 ---
 
@@ -501,6 +574,44 @@ each overrides the matching `openxr:adaptive_*` global:
 xrmonitor = XR-video, 1920x1080@60, anchor:local pos:0.3,1.05,-1.2 yaw:0, size:1.8, adaptive:on roam:body roam_offset:0,1.35,-1.2 roam_yaw:0
 ```
 
+### In Lua
+
+`hl.xr_monitor` takes a table whose fields are the grammar's own key names. `name` is the identity
+field (the analogue of `hl.monitor`'s `output`), `mode` is the same `WxH[@Hz]` token, `anchor` is
+the anchor mode — bare (`"local"`) or fully qualified (`"anchor:local"`), both accepted — and every
+remaining `key:value` sub-token of the classic spec is a field of the same name. Vector fields
+(`pos`, `offset`, `roam_offset`) take `{ x, y, z }` or the `"x,y,z"` string.
+
+```lua
+hl.xr_monitor({
+    name     = "XR-main",
+    mode     = "2560x1440@90",
+    anchor   = "local",
+    pos      = { 0.017, 1.457, -1.408 },
+    yaw      = 5.3,
+    pitch    = 3.0,
+    size     = 2.23,
+    adaptive = true,          -- adaptive:on
+    roam     = "body",        -- roam:body
+    leave    = 1.5,
+    return_radius = 1.0,      -- `return` is a Lua keyword; `["return"] = 1.0` also works
+})
+
+hl.xr_monitor({ name = "XR-chat",    mode = "1280x720", anchor = "head",         offset = { 0.4, -0.2, -1.0 }, size = 0.6 })
+hl.xr_monitor({ name = "XR-palette", mode = "800x800",  anchor = "device:left",  offset = { 0, 0.08, -0.05 },  size = 0.25 })
+```
+
+It also accepts the **classic value string** verbatim, which matters because `hyprctl openxr
+layout` (§5) prints paste-ready `xrmonitor =` lines so you can arrange the desktop in-headset and
+persist the arrangement:
+
+```lua
+hl.xr_monitor("XR-main, 2560x1440@90, anchor:local pos:0.017,1.457,-1.408 yaw:5.3, size:2.23")
+```
+
+Both forms run the same parser, so a malformed declaration produces the same message either way,
+reported as a config error (it does not abort the rest of the config).
+
 ### Reload behavior
 
 Adding/removing/changing an `xrmonitor` line and reloading creates/destroys/re-anchors exactly
@@ -677,6 +788,34 @@ xrrule = blackalpha off, monitor:XR-media focusclass:(mpv|vlc)
 xrrule = alpha 0.55, anchorstate:follow
 ```
 
+### In Lua
+
+`hl.xr_rule` mirrors `hl.window_rule`: **effects at the top level, conditions in `match`**. Field
+names are the grammar's own, and `blackalpha` takes a number or `"off"` exactly as the keyword does.
+
+```lua
+-- THE SAFETY RULE — ship this.
+hl.xr_rule({ alpha = 0.55, match = { anchorstate = "follow" } })
+
+-- Fullscreen games get the panel back at full strength, no keying.
+hl.xr_rule({
+    alpha      = 1.0,
+    blackalpha = "off",
+    match      = { monitor = ".*", anchorstate = "docked", focusclass = "^steam_app_", fullscreen = true },
+})
+
+-- A dedicated video monitor should never dissolve its letterboxing.
+hl.xr_rule({ blackalpha = "off", match = { monitor = "XR-media", focusclass = "(mpv|vlc)" } })
+```
+
+Order is load-bearing here in Lua exactly as it is in a `.conf`: rules are evaluated in the order
+the calls run, and a later match overrides an earlier one per effect. Quoting a condition value with
+spaces is handled for you — write `focustitle = "Mozilla Firefox"`, not the escaped keyword form.
+
+Like `hl.xr_monitor`, this also takes the classic value string: `hl.xr_rule("alpha 0.55,
+anchorstate:follow")`. `hyprctl openxr rules` prints the source line of each rule, and a rule
+declared from a table prints as the canonical keyword line it is equivalent to.
+
 ### The walking rule (ship this)
 
 ```ini
@@ -756,6 +895,15 @@ baked while the source buffer is in hand); this is bounded by the blend duration
 `bind = MODS, KEY, xrmonitor, <verb> [args…]` — also callable as
 `hyprctl dispatch xrmonitor <verb> [args…]` and `hyprctl openxr <verb> [args…]`. Three
 transports, one implementation.
+
+In a Lua config the dispatcher is `hl.dsp.xrmonitor(...)`, which takes the verb and its arguments as
+one string — exactly the text that follows `xrmonitor,` in a classic bind:
+
+```lua
+hl.bind("SUPER + SHIFT + G",   hl.dsp.xrmonitor("gazegrab"))
+hl.bind("SUPER + ALT + equal", hl.dsp.xrmonitor("gazepush 0.1"), { repeating = true })   -- binde
+hl.bind("SUPER + CTRL + Home", hl.dsp.xrmonitor("reseat"), { description = "Re-seat all XR monitors to me" })  -- bindd
+```
 
 | Verb | Args | Effect |
 |---|---|---|
