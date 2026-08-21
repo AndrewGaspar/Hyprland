@@ -108,7 +108,7 @@ EOF
     # colliding with this developer session.
     cat >"$DESKTOP_OUT" <<EOF
 [Desktop Entry]
-Name=HypXRland (fishfood)
+Name=Omarchy XR (fishfood)
 Comment=Hyprland + OpenXR (fishfood build from $WORKTREE)
 Exec=$launcher
 TryExec=uwsm
@@ -120,7 +120,7 @@ EOF
     echo "==> session file generated at $DESKTOP_OUT"
     echo "    Install it (needs root):"
     echo "      sudo install -m644 $DESKTOP_OUT /usr/share/wayland-sessions/hypxrland-fishfood.desktop"
-    echo "    Then pick 'HypXRland (fishfood)' from the session menu at the SDDM login screen."
+    echo "    Then pick 'Omarchy XR (fishfood)' from the session menu at the SDDM login screen."
 }
 
 case ${1:-} in
@@ -141,7 +141,7 @@ case ${1:-} in
         git -C "$WORKTREE" submodule update --init
         build
         build_monado_xreal
-        echo "==> done. Log out and pick HypXRland (fishfood) again (a running session keeps its old binary image)."
+        echo "==> done. Log out and pick Omarchy XR (fishfood) again (a running session keeps its old binary image)."
         ;;
     gen-session)
         gen_session
