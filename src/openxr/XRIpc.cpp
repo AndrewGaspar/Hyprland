@@ -56,6 +56,10 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     // dir currently armed? When true, the socket appearing fires an immediate probe (the backoff timer
     // is just the fallback), so the up-to-30s donning stall is gone.
     const bool         REPROBE_WATCH = g_pOpenXRManager->reprobeWatchArmed();
+    // Sticky `hyprctl openxr disable` (reload-storm containment, 2026-08-21). Reported because a
+    // "disabled" state that no config edit will lift is otherwise indistinguishable from
+    // `openxr:enabled = 0`, and the only way out of it is the `enable` verb.
+    const bool MANUAL_DISABLE = g_pOpenXRManager->manuallyDisabled();
     // Read-only observability for the idle-inhibit predicate (doc 05 §6.1). There is otherwise
     // no queryable surface for "is the compositor's idle-inhibit bit currently raised because of
     // XR" — CIdleNotifyProtocol::isInhibited is private with no getter, and it's a fold of every
@@ -177,6 +181,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "reprobeWaiting": "{}",
     "reprobePendingMs": {},
     "reprobeWatching": {},
+    "manualDisable": {},
     "inhibitingIdle": {},
     "idleInhibitMode": "{}",
     "handInput": {{ "mode": "{}", "state": "{}" }},
@@ -194,10 +199,11 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
 }}
 )#",
                            STATE, RUNTIME, SYSTEM, RTGPU, RTJSON, BLOCKED, BLEND, BLACK.configured, BLACK.effective, BLACK.knee, BLACK.active ? "true" : "false",
-                           BLACK.gatedOff ? "true" : "false", OVERLAY ? "true" : "false", MONITOR_VIEW ? "shown" : "hidden", SELECTED, FOLLOW, UNPLUG_PEND, RECENTER, PRESENCE, RESTORE_CAPTURE ? "true" : "false", VISIBLE,
-                           REPROBE_WAIT, REPROBE_MS, REPROBE_WATCH ? "true" : "false", INHIBITING_IDLE ? "true" : "false", INHIBIT_MODE, HANDIN.mode, HANDIN.state, GAZE.source,
-                           GAZE.hoveredMonitor, GAZE.hoveredName, GAZE.carrying ? "true" : "false", GAZE.carryMonitor, GAZE.dist, HANDS[0].hands ? "hands" : "controllers",
-                           HANDS[0].gesture, HANDS[0].filtered ? "true" : "false", HANDS[1].hands ? "hands" : "controllers", HANDS[1].gesture, HANDS[1].filtered ? "true" : "false",
+                           BLACK.gatedOff ? "true" : "false", OVERLAY ? "true" : "false", MONITOR_VIEW ? "shown" : "hidden", SELECTED, FOLLOW, UNPLUG_PEND, RECENTER, PRESENCE,
+                           RESTORE_CAPTURE ? "true" : "false", VISIBLE, REPROBE_WAIT, REPROBE_MS, REPROBE_WATCH ? "true" : "false", MANUAL_DISABLE ? "true" : "false",
+                           INHIBITING_IDLE ? "true" : "false", INHIBIT_MODE, HANDIN.mode, HANDIN.state, GAZE.source, GAZE.hoveredMonitor, GAZE.hoveredName,
+                           GAZE.carrying ? "true" : "false", GAZE.carryMonitor, GAZE.dist, HANDS[0].hands ? "hands" : "controllers", HANDS[0].gesture,
+                           HANDS[0].filtered ? "true" : "false", HANDS[1].hands ? "hands" : "controllers", HANDS[1].gesture, HANDS[1].filtered ? "true" : "false",
                            L2D.enabled ? "true" : "false", L2D.frozen ? "true" : "false", L2D.refValid ? "true" : "false", L2D.refYawDeg, L2D.placed, L2D.rows, L2D.width,
                            L2D.height, L2D.vertical, L2D.attach, L2D.pxPerDegree, MONS.empty() ? "" : "\n", mons);
     }
@@ -205,9 +211,11 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     const std::string FOLLOWLINE = UNPLUG_PEND >= 0 ? std::format("{} (unplug in {}ms)", FOLLOW, UNPLUG_PEND) : FOLLOW;
     // report-20 issue B1: append the dormant re-probe hint to the state line, e.g.
     // "unavailable (waiting for headset, retrying in 1800ms)".
-    const std::string STATELINE = REPROBE_WAIT.empty()
-        ? STATE
-        : std::format("{} (waiting for {}, retrying in {}ms{})", STATE, REPROBE_WAIT, REPROBE_MS < 0 ? 0 : REPROBE_MS, REPROBE_WATCH ? ", watching socket" : "");
+    const std::string STATELINE = MANUAL_DISABLE ?
+        std::format("{} (manually disabled — `hyprctl openxr enable` to resume)", STATE) :
+        REPROBE_WAIT.empty() ?
+        STATE :
+        std::format("{} (waiting for {}, retrying in {}ms{})", STATE, REPROBE_WAIT, REPROBE_MS < 0 ? 0 : REPROBE_MS, REPROBE_WATCH ? ", watching socket" : "");
     const std::string GAZELINE = GAZE.carrying ? std::format("carrying {} at {:.2f}m", GAZE.carryMonitor, GAZE.dist)
                                                 : (GAZE.hoveredMonitor >= 0 ? std::format("looking at {}", GAZE.hoveredName) : "idle");
     // "black alpha: 0.20 (knee 0.10)" when the luma key is live; "off" when unconfigured; and an
@@ -366,7 +374,9 @@ static std::string openxrRequest(eHyprCtlOutputFormat format, std::string reques
         return openxrStatus(format);
 
     if (SUBCOMMAND == "enable") {
-        g_pOpenXRManager->start();
+        // userEnable(), not start(): it clears the sticky manual-disable latch and the probe floor
+        // so an explicit enable always gets a fresh attempt (reload-storm containment, 2026-08-21).
+        g_pOpenXRManager->userEnable();
         switch (g_pOpenXRManager->state()) {
             case XR_STATE_UNAVAILABLE: return "OpenXR runtime unavailable";
             case XR_STATE_DISABLED: return "failed to start OpenXR session";
@@ -375,7 +385,11 @@ static std::string openxrRequest(eHyprCtlOutputFormat format, std::string reques
     }
 
     if (SUBCOMMAND == "disable") {
-        g_pOpenXRManager->stop();
+        // userDisable(), not stop(): the disable must SURVIVE config reloads. A bare stop() left
+        // openxr:enabled = 1 in the config, so the next reload saw DISABLED + enabled and started
+        // straight back up — under the 1 Hz reload storm of 2026-08-21 the disable lasted under a
+        // second and there was no way to turn XR off at all.
+        g_pOpenXRManager->userDisable();
         return "ok";
     }
 
