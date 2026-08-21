@@ -105,9 +105,30 @@ backoff timer brings the session up automatically once the runtime starts or the
 donned.
 
 **`hyprctl openxr enable`/`disable` vs `openxr:enabled`.** The `enable`/`disable` subcommands
-start/stop the session **without** touching the config value, so a subsequent config reload
-re-applies whatever `openxr:enabled` says in the file. To persist a change, edit the config or
-use `hyprctl keyword openxr:enabled ...` (which does the same thing live).
+start/stop the session **without** touching the config value. `disable` is **sticky**: it
+outranks `openxr:enabled` until you run `hyprctl openxr enable` (or flip `openxr:enabled` from
+`0` back to `1`, which is an explicit instruction through the other control and therefore
+clears the latch). `hyprctl openxr status` says so — `disabled (manually disabled — ...)`, and
+`"manualDisable": true` in `-j`. It did NOT used to be sticky, and that was a real bug: with
+`openxr:enabled = 1` in the file, the next config reload saw "config says on, state is
+disabled" and started straight back up. Under a storm of reloads the disable lasted under a
+second and there was no way to turn XR off at all (live evidence 2026-08-21).
+
+To persist a change across compositor restarts, still edit the config or use
+`hyprctl keyword openxr:enabled ...`.
+
+**A config reload is not a retry.** While the session is dormant in `unavailable`, a reload
+that changes nothing the *handshake* depends on (`enabled`, `gpu`, `runtime_json`,
+`blend_mode`, `overlay`, `overlay_z`, `ignore_kernel_taint`, `reprobe*`) deliberately costs
+nothing: no runtime handshake, no re-arming of the re-probe timer, no rebuilding of the socket
+watch. Retrying is the `openxr:reprobe` backoff timer's job, and re-arming that timer on every
+reload is precisely what stops it from ever firing. Hot-tuning any of the *other* dozens of
+knobs (chrome, grab, adaptive, luma key, layout2d, ...) applies live exactly as before — those
+are re-published on every reload; they just do not buy a handshake.
+
+If you want to force an attempt right now, ask for one: `hyprctl openxr enable` always probes.
+(With `openxr:reprobe = 0` there is no timer to retry instead, so a reload keeps working as the
+manual retry — rate-limited to `openxr:reprobe_interval_ms`.)
 
 ---
 
