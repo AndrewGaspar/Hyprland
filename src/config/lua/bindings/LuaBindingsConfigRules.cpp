@@ -17,6 +17,7 @@
 #include "../../supplementary/propRefresher/PropRefresher.hpp"
 #include "../../shared/animation/AnimationTree.hpp"
 #include "../../shared/monitor/MonitorRuleManager.hpp"
+#include "../../shared/xr/XRDeclarationManager.hpp"
 #include "../../shared/monitor/Parser.hpp"
 #include "../../shared/workspace/WorkspaceRuleManager.hpp"
 
@@ -28,6 +29,8 @@
 #include "../../../layout/LayoutManager.hpp"
 #include "../../../layout/supplementary/WorkspaceAlgoMatcher.hpp"
 #include "../../../animation/AnimationManager.hpp"
+#include "../../../managers/eventLoop/EventLoopManager.hpp"
+#include "../../../openxr/OpenXRManager.hpp"
 #include "../../../managers/input/InputManager.hpp"
 #include "../../../managers/input/trackpad/TrackpadGestures.hpp"
 #include "../../../managers/input/trackpad/gestures/CloseGesture.hpp"
@@ -230,6 +233,72 @@ namespace {
          [](ILuaConfigValue* v, Config::CWorkspaceRule& r) { r.m_layout = *sc<const Config::STRING*>(v->data()); }},
         {"animation", []() -> ILuaConfigValue* { return new CLuaConfigString(STRVAL_EMPTY); },
          [](ILuaConfigValue* v, Config::CWorkspaceRule& r) { r.m_animationStyle = *sc<const Config::STRING*>(v->data()); }},
+    };
+
+    // ---- XR: the `xrmonitor` / `xrrule` keywords, as Lua (docs/openxr/05 §3 / §3.5) ----
+    //
+    // Same contract as everything else in this file: the Lua front end NEVER re-implements a
+    // grammar. It reads named fields, turns each one into exactly one token of the SHARED parser's
+    // own vocabulary, and hands the tokens to that parser. Field names below therefore ARE the
+    // grammar's key names — not a parallel vocabulary that could drift from the `.conf` spelling.
+
+    // How a parsed field becomes its token's value.
+    enum eXRTokenKind : uint8_t {
+        XR_TOK_STRING = 0, // verbatim
+        XR_TOK_FLOAT,      // shortest round-trip decimal. NOT std::to_string / ILuaConfigValue::
+                           // toString(), whose 6-place truncation would silently move a pose
+                           // pasted back from `hyprctl openxr layout`.
+        XR_TOK_BOOL,       // on/off — how the anchor grammar spells a flag
+        XR_TOK_VEC3,       // "x,y,z"; the table form {x, y, z} is accepted and formatted to it
+        XR_TOK_NUM_OR_STR, // a number, or a keyword like "off" (xrrule's blackalpha)
+    };
+
+    struct SXRFieldDesc {
+        const char* name;
+        ILuaConfigValue* (*factory)();
+        eXRTokenKind kind;
+        const char*  token; // the grammar's key; differs from `name` only where Lua reserves a word
+    };
+
+    // hl.xr_monitor's anchor-spec fields (doc 05 §3). `name` / `mode` / `anchor` are positional in
+    // the classic line and handled separately, exactly as hl.monitor handles `output`.
+    inline constexpr SXRFieldDesc XR_MONITOR_FIELDS[] = {
+        {"pos", []() -> ILuaConfigValue* { return new CLuaConfigString(STRVAL_EMPTY); }, XR_TOK_VEC3, "pos"},
+        {"offset", []() -> ILuaConfigValue* { return new CLuaConfigString(STRVAL_EMPTY); }, XR_TOK_VEC3, "offset"},
+        {"yaw", []() -> ILuaConfigValue* { return new CLuaConfigFloat(0.F); }, XR_TOK_FLOAT, "yaw"},
+        {"pitch", []() -> ILuaConfigValue* { return new CLuaConfigFloat(0.F); }, XR_TOK_FLOAT, "pitch"},
+        {"size", []() -> ILuaConfigValue* { return new CLuaConfigFloat(0.F); }, XR_TOK_FLOAT, "size"},
+        {"adaptive", []() -> ILuaConfigValue* { return new CLuaConfigBool(false); }, XR_TOK_BOOL, "adaptive"},
+        {"roam", []() -> ILuaConfigValue* { return new CLuaConfigString(STRVAL_EMPTY); }, XR_TOK_STRING, "roam"},
+        {"roam_offset", []() -> ILuaConfigValue* { return new CLuaConfigString(STRVAL_EMPTY); }, XR_TOK_VEC3, "roam_offset"},
+        {"roam_yaw", []() -> ILuaConfigValue* { return new CLuaConfigFloat(0.F); }, XR_TOK_FLOAT, "roam_yaw"},
+        {"leave", []() -> ILuaConfigValue* { return new CLuaConfigFloat(0.F); }, XR_TOK_FLOAT, "leave"},
+        // `return` is a Lua keyword, so `return_radius` is the spelling that can be written as a
+        // bare table key. `["return"]` still works; both emit the `return:` token of the grammar.
+        // (Apostrophes are deliberately absent from every comment INSIDE these initializers: the
+        // LuaLS stub generator brace-matches this array with a scanner that treats one as a string
+        // delimiter, and an odd count silently swallows the arrays that follow.)
+        {"return_radius", []() -> ILuaConfigValue* { return new CLuaConfigFloat(0.F); }, XR_TOK_FLOAT, "return"},
+        {"return", []() -> ILuaConfigValue* { return new CLuaConfigFloat(0.F); }, XR_TOK_FLOAT, "return"},
+        {"carry", []() -> ILuaConfigValue* { return new CLuaConfigBool(false); }, XR_TOK_BOOL, "carry"},
+    };
+
+    // hl.xr_rule's effects — the half BEFORE the comma in `xrrule = <effects>, <conditions>`.
+    inline constexpr SXRFieldDesc XR_RULE_EFFECT_FIELDS[] = {
+        {"alpha", []() -> ILuaConfigValue* { return new CLuaConfigFloat(1.F); }, XR_TOK_FLOAT, "alpha"},
+        // number, or the string "off" (keying disabled) — the grammar accepts both.
+        {"blackalpha", []() -> ILuaConfigValue* { return new CLuaConfigString(STRVAL_EMPTY); }, XR_TOK_NUM_OR_STR, "blackalpha"},
+        {"blackalpha_knee", []() -> ILuaConfigValue* { return new CLuaConfigFloat(0.1F); }, XR_TOK_FLOAT, "blackalpha_knee"},
+    };
+
+    // hl.xr_rule's conditions — the half AFTER the comma. In `match = { ... }`, mirroring
+    // hl.window_rule, whose conditions live in a `match` table too.
+    inline constexpr SXRFieldDesc XR_RULE_MATCH_FIELDS[] = {
+        {"monitor", []() -> ILuaConfigValue* { return new CLuaConfigString(STRVAL_EMPTY); }, XR_TOK_STRING, "monitor"},
+        {"anchorstate", []() -> ILuaConfigValue* { return new CLuaConfigString(STRVAL_EMPTY); }, XR_TOK_STRING, "anchorstate"},
+        {"focusclass", []() -> ILuaConfigValue* { return new CLuaConfigString(STRVAL_EMPTY); }, XR_TOK_STRING, "focusclass"},
+        {"focustitle", []() -> ILuaConfigValue* { return new CLuaConfigString(STRVAL_EMPTY); }, XR_TOK_STRING, "focustitle"},
+        {"fullscreen", []() -> ILuaConfigValue* { return new CLuaConfigBool(false); }, XR_TOK_BOOL, "fullscreen"},
     };
 
     inline constexpr SFieldDesc DEVICE_FIELDS[] = {
@@ -1169,6 +1238,352 @@ static int hlMonitor(lua_State* L) {
     return 0;
 }
 
+// ---- XR keywords, as Lua (docs/openxr/05 §3 and §3.5) ----
+//
+// The `xrmonitor` and `xrrule` keywords predate this fork's Lua front end and were reachable only
+// from a `.conf`, which is why the XR session was the last thing that could not be written in Lua.
+// These two bindings close that, WITHOUT growing a second grammar: each reads named fields, emits
+// the shared parser's own tokens, and lets that parser do every bit of validation. The parsed
+// result then lands in Config::xrDeclarationMgr(), the same store the classic keyword fills — so
+// the two front ends produce identical state by construction, not by agreement.
+
+namespace {
+    // Format a Lua number for a token. Shortest round-trip, so a pose pasted out of
+    // `hyprctl openxr layout` survives a trip through a Lua config unchanged.
+    std::string xrNum(double v) {
+        return std::format("{}", v);
+    }
+
+    // One field -> the string that follows its `key:`. Leaves the stack as it found it.
+    std::expected<std::string, std::string> xrTokenValue(lua_State* L, const SXRFieldDesc& desc) {
+        if (desc.kind == XR_TOK_VEC3) {
+            // "x,y,z" verbatim, or {x, y, z}. The table form is the reason to bother: a pose is
+            // three numbers, and making the user paste them into a string is a papercut.
+            if (lua_istable(L, -1)) {
+                std::string out;
+                for (int i = 1; i <= 3; ++i) {
+                    lua_rawgeti(L, -1, i);
+                    if (!lua_isnumber(L, -1)) {
+                        lua_pop(L, 1);
+                        return std::unexpected(std::format("expected 3 numbers, element {} is not a number", i));
+                    }
+                    if (i > 1)
+                        out += ',';
+                    out += xrNum(lua_tonumber(L, -1));
+                    lua_pop(L, 1);
+                }
+                lua_rawgeti(L, -1, 4);
+                const bool tooLong = !lua_isnil(L, -1);
+                lua_pop(L, 1);
+                if (tooLong)
+                    return std::unexpected("expected exactly 3 numbers");
+                return out;
+            }
+            if (lua_isstring(L, -1) && !lua_isnumber(L, -1))
+                return std::string(lua_tostring(L, -1));
+            return std::unexpected("expected \"x,y,z\" or { x, y, z }");
+        }
+
+        if (desc.kind == XR_TOK_NUM_OR_STR) {
+            if (lua_isnumber(L, -1))
+                return xrNum(lua_tonumber(L, -1));
+            if (lua_isstring(L, -1))
+                return std::string(lua_tostring(L, -1));
+            return std::unexpected("expected a number or a string");
+        }
+
+        // Everything else goes through the same ILuaConfigValue machinery the other rule bindings
+        // use, so type errors read the same as they do for hl.monitor / hl.window_rule.
+        auto       val = UP<ILuaConfigValue>(desc.factory());
+        const auto err = val->parse(L);
+        if (err.errorCode != PARSE_ERROR_OK)
+            return std::unexpected(err.message);
+
+        switch (desc.kind) {
+            case XR_TOK_FLOAT: return xrNum(*sc<const Config::FLOAT*>(val->data()));
+            // The anchor grammar's flags are on/off; `fullscreen:` takes 0/1 and also accepts these.
+            case XR_TOK_BOOL: return *sc<const Config::BOOL*>(val->data()) ? std::string("on") : std::string("off");
+            default: return *sc<const Config::STRING*>(val->data());
+        }
+    }
+
+    // A condition value may contain spaces (a title regex). The shared tokenizer un-quotes, so
+    // quote here; a value that already contains a quote cannot be expressed either way.
+    std::expected<std::string, std::string> xrQuoteIfNeeded(const std::string& v) {
+        if (v.contains('"'))
+            return std::unexpected("value may not contain a double quote");
+        if (v.find_first_of(" \t") == std::string::npos)
+            return v;
+        return "\"" + v + "\"";
+    }
+
+    // A dynamic `hyprctl keyword xrmonitor` reconciles explicitly because it fires no reload event;
+    // under Lua the same hole is `hyprctl eval`, and isDynamicParse() is how this front end names
+    // it. A full reload must NOT reconcile per line — it reconciles once, from onConfigReload().
+    void xrScheduleReconcile(CConfigManager* self, void (COpenXRManager::*fn)()) {
+#ifdef HAVE_OPENXR
+        if (!self->isDynamicParse() || !g_pEventLoopManager)
+            return;
+        g_pEventLoopManager->doLater([fn] {
+            if (g_pOpenXRManager)
+                (g_pOpenXRManager.get()->*fn)();
+        });
+#else
+        (void)self;
+        (void)fn;
+#endif
+    }
+}
+
+static int hlXRMonitor(lua_State* L) {
+    auto*             self       = sc<CConfigManager*>(lua_touserdata(L, lua_upvalueindex(1)));
+    const std::string sourceInfo = Internal::getSourceInfo(L);
+
+    SXRMonitorParams  params;
+
+    // String form: the value half of a classic `xrmonitor =` line, verbatim. Not a shortcut — it is
+    // the paste target for `hyprctl openxr layout`, which prints paste-ready keyword lines so you
+    // can arrange the desktop in-headset and persist the arrangement (doc 05 §5).
+    if (lua_isstring(L, 1) && !lua_isnumber(L, 1)) {
+        auto parsed = OpenXR::parseXRMonitorLine(lua_tostring(L, 1));
+        if (!parsed) {
+            self->addError(std::format("{}: hl.xr_monitor: {}", sourceInfo, parsed.error()));
+            return 0;
+        }
+        params = std::move(*parsed);
+    } else {
+        if (!lua_istable(L, 1)) {
+            self->addError(std::format("{}: hl.xr_monitor: argument must be a table, or a classic `xrmonitor =` value string", sourceInfo));
+            return 0;
+        }
+
+        lua_getfield(L, 1, "name");
+        if (!lua_isstring(L, -1)) {
+            self->addError(std::format("{}: hl.xr_monitor: 'name' field is required and must be a string", sourceInfo));
+            lua_pop(L, 1);
+            return 0;
+        }
+        params.m_name = lua_tostring(L, -1);
+        lua_pop(L, 1);
+
+        lua_getfield(L, 1, "mode");
+        if (!lua_isnil(L, -1)) {
+            if (!lua_isstring(L, -1)) {
+                self->addError(std::format("{}: hl.xr_monitor: 'mode' must be a string like \"2560x1440@90\"", sourceInfo));
+                lua_pop(L, 1);
+                return 0;
+            }
+            if (auto r = OpenXR::parseXRMonitorMode(lua_tostring(L, -1), params); !r) {
+                self->addError(std::format("{}: hl.xr_monitor: {}", sourceInfo, r.error()));
+                lua_pop(L, 1);
+                return 0;
+            }
+        }
+        lua_pop(L, 1);
+
+        lua_getfield(L, 1, "anchor");
+        if (!lua_isstring(L, -1)) {
+            self->addError(std::format("{}: hl.xr_monitor: 'anchor' field is required (local|head|body|device:left|device:right)", sourceInfo));
+            lua_pop(L, 1);
+            return 0;
+        }
+        std::string anchorMode = lua_tostring(L, -1);
+        lua_pop(L, 1);
+        // Both spellings: the bare mode, and the grammar's own `anchor:local` token, so a line
+        // copied out of a .conf keeps working when it is pasted into a table.
+        if (anchorMode.starts_with("anchor:"))
+            anchorMode = anchorMode.substr(std::string_view("anchor:").size());
+
+        // Collect by descriptor index so tokens come out in a fixed order regardless of Lua's
+        // table iteration order — an error message that moves between reloads is a bad error
+        // message.
+        std::vector<std::optional<std::string>> values(std::size(XR_MONITOR_FIELDS));
+        bool                                    failed = false;
+
+        lua_pushnil(L);
+        while (lua_next(L, 1) != 0) {
+            if (lua_type(L, -2) != LUA_TSTRING) {
+                lua_pop(L, 1);
+                continue;
+            }
+
+            const std::string_view key = lua_tostring(L, -2);
+            if (key == "name" || key == "mode" || key == "anchor") {
+                lua_pop(L, 1);
+                continue;
+            }
+
+            const auto* desc = Internal::findDescByName(XR_MONITOR_FIELDS, key);
+            if (!desc) {
+                self->addError(std::format("{}: hl.xr_monitor: unknown field '{}'", sourceInfo, key));
+                failed = true;
+                lua_pop(L, 1);
+                continue;
+            }
+
+            auto val = xrTokenValue(L, *desc);
+            if (!val) {
+                self->addError(std::format("{}: hl.xr_monitor: field '{}': {}", sourceInfo, key, val.error()));
+                failed = true;
+            } else
+                values[desc - XR_MONITOR_FIELDS] = std::format("{}:{}", desc->token, *val);
+
+            lua_pop(L, 1);
+        }
+
+        if (failed)
+            return 0;
+
+        std::vector<std::string> tokens{"anchor:" + anchorMode};
+        for (auto& v : values) {
+            if (v)
+                tokens.emplace_back(std::move(*v));
+        }
+
+        if (auto r = OpenXR::parseXRAnchorSpec(tokens, params); !r) {
+            self->addError(std::format("{}: hl.xr_monitor: {}", sourceInfo, r.error()));
+            return 0;
+        }
+    }
+
+    Config::xrDeclarationMgr()->addMonitor(std::move(params));
+    xrScheduleReconcile(self, &COpenXRManager::reconcileDeclaredMonitors);
+    return 0;
+}
+
+static int hlXRRule(lua_State* L) {
+    auto*             self       = sc<CConfigManager*>(lua_touserdata(L, lua_upvalueindex(1)));
+    const std::string sourceInfo = Internal::getSourceInfo(L);
+
+    std::string       line;
+
+    // String form: the value half of a classic `xrrule =` line, for the same reason hl.xr_monitor
+    // takes one — a rule copied out of a .conf or the docs should paste in unedited.
+    if (lua_isstring(L, 1) && !lua_isnumber(L, 1))
+        line = lua_tostring(L, 1);
+    else {
+        if (!lua_istable(L, 1)) {
+            self->addError(std::format("{}: hl.xr_rule: argument must be a table, or a classic `xrrule =` value string", sourceInfo));
+            return 0;
+        }
+
+        std::vector<std::optional<std::string>> effects(std::size(XR_RULE_EFFECT_FIELDS));
+        std::vector<std::optional<std::string>> conds(std::size(XR_RULE_MATCH_FIELDS));
+        bool                                    failed = false;
+
+        lua_getfield(L, 1, "match");
+        if (!lua_isnil(L, -1)) {
+            if (!lua_istable(L, -1)) {
+                self->addError(std::format("{}: hl.xr_rule: 'match' must be a table", sourceInfo));
+                lua_pop(L, 1);
+                return 0;
+            }
+
+            const int matchIdx = lua_gettop(L);
+            lua_pushnil(L);
+            while (lua_next(L, matchIdx) != 0) {
+                if (lua_type(L, -2) != LUA_TSTRING) {
+                    lua_pop(L, 1);
+                    continue;
+                }
+
+                const std::string_view key  = lua_tostring(L, -2);
+                const auto*            desc = Internal::findDescByName(XR_RULE_MATCH_FIELDS, key);
+                if (!desc) {
+                    self->addError(std::format("{}: hl.xr_rule: unknown match condition '{}' (valid: monitor, anchorstate, focusclass, focustitle, fullscreen)", sourceInfo, key));
+                    failed = true;
+                    lua_pop(L, 1);
+                    continue;
+                }
+
+                auto val = xrTokenValue(L, *desc);
+                if (!val) {
+                    self->addError(std::format("{}: hl.xr_rule: match '{}': {}", sourceInfo, key, val.error()));
+                    failed = true;
+                    lua_pop(L, 1);
+                    continue;
+                }
+
+                auto quoted = xrQuoteIfNeeded(*val);
+                if (!quoted) {
+                    self->addError(std::format("{}: hl.xr_rule: match '{}': {}", sourceInfo, key, quoted.error()));
+                    failed = true;
+                } else
+                    conds[desc - XR_RULE_MATCH_FIELDS] = std::format("{}:{}", desc->token, *quoted);
+
+                lua_pop(L, 1);
+            }
+        }
+        lua_pop(L, 1);
+
+        lua_pushnil(L);
+        while (lua_next(L, 1) != 0) {
+            if (lua_type(L, -2) != LUA_TSTRING) {
+                lua_pop(L, 1);
+                continue;
+            }
+
+            const std::string_view key = lua_tostring(L, -2);
+            if (key == "match") {
+                lua_pop(L, 1);
+                continue;
+            }
+
+            const auto* desc = Internal::findDescByName(XR_RULE_EFFECT_FIELDS, key);
+            if (!desc) {
+                self->addError(std::format("{}: hl.xr_rule: unknown effect '{}' (valid: alpha, blackalpha, blackalpha_knee)", sourceInfo, key));
+                failed = true;
+                lua_pop(L, 1);
+                continue;
+            }
+
+            auto val = xrTokenValue(L, *desc);
+            if (!val) {
+                self->addError(std::format("{}: hl.xr_rule: effect '{}': {}", sourceInfo, key, val.error()));
+                failed = true;
+            } else
+                effects[desc - XR_RULE_EFFECT_FIELDS] = std::format("{} {}", desc->token, *val);
+
+            lua_pop(L, 1);
+        }
+
+        if (failed)
+            return 0;
+
+        // Re-emit the canonical keyword line. That is not a detour: SXRRule carries `raw`, which
+        // `hyprctl openxr rules` prints back at you, so a Lua rule has to be able to name itself in
+        // the same language a .conf rule does.
+        for (auto& e : effects) {
+            if (!e)
+                continue;
+            if (!line.empty())
+                line += ' ';
+            line += *e;
+        }
+
+        std::string condStr;
+        for (auto& c : conds) {
+            if (!c)
+                continue;
+            if (!condStr.empty())
+                condStr += ' ';
+            condStr += *c;
+        }
+        if (!condStr.empty())
+            line += ", " + condStr;
+    }
+
+    auto parsed = OpenXR::parseXRRuleLine(line);
+    if (!parsed) {
+        self->addError(std::format("{}: hl.xr_rule: {}", sourceInfo, parsed.error()));
+        return 0;
+    }
+
+    Config::xrDeclarationMgr()->addRule(std::move(*parsed));
+    xrScheduleReconcile(self, &COpenXRManager::reloadXRRules);
+    return 0;
+}
+
 static int hlWindowRule(lua_State* L) {
     auto* self = sc<CConfigManager*>(lua_touserdata(L, lua_upvalueindex(1)));
 
@@ -1399,6 +1814,8 @@ void Internal::registerConfigRuleBindings(lua_State* L, CConfigManager* mgr) {
     Internal::setMgrFn(L, mgr, "get_config", hlGetConfig);
     Internal::setMgrFn(L, mgr, "device", hlDevice);
     Internal::setMgrFn(L, mgr, "monitor", hlMonitor);
+    Internal::setMgrFn(L, mgr, "xr_monitor", hlXRMonitor);
+    Internal::setMgrFn(L, mgr, "xr_rule", hlXRRule);
     Internal::setMgrFn(L, mgr, "window_rule", hlWindowRule);
     Internal::setMgrFn(L, mgr, "layer_rule", hlLayerRule);
     Internal::setMgrFn(L, mgr, "workspace_rule", hlWorkspaceRule);

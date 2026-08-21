@@ -198,6 +198,9 @@ namespace Config::Lua {
         ILuaConfigValue*                findDeviceValue(const std::string& dev, const std::string& field);
 
         friend class CConfigManagerPluginLuaTestAccessor;
+        // fork: the xrmonitor/xrrule Lua bindings get their own accessor rather than re-defining the
+        // one above in a second TU (identical-token ODR is not a guarantee worth relying on).
+        friend class CConfigManagerXRLuaTestAccessor;
     };
 
     WP<CConfigManager> mgr();
