@@ -459,7 +459,16 @@ class COpenXRManager {
     // listeners registered in init() — but a bare `hyprctl keyword openxr:enabled 0/1` under the
     // legacy config parser fires neither event (see CConfigManager::parseKeyword's special-case
     // cluster), so that path calls this directly. Idempotent; safe to call redundantly.
-    void onConfigReload();
+    // `forceProbe` = an EXPLICIT user re-assert (the openxr:enabled keyword special-case, `hyprctl
+    // openxr enable`). It bypasses the probe gates below; every other caller leaves it false so a
+    // reload that changes nothing probe-relevant costs nothing (reload-storm containment, 2026-08-21).
+    void onConfigReload(bool forceProbe = false);
+
+    // Sticky user disable (`hyprctl openxr disable` / `enable`). The IPC verbs funnel here rather
+    // than calling stop()/start() directly, so the latch and the lifecycle can never disagree.
+    void userDisable();
+    void userEnable();
+    bool manuallyDisabled() const;
 
     // Legacy `hyprctl keyword monitor ...` also emits no reload/props-refreshed event. Re-evaluate
     // per-field user ownership after that rule has been installed, then restore any XR-owned fields
@@ -470,6 +479,12 @@ class COpenXRManager {
     static const char* stateToString(eXRManagerState state);
 
   private:
+    // Signature of every config value a bring-up attempt depends on (openxr:enabled, :gpu,
+    // :runtime_json, :blend_mode, :overlay(_z), :ignore_kernel_taint, :reprobe*). MAIN THREAD only —
+    // it reads STRING config values. Returns true when it differs from m_lastProbeInputs, and
+    // updates the cache. Reload-storm containment (2026-08-21).
+    bool probeInputsChanged();
+
     void setState(eXRManagerState newState);
     void reevaluateViewpoints();
     void drainViewpointSamples();
@@ -1009,6 +1024,19 @@ class COpenXRManager {
     SP<CEventLoopTimer> m_reprobeTimer;
     int                 m_reprobeAttempt = 0;
     eXRProbeWait        m_probeWait      = XR_WAIT_NONE;
+
+    // Reload-storm containment (live evidence 2026-08-21; see the block above OpenXR::xrReloadAction
+    // in XRMonitorConfig.hpp). m_lastProbeAt is when start() last got past its guards — the floor
+    // that keeps reload-driven probes from out-running the documented cadence. m_lastProbeInputs is
+    // the signature of every config value a bring-up attempt actually depends on; a reload that does
+    // not change it is not a reason to probe. m_manualDisable is the STICKY `hyprctl openxr disable`
+    // latch: without it, the very next reload re-applied `openxr:enabled = 1` and undid the disable.
+    std::optional<Time::steady_tp> m_lastProbeAt;
+    std::string                    m_lastProbeInputs;
+    bool                           m_manualDisable = false;
+    // Last openxr:enabled value onConfigReload() saw (-1 = never). Only a real 0->1 EDGE clears the
+    // sticky disable; the unchanged `= 1` every reload re-applies must not.
+    int m_lastEnabledSeen = -1;
 
     // Event-driven re-probe (don-the-headset dead-air fix). The inotify fd rides the wl_event_loop
     // exactly like m_eventFd/m_eventSource; armed on entering UNAVAILABLE, torn down on leaving. All
