@@ -73,6 +73,7 @@
 #include "../managers/eventLoop/EventLoopTimer.hpp"     // xrrule: the transition-envelope tick
 #include "../config/shared/monitor/MonitorRuleManager.hpp"
 #include "../config/shared/monitor/MonitorRule.hpp"
+#include "../config/shared/xr/XRDeclarationManager.hpp"
 #include "../config/legacy/ConfigManager.hpp"
 #include "../helpers/time/Time.hpp"
 
@@ -4546,7 +4547,7 @@ void COpenXRManager::reloadXRRules() {
     // MAIN THREAD. Snapshot the declared list (config order is load-bearing) and re-evaluate. The
     // snapshot is a copy so a later reload rebuilding CConfigManager's vector can never pull the
     // ground out from under an in-flight evaluation.
-    m_xrRules = Config::Legacy::mgr() ? Config::Legacy::mgr()->declaredXRRules() : std::vector<OpenXR::SXRRule>{};
+    m_xrRules = Config::xrDeclarationMgr()->rules();
 
     // Titles change on every browser tab switch; only pay for that trigger if a rule can act on it.
     m_rulesUseTitle = std::ranges::any_of(m_xrRules, [](const OpenXR::SXRRule& r) { return (bool)r.conds.focusTitleRe; });
@@ -5283,11 +5284,8 @@ std::string COpenXRManager::selectedName() {
 void COpenXRManager::reconcileDeclaredMonitors() {
     // doc 05 §2.5: D = declared set (this parse), L = live layers created BY config
     // (m_declaredByConfig). Runtime-created layers are never touched.
-    auto cm = Config::Legacy::mgr();
-    if (!cm)
-        return; // Lua config or no legacy manager: no declared xrmonitor set (v1 = classic only)
-
-    const auto& declared = cm->declaredXRMonitors();
+    // Front-end independent: both `xrmonitor =` (classic) and hl.xr_monitor (Lua) deposit here.
+    const auto& declared = Config::xrDeclarationMgr()->monitors();
 
     // Snapshot current declared layer names.
     std::vector<std::string> liveDeclared;

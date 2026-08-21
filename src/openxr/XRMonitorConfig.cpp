@@ -733,6 +733,18 @@ std::string OpenXR::serializeXRMonitorLine(const std::string& name, Vector2D res
     return std::format("xrmonitor = {}, {}, {}, size:{:.2f}", name, mode, spec, sizeMeters);
 }
 
+std::expected<void, std::string> OpenXR::parseXRMonitorMode(const std::string& mode, SXRMonitorParams& out) {
+    return parseMode(mode, out);
+}
+
+std::expected<void, std::string> OpenXR::parseXRAnchorSpec(const std::vector<std::string>& tokens, SXRMonitorParams& out) {
+    return parseAnchorAndKV(tokens, out);
+}
+
+std::vector<std::string> OpenXR::tokenizeXRAnchorSpec(const std::string& spec) {
+    return tokenizeAnchor(spec);
+}
+
 std::expected<SXRMonitorParams, std::string> OpenXR::parseXRMonitorLine(const std::string& args) {
     // Slice on the first two commas only: name, mode, and the rest (anchor-spec + kv). The rest
     // is kept unsplit so commas inside pos:/offset: survive (doc 05 §2.2); within it, sub-tokens

@@ -500,4 +500,33 @@ namespace OpenXR {
     // §3.1): space-separated `<name> [WxH[@Hz]] [anchor-spec]`, with defaults applied by the
     // caller (mode defaults to 1920x1080@60, anchor defaults to anchor:local when absent).
     std::expected<SXRMonitorParams, std::string> parseXRMonitorCreateArgs(const std::string& args);
+
+    // ---- the grammar's two halves, exported so every front end drives THE SAME parser ----
+    //
+    // `xrmonitor` has two config front ends now (the classic keyword and Lua's hl.xr_monitor) and
+    // two runtime front ends (the dispatcher and hyprctl). Re-implementing the anchor grammar for
+    // any of them would mean two things that disagree about what parses — the exact failure the
+    // window-rule/monitor-rule design notes warn about. So the grammar lives here, once, and the
+    // front ends only decide how they obtain the pieces:
+    //
+    //   classic keyword    slice the line on its first two commas, hand over the substrings
+    //   hl.xr_monitor      read the table's fields, emit one anchor token per field
+    //
+    // Both then land in exactly these functions, so error text, cross-field validation
+    // (pos-vs-offset, adaptive-on-local-only, return < leave) and the produced SXRMonitorParams
+    // are identical by construction. Pure and unconditional, like the rest of this header.
+
+    // "WxH" or "WxH@Hz" -> out.m_resolution / out.m_refreshRate. The second comma-field of a
+    // classic `xrmonitor =` line, and the `mode` field of an hl.xr_monitor table.
+    std::expected<void, std::string> parseXRMonitorMode(const std::string& mode, SXRMonitorParams& out);
+
+    // The anchor spec plus its trailing key:value tail (doc 05 §2.2/§2.3). tokens[0] must be the
+    // `anchor:<mode>` token; the rest are `key:value`. Fills out.m_anchor / out.m_sizeMeters and
+    // sets out.m_anchorProvided.
+    std::expected<void, std::string> parseXRAnchorSpec(const std::vector<std::string>& tokens, SXRMonitorParams& out);
+
+    // Whitespace-split, comma-stripped tokenizer for an anchor spec written as one string. The
+    // classic keyword feeds it the line's third comma-field; hl.xr_monitor feeds it a string-form
+    // `anchor = "..."` so the string form and the table form cannot drift apart.
+    std::vector<std::string> tokenizeXRAnchorSpec(const std::string& spec);
 }
