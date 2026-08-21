@@ -89,17 +89,11 @@ namespace Config::Legacy {
         std::optional<std::string> handleXRMonitor(const std::string&, const std::string&);
         std::optional<std::string> handleXRRule(const std::string&, const std::string&);
 
-        // Declared XR monitors from the most recent parse (doc 05 §2.5 reconciliation source).
-        const std::vector<SXRMonitorParams>& declaredXRMonitors() const {
-            return m_declaredXRMonitors;
-        }
-
-        // Declared `xrrule` transparency rules from the most recent parse, in CONFIG ORDER — the
-        // order is load-bearing (a later matching rule overrides an earlier one PER EFFECT;
-        // doc 05 §xrrule). COpenXRManager snapshots this on reload.
-        const std::vector<OpenXR::SXRRule>& declaredXRRules() const {
-            return m_declaredXRRules;
-        }
+        // NOTE: the declared xrmonitor/xrrule sets used to live here as members. They now live in
+        // Config::xrDeclarationMgr() so the Lua front end (hl.xr_monitor / hl.xr_rule) can fill the
+        // same store — only one config manager exists per session, so a store owned by this one was
+        // unreachable from a Lua config. These handlers still own the PARSING; they just deposit
+        // the result somewhere front-end-independent.
         std::optional<std::string> handleBind(const std::string&, const std::string&);
         std::optional<std::string> handleUnbind(const std::string&, const std::string&);
         std::optional<std::string> handleWorkspaceRules(const std::string&, const std::string&);
@@ -152,16 +146,6 @@ namespace Config::Legacy {
         std::vector<SPluginVariable>          m_pluginVariables;
 
         std::vector<SP<Desktop::Rule::IRule>> m_keywordRules;
-
-        // XR virtual monitors declared via the `xrmonitor` keyword (doc 05 §2). Rebuilt from
-        // scratch on every parse (cleared in resetHLConfig); COpenXRManager reconciles the
-        // live set against this after a successful reload. Compiles unconditionally.
-        std::vector<SXRMonitorParams>                    m_declaredXRMonitors;
-
-        // Situational per-monitor transparency rules declared via the `xrrule` keyword (doc 05
-        // §xrrule). Rebuilt from scratch on every parse (cleared in resetHLConfig) and kept in
-        // CONFIG ORDER — unlike xrmonitor there is no name key, every rule is evaluated.
-        std::vector<OpenXR::SXRRule>                     m_declaredXRRules;
 
         bool                                             m_isFirstLaunch = true; // For exec-once
 

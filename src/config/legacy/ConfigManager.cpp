@@ -10,6 +10,7 @@
 #include "../shared/complex/ComplexDataTypes.hpp"
 #include "../shared/monitor/MonitorRuleManager.hpp"
 #include "../shared/workspace/WorkspaceRuleManager.hpp"
+#include "../shared/xr/XRDeclarationManager.hpp"
 #include "../shared/animation/AnimationTree.hpp"
 #include "../shared/monitor/Parser.hpp"
 #include "../shared/parserUtils/ParserUtils.hpp"
@@ -801,8 +802,7 @@ std::optional<std::string> CConfigManager::resetHLConfig() {
     m_declaredPlugins.clear();
     m_failedPluginConfigValues.clear();
     m_keywordRules.clear();
-    m_declaredXRMonitors.clear();
-    m_declaredXRRules.clear();
+    Config::xrDeclarationMgr()->clear();
 
     // paths
     m_configPaths.clear();
@@ -1564,9 +1564,9 @@ std::optional<std::string> CConfigManager::handleXRMonitor(const std::string& co
     if (!parsed.has_value())
         return parsed.error();
 
-    // Later declarations of the same name override earlier ones within a single parse.
-    std::erase_if(m_declaredXRMonitors, [&](const SXRMonitorParams& p) { return p.m_name == parsed->m_name; });
-    m_declaredXRMonitors.emplace_back(std::move(parsed.value()));
+    // Later declarations of the same name override earlier ones within a single parse; the
+    // store enforces that so both config front ends get the same rule for free.
+    Config::xrDeclarationMgr()->addMonitor(std::move(parsed.value()));
 
 #ifdef HAVE_OPENXR
     // A dynamic `hyprctl keyword xrmonitor` does not fire config.reloaded / props_refreshed, so
@@ -1591,7 +1591,7 @@ std::optional<std::string> CConfigManager::handleXRRule(const std::string& comma
     if (!parsed.has_value())
         return parsed.error();
 
-    m_declaredXRRules.emplace_back(std::move(parsed.value()));
+    Config::xrDeclarationMgr()->addRule(std::move(parsed.value()));
 
 #ifdef HAVE_OPENXR
     // A dynamic `hyprctl keyword xrrule ...` fires neither config.reloaded nor props_refreshed, so

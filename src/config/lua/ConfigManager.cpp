@@ -20,6 +20,7 @@
 #include "../supplementary/jeremy/Jeremy.hpp"
 #include "../shared/workspace/WorkspaceRuleManager.hpp"
 #include "../shared/monitor/MonitorRuleManager.hpp"
+#include "../shared/xr/XRDeclarationManager.hpp"
 #include "../shared/animation/AnimationTree.hpp"
 #include "../shared/inotify/ConfigWatcher.hpp"
 
@@ -699,6 +700,9 @@ void CConfigManager::reload() {
     Config::animationTree()->reset();
     Config::workspaceRuleMgr()->clear();
     Config::monitorRuleMgr()->clear();
+    // Declared xrmonitor/xrrule sets are rebuilt from scratch by every parse, exactly as the
+    // legacy front end rebuilds them in resetHLConfig().
+    Config::xrDeclarationMgr()->clear();
     Desktop::Rule::ruleEngine()->clearAllRules();
     g_pTrackpadGestures->clearGestures();
     cleanTimers();
