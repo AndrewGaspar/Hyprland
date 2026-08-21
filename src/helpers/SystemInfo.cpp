@@ -175,7 +175,10 @@ std::string SystemInfo::getSystemInfo() {
     result += "\n\n";
 
 #if defined(__DragonFly__) || defined(__FreeBSD__)
-    const std::string GPUINFO = execAndGet("pciconf -lv | grep -F -A4 vga");
+    // Cached for the lifetime of the process: see the lspci note below. The GPU set
+    // does not change over a session, and this is the only subprocess getSystemInfo()
+    // runs.
+    static const std::string GPUINFO = execAndGet("pciconf -lv | grep -F -A4 vga");
 #elif defined(__arm__) || defined(__aarch64__)
     std::string                 GPUINFO;
     const std::filesystem::path dev_tree = "/proc/device-tree";
@@ -196,7 +199,18 @@ std::string SystemInfo::getSystemInfo() {
         }
     } catch (...) { GPUINFO = "error"; }
 #else
-    const std::string GPUINFO = execAndGet("lspci -vnn | grep -E '(VGA|Display|3D)'");
+    // `lspci -vnn` reads the PCI *config space* of every device on the bus. On a
+    // hybrid laptop that resumes a runtime-suspended dGPU out of D3cold, and the
+    // resume is synchronous: measured on a Framework 16 (RTX 5070 Max-Q) it costs
+    // ~2.5 s cold vs ~118 ms warm, and leaves one "Enabling HDA controller" in dmesg
+    // per call. getSystemInfo() runs on the main thread, so every `hyprctl systeminfo`
+    // from any client parks the whole compositor for that long -- a user script that
+    // called it once per window event froze the session every few seconds.
+    //
+    // The GPU set does not change over a session, so run it exactly once. The startup
+    // call in CCompositor already warms it, which makes every later `hyprctl
+    // systeminfo` free rather than merely cheaper. Static init is thread-safe.
+    static const std::string GPUINFO = execAndGet("lspci -vnn | grep -E '(VGA|Display|3D)'");
 #endif
     result += "GPU information: \n" + GPUINFO;
     if (GPUINFO.contains("NVIDIA") && std::filesystem::exists("/proc/driver/nvidia/version")) {

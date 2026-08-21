@@ -2141,7 +2141,7 @@ std::string CHyprCtl::getReply(std::string request) {
         std::string_view probe = request;
         if (probe.starts_with("[[BATCH]]"))
             probe.remove_prefix(9);
-        static constexpr std::string_view RELOAD_CLASS[] = {"reload", "eval", "repl", "keyword"};
+        static constexpr std::string_view RELOAD_CLASS[] = {"reload", "eval", "repl", "keyword", "systeminfo"}; // systeminfo: a known main-thread-stall vector (2026-08-21), log its callers too
         for (const auto& verb : RELOAD_CLASS) {
             if (!probe.starts_with(verb))
                 continue;
