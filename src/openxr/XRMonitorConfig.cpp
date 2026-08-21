@@ -536,6 +536,42 @@ int64_t OpenXR::xrReprobeDelayMs(bool headsetWait, bool activityRecent, int atte
     return xrReprobeBackoffMs(attempt, baseMs, capMs);
 }
 
+OpenXR::eXRReloadAction OpenXR::xrReloadAction(const SXRReloadInputs& in) {
+    // 1. Sticky disable. A user who typed `hyprctl openxr disable` stays disabled until they type
+    //    `enable`, regardless of what openxr:enabled says on the next reload.
+    if (!in.enabled || in.manualDisable)
+        return in.stateDisabled ? XR_RELOAD_RECONCILE_ONLY : XR_RELOAD_STOP;
+
+    // 2. Not dormant: a live or in-flight session is never restarted by a reload.
+    if (!in.stateDisabled && !in.stateUnavailable)
+        return XR_RELOAD_RECONCILE_ONLY;
+
+    // 3. Explicit user re-assert always probes.
+    if (in.forceProbe)
+        return XR_RELOAD_START;
+
+    // 4. THE STORM GATE. Dormant in UNAVAILABLE with nothing probe-relevant changed: the re-probe
+    //    timer owns the retry cadence, so this reload must cost nothing. (DISABLED is exempt: no
+    //    re-probe timer runs there, so a reload is the only thing that could ever heal it — and the
+    //    same is true of UNAVAILABLE when openxr:reprobe is off, hence the reprobeEnabled clause.)
+    if (in.stateUnavailable && !in.probeInputsChanged && in.reprobeEnabled)
+        return XR_RELOAD_RECONCILE_ONLY;
+
+    // 5. Floor. Even a changing config cannot probe faster than the base cadence.
+    if (in.msSinceLastProbe >= 0 && in.msSinceLastProbe < in.minProbeIntervalMs)
+        return XR_RELOAD_RECONCILE_ONLY;
+
+    return XR_RELOAD_START;
+}
+
+bool OpenXR::xrShouldRearmReprobe(bool armed, int64_t leftMs, int64_t wantMs) {
+    if (!armed)
+        return true;
+    // Strictly sooner. Equal delays mean "the same probe, re-requested" — keep the pending one so a
+    // stream of reloads cannot walk the deadline forward forever.
+    return wantMs < leftMs;
+}
+
 bool OpenXR::xrReprobeSubdirMatch(const SXRReprobeWatch& w, const std::string& name) {
     for (const auto& s : w.subdirNames)
         if (s == name)

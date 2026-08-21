@@ -404,6 +404,65 @@ namespace OpenXR {
     // How long after the last relevant watch event the backoff stays capped at the base interval.
     inline constexpr int64_t XR_REPROBE_ACTIVITY_WINDOW_MS = 60000;
 
+    // ---- reload-storm containment (live evidence, boot 2026-08-21, 02:50-03:00) ---------------
+    //
+    // WHAT HAPPENED. A ~1 Hz storm of config PROP REFRESHES (config.props_refreshed, not even a
+    // real `hyprctl reload` — see the manager's listener wiring) drove 559 full OpenXR bring-up
+    // attempts in ten minutes while the WiVRn runtime was down. Each one spawned a detached
+    // handshake worker that dlopens the OpenXR runtime and enumerates its extensions, tore down and
+    // rebuilt the inotify re-probe watch, and — the part that made the log lie — RE-ARMED the
+    // dormant re-probe timer from scratch. Re-arming at 1 Hz with a 16s delay means the timer never
+    // expires: `hyprctl openxr status` reported "retrying in 15916ms" while the manager was in fact
+    // probing every second, and the documented backoff never advanced (the attempt counter moved 5
+    // times in 618 seconds, all of it from the handful of timer firings that squeezed through).
+    //
+    // THE RULE THIS ENCODES. A config reload is not a reason to probe. Probing is the re-probe
+    // timer's job and it already has a policy (xrReprobeDelayMs above). A reload may only start a
+    // probe when something the probe actually depends on changed, or when the user explicitly asked
+    // — and never faster than the base cadence, no matter how many reloads arrive.
+
+    // What a config reload / prop refresh should do to a dormant manager.
+    enum eXRReloadAction : uint8_t {
+        XR_RELOAD_RECONCILE_ONLY = 0, // cheap path: re-apply declared monitors, touch no probe state
+        XR_RELOAD_START,              // launch a bring-up attempt
+        XR_RELOAD_STOP,               // tear the session down
+    };
+
+    struct SXRReloadInputs {
+        bool    enabled            = false; // openxr:enabled
+        bool    manualDisable      = false; // sticky `hyprctl openxr disable`, survives reloads until `enable`
+        bool    stateDisabled      = false; // manager is in XR_STATE_DISABLED
+        bool    stateUnavailable   = false; // manager is dormant in XR_STATE_UNAVAILABLE
+        bool    probeInputsChanged = false; // a probe-relevant config value changed since the last attempt
+        bool    forceProbe         = false; // explicit user re-assert (`openxr enable`, openxr:enabled keyword)
+        bool    reprobeEnabled     = true;  // openxr:reprobe — false means NOTHING else will ever retry
+        int64_t msSinceLastProbe   = -1;    // <0 = never probed this session
+        int64_t minProbeIntervalMs = 2000;  // floor between reload-driven probes (the reprobe base)
+    };
+
+    // Pure decision. Order matters and each clause is load-bearing:
+    //   1. A manual disable wins over openxr:enabled — that is what makes it STICKY across reloads.
+    //      Re-applying `openxr:enabled = 1` on every reload is exactly how a `hyprctl openxr disable`
+    //      used to be undone a second after it was issued.
+    //   2. Only a dormant manager (DISABLED/UNAVAILABLE) can be started at all; anything mid-flight
+    //      (STARTING) or live keeps its session and just reconciles.
+    //   3. forceProbe bypasses the gates: an explicit user re-assert must always get a fresh attempt.
+    //   4. From UNAVAILABLE, an unchanged config is NOT a reason to probe. This is the storm gate —
+    //      but ONLY while openxr:reprobe is on, because the gate is only justified by the re-probe
+    //      timer being there to retry instead. With reprobe off, a reload is the user's only retry
+    //      and must keep working (the floor still applies, so it is a bounded one).
+    //   5. The floor applies last, so even a genuinely-changing config (or a stop/start flap) cannot
+    //      out-run the documented cadence.
+    eXRReloadAction xrReloadAction(const SXRReloadInputs& in);
+
+    // May a (re-)arm request push out a re-probe timer that is ALREADY pending?
+    // Only if it would fire SOONER. A reload re-arming an armed timer with the same-or-longer delay
+    // is what starved the timer during the storm, so the answer there is a flat no.
+    //   armed  — the timer currently has a pending timeout
+    //   leftMs — ms remaining on it (meaningless when !armed)
+    //   wantMs — the delay being requested
+    bool xrShouldRearmReprobe(bool armed, int64_t leftMs, int64_t wantMs);
+
     // The known runtime IPC socket paths under $XDG_RUNTIME_DIR ({} when runtimeDir is empty):
     //   $RT/monado_comp_ipc  and  $RT/wivrn/comp_ipc
     // Used by the manager to refine the degraded-runtime wait classification: WiVRn's CLIENT lib
