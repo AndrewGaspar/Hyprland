@@ -202,7 +202,13 @@ bool CXRGraphics::selectDisplay(const std::string& gpuOverride) {
     // targetNode is captured BY VALUE, not by reference. On a timeout this frame returns while the
     // worker is still running — a captured reference would dangle into a destroyed local the moment
     // the abandoned thread unblocked and compared it against a device path.
-    const auto scanned = OpenXR::runBoundedProbe([targetNode](const std::atomic<bool>& abandon) { return scanEglDevices(targetNode, abandon); });
+    int        blockedMs = 0;
+    const auto scanned =
+        OpenXR::runBoundedProbe([targetNode](const std::atomic<bool>& abandon) { return scanEglDevices(targetNode, abandon); }, OpenXR::XR_PROBE_TIMEOUT_MS, &blockedMs);
+    // The bound abandons the WORKER; the caller still parks for the full duration. On the main
+    // thread that IS the desktop hitch, so name it rather than leaving it invisible.
+    if (blockedMs >= OpenXR::XR_MAIN_THREAD_STALL_WARN_MS)
+        Log::logger->log(Log::WARN, "[OPENXR] EGL device enumeration blocked the compositor main thread for {}ms (a GPU driver was slow to answer)", blockedMs);
     if (!scanned.has_value()) {
         Log::logger->log(Log::ERR,
                          "[OPENXR] EGL device enumeration did not complete within {}ms — a GPU driver is not responding. Refusing to start XR (the desktop is unaffected; "

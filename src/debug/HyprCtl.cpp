@@ -2129,6 +2129,30 @@ std::string CHyprCtl::getReply(std::string request) {
             request = request.substr(sepIndex + 1); // remove flags and separator so we can compare the rest of the string
     }
 
+    // RELOAD-CLASS COMMAND ATTRIBUTION (live evidence 2026-08-21). A ~1 Hz storm of config refreshes
+    // ran for ten minutes and could not be traced to a caller, because "Hyprctl: new connection from
+    // pid N" is all the compositor has ever logged — the command text was never written down, so a
+    // log with 2585 connections in it named 2585 anonymous pids and nothing else. These four verbs
+    // are the ones that can re-apply config and so reach every config.reloaded / props_refreshed
+    // listener (CConfigManager::reload, the Lua eval bindings' scheduleRefresh, parseKeyword); no
+    // other command can start a storm. Cost is one prefix compare per request on the commands that
+    // are rare by nature, and it makes the next storm one grep from attributable.
+    {
+        std::string_view probe = request;
+        if (probe.starts_with("[[BATCH]]"))
+            probe.remove_prefix(9);
+        static constexpr std::string_view RELOAD_CLASS[] = {"reload", "eval", "repl", "keyword"};
+        for (const auto& verb : RELOAD_CLASS) {
+            if (!probe.starts_with(verb))
+                continue;
+            // Enough of the argument to tell `eval hl.monitor{...}` from `eval hl.config{...}` —
+            // which is exactly the distinction that would have named the culprit — and no more.
+            Log::logger->log(Log::DEBUG, "Hyprctl: reload-class command from pid {}: {}{}", m_currentRequestParams.pid, probe.substr(0, std::min<size_t>(probe.size(), 96)),
+                             probe.size() > 96 ? "..." : "");
+            break;
+        }
+    }
+
     std::string result = "";
 
     // parse exact cmds first, then non-exact.
