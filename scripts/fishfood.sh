@@ -31,7 +31,7 @@ BRANCH=${HYPXRLAND_FISHFOOD_BRANCH:-fishfood}
 TRACK=${HYPXRLAND_FISHFOOD_TRACK:-hypxrland}
 CONF=${HYPXRLAND_FISHFOOD_CONF:-$HOME/.config/hypr/hyprland-xr.conf}
 BUILD=$WORKTREE/build
-DESKTOP_OUT=${XDG_DATA_HOME:-$HOME/.local/share}/hypxrland/hypxrland.desktop
+DESKTOP_OUT=${XDG_DATA_HOME:-$HOME/.local/share}/hypxrland/hypxrland-fishfood.desktop
 JOBS=${HYPXRLAND_FISHFOOD_JOBS:-8} # deliberately modest: this box has frozen twice under heavy parallel builds
 
 build() {
@@ -103,9 +103,12 @@ EOF
     chmod +x "$launcher"
     # DesktopNames stays "Hyprland" so portals/theming/apps treat the session
     # exactly like the stock one; only the entry Name differs at the greeter.
+    # The file and Name carry "fishfood" so a packaged HypXRland (custom Arch
+    # repo, 2026-08) can own the plain hypxrland / omarchy-xr entries without
+    # colliding with this developer session.
     cat >"$DESKTOP_OUT" <<EOF
 [Desktop Entry]
-Name=HypXRland
+Name=HypXRland (fishfood)
 Comment=Hyprland + OpenXR (fishfood build from $WORKTREE)
 Exec=$launcher
 TryExec=uwsm
@@ -116,8 +119,8 @@ EOF
     echo "==> session launcher generated at $launcher"
     echo "==> session file generated at $DESKTOP_OUT"
     echo "    Install it (needs root):"
-    echo "      sudo install -m644 $DESKTOP_OUT /usr/share/wayland-sessions/hypxrland.desktop"
-    echo "    Then pick 'HypXRland' from the session menu at the SDDM login screen."
+    echo "      sudo install -m644 $DESKTOP_OUT /usr/share/wayland-sessions/hypxrland-fishfood.desktop"
+    echo "    Then pick 'HypXRland (fishfood)' from the session menu at the SDDM login screen."
 }
 
 case ${1:-} in
@@ -138,7 +141,7 @@ case ${1:-} in
         git -C "$WORKTREE" submodule update --init
         build
         build_monado_xreal
-        echo "==> done. Log out and pick HypXRland again (a running session keeps its old binary image)."
+        echo "==> done. Log out and pick HypXRland (fishfood) again (a running session keeps its old binary image)."
         ;;
     gen-session)
         gen_session
