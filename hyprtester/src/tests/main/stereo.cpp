@@ -581,7 +581,7 @@ TEST_CASE(stereoSbsOneLogicalMonitor) {
     EXPECT(monitorField(STEREO_MON, "scanoutWidth"), std::string("3840"));
     EXPECT(monitorField(STEREO_MON, "scanoutHeight"), std::string("1080"));
     // scale is untouched by the pack — the desktop is 1920 logical at scale 1, not 3840 at scale 2
-    EXPECT(monitorField(STEREO_MON, "scale"), std::string("1.00"));
+    EXPECT(monitorField(STEREO_MON, "scale"), std::string("1"));
 
     // the control output must carry none of it
     EXPECT(monitorField(CONTROL_MON, "width"), std::string("1920"));
@@ -692,7 +692,7 @@ TEST_CASE(stereoAutoScaleStaysAtOne) {
     CScopeGuard guard = {[&]() { getFromSocket(std::format("/output remove {}", STEREO_MON)); }};
 
     ASSERT(waitForMonitorPresent(STEREO_MON, true), true);
-    ASSERT(waitForMonitorField(STEREO_MON, "scale", "1.00"), true);
+    ASSERT(waitForMonitorField(STEREO_MON, "scale", "1"), true);
 
     // the invariant, restated for the auto case: one logical monitor at the presented per-eye size
     EXPECT(monitorField(STEREO_MON, "width"), std::string("1920"));
@@ -1199,7 +1199,7 @@ TEST_CASE(stereoLegacyConfigFrontEnds) {
         EXPECT(monitorField(NAME, "height"), std::string("1080"));
         EXPECT(monitorField(NAME, "stereo"), std::string("sbs"));
         EXPECT(monitorField(NAME, "scanoutWidth"), std::string("3840"));
-        EXPECT(monitorField(NAME, "scale"), std::string("1.00"));
+        EXPECT(monitorField(NAME, "scale"), std::string("1"));
     }
 
     // the control shares the mode and omits the token: 3840 stays 3840, so a run in which every
