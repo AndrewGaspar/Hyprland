@@ -826,6 +826,10 @@ if(BUILD_TESTING OR WITH_TESTS)
   add_executable(hyprland_gtests ${TESTFILES})
   target_compile_options(hyprland_gtests PRIVATE --coverage)
   target_link_options(hyprland_gtests PRIVATE --coverage)
+  # A test that reads a file SHIPPED in the repo (contrib/, example/) cannot find it from __FILE__:
+  # -fmacro-prefix-map makes that relative, so the path only resolves when the binary happens to be
+  # run from the source root. Hand the real root in instead.
+  target_compile_definitions(hyprland_gtests PRIVATE HYPRLAND_SOURCE_ROOT="${CMAKE_SOURCE_DIR}")
   target_include_directories(
     hyprland_gtests
     PUBLIC "./include"
