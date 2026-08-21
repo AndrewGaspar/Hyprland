@@ -1172,8 +1172,12 @@ std::string CConfigManager::parseKeyword(const std::string& COMMAND, const std::
     // — but exactly like openxr:inhibit_idle above, a bare `hyprctl keyword openxr:enabled 0/1`
     // fires neither event under the legacy parser, so the toggle silently did nothing outside a
     // full `/reload`. Same targeted fix, mirroring the inhibit_idle special-case.
+    // forceProbe: this IS the explicit user re-assert the reload gate exempts. `hyprctl keyword
+    // openxr:enabled 1` while dormant in UNAVAILABLE leaves the VALUE unchanged, so the ordinary
+    // "did anything probe-relevant change" gate would (correctly) refuse to probe — and this control
+    // would silently do nothing again, which is the bug report-17 WP-L7 fixed.
     if (COMMAND == "openxr:enabled" && g_pOpenXRManager)
-        g_pOpenXRManager->onConfigReload();
+        g_pOpenXRManager->onConfigReload(/*forceProbe=*/true);
 
     // openxr:monitors_follow_session (research/18) + openxr:monitor_unplug_grace_ms (report-18
     // addendum) are applied by onConfigReload()'s idempotent updateMonitorsPlugged() re-assert —

@@ -318,6 +318,10 @@ void COpenXRManager::start() {
     if (m_state != XR_STATE_DISABLED && m_state != XR_STATE_UNAVAILABLE)
         return;
 
+    // Reload-storm containment: stamp every attempt that gets past the guard, so onConfigReload()'s
+    // floor can tell "the config genuinely changed again" from "the same second, a hundred reloads".
+    m_lastProbeAt = Time::steadyNow();
+
     // lastWorld and layers survive a session restart, but last session's submitted counts must not:
     // LOCAL_FLOOR has not been established yet and no quad is eligible until this session submits it.
     clearCrossingSubmissionState();
@@ -726,8 +730,13 @@ void COpenXRManager::continueBringup(CXRSession* sess) {
         if (sess->m_hasEglDeviceQuery) {
             const XrInstance inst = sess->m_instance;
             const XrSystemId sys  = sess->m_systemId;
-            const auto       eglProbe =
-                OpenXR::runBoundedProbe([inst, sys](const std::atomic<bool>& abandon) { return OpenXR::probeRuntimeEglDevice(inst, sys, &abandon); });
+            int              eglBlockedMs = 0;
+            const auto       eglProbe     = OpenXR::runBoundedProbe([inst, sys](const std::atomic<bool>& abandon) { return OpenXR::probeRuntimeEglDevice(inst, sys, &abandon); },
+                                                                    OpenXR::XR_PROBE_TIMEOUT_MS, &eglBlockedMs);
+            // The bound abandons the WORKER; it does not stop this thread parking. Say so when the
+            // park was long enough for the user to feel it (reload-storm investigation 2026-08-21).
+            if (eglBlockedMs >= OpenXR::XR_MAIN_THREAD_STALL_WARN_MS)
+                Log::logger->log(Log::WARN, "[OPENXR] the runtime's EGL device query blocked the compositor main thread for {}ms", eglBlockedMs);
             if (eglProbe.has_value())
                 rt = *eglProbe;
             else {
@@ -749,8 +758,11 @@ void COpenXRManager::continueBringup(CXRSession* sess) {
             // a healthy runtime) we get a reliable cross-GPU verdict.
             const XrInstance inst = sess->m_instance;
             const XrSystemId sys  = sess->m_systemId;
-            const auto       vkProbe =
-                OpenXR::runBoundedProbe([inst, sys](const std::atomic<bool>& abandon) { return OpenXR::probeRuntimeRenderNode(inst, sys, &abandon); });
+            int              vkBlockedMs = 0;
+            const auto       vkProbe     = OpenXR::runBoundedProbe([inst, sys](const std::atomic<bool>& abandon) { return OpenXR::probeRuntimeRenderNode(inst, sys, &abandon); },
+                                                                   OpenXR::XR_PROBE_TIMEOUT_MS, &vkBlockedMs);
+            if (vkBlockedMs >= OpenXR::XR_MAIN_THREAD_STALL_WARN_MS)
+                Log::logger->log(Log::WARN, "[OPENXR] the runtime GPU (Vulkan) probe blocked the compositor main thread for {}ms", vkBlockedMs);
 
             if (vkProbe.has_value())
                 rt = *vkProbe;
@@ -3598,6 +3610,64 @@ void COpenXRManager::resetPresenceState() {
     publishRestoreCapture();
 }
 
+// ---- reload-storm containment (live evidence 2026-08-21). Main thread only. ----
+
+bool COpenXRManager::probeInputsChanged() {
+    // MAIN THREAD ONLY — reads STRING config values (the frame thread must never; see task #25).
+    //
+    // Every config value a bring-up ATTEMPT depends on, and nothing else. The dozens of hot-tunable
+    // knobs onConfigReload() re-publishes above (chrome, grab, adaptive, black_alpha, ...) are
+    // deliberately absent: changing one of those has no bearing on whether an OpenXR runtime is
+    // there to talk to, so it must not buy a probe.
+    static auto PENABLED  = CConfigValue<Hyprlang::INT>("openxr:enabled");
+    static auto PGPU      = CConfigValue<std::string>("openxr:gpu");
+    static auto PRTJSON   = CConfigValue<std::string>("openxr:runtime_json");
+    static auto PBLEND    = CConfigValue<std::string>("openxr:blend_mode");
+    static auto POVERLAY  = CConfigValue<Hyprlang::INT>("openxr:overlay");
+    static auto POVERLAYZ = CConfigValue<Hyprlang::INT>("openxr:overlay_z");
+    static auto PTAINT    = CConfigValue<Hyprlang::INT>("openxr:ignore_kernel_taint");
+    static auto PREPROBE  = CConfigValue<Hyprlang::INT>("openxr:reprobe");
+    static auto PBASE     = CConfigValue<Hyprlang::INT>("openxr:reprobe_interval_ms");
+    static auto PWATCH    = CConfigValue<Hyprlang::INT>("openxr:reprobe_watch");
+
+    // Unit-separator joined so no value can forge a boundary out of its own content.
+    const std::string sig = std::format("{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}\x1f{}", (int)*PENABLED, *PGPU, *PRTJSON, *PBLEND, (int)*POVERLAY, (int64_t)*POVERLAYZ,
+                                        (int)*PTAINT, (int)*PREPROBE, (int64_t)*PBASE, (int)*PWATCH);
+
+    if (sig == m_lastProbeInputs)
+        return false;
+
+    // First call of the session establishes the baseline. Report it as "changed" so the very first
+    // reload after startup still behaves exactly as it always did.
+    const bool first  = m_lastProbeInputs.empty();
+    m_lastProbeInputs = sig;
+    if (!first)
+        Log::logger->log(Log::DEBUG, "[OPENXR] probe-relevant config changed — this reload may start a fresh attempt");
+    return true;
+}
+
+void COpenXRManager::userDisable() {
+    // STICKY (live evidence 2026-08-21): `hyprctl openxr disable` used to call stop() and nothing
+    // else, so the next config reload read `openxr:enabled = 1`, saw DISABLED, and started right
+    // back up. Under the observed 1 Hz reload storm the disable was undone within a second and the
+    // user could not turn the thing off at all. The latch outranks openxr:enabled until an explicit
+    // `enable` (or a change to openxr:enabled itself) clears it.
+    m_manualDisable = true;
+    Log::logger->log(Log::DEBUG, "[OPENXR] user disable — sticky across reloads until `hyprctl openxr enable`");
+    stop();
+}
+
+void COpenXRManager::userEnable() {
+    m_manualDisable = false;
+    // Explicit user intent: bypass the reload gates and the probe floor entirely.
+    m_lastProbeAt.reset();
+    start();
+}
+
+bool COpenXRManager::manuallyDisabled() const {
+    return m_manualDisable;
+}
+
 // ---- dormant re-probe (report-17 WP-L3 / report-20 issue B1). Main thread only. ----
 
 void COpenXRManager::maybeArmReprobe() {
@@ -3631,6 +3701,17 @@ void COpenXRManager::maybeArmReprobe() {
 
 void COpenXRManager::armReprobeTimer(int ms) {
     const auto dur = std::chrono::milliseconds(std::max(0, ms));
+    // Reload-storm containment: an arm request may only push out an ALREADY-PENDING probe if it
+    // would fire sooner. Belt-and-braces behind the onConfigReload() gate — whatever else learns to
+    // call this, a stream of re-arms can no longer walk the deadline forward forever.
+    if (m_reprobeTimer && m_reprobeTimer->armed()) {
+        const float   leftUs = m_reprobeTimer->leftUs();
+        const int64_t leftMs = leftUs <= 0.f ? 0 : (int64_t)(leftUs / 1000.f);
+        if (!OpenXR::xrShouldRearmReprobe(true, leftMs, (int64_t)std::max(0, ms))) {
+            Log::logger->log(Log::DEBUG, "[OPENXR] re-probe already pending in {}ms — not pushing it out to {}ms", leftMs, ms);
+            return;
+        }
+    }
     if (!m_reprobeTimer) {
         m_reprobeTimer = makeShared<CEventLoopTimer>(
             dur, [this](SP<CEventLoopTimer> self, void*) { onReprobeExpired(); }, nullptr);
@@ -4269,7 +4350,7 @@ void COpenXRManager::markSwapchainsDirtyIfChromeChanged() {
         l->m_swapchainDirty.store(true, std::memory_order_release);
 }
 
-void COpenXRManager::onConfigReload() {
+void COpenXRManager::onConfigReload(bool forceProbe) {
     // The rule manager now contains either freshly parsed config or a runtime keyword update. Take
     // field ownership before any reassertion can copy our durable mode/position back over it.
     refreshMonitorRuleOwnership();
@@ -4309,15 +4390,48 @@ void COpenXRManager::onConfigReload() {
 
     // report-17 WP-L7 / report-20 issue B1: also start from UNAVAILABLE, not just DISABLED. Previously
     // `hyprctl keyword openxr:enabled 1` while dormant in UNAVAILABLE (value already 1) was a silent
-    // no-op — start()'s own guard accepts UNAVAILABLE, the reload path just never asked. Now a keyword
-    // re-assert kicks a fresh attempt immediately (the dormant re-probe timer makes it unnecessary, but
-    // this keeps the explicit control working).
-    if (enabled && (m_state == XR_STATE_DISABLED || m_state == XR_STATE_UNAVAILABLE))
-        start(); // start() reconciles declared monitors itself
-    else if (!enabled && m_state != XR_STATE_DISABLED)
-        stop();
-    else
-        reconcileDeclaredMonitors(); // no state edge: still reconcile the declared set
+    // no-op — start()'s own guard accepts UNAVAILABLE, the reload path just never asked. A keyword
+    // re-assert must still kick a fresh attempt immediately, which is what `forceProbe` is for.
+    //
+    // Everything else now goes through the gate (reload-storm containment, live evidence 2026-08-21 —
+    // see the block above OpenXR::xrReloadAction). A reload that changes nothing probe-relevant must
+    // not start(): start() would setState(STARTING), which cancels the re-probe timer and tears down
+    // the inotify watch, and the failing attempt then re-arms both from scratch. At the observed 1 Hz
+    // that meant the 16s timer was pushed forward before it could ever fire — the manager probed
+    // every second while `hyprctl openxr status` truthfully reported the timer's own "retrying in
+    // 15916ms". The backoff cannot back off if every reload resets it.
+    static auto   PBASE         = CConfigValue<Hyprlang::INT>("openxr:reprobe_interval_ms");
+    static auto   PREPROBE_GATE = CConfigValue<Hyprlang::INT>("openxr:reprobe");
+    const int64_t base          = std::max<int64_t>(250, (int64_t)*PBASE);
+
+    // An explicit flip of openxr:enabled back to 1 outranks the sticky disable — the user has said
+    // "on" through the other control, and leaving the latch set would make that config edit look
+    // broken. A reload that merely RE-APPLIES an unchanged `= 1` (what every reload does) must not.
+    const int enabledNow = enabled ? 1 : 0;
+    if (m_lastEnabledSeen >= 0 && m_lastEnabledSeen != enabledNow && enabledNow == 1 && m_manualDisable) {
+        Log::logger->log(Log::DEBUG, "[OPENXR] openxr:enabled flipped back to 1 — clearing the sticky manual disable");
+        m_manualDisable = false;
+    }
+    m_lastEnabledSeen = enabledNow;
+
+    OpenXR::SXRReloadInputs gate;
+    gate.enabled            = enabled;
+    gate.manualDisable      = m_manualDisable;
+    gate.stateDisabled      = m_state == XR_STATE_DISABLED;
+    gate.stateUnavailable   = m_state == XR_STATE_UNAVAILABLE;
+    gate.probeInputsChanged = probeInputsChanged(); // ALWAYS evaluated: it also refreshes the cache
+    gate.forceProbe         = forceProbe;
+    // With openxr:reprobe off there is no timer to retry instead, so the storm gate must not strand
+    // a dormant manager: a reload stays the user's retry (bounded by the floor below).
+    gate.reprobeEnabled     = *PREPROBE_GATE != 0;
+    gate.msSinceLastProbe   = m_lastProbeAt ? std::chrono::duration_cast<std::chrono::milliseconds>(Time::steadyNow() - *m_lastProbeAt).count() : -1;
+    gate.minProbeIntervalMs = base;
+
+    switch (OpenXR::xrReloadAction(gate)) {
+        case OpenXR::XR_RELOAD_START: start(); break; // start() reconciles declared monitors itself
+        case OpenXR::XR_RELOAD_STOP: stop(); break;
+        case OpenXR::XR_RELOAD_RECONCILE_ONLY: reconcileDeclaredMonitors(); break;
+    }
 
     // A reparse wiped the rule manager, taking our requested-mode rules with it. reconcile above
     // re-installed them for DECLARED layers only; do the same for runtime-created ones (which
