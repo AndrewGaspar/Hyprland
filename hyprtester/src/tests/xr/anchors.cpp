@@ -357,7 +357,10 @@ TEST_CASE(xr_anchor_restore_across_session) {
         EXPECT(dist3(placed, std::vector<float>{0.f, 0.f, 0.f}) > 2.f, true);
         // The create-time seed makes it restorable straight away (doc 03 §8.3).
         EXPECT(XR::fieldAfter(st, p, "restorable"), std::string("true"));
-        relPlaced = XR::parseFloatArray(XR::fieldAfter(st, p, "offset"));
+        // research/28 H2: read the STAGED offset, not the committed one. The durable slot only moves
+        // on an edge now (doff / visibility drop / session end), so mid-session it is the create-time
+        // seed by design; "stagedOffset" is the live measurement this test is actually about.
+        relPlaced = XR::parseFloatArray(XR::fieldAfter(st, p, "stagedOffset"));
         ASSERT(relPlaced.size(), (size_t)3);
     }
 
@@ -379,7 +382,10 @@ TEST_CASE(xr_anchor_restore_across_session) {
         // replay the create-time seed instead — say so here rather than leaving it to be inferred
         // from a pose landing somewhere unexpected two session transitions later.
         EXPECT(XR::fieldAfter(st, size_t{0}, "restoreCapture"), std::string("true"));
-        relLeft = XR::parseFloatArray(XR::fieldAfter(st, p, "offset"));
+        // research/28 H2: the STAGED value is what tracked the move; the memory it will become is
+        // written at the session-end edge below, which is the edge this test then rides.
+        EXPECT(XR::fieldAfter(st, p, "staged"), std::string("true"));
+        relLeft = XR::parseFloatArray(XR::fieldAfter(st, p, "stagedOffset"));
         ASSERT(relLeft.size(), (size_t)3);
         NLog::log("xr_anchor_restore_across_session: placed [{:.3f}, {:.3f}, {:.3f}] -> left [{:.3f}, {:.3f}, {:.3f}], capture offset [{:.3f}, {:.3f}, {:.3f}]", placed[0], placed[1],
                   placed[2], left[0], left[1], left[2], relLeft[0], relLeft[1], relLeft[2]);
