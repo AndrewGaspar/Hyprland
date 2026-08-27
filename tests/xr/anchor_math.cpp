@@ -981,23 +981,244 @@ TEST(XRAnchorRestore, ReseatSourceLadderCoversTheDegenerateCases) {
 }
 
 TEST(XRAnchorRestore, DeclaredRigIsRecognisedAsARigNotAPlacement) {
-    // The capture must not record a monitor that is still sitting at its raw `xrmonitor` pose: that
-    // pose is relative to the runtime's ARBITRARY origin (the thing §8.2 exists to rescue it from),
-    // so remembering it would defeat the rescue on the next session. "Still at its declaration" is a
-    // question about provenance — is this pose literally the copy it was assigned from — so the test
-    // is bit-equality, with no epsilon that would misjudge a monitor deliberately parked a
-    // millimetre away.
+    // CONTRACT CHANGE (research/28 §F). This used to ask "is the live pose still bit-equal to the
+    // DECLARATION", which answered the right question against the wrong reference: it only ever
+    // existed for config-declared monitors, and it said nothing at all about a pose whose frame died
+    // mid-session. The question generalises to "has anything placed this monitor since the last time
+    // its reference frame stopped meaning anything", and the reference generalises with it — at
+    // session start the pose recorded at the discontinuity IS the declaration, so every case the old
+    // check covered still behaves identically.
     const SXRPose declared{{0.f, 1.5f, -1.5f}, qFromYaw(0.2f)};
-    EXPECT_TRUE(xrPoseIdentical(declared, declared));
-    EXPECT_TRUE(xrPoseIdentical(declared, SXRPose{{0.f, 1.5f, -1.5f}, qFromYaw(0.2f)}));
+
+    // A monitor sitting at the pose it held when its frame died is not a placement, it is a set of
+    // numbers in a dead frame. Nothing durable may be derived from it.
+    EXPECT_FALSE(xrAnchorFrameReestablished(/*stale=*/true, declared, declared));
+    EXPECT_FALSE(xrAnchorFrameReestablished(true, SXRPose{{0.f, 1.5f, -1.5f}, qFromYaw(0.2f)}, declared));
 
     // A re-seat moves it out of the origin-relative rig and into the room, so capture resumes.
-    const SXRPose seated = reseatFrom(OLD_HEAD, declared);
-    EXPECT_FALSE(xrPoseIdentical(seated, declared));
+    EXPECT_TRUE(xrAnchorFrameReestablished(true, reseatFrom(OLD_HEAD, declared), declared));
+    // ...as does the smallest deliberate nudge. Bit-exact on purpose: the question is provenance, not
+    // proximity, and an epsilon would misjudge a monitor parked a millimetre from where it started.
+    EXPECT_TRUE(xrAnchorFrameReestablished(true, SXRPose{{0.001f, 1.5f, -1.5f}, qFromYaw(0.2f)}, declared));
+    EXPECT_TRUE(xrAnchorFrameReestablished(true, SXRPose{{0.f, 1.5f, -1.5f}, qFromYaw(0.2001f)}, declared));
 
-    // ...as does the smallest deliberate nudge.
-    EXPECT_FALSE(xrPoseIdentical(declared, SXRPose{{0.001f, 1.5f, -1.5f}, qFromYaw(0.2f)}));
-    EXPECT_FALSE(xrPoseIdentical(declared, SXRPose{{0.f, 1.5f, -1.5f}, qFromYaw(0.2001f)}));
+    // And once the frame is not in question, the reference is irrelevant — a monitor that has not
+    // moved since the last frame is still perfectly capturable.
+    EXPECT_TRUE(xrAnchorFrameReestablished(/*stale=*/false, declared, declared));
+}
+
+// ---- research/28 H2 + §F: the capture is a measurement, the memory is a commit ----
+//
+// §1.4: the durable offset was re-derived EVERY FRAME while visible+wearing, last-write-wins, with no
+// plausibility bound and no snapshot at the doff edge. Doc 03 §8.3 even described the intent — the
+// offset "becomes a memory only when the gate shuts" — but nothing implemented a commit; the value
+// left lying in the slot by the last frame before the gate shut simply became the memory by default.
+// Stand up, walk out of the room while still wearing, then doff, and a 6 m displacement was written
+// verbatim into "where I left my monitors" (§3.3 #1, the likeliest cause of the bedroom restore).
+//
+// These pin the three pure pieces the fix is made of: what may be staged, what may be committed, and
+// the ordering rule that stops a session's first frames from overwriting the memory its own re-seat
+// is about to consume.
+
+namespace {
+    // The staging step the frame thread performs, in one line, so the scenarios below read as
+    // sequences of user actions rather than as pose algebra.
+    SXRPose stage(const SXRPose& head, const SXRPose& world) {
+        return xrPoseInHeadFrame(head, world);
+    }
+}
+
+TEST(XRRestoreCommit, PerFrameCapturesNeverTouchTheMemoryOnTheirOwn) {
+    // The invariant behind invariant I11 ("durable state is never written from the frame path"): a
+    // staged value is a candidate, and the gate is the only door into the memory. Nothing here can
+    // reach m_restoreOffset without a verdict.
+    const SXRPose remembered{{0.3f, 1.4f, -1.5f}, Quat{}};
+
+    // Frame after frame at the desk: tiny head jitter, tiny staged deltas, all committable.
+    for (float jitter : {0.f, 0.01f, -0.02f, 0.03f}) {
+        const SXRPose staged{{0.3f + jitter, 1.4f, -1.5f}, Quat{}};
+        EXPECT_EQ(xrRestoreCommitGate(true, staged, true, remembered), XR_COMMIT_OK);
+    }
+    // With nothing staged there is nothing to commit, and the previous memory stands untouched. That
+    // is the state a doffed session, an unplugged monitor or an already-consumed commit leaves.
+    EXPECT_EQ(xrRestoreCommitGate(false, SXRPose{}, true, remembered), XR_COMMIT_NOTHING_STAGED);
+}
+
+TEST(XRRestoreCommit, TheWalkAwayIsRefusedAndTheWorkspaceIsKept) {
+    // SYMPTOM A, as a sequence. The user's monitors are 1.5 m in front of the chair they were
+    // re-seated to; the memory and the live measurement agree, because a re-seat makes them agree by
+    // construction. Then the user stands up and walks 6 m to the kitchen, still wearing, and doffs
+    // there. The last frames measure the monitors 6 m BEHIND them — an accurate description of a walk
+    // and a catastrophic description of a workspace.
+    const SXRPose chair{{0.f, 1.6f, 0.f}, Quat{}};
+    const SXRPose monitor = reseatFrom(chair, SXRPose{{0.f, 1.4f, -1.5f}, Quat{}});
+    const SXRPose remembered = stage(chair, monitor);
+
+    const SXRPose kitchen{{0.f, 1.6f, 6.f}, Quat{}}; // six metres away, same facing
+    const SXRPose walked  = stage(kitchen, monitor);
+    EXPECT_GT((walked.pos - remembered.pos).length(), 5.f);
+    EXPECT_EQ(xrRestoreCommitGate(true, walked, true, remembered), XR_COMMIT_DRIFTED);
+
+    // Deliberately re-arranging the desk is the case that must NOT be refused: grab a monitor and
+    // drag it half a metre, and the delta is centimetres, not metres.
+    const SXRPose nudged = stage(chair, SXRPose{{monitor.pos.x + 0.5f, monitor.pos.y, monitor.pos.z}, monitor.rot});
+    EXPECT_EQ(xrRestoreCommitGate(true, nudged, true, remembered), XR_COMMIT_OK);
+
+    // And so is moving to a NEW desk and bringing the monitors with you — the re-seat puts them back
+    // in front of you, so the offset returns to what it always was and the commit sails through. The
+    // bound measures how far you have walked AWAY from your monitors, not how far you have walked.
+    const SXRPose newDesk{{4.f, 1.6f, -3.f}, qFromYaw(2.f)};
+    const auto    reseated = reseatFrom(newDesk, remembered);
+    EXPECT_EQ(xrRestoreCommitGate(true, stage(newDesk, reseated), true, remembered), XR_COMMIT_OK);
+}
+
+TEST(XRRestoreCommit, AFirstMemoryIsBoundedByReachInstead) {
+    // With nothing to compare against there is no drift to measure, so the bound is absolute: a
+    // placement nobody could have been looking at is not a memory worth keeping. This is the floor
+    // under a monitor created while the user was standing somewhere odd, and under invariant I14.
+    EXPECT_EQ(xrRestoreCommitGate(true, SXRPose{{0.f, 1.4f, -1.5f}, Quat{}}, false, SXRPose{}), XR_COMMIT_OK);
+    EXPECT_EQ(xrRestoreCommitGate(true, SXRPose{{0.f, 1.4f, -20.f}, Quat{}}, false, SXRPose{}), XR_COMMIT_OUT_OF_REACH);
+    EXPECT_EQ(xrRestoreCommitGate(true, SXRPose{{9.f, 1.4f, 0.f}, Quat{}}, false, SXRPose{}), XR_COMMIT_OUT_OF_REACH);
+    EXPECT_EQ(xrRestoreCommitGate(true, SXRPose{{0.f, 12.f, -1.5f}, Quat{}}, false, SXRPose{}), XR_COMMIT_OUT_OF_REACH);
+}
+
+TEST(XRRestoreCommit, NaNNeverBecomesAMemory) {
+    // §3.4.2: xrToPose is a raw field copy, springStep and qSlerp both propagate NaN, and
+    // serializeXRMonitorLine would happily emit `nan`. Nothing between the runtime and the durable
+    // slot used to test for it.
+    const SXRPose good{{0.f, 1.4f, -1.5f}, Quat{}};
+    EXPECT_EQ(xrRestoreCommitGate(true, SXRPose{{std::nanf(""), 1.4f, -1.5f}, Quat{}}, true, good), XR_COMMIT_NONFINITE);
+    EXPECT_EQ(xrRestoreCommitGate(true, SXRPose{{0.f, std::numeric_limits<float>::infinity(), -1.5f}, Quat{}}, false, SXRPose{}), XR_COMMIT_NONFINITE);
+    // An unnormalised quaternion is the same class of corruption: it is not a rotation.
+    EXPECT_EQ(xrRestoreCommitGate(true, SXRPose{{0.f, 1.4f, -1.5f}, Quat{0.f, 0.f, 0.f, 0.f}}, true, good), XR_COMMIT_NONFINITE);
+
+    EXPECT_FALSE(xrPoseFinite(SXRPose{{0.f, 1.4f, std::nanf("")}, Quat{}}));
+    EXPECT_TRUE(xrPoseFinite(good));
+    EXPECT_TRUE(xrPoseFinite(SXRPose{{4.f, 1.f, -2.f}, qFromYaw(2.2f)}));
+}
+
+TEST(XRRestoreOrdering, ACaptureCannotPrecedeTheSessionsFirstReseat) {
+    // THE ordering window (§F). Session one leaves a good memory. Session two comes up with a brand
+    // new — and under WiVRn boundaryless/standby, frankly arbitrary — LOCAL_FLOOR origin, so every
+    // surviving anchorPose is a set of numbers measured against a frame that no longer exists. The
+    // RESTORE re-seat that repairs them is armed by the first PLUG, and that plug is deferred behind
+    // presence or a 1.5 s settle — while the capture gate opens on VISIBILITY alone.
+    //
+    // For that second and a half the old code cheerfully measured the dead-frame poses against the
+    // live head and overwrote the very offsets the re-seat was about to consume. Ordering, not a
+    // symptom: nothing may be staged from a pose until something has re-placed it.
+    const SXRPose good{{0.f, 1.4f, -1.5f}, Quat{}}; // what session one committed
+
+    // Session two: the layer still holds session one's world pose, which now means nothing.
+    const SXRPose deadPose = reseatFrom(OLD_HEAD, good);
+    const SXRPose frameRef = deadPose; // recorded when the session ended
+    bool          stale    = true;
+
+    // ...frames arrive, the user is visible and wearing, the plug has not landed. The head is
+    // somewhere else entirely (a new session, a new origin).
+    EXPECT_FALSE(xrAnchorFrameReestablished(stale, deadPose, frameRef));
+    // What the old code would have staged, had it been allowed to: garbage, metres out.
+    EXPECT_GT((stage(NEW_HEAD, deadPose).pos - good.pos).length(), 5.f);
+
+    // ...and the plausibility bound is NOT a substitute for the ordering rule, which is the reason
+    // this is fixed at the source rather than left to the gate. A new session whose origin lands a
+    // modest two metres from the old one produces a dead-frame measurement that is comfortably within
+    // reach AND within the drift bound — perfectly plausible, entirely wrong, and it would have
+    // replaced a memory that was correct.
+    const SXRPose nearHead{{OLD_HEAD.pos.x + 2.f, OLD_HEAD.pos.y, OLD_HEAD.pos.z}, OLD_HEAD.rot};
+    const SXRPose plausibleButDead = stage(nearHead, deadPose);
+    EXPECT_NEAR((plausibleButDead.pos - good.pos).length(), 2.f, 1e-3f);
+    EXPECT_EQ(xrRestoreCommitGate(true, plausibleButDead, true, good), XR_COMMIT_OK);
+    EXPECT_FALSE(xrAnchorFrameReestablished(stale, deadPose, frameRef)); // ...so nothing stages it
+
+    // Now the first plug lands and the RESTORE re-seat plants the remembered offset around the head.
+    const SXRPose seated = reseatFrom(NEW_HEAD, good);
+    stale                = false; // the re-seat re-established the frame
+
+    // From here the capture is not only permitted but a no-op against the memory: the re-seat and the
+    // capture are exact inverses, so the staged value equals what was committed, to the float.
+    EXPECT_TRUE(xrAnchorFrameReestablished(stale, seated, frameRef));
+    const SXRPose staged = stage(NEW_HEAD, seated);
+    expectVecNear(staged.pos, good.pos, 1e-4f);
+    EXPECT_EQ(xrRestoreCommitGate(true, staged, true, good), XR_COMMIT_OK);
+}
+
+// ---- research/28 W4: the STAGE change we were already being sent ----
+//
+// §2.4: our deployed wivrn-xg fork forwards the headset's STAGE reference-space change over the wire,
+// corrects for it by parking the tracking origin when the pose is valid, and — when it is NOT, which
+// is exactly the carried-to-another-room case — pushes a STAGE change event so that "content anchored
+// in the room is at least known to be suspect rather than silently wrong". monado delivers it to
+// every session. The compositor filtered on the space type it happened to have created and discarded
+// it without so much as a log line: the one signal in the entire stack that means "your world moved
+// by an unknown amount", generated correctly by our own fork and dropped at the last hop.
+
+TEST(XRSpaceChange, TheRoomFrameMovingIsNotARecenter) {
+    // Our own reference space moving is a recenter, whatever the pose says — the ladder decides how
+    // to repair it from there (poseValid picks the rung, xrRecenterFix).
+    EXPECT_EQ(xrSpaceChangeAction(/*ours=*/true, /*stage=*/false, /*poseValid=*/true), XR_SPACECHANGE_RECENTER);
+    EXPECT_EQ(xrSpaceChangeAction(true, false, false), XR_SPACECHANGE_RECENTER);
+
+    // STAGE moving WITH a delta: the runtime has already compensated. Observe, count, do nothing.
+    EXPECT_EQ(xrSpaceChangeAction(false, true, true), XR_SPACECHANGE_WORLD_OK);
+
+    // STAGE moving WITHOUT one: no transform exists at any layer, so every world pose in the process
+    // is now wrong by an unknown amount. A discontinuity — the recenter ladder's row 3.
+    EXPECT_EQ(xrSpaceChangeAction(false, true, false), XR_SPACECHANGE_WORLD_LOST);
+
+    // A type we do not hold is ignored — but the caller logs it, because a silent drop is what this
+    // whole work package is about (invariant I9).
+    EXPECT_EQ(xrSpaceChangeAction(false, false, true), XR_SPACECHANGE_IGNORE);
+    EXPECT_EQ(xrSpaceChangeAction(false, false, false), XR_SPACECHANGE_IGNORE);
+}
+
+TEST(XRSpaceChange, AnUnresolvableRoomChangeStopsTheMemoryBeingOverwritten) {
+    // What XR_SPACECHANGE_WORLD_LOST costs, in poses. The user is at their desk with the monitors
+    // 1.5 m in front and a good memory of that. The headset's room frame is then redefined with no
+    // delta — a Space re-setup, or a reconnect in another room — which the streamed world silently
+    // absorbs: the anchor NUMBERS are untouched, and they now describe somewhere else.
+    const SXRPose desk{{0.f, 1.6f, 0.f}, Quat{}};
+    const SXRPose monitor    = reseatFrom(desk, SXRPose{{0.f, 1.4f, -1.5f}, Quat{}});
+    const SXRPose remembered = stage(desk, monitor);
+
+    // The head is now reported in a frame shifted by an amount nobody can compute.
+    const SXRPose shifted{{6.5f, 1.6f, -4.f}, qFromYaw(2.4f)};
+
+    // With the frames marked dead, no staging happens at all — the memory survives untouched, and it
+    // is the memory the RESTORE re-seat consumes to put the room back around the user.
+    EXPECT_FALSE(xrAnchorFrameReestablished(/*stale=*/true, monitor, monitor));
+    // Had it staged, this is what would have been remembered: not where anything was left.
+    EXPECT_EQ(xrRestoreCommitGate(true, stage(shifted, monitor), true, remembered), XR_COMMIT_DRIFTED);
+
+    // The re-seat that follows plants the surviving memory around the head, and the arrangement comes
+    // back in front of the user at the distance they left it.
+    const SXRPose back = reseatFrom(shifted, remembered);
+    const Vec3    toBack{back.pos.x - shifted.pos.x, 0.f, back.pos.z - shifted.pos.z};
+    EXPECT_NEAR(toBack.length(), 1.5f, 1e-3f);
+}
+
+TEST(XRRestoreCapture, TheRemovalMotionIsNotAPlacement) {
+    // §3.3's sub-case. The frames between a physical doff and the visibility/presence drop ARE the
+    // removal: the headset is tilted, rotated, lowered and set down. A head tilted through vertical
+    // has no observable yaw at all, and qYawOf then returns its caller's fallback — stamping a yaw of
+    // 0 in the runtime's arbitrary frame, which rotates the whole remembered arrangement about the
+    // user by up to 180 degrees. The staging step refuses those frames outright.
+    EXPECT_TRUE(qYawObservable(qFromYaw(1.2f)));
+    EXPECT_TRUE(qYawObservable(qMul(qFromYaw(0.4f), qFromPitch(0.6f))));
+    // Straight down at the desk on the way out of the headset, and straight up at the ceiling.
+    EXPECT_FALSE(qYawObservable(qFromPitch(-90.f * PI / 180.f)));
+    EXPECT_FALSE(qYawObservable(qFromPitch(90.f * PI / 180.f)));
+
+    // And what it would have cost: a monitor 1.5 m in front, measured against a head whose yaw fell
+    // back to 0 while the user was actually facing 150 degrees away, is remembered somewhere else
+    // entirely — far enough that even the drift bound would have caught it, which is the point of
+    // having both.
+    const SXRPose facing{{0.f, 1.6f, 0.f}, qFromYaw(150.f * PI / 180.f)};
+    const SXRPose monitor    = reseatFrom(facing, SXRPose{{0.f, 1.4f, -1.5f}, Quat{}});
+    const SXRPose honest     = stage(facing, monitor);
+    const SXRPose fallenBack = stage(SXRPose{facing.pos, Quat{}}, monitor);
+    EXPECT_GT((fallenBack.pos - honest.pos).length(), 2.5f);
+    EXPECT_EQ(xrRestoreCommitGate(true, fallenBack, true, honest), XR_COMMIT_DRIFTED);
 }
 
 TEST(XRAnchorRestore, UnrestorableMonitorLandsInFrontOfTheUserAnyway) {
@@ -1136,10 +1357,10 @@ TEST(XRReseatRestore, GroupGeometrySurvivesADeliberateReseat) {
 // the frame loop actually performs.
 
 namespace {
-    // Exactly what the frame loop's GROUP branch does: derive the seat frame, then re-express every
-    // monitor in it and re-plant that in the head's frame.
-    std::vector<SXRPose> groupReseat(const std::vector<SXRPose>& worlds, const SXRPose& head) {
-        const auto           seat = xrGroupSeatFrame(worlds.data(), worlds.size(), head);
+    // Exactly what the frame loop's GROUP branch does: derive the seat frame at the group's AUTHORED
+    // viewing distance, then re-express every monitor in it and re-plant that in the head's frame.
+    std::vector<SXRPose> groupReseat(const std::vector<SXRPose>& worlds, const SXRPose& head, float authored) {
+        const auto           seat = xrGroupSeatFrame(worlds.data(), worlds.size(), authored);
         std::vector<SXRPose> out;
         if (!seat.valid)
             return worlds; // the frame loop leaves the group alone
@@ -1181,33 +1402,139 @@ namespace {
 }
 
 TEST(XRGroupSeat, WallSeatIsWhereItsViewerStands) {
-    // The seat frame of a wall is dead in front of it, at the distance the viewer is currently
-    // viewing it from — so a user already sitting square to their monitors gets the identity, and
-    // the verb honestly reports "re-seated 3 monitors" that did not need to move.
+    // The seat frame of a wall is dead in front of it, at the distance it was AUTHORED to be viewed
+    // from — so a user already sitting square to their monitors gets the identity, and the verb
+    // honestly reports "re-seated 3 monitors" that did not need to move.
     const auto    monitors = wallAt(-1.5f);
     const SXRPose head{{0.f, 1.6f, 0.f}, Quat{}};
 
-    const auto    seat = xrGroupSeatFrame(monitors.data(), monitors.size(), head);
+    const auto    seat = xrGroupSeatFrame(monitors.data(), monitors.size(), 1.5f);
     ASSERT_TRUE(seat.valid);
     expectVecNear(seat.frame.pos, Vec3{0.f, 0.f, 0.f}, 1e-4f);
     EXPECT_NEAR(qYawOf(seat.frame.rot, 999.f), 0.f, 1e-4f);
+    EXPECT_NEAR(seat.distance, 1.5f, 1e-4f);
 
-    const auto after = groupReseat(monitors, head);
+    const auto after = groupReseat(monitors, head, 1.5f);
     for (size_t i = 0; i < monitors.size(); ++i)
         expectVecNear(after[i].pos, monitors[i].pos, 1e-4f);
 }
 
 TEST(XRGroupSeat, ArcSeatIsItsFocus) {
-    // A toed-in arc names its own viewing point exactly: the mean normal points at the focus and
-    // the perpendicular distance is the radius. This is the arrangement a HypXRland desk actually
-    // ends up in after a few grab-moves.
-    const auto    monitors = arcAt(1.5f, {-30.f, 0.f, 30.f});
-    const SXRPose head{{0.f, 1.62f, 0.f}, Quat{}};
+    // A toed-in arc names its own viewing point exactly: the mean normal points at the focus and the
+    // authored distance is the radius. This is the arrangement a HypXRland desk actually ends up in
+    // after a few grab-moves.
+    const auto monitors = arcAt(1.5f, {-30.f, 0.f, 30.f});
 
-    const auto    seat = xrGroupSeatFrame(monitors.data(), monitors.size(), head);
+    // Note what the authored distance of an arc IS: the distance from the viewer to the group's
+    // CENTROID, which a toed-in arc pulls in from the radius (its ends are further round the circle
+    // than the middle). That is the quantity the seat formula consumes, so deriving it from the
+    // arrangement and feeding it back lands the seat exactly on the focus.
+    const float authored = xrGroupAuthoredDistance(monitors.data(), monitors.size(), 99.f);
+    EXPECT_LT(authored, 1.5f);
+
+    const auto seat = xrGroupSeatFrame(monitors.data(), monitors.size(), authored);
     ASSERT_TRUE(seat.valid);
     expectVecNear(seat.frame.pos, Vec3{0.f, 0.f, 0.f}, 1e-3f);
     EXPECT_NEAR(qYawOf(seat.frame.rot, 999.f), 0.f, 1e-3f);
+}
+
+// ---- research/28 S1: the authored viewing distance ----
+//
+// §3.2 is the whole of reported symptom B: the seat distance used to be "however far the group
+// currently happens to be from you", clamped into [0.3, 5]. A bad restore parks the group 20 m away,
+// the user presses the keybind that exists to repair exactly that, and the verb faithfully reproduces
+// the corruption at the clamp — five metres out, in front of them, unusable. A repair may not derive
+// its target from the state it is repairing (invariant I4). These pin the replacement.
+
+TEST(XRGroupSeatAuthored, DeclaredRigsNameTheDistanceTheyWereAuthoredFor) {
+    // A declared `xrmonitor = …, pos:0,1.4,-1.5` means "1.5 m in front of ME": the rig is
+    // head-relative by construction, so the wearer stands at the origin of the frame those poses are
+    // named in and the authored distance is just the seat geometry evaluated with the head there.
+    const auto wall = wallAt(-1.5f);
+    EXPECT_NEAR(xrGroupAuthoredDistance(wall.data(), wall.size(), 99.f), 1.5f, 1e-4f);
+
+    // For a toed-in arc it is the distance to the CENTROID rather than the radius — which is exactly
+    // the quantity the seat formula wants, so the round trip puts the seat back on the arc's focus.
+    const auto  arc      = arcAt(2.2f, {-30.f, 0.f, 30.f});
+    const float arcDist  = xrGroupAuthoredDistance(arc.data(), arc.size(), 99.f);
+    EXPECT_GT(arcDist, 1.9f);
+    EXPECT_LT(arcDist, 2.2f);
+    expectVecNear(xrGroupSeatFrame(arc.data(), arc.size(), arcDist).frame.pos, Vec3{0.f, 0.f, 0.f}, 1e-3f);
+
+    // No rigs at all — every monitor in the group is ad-hoc — falls back to openxr:default_distance.
+    EXPECT_NEAR(xrGroupAuthoredDistance(nullptr, 0, 1.5f), 1.5f, 1e-4f);
+
+    // A rig set with no common facing says nothing about a distance either. So does one whose implied
+    // distance is outside the range a placement verb would ever have produced: an ad-hoc monitor's
+    // "declaration" is dead-frame world coordinates, and the whole point is not to inherit those.
+    const std::vector<SXRPose> ring{{{0.f, 1.4f, -1.5f}, Quat{}}, {{0.f, 1.4f, 1.5f}, qFromYaw(PI)}};
+    EXPECT_NEAR(xrGroupAuthoredDistance(ring.data(), ring.size(), 1.5f), 1.5f, 1e-4f);
+    const auto absurd = wallAt(-42.f);
+    EXPECT_NEAR(xrGroupAuthoredDistance(absurd.data(), absurd.size(), 1.5f), 1.5f, 1e-4f);
+}
+
+TEST(XRGroupSeatAuthored, AReseatRepairsDistanceInsteadOfPreservingIt) {
+    // SYMPTOM B, and the test that replaces XRGroupSeat.ViewingDistanceIsClamped — which asserted the
+    // old behaviour on purpose, and which the old behaviour is precisely the bug. A bad restore has
+    // thrown the wall 20 m away; the user presses re-seat.
+    //
+    // Before: dist = clamp(20, 0.3, 5) = 5, and the wall lands five metres in front of their face.
+    // Now: the wall was authored to be viewed from 1.5 m, and it comes back at 1.5 m.
+    const auto    monitors = wallAt(-20.f);
+    const SXRPose head{{0.f, 1.6f, 0.f}, Quat{}};
+
+    const auto    seat = xrGroupSeatFrame(monitors.data(), monitors.size(), 1.5f);
+    ASSERT_TRUE(seat.valid);
+    EXPECT_NEAR(seat.frame.pos.z, -20.f + 1.5f, 1e-4f); // NOT -20 + XR_DISTANCE_MAX
+
+    const auto after = groupReseat(monitors, head, 1.5f);
+    const Vec3 toMid{after[1].pos.x - head.pos.x, 0.f, after[1].pos.z - head.pos.z};
+    EXPECT_NEAR(toMid.length(), 1.5f, 1e-3f);
+    // ...and it is in front of the user, not behind: -Z is forward at yaw 0.
+    EXPECT_LT(after[1].pos.z, 0.f);
+    // The arrangement itself is untouched — this repairs WHERE the group is, never its layout.
+    for (size_t i = 0; i + 1 < after.size(); ++i)
+        EXPECT_NEAR((after[i + 1].pos - after[i].pos).length(), (monitors[i + 1].pos - monitors[i].pos).length(), 1e-3f);
+}
+
+TEST(XRGroupSeatAuthored, AuthoredDistanceIsStillClampedToTheReachableRange) {
+    // The clamp survives as what it always should have been — a bound on the ANSWER, not a repair
+    // mechanism. An absurd authored distance cannot park content out of reach (invariant I14).
+    const auto monitors = wallAt(-1.5f);
+    EXPECT_NEAR(xrGroupSeatFrame(monitors.data(), monitors.size(), 40.f).distance, XR_DISTANCE_MAX, 1e-4f);
+    EXPECT_NEAR(xrGroupSeatFrame(monitors.data(), monitors.size(), 0.01f).distance, XR_DISTANCE_MIN, 1e-4f);
+    EXPECT_NEAR(xrGroupSeatFrame(monitors.data(), monitors.size(), std::nanf("")).distance, XR_DISTANCE_MIN, 1e-4f);
+}
+
+TEST(XRGroupSeatAuthored, TheFixedPointSurvivesAndIsNowUnconditional) {
+    // The property the old design bought with the corruption it inherited: press the keybind twice
+    // and the second press does nothing. It still holds — and now it holds even when the first press
+    // had to move the group a long way, because the distance no longer depends on where the group
+    // started. Same corrupted 20 m group as above, from an off-axis head.
+    const auto    monitors = wallAt(-20.f);
+    const SXRPose head{{2.f, 1.55f, -3.f}, qFromYaw(1.1f)};
+
+    const auto    once  = groupReseat(monitors, head, 1.5f);
+    const auto    twice = groupReseat(once, head, 1.5f);
+    for (size_t i = 0; i < once.size(); ++i) {
+        expectVecNear(twice[i].pos, once[i].pos, 1e-3f);
+        EXPECT_NEAR(qAngleBetween(twice[i].rot, once[i].rot), 0.f, 2e-3f);
+    }
+}
+
+TEST(XRGroupSeatAuthored, DeclaredRigsDriveTheDistanceEndToEnd) {
+    // The path the frame loop actually takes: gather the declared rigs, ask them for the authored
+    // distance, seat the LIVE arrangement at it. A user whose config says 2.5 m gets 2.5 m back —
+    // openxr:default_distance is the fallback, not an override of what they wrote down.
+    const auto rigs     = wallAt(-2.5f);            // what the xrmonitor lines declare
+    const auto monitors = wallAt(-9.f);             // where a bad restore left them
+    const float authored = xrGroupAuthoredDistance(rigs.data(), rigs.size(), 1.5f);
+    EXPECT_NEAR(authored, 2.5f, 1e-4f);
+
+    const SXRPose head{{0.f, 1.6f, 0.f}, Quat{}};
+    const auto    after = groupReseat(monitors, head, authored);
+    const Vec3    toMid{after[1].pos.x - head.pos.x, 0.f, after[1].pos.z - head.pos.z};
+    EXPECT_NEAR(toMid.length(), 2.5f, 1e-3f);
 }
 
 TEST(XRGroupSeat, PivotInPlaceBringsTheGroupToTheNewFacing) {
@@ -1218,7 +1545,9 @@ TEST(XRGroupSeat, PivotInPlaceBringsTheGroupToTheNewFacing) {
     const float   pivot    = 90.f * PI / 180.f;
     const SXRPose head{{0.f, 1.6f, 0.f}, qFromYaw(pivot)};
 
-    const auto    after = groupReseat(monitors, head);
+    // Authored from the arrangement itself, so this is a pure rotation about the user and every
+    // distance below is preserved exactly.
+    const auto    after = groupReseat(monitors, head, xrGroupAuthoredDistance(monitors.data(), monitors.size(), 1.5f));
     ASSERT_EQ(after.size(), monitors.size());
 
     // Each monitor is now the same distance from the head as before (the head did not move, and the
@@ -1242,13 +1571,12 @@ TEST(XRGroupSeat, PivotInPlaceBringsTheGroupToTheNewFacing) {
 
 TEST(XRGroupSeat, ReseatIsAFixedPoint) {
     // Mash the keybind: the second press must be the identity. After a re-seat the head IS the
-    // group's seat frame, so the derivation returns it and the transform collapses. Without the
-    // perpendicular projection this would creep on every press.
+    // group's seat frame, so the derivation returns it and the transform collapses.
     const auto    monitors = arcAt(1.6f, {-40.f, -10.f, 20.f});
     const SXRPose head{{2.f, 1.55f, -3.f}, qFromYaw(1.1f)};
 
-    const auto    once  = groupReseat(monitors, head);
-    const auto    twice = groupReseat(once, head);
+    const auto    once  = groupReseat(monitors, head, 1.6f);
+    const auto    twice = groupReseat(once, head, 1.6f);
     for (size_t i = 0; i < once.size(); ++i) {
         expectVecNear(twice[i].pos, once[i].pos, 1e-3f);
         EXPECT_NEAR(qAngleBetween(twice[i].rot, once[i].rot), 0.f, 2e-3f);
@@ -1256,44 +1584,29 @@ TEST(XRGroupSeat, ReseatIsAFixedPoint) {
 }
 
 TEST(XRGroupSeat, SlidingAlongAWallIsNotWalkingAwayFromIt) {
-    // The viewing distance is measured PERPENDICULARLY to the group's facing. Standing 3 m to one
-    // side of a wall you are 1.5 m from is still a 1.5 m viewing distance, so the wall comes round
-    // to 1.5 m in front of you rather than being flung 3.4 m away.
+    // Standing 3 m to one side of a wall you sit 1.5 m from must bring the wall round to 1.5 m in
+    // front of you, not fling it 3.4 m away. This used to be bought by measuring the distance
+    // PERPENDICULARLY to the group's facing; with an authored distance it is free — where the user
+    // happens to be standing no longer enters the derivation at all.
     const auto    monitors = wallAt(-1.5f);
     const SXRPose head{{3.f, 1.6f, 0.f}, qFromYaw(0.3f)};
 
-    const auto    seat = xrGroupSeatFrame(monitors.data(), monitors.size(), head);
+    const auto    seat = xrGroupSeatFrame(monitors.data(), monitors.size(), 1.5f);
     ASSERT_TRUE(seat.valid);
     EXPECT_NEAR(seat.frame.pos.z, 0.f, 1e-4f); // 1.5 m out from the wall, not 3.4 m
 
-    const auto after = groupReseat(monitors, head);
+    const auto after = groupReseat(monitors, head, 1.5f);
     const Vec3 toMid{after[1].pos.x - head.pos.x, 0.f, after[1].pos.z - head.pos.z};
     EXPECT_NEAR(toMid.length(), 1.5f, 1e-3f);
 }
 
-TEST(XRGroupSeat, ViewingDistanceIsClamped) {
-    // Re-seating from across the room must not park the group across the room. Same clamp every
-    // other placement verb uses.
-    const auto    monitors = wallAt(-1.5f);
-    const SXRPose faraway{{0.f, 1.6f, 20.f}, Quat{}};
-    const auto    seat = xrGroupSeatFrame(monitors.data(), monitors.size(), faraway);
-    ASSERT_TRUE(seat.valid);
-    EXPECT_NEAR(seat.frame.pos.z, -1.5f + XR_DISTANCE_MAX, 1e-4f);
-
-    // ...and standing inside them does not put them on the tip of your nose.
-    const SXRPose inside{{0.f, 1.6f, -1.55f}, Quat{}};
-    const auto    close = xrGroupSeatFrame(monitors.data(), monitors.size(), inside);
-    ASSERT_TRUE(close.valid);
-    EXPECT_NEAR(std::fabs(close.frame.pos.z + 1.5f), XR_DISTANCE_MIN, 1e-4f);
-}
-
 TEST(XRGroupSeat, SingleMonitorWorks) {
-    // The most common arrangement of all. One monitor 2 m to the user's left, facing them; a re-seat
-    // puts it 2 m dead ahead, still facing them.
+    // The most common arrangement of all. One monitor 2 m to the user's left, facing them, authored
+    // to be viewed from 2 m; a re-seat puts it 2 m dead ahead, still facing them.
     const std::vector<SXRPose> one{{{-2.f, 1.4f, 0.f}, qFromYaw(-90.f * PI / 180.f)}};
     const SXRPose              head{{0.f, 1.6f, 0.f}, Quat{}};
 
-    const auto                 after = groupReseat(one, head);
+    const auto                 after = groupReseat(one, head, 2.f);
     ASSERT_EQ(after.size(), size_t{1});
     expectVecNear(after[0].pos, Vec3{0.f, 1.4f, -2.f}, 1e-3f);
     // Its normal points back at the head (+Z of the quad toward the viewer).
@@ -1309,11 +1622,10 @@ TEST(XRGroupSeat, NoCommonFacingHasNoSeat) {
         {{0.f, 1.4f, -1.5f}, Quat{}},
         {{0.f, 1.4f, 1.5f}, qFromYaw(PI)},
     };
-    const SXRPose head{{0.f, 1.6f, 0.f}, Quat{}};
-    EXPECT_FALSE(xrGroupSeatFrame(ring.data(), ring.size(), head).valid);
+    EXPECT_FALSE(xrGroupSeatFrame(ring.data(), ring.size(), 1.5f).valid);
 
     // An empty group is likewise unanswerable (the verb's own gate catches this first).
-    EXPECT_FALSE(xrGroupSeatFrame(nullptr, 0, head).valid);
+    EXPECT_FALSE(xrGroupSeatFrame(nullptr, 0, 1.5f).valid);
 }
 
 TEST(XRGroupSeat, MonitorsLyingFlatDoNotVoteOnFacing) {
@@ -1324,11 +1636,11 @@ TEST(XRGroupSeat, MonitorsLyingFlatDoNotVoteOnFacing) {
     monitors.push_back(SXRPose{{0.f, 2.4f, -1.f}, qFromPitch(-90.f * PI / 180.f)}); // a ceiling panel
 
     const SXRPose head{{0.f, 1.6f, 0.f}, Quat{}};
-    const auto    seat = xrGroupSeatFrame(monitors.data(), monitors.size(), head);
+    const auto    seat = xrGroupSeatFrame(monitors.data(), monitors.size(), 1.5f);
     ASSERT_TRUE(seat.valid);
     EXPECT_NEAR(qYawOf(seat.frame.rot, 999.f), 0.f, 1e-4f);
 
-    const auto after = groupReseat(monitors, head);
+    const auto after = groupReseat(monitors, head, 1.5f);
     ASSERT_EQ(after.size(), monitors.size());
     // The ceiling panel travelled with everything else, keeping its offset from the wall.
     EXPECT_NEAR((after[3].pos - after[1].pos).length(), (monitors[3].pos - monitors[1].pos).length(), 1e-3f);
