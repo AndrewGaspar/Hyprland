@@ -179,6 +179,41 @@ class COpenXRManager {
     // restarting the thing you were asking about.
     bool restoreCaptureActive() const;
 
+    // research/28 H2: promote every layer's STAGED capture into its durable slot, through
+    // xrRestoreCommitGate. MAIN THREAD ONLY (invariant I11) and edge-triggered — the wearing gate
+    // closing (doff / visibility drop / session end) and the session teardown are the only callers.
+    // `why` is logged with the per-layer verdicts.
+    void commitRestorePlacements(const char* why);
+
+    // research/28 §F/W4: declare every anchor's reference frame dead. Raises m_anchorFrameStale on
+    // each layer and records the pose it held, so the capture refuses to derive a memory from a pose
+    // whose frame no longer means anything until something has actually re-placed it. Takes
+    // m_layersMu; callable from either thread (POD writes only).
+    void invalidateAnchorFrames(const char* why);
+
+    // research/28 W4: the "your world moved by an unknown amount" path, shared by the recenter
+    // ladder's row 3 (no head sample straddles the change) and by a STAGE reference-space change the
+    // runtime could not describe. Invalidates the frames, then re-seats the group to the head if the
+    // user has permitted the compositor to move monitors on its own initiative — and says so either
+    // way. FRAME THREAD.
+    void handleFrameDiscontinuity(const std::string& why);
+
+    // research/28 M0: the read-only STAGE probe. `available` is whether the runtime gave us a STAGE
+    // space at all (a runtime without one self-skips); the pose is STAGE expressed in our LOCAL_FLOOR
+    // reference space at the last probe, with the raw XrSpaceLocationFlags it came with. `changes` /
+    // `unresolvable` count the STAGE reference-space changes W4 accepted, and how many of those
+    // carried no usable pose. Main thread reads a frame-thread snapshot.
+    struct SXRWorldFrameStatus {
+        bool     available    = false;
+        bool     located      = false;
+        bool     tracked      = false;
+        float    x = 0.f, y = 0.f, z = 0.f, yawDeg = 0.f;
+        uint32_t probes       = 0;
+        uint32_t changes      = 0;
+        uint32_t unresolvable = 0;
+    };
+    SXRWorldFrameStatus worldFrameStatus() const;
+
     // Milliseconds until the pending grace-period unplug fires, or -1 when none is armed. Cheap
     // read of the timer for `hyprctl openxr status` observability. Main thread only.
     int  monitorUnplugPendingMs() const;
@@ -284,6 +319,14 @@ class COpenXRManager {
         // -z is in front of you, +x to your right, y is height above the floor.
         bool        restorable = false;
         float       restoreX = 0.f, restoreY = 0.f, restoreZ = 0.f;
+        // research/28 H2: the LIVE measurement behind that memory. `staged` is what the frame thread
+        // has captured since the last commit and what the next doff edge would commit; `commit` is
+        // why the last attempt did or did not take (xrRestoreCommitName). Reported separately from
+        // the memory because "the capture is running" and "the memory changed" are now different
+        // facts, and conflating them is what let a walk-away overwrite a workspace.
+        bool        staged   = false;
+        float       stagedX = 0.f, stagedY = 0.f, stagedZ = 0.f;
+        std::string commit  = "nothing staged";
         // Adaptive anchoring (research/13 §6.4).
         bool        adaptiveEnabled  = false;
         std::string adaptivePhase    = "docked"; // docked | undocking | roaming | redocking
@@ -973,13 +1016,12 @@ class COpenXRManager {
     std::optional<Time::steady_tp> m_visibleSince;
     SP<CEventLoopTimer>        m_plugSettleTimer;
 
-    // Recenter-on-plug (report-20 issue C). m_recenteredThisSession: gate so a session re-seats its
-    // anchor:local monitors exactly once, on the FIRST presence-confirmed plug (a brief doff+don in
-    // the same session must NOT re-seat). Reset per session in resetPresenceState(). m_reseatArmed
-    // is set on that first plug (main thread) and consumed by the frame thread, which owns the head
-    // pose — it re-seats when a valid view is available (so a plug while the view is momentarily
-    // invalid still recenters on the next good frame). Atomic: both threads arm, frame reads/clears.
-    bool                 m_recenteredThisSession = false;
+    // Recenter-on-plug (report-20 issue C). A session re-seats its anchor:local monitors exactly
+    // once, on the FIRST presence-confirmed plug (a brief doff+don in the same session must NOT
+    // re-seat) — m_everPlugged above is that gate. m_reseatArmed is set on that first plug (main
+    // thread) and consumed by the frame thread, which owns the head pose — it re-seats when a valid
+    // view is available (so a plug while the view is momentarily invalid still recenters on the next
+    // good frame). Atomic: both threads arm, frame reads/clears.
     std::atomic<uint8_t> m_reseatArmed{OpenXR::XR_RESEAT_ARM_NONE};
 
     // Arm a pending re-seat. RESTORE outranks GROUP if both land before the frame thread consumes
@@ -1017,6 +1059,20 @@ class COpenXRManager {
     // presence edge (or, on a runtime without XR_EXT_user_presence, the plug edge) closes the gate
     // while the last sample is still one the user's actual head produced. Main writes, frame reads.
     std::atomic<bool>   m_restoreCapture{false};
+
+    // research/28 M0 — the STAGE probe, published by the frame thread for `hyprctl openxr status`.
+    // Read-only instrumentation: nothing is ever anchored in STAGE by this tranche. Plain atomics
+    // rather than a lock because the frame thread writes them (XRMonitorLayer.hpp's rules) and a
+    // status query is allowed to see a half-updated snapshot of six independent numbers.
+    std::atomic<bool>     m_stageAvailable{false};
+    std::atomic<bool>     m_stageLocated{false};
+    std::atomic<bool>     m_stageTracked{false};
+    std::atomic<float>    m_stageX{0.f}, m_stageY{0.f}, m_stageZ{0.f}, m_stageYawDeg{0.f};
+    std::atomic<uint32_t> m_stageProbes{0};
+    // research/28 W4: STAGE reference-space changes seen, and how many carried no usable pose (the
+    // "your world moved by an unknown amount" case the compositor used to discard without a log).
+    std::atomic<uint32_t> m_worldChanges{0};
+    std::atomic<uint32_t> m_worldChangesUnresolvable{0};
 
     // Dormant re-probe timer (report-17 WP-L3 / report-20 issue B1). m_reprobeTimer re-attempts
     // start() while UNAVAILABLE; m_reprobeAttempt counts consecutive failures (drives the backoff);

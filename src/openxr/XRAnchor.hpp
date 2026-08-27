@@ -261,6 +261,80 @@ namespace OpenXR {
         return (mode == XR_ANCHOR_LOCAL && restoreValid) ? XR_RESEAT_RESTORED : XR_RESEAT_DECLARED;
     }
 
+    // ---- is this anchor pose expressed in a frame that still means something? (research/28 §F, I11) ----
+    //
+    // A LOCAL anchorPose is named against the runtime's origin, and that origin dies at the end of a
+    // session and can be silently swapped mid-session (a recenter nothing observed, the headset's own
+    // room frame moving). Across such a discontinuity the NUMBERS are untouched and their MEANING is
+    // gone — which is the whole "restored way off in the bedroom" bug (§7.5: the data was not bad, it
+    // was unlabelled). So each layer records the pose it held at the last discontinuity, and its pose
+    // counts as re-established only once something has actually placed it since: a re-seat, a grab, a
+    // verb. Until then nothing durable may be derived from it.
+    //
+    // Bit-exact on purpose, exactly like xrPoseIdentical's other caller: the question is provenance
+    // ("has anything placed this monitor since its frame died"), not proximity. This subsumes the
+    // older "is the live pose still bit-equal to the DECLARATION" heuristic, which asked the same
+    // question against a reference that only existed for config-declared monitors and never covered a
+    // mid-session discontinuity at all.
+    inline bool xrAnchorFrameReestablished(bool stale, const SXRPose& live, const SXRPose& atDiscontinuity) {
+        return !stale || !xrPoseIdentical(live, atDiscontinuity);
+    }
+
+    // ---- committing a durable placement (research/28 H2, invariants I3/I4/I11/I14) ----
+    //
+    // The capture used to be a live measurement written straight into the durable slot by the frame
+    // thread, every frame, last-write-wins, with nothing validating the last write (§1.4). Stand up,
+    // walk out of the room while still wearing, then doff, and a 6 m displacement was written verbatim
+    // into "where I left my monitors" — §3.3 #1, the likeliest cause of the bedroom restore, and the
+    // reason "you never worked there" was beside the point: WALKING there while wearing was enough.
+    //
+    // Now the frame thread only STAGES, and the durable slot is written on an edge (the doff /
+    // visibility drop / session end) by the main thread, through this gate.
+    //
+    // The bound that does the work is the DRIFT one, and it is worth stating why it is a delta rather
+    // than an absolute: at the moment a session's placements are established (the RESTORE re-seat) the
+    // staged offset EQUALS the committed one by construction, so the delta at the commit edge measures
+    // exactly one thing — how far the wearer has moved away from the seat those monitors were put in
+    // front of. A walk to the kitchen shows up as metres; re-arranging the desk (grab, push-pull, or a
+    // deliberate re-seat, which re-centres the whole group on the new seat) shows up as centimetres.
+    // The asymmetry in the costs is the reason the threshold is tight: refusing a good commit keeps
+    // the previous memory and logs it, while accepting a bad one is the reported catastrophe.
+    enum eXRRestoreCommit : uint8_t {
+        XR_COMMIT_OK = 0,
+        XR_COMMIT_NOTHING_STAGED, // no capture has been taken since the last commit
+        XR_COMMIT_NONFINITE,      // NaN/inf reached the staging value
+        XR_COMMIT_OUT_OF_REACH,   // a FIRST memory of a placement nobody could have been looking at
+        XR_COMMIT_DRIFTED,        // it moved too far from the placement it replaces: a walk, not a workspace
+    };
+
+    constexpr float XR_RESTORE_MAX_REACH  = 8.0F; // m, horizontal, for a first commit with nothing to compare to
+    constexpr float XR_RESTORE_MAX_HEIGHT = 4.0F; // m, |y|, likewise
+    constexpr float XR_RESTORE_MAX_DRIFT  = 2.5F; // m, horizontal, from the placement being replaced
+
+    inline eXRRestoreCommit xrRestoreCommitGate(bool staged, const SXRPose& stagedOffset, bool havePrev, const SXRPose& prevOffset, float maxReach = XR_RESTORE_MAX_REACH,
+                                                float maxHeight = XR_RESTORE_MAX_HEIGHT, float maxDrift = XR_RESTORE_MAX_DRIFT) {
+        if (!staged)
+            return XR_COMMIT_NOTHING_STAGED;
+        if (!xrPoseFinite(stagedOffset))
+            return XR_COMMIT_NONFINITE;
+        if (havePrev && xrPoseFinite(prevOffset)) {
+            const float dx = stagedOffset.pos.x - prevOffset.pos.x, dz = stagedOffset.pos.z - prevOffset.pos.z;
+            return std::sqrt(dx * dx + dz * dz) > maxDrift ? XR_COMMIT_DRIFTED : XR_COMMIT_OK;
+        }
+        const float r = std::sqrt(stagedOffset.pos.x * stagedOffset.pos.x + stagedOffset.pos.z * stagedOffset.pos.z);
+        return (r > maxReach || std::fabs(stagedOffset.pos.y) > maxHeight) ? XR_COMMIT_OUT_OF_REACH : XR_COMMIT_OK;
+    }
+
+    inline const char* xrRestoreCommitName(eXRRestoreCommit c) {
+        switch (c) {
+            case XR_COMMIT_OK: return "committed";
+            case XR_COMMIT_NONFINITE: return "refused (non-finite)";
+            case XR_COMMIT_OUT_OF_REACH: return "refused (out of reach)";
+            case XR_COMMIT_DRIFTED: return "refused (drifted — that was a walk, not a workspace)";
+            default: return "nothing staged";
+        }
+    }
+
     // ---- the deliberate re-seat (doc 03 §8.4) ----
     //
     // WHICH monitors a re-seat moves — the one definition every re-seat path shares (the first plug
@@ -302,25 +376,38 @@ namespace OpenXR {
     // face, to see the whole arrangement head-on. Yaw-only and on the floor (y = 0), i.e. the same
     // shape xrHeadFrame produces, so it drops straight into xrPoseInHeadFrame / recenterLocalToHead.
     //
-    // Position: the group's centroid pushed back along its mean facing normal by the distance the
-    // user is currently viewing it from, measured PERPENDICULARLY to that normal. The perpendicular
-    // component is what makes the operation idempotent — after a re-seat the head sits exactly at
-    // the frame this returns, so asking again yields the identity — and it is also what makes
-    // sliding along a wall of monitors not count as "moving away from" them.
-    // Orientation: facing the group (forward = -normal).
+    // Position: the group's centroid pushed back along its mean facing normal by the group's
+    // AUTHORED viewing distance. Orientation: facing the group (forward = -normal).
+    //
+    // The authored distance is the whole point, and it is research/28 §3.2 (symptom B) in one
+    // parameter. This used to measure how far the user CURRENTLY happens to be from the group and
+    // clamp that into [0.3, 5]: a re-seat therefore inherited the very corruption it exists to
+    // repair, and a group a bad restore had parked 20 m away came back at exactly 5 m — "in front of
+    // me but far in the distance", verbatim. A repair may not derive its target from the state it is
+    // repairing (invariant I4), so the distance now comes from the arrangement's DECLARATION (the
+    // head-relative `pos:` rigs, via xrGroupAuthoredDistance) or from openxr:default_distance. The
+    // head does not enter this derivation at all any more — it enters the re-seat, which maps this
+    // frame onto the wearer's.
+    //
+    // Idempotence survives, and unconditionally rather than by construction: after a re-seat the
+    // group sits exactly `dist` perpendicular from the head along its own normal, so a second press
+    // derives the same frame and the transform collapses to the identity.
     //
     // `valid` is false when the group says nothing about a facing: no monitors, or normals that
     // cancel (a ring of monitors surrounding the user — there is no "in front of" to bring them to).
     // The caller must leave the group alone in that case rather than invent a frame.
     struct SXRGroupSeat {
         SXRPose frame;
-        bool    valid = false;
+        float   distance = 0.F; // the authored viewing distance actually used (post-clamp)
+        bool    valid    = false;
     };
 
-    inline SXRGroupSeat xrGroupSeatFrame(const SXRPose* group, size_t n, const SXRPose& head, float minDist = XR_DISTANCE_MIN, float maxDist = XR_DISTANCE_MAX) {
-        SXRGroupSeat out;
+    // The centroid + mean facing normal of a set of quad poses, shared by the seat frame and by the
+    // authored-distance derivation below (which is the same geometry asked of the declared rigs
+    // instead of the live arrangement). Returns false when the normals cancel or the set is empty.
+    inline bool xrGroupFacing(const SXRPose* group, size_t n, Vec3& centroidOut, Vec3& normalOut) {
         if (!group || n == 0)
-            return out;
+            return false;
 
         Vec3 centroid{};
         Vec3 normalSum{};
@@ -340,17 +427,37 @@ namespace OpenXR {
 
         const float nl = std::sqrt(normalSum.x * normalSum.x + normalSum.z * normalSum.z);
         if (nl < 1e-3F)
-            return out; // the normals cancel: no common front to bring the group around to
-        const Vec3 normal{normalSum.x / nl, 0.F, normalSum.z / nl};
+            return false; // the normals cancel: no common front to bring the group around to
 
-        // How far the user currently views the group from, along its normal. Absolute value so
-        // standing BEHIND the group (you walked around it) still yields a sane viewing distance
-        // rather than a clamp to arm's length; clamped to the range every other placement verb
-        // clamps to, so a re-seat from across the room does not park the group across the room.
-        const Vec3  toHead{head.pos.x - centroid.x, 0.F, head.pos.z - centroid.z};
-        const float dist = std::clamp(std::fabs(toHead.x * normal.x + toHead.z * normal.z), minDist, maxDist);
+        centroidOut = centroid;
+        normalOut   = Vec3{normalSum.x / nl, 0.F, normalSum.z / nl};
+        return true;
+    }
 
-        out.frame.pos = Vec3{centroid.x + normal.x * dist, 0.F, centroid.z + normal.z * dist};
+    // The viewing distance a set of DECLARED rigs was authored for. A declared `xrmonitor = …,
+    // pos:0,1.4,-1.5` says "1.5 m in front of me" — the rig is head-relative by construction, so the
+    // wearer stands at the origin of the frame those poses are named in, and the authored distance is
+    // just the seat geometry evaluated with the head THERE. Falls back when the rigs are degenerate,
+    // when there are none (every monitor is ad-hoc), or when the answer is outside the range a
+    // placement verb would have accepted in the first place.
+    inline float xrGroupAuthoredDistance(const SXRPose* rigs, size_t n, float fallback, float minDist = XR_DISTANCE_MIN, float maxDist = XR_DISTANCE_MAX) {
+        Vec3 centroid{}, normal{};
+        if (!xrGroupFacing(rigs, n, centroid, normal))
+            return std::clamp(fallback, minDist, maxDist);
+        const float d = std::fabs(-centroid.x * normal.x + -centroid.z * normal.z);
+        if (!xrFinite(d) || d < minDist || d > maxDist)
+            return std::clamp(fallback, minDist, maxDist);
+        return d;
+    }
+
+    inline SXRGroupSeat xrGroupSeatFrame(const SXRPose* group, size_t n, float authoredDistance, float minDist = XR_DISTANCE_MIN, float maxDist = XR_DISTANCE_MAX) {
+        SXRGroupSeat out;
+        Vec3         centroid{}, normal{};
+        if (!xrGroupFacing(group, n, centroid, normal))
+            return out;
+
+        out.distance  = std::clamp(xrFinite(authoredDistance) ? authoredDistance : minDist, minDist, maxDist);
+        out.frame.pos = Vec3{centroid.x + normal.x * out.distance, 0.F, centroid.z + normal.z * out.distance};
         // Face the group: forward (-Z) must be -normal, and qYawOf's convention makes that
         // atan2(normal.x, normal.z).
         out.frame.rot = qFromYaw(std::atan2(normal.x, normal.z));
