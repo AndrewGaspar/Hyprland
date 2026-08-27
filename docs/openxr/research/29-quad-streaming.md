@@ -75,6 +75,17 @@ Sequence:
 > picture carried as two 4:2:0 streams, recombined client-side) works on any 4:2:0 encoder at ~2×
 > engine cost — an option for text-critical quads, though it fights the engine-scarcity finding and
 > likely loses to "text-class quads never touch the video engine at all."
+>
+> **MEASURED (2026-08-21, `vainfo` on `/dev/dri/renderD129`, radeonsi/Mesa 26.2.1, VCN 4.0.5).** The
+> highest-value experiment this memo requested is done. Encode entrypoints: H264 CB/Main/High, HEVC
+> Main/Main10, AV1 Profile0 — 4:2:0 only, confirming the no-4:4:4 verdict on the device itself (the
+> `HEVCMain444` rows a bare `sudo vainfo` shows are the NVIDIA card's NVDEC **decode** shim).
+> `VAConfigAttribEncROI: num_roi_regions=32` — **ROI is supported; Phase 1a's ~20-line ffmpeg path is
+> GO.** `EncDirtyRect` and `EncSkipFrame` are **absent** from radeonsi's attribute set, so regime A is
+> ROI-only on this hardware regardless of the soundness argument above. Also measured: 32 quality
+> levels, 4 temporal layers, max picture width 4096 (H264) / 8192 (HEVC/AV1). Caveat for anyone
+> re-running: the user session exports the hypxrva shim (`LIBVA_DRIVERS_PATH`); override
+> `LIBVA_DRIVER_NAME=radeonsi LIBVA_DRIVERS_PATH=/usr/lib/dri` or the query fails.
 
 - **Now, unconditionally, three things.** (i) **Feed the damage we already compute downward into the
   encoder.** VA-API has taken damage-shaped input for years — `VAConfigAttribEncDirtyRect`, `EncROI`,
