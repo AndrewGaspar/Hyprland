@@ -508,6 +508,36 @@ reference-space change anyway). With `recenter_on_plug = false` the anchors are 
 says so — that is a deliberate "don't move my monitors" choice, and its cost is that the coordinates
 are now expressed in a frame that no longer exists.
 
+Either way that row now calls `handleFrameDiscontinuity`, which **first** marks every anchor's frame
+dead (§8.3) and only then decides whether to re-seat. Without that the `recenter_on_plug = false`
+branch left the anchors in a dead frame while the §8.3 capture went on happily deriving memories from
+them — a compensator that WARNed about the problem it was creating.
+
+#### The other reference space: STAGE
+
+`LOCAL`/`LOCAL_FLOOR` is the app's **seat**; `STAGE` is the **room** (research/28 §1.1). The same
+event type carries both, and which one it names changes what it means, so
+`xrSpaceChangeAction` decides:
+
+| space | `poseValid` | meaning | action |
+|---|---|---|---|
+| ours (`LOCAL`/`LOCAL_FLOOR`) | either | a recenter — the seat was re-established | the ladder above |
+| `STAGE` | true | the room frame moved and the runtime compensated for it | count it, log it, move nothing |
+| `STAGE` | false | the streamed world shifted by an amount **nobody can compute** | `handleFrameDiscontinuity` |
+| anything else | — | a space we do not hold | ignored, **with a log line** |
+
+The third row is the one that matters and the reason this exists. Our deployed WiVRn fork forwards
+the headset's own STAGE change, corrects it out when the runtime supplies a delta, and pushes this
+event when it cannot — explicitly so that "content anchored in the room is at least known to be
+suspect rather than silently wrong". The compositor used to filter on the space type it had created
+and drop it with no log at all: the only signal the whole stack produces that means *your world moved
+by an unknown amount*, discarded at the last hop.
+
+A read-only `STAGE` space is also created and located once a second for instrumentation (research/28
+M0) — `hyprctl openxr status` reports `world frame (STAGE)` and the log carries
+`M0 stage probe: T_localfloor<-stage = …`. Nothing is anchored in it yet; that measurement is what
+Track W is waiting on.
+
 #### Deliberate vs involuntary
 
 Everything above answers *"the origin moved; where do the monitors belong?"* with **the room** —
@@ -579,18 +609,29 @@ That is reference-space independent — when the origin moves, the head and the 
 and the offset does not change (gtest: `CaptureIsReferenceSpaceIndependent`). It is the exact inverse
 of the composition §8.2 performs, so the two round-trip.
 
-**Capture.** The frame loop re-derives each `anchor:local` monitor's offset into
-`CXRMonitorLayer::m_restoreOffset` every frame, immediately after the re-seat consumption (so a first
-plug reads the freshly seated pose rather than clobbering a good offset with the coordinates it is in
-the middle of replacing). It is gated on `m_restoreCapture`, because frames keep arriving after a doff
-from a headset lying on a desk, and remembering *that* arrangement would be worse than the bug.
+**Capture — a measurement, then a commit** (research/28 H2; changed 2026-08-27). While the user is
+wearing the headset, a monitor's offset is not a memory of where they *put* it, it is a live
+measurement of where it *is relative to them*. It becomes a memory only when the gate shuts. The two
+are now separate values, and the second one can refuse:
 
-**"Every frame" has a consequence worth stating here** rather than leaving it to be discovered: while
-the user is wearing the headset, a monitor's stored offset is not a memory of where they *put* it, it
-is a live measurement of where it *is relative to them*. It becomes a memory only when the gate shuts
-(doff, session end) and freezes the last such measurement — which is exactly the state §8.2's re-seat
-is designed to consume. Replanting a stored offset while the gate is OPEN is the identity, and §8.4
-exists because of it.
+- the frame loop re-derives the measurement into `CXRMonitorLayer::m_restoreStaged` every frame,
+  immediately after the re-seat consumption (so a first plug reads the freshly seated pose);
+- `COpenXRManager::commitRestorePlacements` promotes it into the durable `m_restoreOffset` on the
+  **main thread**, at an **edge** — the wearing gate closing (doff / visibility drop / session end),
+  and session teardown — through `xrRestoreCommitGate`.
+
+That split is invariant I11 (*durable state is never written from the frame path*), and it is what
+makes the "walk out of the room while still wearing, then doff" case survivable: the gate compares
+the staged value against the memory it would replace and refuses a horizontal drift beyond
+`XR_RESTORE_MAX_DRIFT` (2.5 m), because a re-seat makes the two equal by construction and the delta at
+the edge therefore measures exactly one thing — how far the wearer has moved **away from** the seat
+those monitors were placed in front of. Re-arranging the desk is centimetres; walking to the kitchen
+is metres. With no memory to compare against (a first commit) the bound is absolute instead:
+`XR_RESTORE_MAX_REACH` (8 m) horizontally, `XR_RESTORE_MAX_HEIGHT` (4 m) in y. Non-finite values are
+refused outright. Every refusal keeps the previous memory and is logged, and the verdict is readable
+in `hyprctl openxr status`.
+
+Replanting a stored offset while the gate is OPEN is the identity, and §8.4 exists because of it.
 
 The gate is **session visibility**, refined by presence — *not* the monitor plug state.
 `VISIBLE`/`FOCUSED` means the runtime is compositing our frames, which is the same condition `visible`
@@ -604,17 +645,37 @@ wearing, since refusing to capture until the first don event would leave a fresh
 with no durable placement at all. `publishRestoreCapture()` folds both, from the
 `updateMonitorsPlugged()` funnel every relevant edge already passes through, and logs its transitions.
 
+Three further gates on the staging step (research/28 H1/§F, added 2026-08-27):
+
+- the head sample must be **`TRACKED`**, not merely `VALID`. A valid-but-untracked pose is the
+  runtime's inferred or last-known guess, and a guess must never become a memory (§5.4 of report 28,
+  invariant I3). `VALID` still drives the *solve* — freezing the display whenever tracking blinks
+  would be worse than rendering the guess. The requirement is conditional on the runtime having ever
+  demonstrated it reports tracking at all, so a runtime that never sets the bits (monado's
+  null/remote drivers, i.e. the container suite) does not silently lose the whole feature;
+- the head must have an **observable yaw**. The frames between a physical doff and the visibility
+  drop *are* the removal motion, and a headset tilted through vertical has `qYawOf` fall back to its
+  caller's default — stamping a yaw of 0 in an arbitrary frame and rotating the whole remembered
+  arrangement about the user;
+- the layer's **reference frame must not be dead**. `invalidateAnchorFrames` raises
+  `m_anchorFrameStale` on every layer at each discontinuity (session start and end, a recenter
+  nothing could reconstruct, an unresolvable STAGE change — §8.1, W4) and records the pose it held
+  at that instant; `xrAnchorFrameReestablished` then refuses to stage until something has actually
+  re-placed it — a re-seat, a grab, a verb. **This is what stops a session's first frames from
+  overwriting the memory its own re-seat is about to consume**: at session start every surviving
+  `anchorPose` is still expressed in the dead `LOCAL_FLOOR` of the session that just ended, the
+  RESTORE re-seat is armed by the first *plug*, and that plug is deferred behind presence or
+  `monitor_plug_settle_ms` while the capture gate opens on visibility alone.
+  This generalises the older "skip while the live pose is still bit-equal to the **declaration**"
+  rule, which asked the same provenance question against a reference that only existed for
+  config-declared monitors and said nothing about a mid-session discontinuity. It is still bit-exact
+  rather than epsilon'd, and for the same reason: it asks "is this pose still the copy it was
+  assigned from", not "is it near it".
+
 Capture is also skipped while an adaptive monitor is anything but `DOCKED`: its `anchorPose` is the
 saved desk pose while the user has walked away from it, so measuring that against their current head
-would remember the walk.
-
-It is skipped, too, while the live pose is still **bit-equal** to the declaration (`xrPoseIdentical`).
-A monitor that has not been re-seated or moved since its `xrmonitor` line was applied is literally
-sitting at "`pos:` relative to the runtime's origin" — the arbitrary spot §8.2 exists to rescue it
-from — and remembering that would defeat the rescue next session. The test is exact rather than
-epsilon'd on purpose: it asks about provenance ("is this pose still the copy it was assigned from"),
-not proximity. A config reload that changes a declared anchor re-seeds the live pose *and* clears the
-stored capture, so the new declaration wins over an older placement.
+would remember the walk. A config reload that changes a declared anchor re-seeds the live pose, clears
+the stored capture *and* re-marks the frame, so the new declaration wins over an older placement.
 
 **Restore.** `xrReseatSource(mode, restoreValid)` picks:
 
@@ -641,8 +702,10 @@ lands in front of whoever plugs in). `openxr create` with a caller-supplied `pos
 uncaptured at creation for the same reason — an explicit `pos:` is a declared rig, and measuring where
 it currently sits would make a monitor the user cannot see permanently unreachable.
 
-`hyprctl openxr status` reports this per monitor (`restore [x, y, z] (head-relative)`, or `restore
-none`), so "will my room come back" is answerable before restarting anything.
+`hyprctl openxr status` reports this per monitor — the memory (`restore [x, y, z] (head-relative)`, or
+`restore none`), the live measurement behind it (`staged […]`), and the verdict of the last commit
+(`last commit committed` / `refused (drifted …)` / `nothing staged`) — so "will my room come back" is
+answerable before restarting anything, and a *refusal* does not look like a dead capture.
 
 ### 8.4 The deliberate re-seat — `xrmonitor reseat`
 
@@ -695,8 +758,8 @@ monitor group implies the frame of the viewer it was arranged **for** — stand 
 head-on — and re-seating means moving that implied viewer onto the actual one
 (`xrGroupSeatFrame`, `XRAnchor.hpp`):
 
-- **position** = the group's centroid, pushed back along its **mean facing normal** by the distance
-  the user is currently viewing it from, measured **perpendicularly** to that normal;
+- **position** = the group's centroid, pushed back along its **mean facing normal** by the group's
+  **authored** viewing distance;
 - **orientation** = facing the group (forward = −normal);
 - yaw-only, on the floor (`y = 0`) — the same shape `xrHeadFrame` produces, so it drops straight
   into `xrPoseInHeadFrame` / `recenterLocalToHead`.
@@ -704,15 +767,31 @@ head-on — and re-seating means moving that implied viewer onto the actual one
 Every monitor is then re-expressed in that one frame and replanted in the head's, so the transform
 is rigid: **relative layout preserved exactly**, only the group as a whole travels.
 
+**Where the authored distance comes from** (research/28 S1; changed 2026-08-27 — this used to be the
+distance the group *currently happened* to be from the user, and that was reported symptom B). A
+declared, head-relative `pos:` is a sentence about the wearer, so evaluating the same seat geometry
+over the **declared rigs** with the head at their origin says how far back the arrangement was meant
+to be viewed from (`xrGroupAuthoredDistance`). With no rigs to ask — every monitor in the group is
+ad-hoc — `openxr:default_distance` answers. An ad-hoc monitor's "declaration" is deliberately excluded
+from the vote: it is the dead-frame world pose `applyCenter` derived, i.e. the very corruption an
+authored distance exists not to inherit (`CXRMonitorLayer::m_declaredRig`).
+
+Note what the authored distance of a toed-in *arc* is: the distance to the group's **centroid**, which
+an arc pulls in from its radius. That is exactly the quantity this formula consumes, so deriving it
+from an arrangement and feeding it back reproduces that arrangement's own focus.
+
 Three properties earn their design:
 
-- **It is a fixed point.** After a re-seat the head *is* the group's seat frame, so pressing again is
-  the identity. The perpendicular projection is what buys this; a plain head-distance would creep the
-  group outward on every press.
+- **It is a fixed point**, now unconditionally. After a re-seat the group sits exactly `dist`
+  perpendicular from the head along its own normal, so a second press derives the same frame and the
+  transform collapses. The old measured form bought this with the perpendicular projection, and only
+  as far as the clamp allowed.
 - **Sliding along a wall is not walking away from it.** Standing 3 m to one side of monitors you sit
-  1.5 m from is still a 1.5 m viewing distance, so they come round to 1.5 m in front of you.
-- **The distance is clamped** to `XR_DISTANCE_MIN`…`XR_DISTANCE_MAX` (0.3–5 m), the same clamp every
-  placement verb uses, so re-seating from across the room does not park the group across the room.
+  1.5 m from still brings them round to 1.5 m in front of you — now for free, because where the user
+  happens to be standing no longer enters the derivation at all.
+- **The distance is clamped** to `XR_DISTANCE_MIN`…`XR_DISTANCE_MAX` (0.3–5 m) — as a bound on the
+  *answer*, which is all a clamp should ever have been. Using it as a *repair* is what planted a
+  20 m-corrupted group at exactly 5 m, in front of the user and unusable (invariant I14).
 
 Degenerate groups are refused rather than guessed at. Normals that cancel — a ring of monitors
 surrounding the user — have no "in front of" to be brought around to, so the frame loop leaves the
@@ -723,9 +802,10 @@ with the group but gets no vote on where its front is.
 
 §8.3's capture runs immediately after the re-seat, on the same frame, off the same head — and
 `xrPoseInHeadFrame` is the exact inverse of the composition `recenterLocalToHead` performs. So the
-capture re-measures the very offset the re-seat just planted: the stored placement comes back
-unchanged, and a monitor that was `restorable` before a re-seat is still `restorable` after it, with
-the same meaning. That is what makes the verb safe to bind to a key and mash, and what makes a
+capture re-measures the very offset the re-seat just planted: the *staged* value comes back unchanged,
+the memory it will be committed against is the one it already agrees with, and a monitor that was
+`restorable` before a re-seat is still `restorable` after it, with the same meaning. (That agreement
+is also what gives the commit gate's drift bound its meaning — see §8.3.) That is what makes the verb safe to bind to a key and mash, and what makes a
 `follow`-policy recenter idempotent instead of cumulative
 (gtest: `ReseatThenCaptureIsAFixedPoint`).
 

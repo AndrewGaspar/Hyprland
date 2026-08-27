@@ -1,8 +1,15 @@
 # 28 — The spatial model: frames, hydration, and what a placement actually *means*
 
-**Status:** research / problem-shaping. **Nothing here is implemented.** No code changes, no builds, no
-live actuation — every `hyprctl` call in the evidence base was read-only, the live fishfood session was
-never touched, and no process was signalled. Author: research pass 2026-08-26. Base commit: `67200a838`.
+**Status:** research / problem-shaping. Author: research pass 2026-08-26. Base commit: `67200a838`.
+No code changes, no builds and no live actuation in the research pass itself — every `hyprctl` call in
+the evidence base was read-only, the live fishfood session was never touched, and no process was
+signalled.
+
+> **2026-08-27 — the first tranche is built.** `W4`, `H2`, `S1`, `M0` and the §3.4 hygiene items
+> shipped on branch `spatial-model-t1` (base `3d05c096b`), gtested but **not yet exercised against a
+> headset**. **[§14](#14--addendum-2026-08-27--tranche-1-what-shipped-and-what-it-retired) is the
+> addendum**: what was built, what it retired, and what the next tranche should be. The body of this
+> report is unchanged and still describes the pre-tranche code — read §14 alongside §1, §3 and §10.
 
 **Relationship to report 22.** [22-spatial-persistence-locations](22-spatial-persistence-locations.md)
 (2026-08-03, base `c3bdf3aa`) asked *"how do we obtain a stable frame?"* and answered with the
@@ -2276,3 +2283,167 @@ this report depends on, and `xrgrid recenter`, the direct ancestor of a frame re
 display-time-constraint vs stored-identity distinction); `research/XREAL-3DOF.md` §6 (the 3DoF
 degradation contract); `research/25-staging-container-headset-loop.md` §3.3 (a headset that leaves for
 another server is a session *loss*, so the 20 s unplug grace does not apply).
+
+---
+
+## 14 — Addendum 2026-08-27 — tranche 1: what shipped, and what it retired
+
+Branch `spatial-model-t1`, base `3d05c096b`. Built to §10's "if only three things get built" list —
+**W4, H2, S1** — plus **M0**'s instrumentation and the §3.4 hygiene items, under an explicit
+simplification mandate. gtests **1091 → 1103** (one deleted, thirteen added), all passing. **Not yet
+run against a headset, and not deployed.**
+
+### 14.1 What was built
+
+| WP | what | where |
+|---|---|---|
+| **W4** | The STAGE reference-space change is no longer discarded. `xrSpaceChangeAction` (`XRMath.hpp:341`) splits the one event struct into *our seat frame moved* / *the room frame moved and the runtime compensated* / *the room frame moved by an unknown amount* / *a space we do not hold*, and the last of those is logged instead of returning silently. The unresolvable case runs `handleFrameDiscontinuity` (`OpenXRManager.cpp:4454`). | `XRSession.cpp:451-479`, `OpenXRManager.cpp:1575-1595` |
+| **H2** | The capture stages (`m_restoreStaged`, frame thread) and the **main thread commits at the edge** through `xrRestoreCommitGate` — doff / visibility drop / session end. Invariant I11 holds by construction. The gate refuses a non-finite pose, a first memory out of reach, and — the one that matters — a drift beyond 2.5 m from the memory it would replace, which is the walk-away of §3.3 #1. | `XRAnchor.hpp:290-345`, `OpenXRManager.cpp:2325-2367` (stage), `:4400` (commit) |
+| **H2/§F** | The **ordering window** is closed at its source. `invalidateAnchorFrames` (`:4435`) marks every anchor's frame dead at each discontinuity and records the pose it held; `xrAnchorFrameReestablished` (`XRAnchor.hpp:279`) refuses to stage until something has re-placed it. A session's first frames can no longer overwrite the memory its own re-seat is about to consume. | as above |
+| **S1** | `xrGroupSeatFrame` (`XRAnchor.hpp:453`) takes an **authored** distance instead of measuring the live one. `xrGroupAuthoredDistance` derives it from the declared, head-relative rigs, else `openxr:default_distance`. The head no longer enters the seat derivation at all. | `XRAnchor.hpp:388-470`, `OpenXRManager.cpp:2257`, `:4529` |
+| **M0** | A read-only `STAGE` space, created best-effort (`XRSession.cpp:createStageSpace`), located in `LOCAL_FLOOR` once a second and at every moment that could move either — session start, recenter, don/doff, a STAGE change — plus the play-area extents once. Logged as `M0 stage probe:` (`OpenXRManager.cpp:2087`) and reported as `world frame (STAGE)` in status. Self-skips on a runtime that does not enumerate STAGE. | `XRSession.cpp:295-336`, `OpenXRManager.cpp:2060-2100` |
+| **H1 / §3.4** | `TRACKED` as well as `VALID` for anything that feeds durable state (and *only* for that — `VALID` still drives the solve), conditional on the runtime having ever set the bits; finiteness at every durable boundary; an observable head yaw required to stage; `m_lastVerbCtx` reset in `stop()`. | `OpenXRManager.cpp:2040-2058`, `:1127` |
+
+**The M0 probe is what the next attended session is for.** One don, with the log at DEBUG, doing:
+recenter ×2, doff/don, a WiVRn reconnect, and — the important one — a Quest Space re-setup. If
+`T_localfloor←stage` stays put across the first three and the fourth produces a `STAGE` change event,
+Track W is unblocked exactly as §2.6 predicts. If STAGE drifts with LOCAL_FLOOR, it is worth no more
+than LOCAL_FLOOR and §7.1's cheapest rung is gone.
+
+### 14.2 The simplification audit
+
+The report's diagnosis is *three parallel, independently-latched spatial references with no single
+owner*, plus a ladder of compensators. This is every compensator, latch and knob in the placement
+stack, and its fate. **Deletions were made only where this tranche's own changes subsume them**, each
+with the invariant that now covers it; the ladder is not big-banged.
+
+#### Retired by this tranche (deleted)
+
+| what | why it was there | what covers it now |
+|---|---|---|
+| `xrGroupSeatFrame`'s head-distance measurement + `clamp(…, 0.3, 5)` **as a repair** (~8 lines, and the `head` parameter with it) | the seat needed *a* distance and the live one was the only one available | the **authored** distance (S1). The clamp survives as a bound on the answer, which is invariant I14's job, not a repair mechanism |
+| `m_recenteredThisSession` (decl + comment + 3 uses, ~12 lines) | read as a second gate on "re-seat once per session" | it was **dead state**: only ever set inside `if (firstPlug && !m_recenteredThisSession)`, with `m_everPlugged` set true on the same path, so the second term was always true when the first was. `m_everPlugged` is the gate |
+| the per-frame durable write `l->m_restoreOffset = …; l->m_restoreValid = true;` on the frame thread | there was no commit, so the last frame's measurement became the memory by default | staging + `commitRestorePlacements` (**I11**). SteamVR has the same bug (openvr#994) |
+| the `xrPoseIdentical(anchorPose, declaredAnchor)` capture skip (~10 lines) | a proxy for "nothing has placed this monitor yet" | `xrAnchorFrameReestablished` asks the same provenance question against the pose held at the last **discontinuity** — which exists for ad-hoc monitors too, and covers mid-session frame deaths the old check never saw. Strictly a superset; gtest `DeclaredRigIsRecognisedAsARigNotAPlacement` proves every old case still behaves identically |
+| the duplicated `observable` lambda inside `solveReferenceSpaceChangeFromHead` | it predated any shared helper | `qYawObservable`, which the staging gate needed anyway |
+| the recenter ladder's row-3 body, duplicated in prose and code with W4's needs (~25 lines) | there was only one caller | `handleFrameDiscontinuity` — and unifying them **fixed a bug**: the `recenter_on_plug = 0` branch used to WARN about a dead frame and then let the capture go on writing memories from it (§3.3 #2) |
+| `m_lastVerbCtx` surviving a session (§3.4.3) | nothing reset it | reset in `stop()`. It kept reporting `viewValid == true` with a dead session's head pose *forever* |
+
+#### Retired by a later track (left standing, deliberately)
+
+| what | retired by | note |
+|---|---|---|
+| `m_declaredAnchor` holding an ad-hoc monitor's dead-frame world pose | **W5** (the binding record) / **H3** (provenance) | the §3.3 #3 hole is *narrowed* — a refused or absent commit still falls back to planting these coordinates — but not closed. **This is the largest remaining sharp edge**, see §14.5 |
+| `xrReseatSource`'s DECLARED/RESTORED ladder | **W1/W5** | a binding that names its frame makes the question disappear rather than answering it |
+| the adaptive dock seat `m_dockHeadPos` being unpersisted, and `bodyHeight` recaptured on first wear (§7.4) | **H3** | both are placements in a frame with no provenance; the fix is the provenance record, not a new latch |
+| the stored restore offset carrying a full quaternion while the re-seat is yaw-only and serialization drops roll (§3.4.5) | **H3/W5** | one representation, once |
+| the floor-regime ambiguity — a pose captured under `LOCAL_FLOOR` restored under `LOCAL + floor_offset` (§3.4.6) | **H3** | provenance has to record the regime |
+| `openxr:recenter = hold\|follow` gaining `auto` (§7.3) | **H5** | needs a generation token to be conditional on |
+| `openxr:recenter_on_plug` as a global knob | **W3** | becomes the default *don policy* of a binding; the boolean keeps parsing (§9.1) |
+| the near-cancelling group normal band `1e-3 … ~0.05` (§3.4.4) | **S2** | a seat that is an object has a stored facing and stops deriving one from noise |
+| four hydration paths (first-plug RESTORE, the recenter fallback, GROUP, reload reconciliation) (**I12**) | **W3** | one locatability-edge handler with a synthesised initial edge |
+| `XRInput.cpp:344` grips checked for `VALID` only | **H1 (rest)** | deliberately untouched: grips feed grabs, not durable state, and the release ring already rejects the release jerk. Gating them on `TRACKED` risks breaking hand tracking for no durable-state gain |
+
+#### Load-bearing keep
+
+| what | why |
+|---|---|
+| the head-pair delta reconstruction (`solveReferenceSpaceChangeFromHead`) | monado hard-codes `pose_valid = false` on *every* recenter. Only **R2** (a runtime fix) retires this, and it is the difference between holding the room and an 8.25 m teleport |
+| `xrRecenterFix`'s three-rung ladder | each rung answers a different knowable; rows 1-2 are unaffected by this tranche |
+| `xrRecenterIsNoOp` | skipping a null delta avoids warping every spring for nothing |
+| the RESTORE / GROUP split and the CAS-max arming | §8.4's argument still holds exactly: a discontinuity must be repaired from stored offsets *before* "move the live arrangement" means anything |
+| `xrReseatEligible`, `xrReseatBlock` | one definition of which monitors move and when the verb must refuse; both gtested |
+| `m_restoreCapture`'s visibility+presence fold, and presence-unknown-counts-as-wearing | the gate is right and the ordering hazard it created is now fixed elsewhere. Gating it on the *plug* instead silently disabled the whole feature under `monitors_follow_session = off` once already |
+| capture skipped while an adaptive monitor is not `DOCKED` | measuring a saved desk pose against a walked-away head remembers the walk |
+| the whole adaptive decorator (geofence, dwell, easing, `m_adLeftSinceDock`) | §7.4: shipped, tuned, live-validated, and matching both vendors' published guidance. **Do not rebuild** |
+| `openxr:default_distance` | now *more* load-bearing: it is the authored distance's fallback |
+| `openxr:floor_offset`, `monitors_follow_session` + settle/grace | unrelated to the frame problem; W3 reuses the plug machinery for hydration gating |
+| dropping the latched 2D reference on a re-seat (report 12 §3a) | the projection must re-derive against the head the group just landed in front of |
+
+**Verdict on the slop hypothesis.** Partly right, and not where it looked. There was exactly one piece
+of genuinely dead state (`m_recenteredThisSession`) and one piece of duplicated logic (the row-3
+block); the rest of the ladder is doing real work against a runtime that withholds the delta on every
+recenter. What *was* slop is subtler and worse than redundancy: **two mechanisms that approximated a
+missing invariant** — the bit-equal-to-declaration check standing in for "has this pose been
+established in the live frame", and the clamp standing in for "how far away was this meant to be
+viewed from". Both were sound-looking code doing the wrong job, and both shrank when the real
+invariant was written down. That is the shape to look for in the next tranche, rather than for
+unused variables.
+
+### 14.3 Line counts
+
+| | added | deleted |
+|---|---|---|
+| `src/openxr/` (all lines) | 794 | 129 |
+| `src/openxr/` (code only, comment-only lines excluded) | 399 | 73 |
+| `tests/xr/anchor_math.cpp` | 374 | 62 |
+| `hyprtester/src/tests/xr/anchors.cpp` | 8 | 2 |
+
+Net **+665 lines in `src/`**, of which roughly half is comment: this tranche adds a commit path, a
+frame-liveness rule, a probe and a status surface, and deletes two compensators. It is not a net
+shrink and was never going to be — the shrink shows up in the *later* tracks, where a binding record
+retires the four-way "which pose do I mean" split (§1.2) and the four hydration paths (I12) that this
+tranche only makes safe.
+
+### 14.4 Deviations from this report, with reasons
+
+1. **No debounced periodic commit** (H2 asks for one, citing WayVR's issue #529). With no disk
+   persistence, every edge that matters already produces a commit: doff, visibility drop, session
+   stop, and `stop()` itself. The only uncovered case is a compositor crash, which loses the layers
+   too. Adding a timer would be a moving part with nothing to buy. **This becomes necessary the moment
+   W5's state file exists** — at that point an unclean compositor exit *does* lose committed state.
+2. **The plausibility bound is a drift bound, not a head-motion bound.** The report's H2 sketch says
+   "reject a capture whose delta from the previous accepted one exceeds a plausibility bound"; §3.3's
+   narrative suggests measuring the head. Drift is the better instrument *because* a RESTORE re-seat
+   makes the staged and committed values equal by construction, so the delta at the edge measures
+   precisely "how far has the wearer moved away from the seat these monitors were placed in front
+   of" — and a deliberate re-seat at a new desk resets it to zero, so genuine re-arrangement is
+   never punished. Thresholds are asymmetric on purpose (2.5 m): a refused good commit costs one
+   keybind, an accepted bad one is the reported catastrophe.
+3. **The `TRACKED` requirement is conditional.** I3 says durable state must never come from an
+   untracked pose. Enforced unconditionally, a runtime that never sets the bits (monado's
+   null/remote drivers — i.e. the entire container suite, and possibly some real ones) would silently
+   lose the whole restore feature. It is enforced only once the runtime has demonstrated it reports
+   tracking at all, and says so once at DEBUG when it has not. §4.9's rule, applied to ourselves:
+   ship only the states you actually emit.
+4. **STAGE is created, which §14's brief scoped out of W-work.** It is created *read-only* and used
+   only by the M0 probe; no anchor, binding or layer references it. Without it M0 cannot answer its
+   question, and W4's event handling is unchanged either way (monado delivers the event regardless of
+   which spaces the session created — `oxr_session.c:150-200`).
+5. **The authored distance is derived from declared rigs, not stored per group.** A true authored
+   *seat pose* is S2. Consequence worth stating: a user who grab-moves their whole arrangement further
+   away has not re-authored anything, so a re-seat brings it back to the declared/default distance
+   rather than the one they last used. That is the intended repair (§3.2, I4) and it will feel wrong
+   to anyone who deliberately sits 3 m back with no `xrmonitor` lines — S2 is what fixes that
+   properly, and `openxr:default_distance` is the escape hatch until then.
+6. **A STAGE change with a *valid* pose is counted and logged, not acted on.** §2.4's server-side
+   correction has already parked the tracking origin, so LOCAL_FLOOR and STAGE moved together and our
+   content is where the room left it. Acting would double-correct — which is precisely the bug
+   `38a8cdfe` deleted on the WiVRn side.
+
+### 14.5 What the next tranche should be
+
+In order, and the first one is not code:
+
+1. **Run M0.** One attended don. Everything in Track W is contingent on it and it cannot be answered
+   from the desk.
+2. **H3 — provenance**, and specifically the *binding record* half: `{frameId, generation, capturedAt,
+   evidence}` on every stored pose. It is the report's highest-value single change (§1.2, I1), and it
+   is what retires the `m_declaredAnchor`-holds-dead-coordinates hole this tranche only narrowed.
+   Concretely, that hole is the last remaining path by which a monitor can still land "outside the
+   house": a `LOCAL` monitor whose commit was refused (or never made) falls back to a "declared" rig
+   that, for an ad-hoc monitor, is a dead frame's world pose. With a provenance stamp the restore can
+   **refuse** instead of planting it — which is I2, and which needs W3's "unhydrated is a first-class
+   outcome" to have somewhere to put the refusal.
+3. **H5 — mint our own generation ID.** Needs nothing from any runtime, upgrades in place the day one
+   supplies a real `XR_EXT_stationary_reference_space` id, and it is the only thing that addresses
+   S12b (carried to another room while doffed). It also makes `openxr:recenter = auto` expressible.
+4. **S2 — the seat as an object**, which turns S1's derived distance into a stored one and demotes
+   `xrGroupSeatFrame` to an initialiser.
+5. Then Track W proper, gated on M0.
+
+**Acceptance scenarios this tranche now covers** (§8.2): S3 (the walk-away is refused — gtest
+`TheWalkAwayIsRefusedAndTheWorkspaceIsKept`), S6 (re-seat returns to the authored distance and is
+still a fixed point), S8 (an untracked head produces no durable write), and S12's compositor half (an
+unresolvable STAGE change is loud and treated as a discontinuity). **Still open:** S2, S5's refusal
+half, S7, S11, S12b, S16, S17 — all of which need a binding that names its frame.
