@@ -288,8 +288,46 @@ bool CXRSession::createSpaces(CXRGraphics& gfx) {
         return false;
     }
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] reference spaces created ({} + VIEW)", m_usingLocalFloor ? "LOCAL_FLOOR" : "LOCAL");
+    // research/28 M0: STAGE, read-only. Its support is `optional:` in the spec, so enumerate first —
+    // "the runtime does not have a room frame" and "creating it failed" are different answers and the
+    // probe has to be able to say which. A failure here is never fatal: the probe self-skips and every
+    // other path is untouched (nothing is anchored in STAGE by this tranche).
+    createStageSpace(gfx);
+
+    Log::logger->log(Log::DEBUG, "[OPENXR] reference spaces created ({} + VIEW{})", m_usingLocalFloor ? "LOCAL_FLOOR" : "LOCAL", m_stageSpace != XR_NULL_HANDLE ? " + STAGE" : "");
     return true;
+}
+
+void CXRSession::createStageSpace(CXRGraphics& gfx) {
+    uint32_t spaceCount = 0;
+    if (XR_FAILED(xrEnumerateReferenceSpaces(m_session, 0, &spaceCount, nullptr)) || spaceCount == 0) {
+        Log::logger->log(Log::DEBUG, "[OPENXR] xrEnumerateReferenceSpaces returned nothing — no STAGE probe (research/28 M0)");
+        return;
+    }
+    std::vector<XrReferenceSpaceType> types(spaceCount);
+    if (XR_FAILED(xrEnumerateReferenceSpaces(m_session, spaceCount, &spaceCount, types.data())))
+        return;
+    for (auto t : types)
+        if (t == XR_REFERENCE_SPACE_TYPE_STAGE)
+            m_stageEnumerated = true;
+
+    if (!m_stageEnumerated) {
+        Log::logger->log(Log::DEBUG, "[OPENXR] runtime does not enumerate XR_REFERENCE_SPACE_TYPE_STAGE — the room-frame probe self-skips (research/28 M0)");
+        return;
+    }
+
+    XrReferenceSpaceCreateInfo info = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+    info.poseInReferenceSpace       = {{0, 0, 0, 1}, {0, 0, 0}};
+    info.referenceSpaceType         = XR_REFERENCE_SPACE_TYPE_STAGE;
+
+    eglMakeCurrent(gfx.m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, gfx.m_xrContext);
+    const XrResult r = xrCreateReferenceSpace(m_session, &info, &m_stageSpace);
+    eglMakeCurrent(gfx.m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+
+    if (XR_FAILED(r)) {
+        m_stageSpace = XR_NULL_HANDLE;
+        Log::logger->log(Log::WARN, "[OPENXR] STAGE is enumerated but xrCreateReferenceSpace failed: {} — the room-frame probe self-skips", (int)r);
+    }
 }
 
 bool CXRSession::chooseSwapchainFormat() {
@@ -411,14 +449,47 @@ void CXRSession::pollEvents() {
                 break;
             }
             case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING: {
-                // Runtime recenter (doc 03 §6). Forward to the anchor engine via the frame loop.
+                // Two different events wear this one struct, and telling them apart is research/28's
+                // single most actionable finding (§2.4, W4).
+                //
+                //  - OUR reference space (LOCAL / LOCAL_FLOOR) moved: a recenter (doc 03 §6). The app
+                //    SEAT was re-established; content expressed against it has to be re-expressed.
+                //  - STAGE moved: the ROOM frame the headset streams every pose in was redefined —
+                //    a Quest Space re-setup, a boundary redraw, a switch to a different recognised
+                //    Space. Our deployed wivrn-xg fork corrects this out when the runtime hands it a
+                //    delta and pushes THIS event when it cannot, precisely so applications learn that
+                //    room-anchored content is now suspect. It used to be dropped here without so much
+                //    as a log line: the one signal in the whole stack that means "your world moved by
+                //    an unknown amount", generated correctly by our own fork, delivered correctly by
+                //    monado, and discarded silently at the last hop.
+                //
+                // Anything else (VIEW, a type we never created) is still ignored — but never silently
+                // (invariant I9: no silent drops).
                 auto*      ev      = reinterpret_cast<XrEventDataReferenceSpaceChangePending*>(&event);
                 const auto ourType = m_usingLocalFloor ? XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR_EXT : XR_REFERENCE_SPACE_TYPE_LOCAL;
-                if (ev->referenceSpaceType == ourType) {
-                    m_recenterPending   = true;
-                    m_recenterPoseValid = ev->poseValid;
-                    m_recenterPose      = xrToPose(ev->poseInPreviousSpace);
-                    Log::logger->log(Log::DEBUG, "[OPENXR] reference space change pending (recenter, poseValid={})", (bool)ev->poseValid);
+                switch (OpenXR::xrSpaceChangeAction(ev->referenceSpaceType == ourType, ev->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_STAGE, ev->poseValid)) {
+                    case OpenXR::XR_SPACECHANGE_RECENTER:
+                        m_recenterPending   = true;
+                        m_recenterPoseValid = ev->poseValid;
+                        m_recenterPose      = xrToPose(ev->poseInPreviousSpace);
+                        Log::logger->log(Log::DEBUG, "[OPENXR] reference space change pending (recenter, poseValid={})", (bool)ev->poseValid);
+                        break;
+                    case OpenXR::XR_SPACECHANGE_WORLD_OK:
+                        m_worldChangePending   = true;
+                        m_worldChangePoseValid = true;
+                        Log::logger->log(Log::DEBUG, "[OPENXR] the headset's STAGE (room) frame was redefined with a usable delta — the runtime compensated; world content is unmoved");
+                        break;
+                    case OpenXR::XR_SPACECHANGE_WORLD_LOST:
+                        m_worldChangePending   = true;
+                        m_worldChangePoseValid = false;
+                        Log::logger->log(Log::WARN,
+                                         "[OPENXR] the headset's STAGE (room) frame was redefined with NO usable delta — the streamed world has shifted by an unknown amount and "
+                                         "cannot be corrected");
+                        break;
+                    case OpenXR::XR_SPACECHANGE_IGNORE:
+                        Log::logger->log(Log::DEBUG, "[OPENXR] ignoring a reference space change for type {} (we hold {} + VIEW{})", (int)ev->referenceSpaceType, (int)ourType,
+                                         m_stageSpace != XR_NULL_HANDLE ? " + STAGE" : "");
+                        break;
                 }
                 break;
             }
@@ -459,6 +530,11 @@ void CXRSession::destroy(bool runtimeLost) {
         if (!runtimeLost)
             xrDestroySpace(m_viewSpace);
         m_viewSpace = XR_NULL_HANDLE;
+    }
+    if (m_stageSpace != XR_NULL_HANDLE) {
+        if (!runtimeLost)
+            xrDestroySpace(m_stageSpace);
+        m_stageSpace = XR_NULL_HANDLE;
     }
     if (m_refSpace != XR_NULL_HANDLE) {
         if (!runtimeLost)

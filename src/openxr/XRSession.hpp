@@ -57,7 +57,7 @@ class CXRSession {
     bool               createInstance();                // false => UNAVAILABLE (no runtime / missing required ext)
     bool               getSystem();                     // xrGetSystem + xrGetSystemProperties + enumerate blend modes
     bool               createSession(CXRGraphics& gfx); // XrGraphicsBindingEGLMNDX
-    bool               createSpaces(CXRGraphics& gfx);  // reference space (LOCAL_FLOOR/LOCAL) + VIEW space
+    bool               createSpaces(CXRGraphics& gfx);  // reference space (LOCAL_FLOOR/LOCAL) + VIEW space (+ STAGE, best effort)
     bool               chooseSwapchainFormat();         // enumerate + pick once; stored on m_swapchainFormat
     // Teardown ordering (doc 01): spaces, session, instance. When runtimeLost is true (the runtime IPC
     // is already dead — a killed/restarted monado-service), the per-child xr destroy calls (spaces,
@@ -87,6 +87,13 @@ class CXRSession {
     XrSession  m_session         = XR_NULL_HANDLE;
     XrSpace    m_refSpace        = XR_NULL_HANDLE; // LOCAL_FLOOR or LOCAL
     XrSpace    m_viewSpace       = XR_NULL_HANDLE; // VIEW
+    // research/28 M0: STAGE — the runtime's ROOM frame, as opposed to the app SEAT that LOCAL/
+    // LOCAL_FLOOR are (§1.1). Created READ-ONLY and located for instrumentation only: nothing is
+    // anchored in it by this tranche, and the whole recommendation of report 28 hangs on one attended
+    // measurement of whether the Quest still publishes a stable STAGE while our WiVRn fork suppresses
+    // the boundary. XR_NULL_HANDLE on any runtime that does not enumerate it (the probe self-skips).
+    XrSpace    m_stageSpace      = XR_NULL_HANDLE;
+    bool       m_stageEnumerated = false; // STAGE appeared in xrEnumerateReferenceSpaces
     bool       m_usingLocalFloor = false;
     bool       m_hasLocalFloor = false, m_hasHandInteraction = false, m_hasHandTracking = false;
     // The two probe-only extensions behind the wrong-GPU guard in start(), each advertised AND
@@ -155,7 +162,22 @@ class CXRSession {
     bool            m_recenterPoseValid = false;
     OpenXR::SXRPose m_recenterPose;
 
+    // research/28 W4 — the one signal the whole stack produces that means "your world has moved by
+    // an unknown amount", and until now the compositor was the only component that threw it away.
+    // Our deployed WiVRn fork (wivrn-xg) forwards the headset's STAGE reference-space change over the
+    // wire, corrects for it when the pose is valid, and — when it is NOT, which is exactly the
+    // carried-to-another-room case — pushes a STAGE XrEventDataReferenceSpaceChangePending so that
+    // "content anchored in the room is at least known to be suspect rather than silently wrong".
+    // monado delivers it to every session regardless of which spaces that session created. Set by
+    // pollEvents; consumed + cleared by the frame loop. Frame-thread only, like the recenter flags.
+    bool            m_worldChangePending   = false;
+    bool            m_worldChangePoseValid = false;
+
   private:
+    // research/28 M0: enumerate + create STAGE, read-only. Never fatal; leaves m_stageSpace null when
+    // the runtime has no room frame to offer.
+    void        createStageSpace(CXRGraphics& gfx);
+
     std::string m_runtimeName;
     std::string m_systemName;
 };
