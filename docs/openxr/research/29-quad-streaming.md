@@ -63,6 +63,19 @@ the system's primary scarce resource. So the project is not *"forward the quads"
 **Recommendation.** Extend Monado/WiVRn; do **not** write a runtime, and do **not** write a client.
 Sequence:
 
+> **CORRECTION (2026-08-21, operator review).** Two precisions on this list, from review discussion.
+> (1) `VAEncDirtyRect`/`EncSkipFrame` are **unsound against today's eye-buffer encode**: micro head
+> motion re-projects every world-locked quad every frame, so "areas not covered are assumed
+> unchanged" would be false for the whole frame — the encoder would corrupt blocks it was told to
+> trust. In regime A only **ROI** (a quality bias, valid under global motion) applies today; dirty
+> rects and skip-frames become sound exactly when the encoded object is a quad's *own surface*
+> (§ forwarded layers), where desktop damage maps 1:1 to encoder damage. The engine-time win today
+> lives entirely in regime B (frame gating + client reprojection), as the ranking below already says.
+> (2) "No AMD ASIC can encode 4:4:4" stands, but RDP's **AVC444** precedent (MS-RDPEGFX: a 4:4:4
+> picture carried as two 4:2:0 streams, recombined client-side) works on any 4:2:0 encoder at ~2×
+> engine cost — an option for text-critical quads, though it fights the engine-scarcity finding and
+> likely loses to "text-class quads never touch the video engine at all."
+
 - **Now, unconditionally, three things.** (i) **Feed the damage we already compute downward into the
   encoder.** VA-API has taken damage-shaped input for years — `VAConfigAttribEncDirtyRect`, `EncROI`,
   `EncSkipFrame` — and we hand it none; ROI is reachable *today* through WiVRn's existing ffmpeg path
