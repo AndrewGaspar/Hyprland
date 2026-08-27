@@ -1537,6 +1537,85 @@ TEST(XRGroupSeatAuthored, DeclaredRigsDriveTheDistanceEndToEnd) {
     EXPECT_NEAR(toMid.length(), 2.5f, 1e-3f);
 }
 
+TEST(XRGroupSeatAuthored, OneCorruptedMonitorNoLongerDragsTheWholeGroupBack) {
+    // The container suite's `xr_reseat_verb`, reproduced to the third decimal. It is worth pinning
+    // numerically because that case FAILED against this tranche, and working out which side was wrong
+    // is the whole argument for S1 — the failure is the feature.
+    //
+    // The shared container session had drifted: `XR-conf-a` (a config-declared monitor whose rig is
+    // `pos:0,1.4,-1.5`) had been thrown to roughly [5.72, 1.4, -5.47], facing 146 degrees away, by
+    // earlier tests in the same instance — its committed restore offset in the artifacts reads 6.25 m.
+    // The test's own two monitors sat correctly at their declared ±0.6, -1.5. The user then swivels
+    // 75 degrees and presses re-seat.
+    //
+    // RETIRED contract: the seat distance is `clamp(|(head − centroid) · n|, 0.3, 5)` = 3.369 m,
+    // because ONE corrupted monitor dragged the centroid 2.8 m back. The whole arrangement — including
+    // the two monitors that were exactly where they belonged — is then re-seated to 3.4 m out. That is
+    // symptom B happening inside the test suite, asserted as correct.
+    //
+    // AUTHORED contract: the declared rigs all say 1.5 m, so 1.5 m is what comes back.
+    //
+    // Everything else about the two models is IDENTICAL: same centroid, same mean normal, same seat
+    // yaw, same rigid transform. The 1.87 m the container measured is exactly (3.369 − 1.5) along that
+    // normal, and nothing else.
+    const float                PIV    = 75.f * PI / 180.f;
+    const SXRPose              head{{0.f, 1.6f, 0.f}, qFromYaw(PIV)};
+    const float                badYaw = -146.0685f * PI / 180.f;
+    const std::vector<SXRPose> live{
+        {{-0.6f, 1.4f, -1.5f}, Quat{}},                // the test's own two, where they belong
+        {{0.6f, 1.4f, -1.5f}, Quat{}},                 //
+        {{5.7158f, 1.4f, -5.4706f}, qFromYaw(badYaw)}, // XR-conf-a, corrupted by earlier tests
+    };
+    // ...and what all three were DECLARED as: a flat wall 1.5 m in front of the wearer.
+    const std::vector<SXRPose> rigs{
+        {{-0.6f, 1.4f, -1.5f}, Quat{}},
+        {{0.6f, 1.4f, -1.5f}, Quat{}},
+        {{0.f, 1.4f, -1.5f}, Quat{}},
+    };
+
+    const float authored = xrGroupAuthoredDistance(rigs.data(), rigs.size(), 1.5f);
+    EXPECT_NEAR(authored, 1.5f, 1e-4f); // the verb reported "authored distance 1.50m"
+
+    // What the retired contract would have measured, from the same group the seat is derived from.
+    Vec3 centroid{}, normal{};
+    ASSERT_TRUE(xrGroupFacing(live.data(), live.size(), centroid, normal));
+    const float measured = std::fabs((head.pos.x - centroid.x) * normal.x + (head.pos.z - centroid.z) * normal.z);
+    EXPECT_NEAR(measured, 3.369f, 5e-3f);
+
+    // The two models differ in the distance and in NOTHING else — same seat orientation, and two seat
+    // positions separated by exactly (measured − authored) along the group's own normal.
+    const auto seatNew = xrGroupSeatFrame(live.data(), live.size(), authored);
+    const auto seatOld = xrGroupSeatFrame(live.data(), live.size(), measured);
+    ASSERT_TRUE(seatNew.valid);
+    EXPECT_NEAR(qAngleBetween(seatNew.frame.rot, seatOld.frame.rot), 0.f, 1e-4f);
+    EXPECT_NEAR(qYawOf(seatNew.frame.rot, 999.f) * 180.f / PI, -25.5f, 0.1f);
+    EXPECT_NEAR((seatOld.frame.pos - seatNew.frame.pos).length(), measured - authored, 1e-3f);
+    EXPECT_NEAR((seatOld.frame.pos - seatNew.frame.pos).length(), 1.87f, 1e-2f);
+
+    // A tell worth recording, because it is the defect stated as geometry: under the retired contract
+    // the seat always landed on the plane through the HEAD perpendicular to the group's normal. The
+    // "frame the arrangement was authored for" was defined to be wherever the user happened to be
+    // standing, projected — which is precisely why the verb could not repair anything.
+    EXPECT_NEAR((seatOld.frame.pos.x - head.pos.x) * normal.x + (seatOld.frame.pos.z - head.pos.z) * normal.z, 0.f, 1e-3f);
+
+    // The landings, to the centimetre. `authored` is what the compositor actually produced in the
+    // container; `measured` is what the test's longhand expected. Both are reproduced here exactly.
+    const auto afterNew = groupReseat(live, head, authored);
+    const auto afterOld = groupReseat(live, head, measured);
+    expectVecNear(afterNew[0].pos, Vec3{0.309f, 1.4f, 1.834f}, 1e-2f);  // observed in the container
+    expectVecNear(afterOld[0].pos, Vec3{-1.496f, 1.4f, 1.350f}, 1e-2f); // the retired expectation
+    EXPECT_NEAR((afterNew[0].pos - afterOld[0].pos).length(), 1.87f, 1e-2f);
+
+    // What the user gets out of it: the group's centroid comes back at the distance it was authored
+    // for, rather than at the distance one broken monitor had dragged it to (scenario S6).
+    Vec3 c2{}, n2{};
+    ASSERT_TRUE(xrGroupFacing(afterNew.data(), afterNew.size(), c2, n2));
+    EXPECT_NEAR(std::fabs((head.pos.x - c2.x) * n2.x + (head.pos.z - c2.z) * n2.z), authored, 2e-3f);
+    // ...and the arrangement itself is untouched: the re-seat moves the group, never its layout.
+    for (size_t i = 0; i + 1 < live.size(); ++i)
+        EXPECT_NEAR((afterNew[i + 1].pos - afterNew[i].pos).length(), (live[i + 1].pos - live[i].pos).length(), 1e-3f);
+}
+
 TEST(XRGroupSeat, PivotInPlaceBringsTheGroupToTheNewFacing) {
     // THE reported case, in its mild form: the user swivels their chair and wants the layout to
     // come round. Note what the §8.2 re-seat would have done here — nothing, because the capture had
