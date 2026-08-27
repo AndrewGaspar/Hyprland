@@ -166,12 +166,35 @@ namespace OpenXR {
         return qRotate(q, Vec3{0.F, 0.F, -1.F});
     }
 
+    // Does this orientation have an observable yaw at all? A head staring straight up or down (or a
+    // headset being lifted off, tilted through vertical on its way to the desk — research/28 §3.3)
+    // projects to nothing on the floor, and qYawOf below returns its caller's fallback rather than a
+    // measurement. Anything that STORES a yaw has to ask this first: the fallback is a sane default
+    // for a display frame and a fabrication for a memory.
+    inline bool qYawObservable(const Quat& q) {
+        const Vec3 f = qRotate(q, Vec3{0.F, 0.F, -1.F});
+        return std::sqrt(f.x * f.x + f.z * f.z) >= 1e-4F;
+    }
+
     // yaw about +Y such that yaw 0 faces -Z; returns fallback near vertical (doc 03 §1.5).
     inline float qYawOf(const Quat& q, float fallback) {
-        const Vec3 f = qRotate(q, Vec3{0.F, 0.F, -1.F});
-        if (std::sqrt(f.x * f.x + f.z * f.z) < 1e-4F)
+        if (!qYawObservable(q))
             return fallback;
+        const Vec3 f = qRotate(q, Vec3{0.F, 0.F, -1.F});
         return std::atan2(-f.x, -f.z);
+    }
+
+    // ---- finiteness (research/28 §3.4.2, invariant I3) ----
+    //
+    // xrToPose is a raw field copy and nothing between the runtime and a stored placement tested for
+    // NaN: springStep and qSlerp both propagate it, and serializeXRMonitorLine would happily emit
+    // `nan`. Every boundary where a pose becomes DURABLE state checks this.
+    inline bool xrFinite(float v) {
+        return std::isfinite(v);
+    }
+    inline bool xrPoseFinite(const SXRPose& p) {
+        return xrFinite(p.pos.x) && xrFinite(p.pos.y) && xrFinite(p.pos.z) && xrFinite(p.rot.x) && xrFinite(p.rot.y) && xrFinite(p.rot.z) && xrFinite(p.rot.w) &&
+            std::fabs(p.rot.x * p.rot.x + p.rot.y * p.rot.y + p.rot.z * p.rot.z + p.rot.w * p.rot.w - 1.F) < 1e-2F;
     }
 
     inline float qAngleBetween(const Quat& a, const Quat& b) {
@@ -264,11 +287,7 @@ namespace OpenXR {
     inline SXRPose solveReferenceSpaceChangeFromHead(const SXRPose& headOld, const SXRPose& headNew) {
         // A head staring straight up or down has no observable yaw (doc 03 §1.5). Rather than let
         // qYawOf's fallback invent one, treat the rotation as unchanged and correct translation only.
-        const auto observable = [](const Quat& q) {
-            const Vec3 f = qRotate(q, Vec3{0.F, 0.F, -1.F});
-            return std::sqrt(f.x * f.x + f.z * f.z) >= 1e-4F;
-        };
-        const Quat R = observable(headOld.rot) && observable(headNew.rot) ? qFromYaw(qYawOf(headOld.rot, 0.F) - qYawOf(headNew.rot, 0.F)) : Quat{};
+        const Quat R = qYawObservable(headOld.rot) && qYawObservable(headNew.rot) ? qFromYaw(qYawOf(headOld.rot, 0.F) - qYawOf(headNew.rot, 0.F)) : Quat{};
         return SXRPose{headOld.pos - qRotate(R, headNew.pos), R};
     }
 
@@ -293,6 +312,38 @@ namespace OpenXR {
         if (headOldValid && headOldAgeNs >= 0 && headOldAgeNs <= maxAgeNs)
             return eXRRecenterFix::XR_RECENTER_SOLVE_FROM_HEAD;
         return eXRRecenterFix::XR_RECENTER_RESEAT_TO_HEAD;
+    }
+
+    // ---- which reference space changed, and what that means (research/28 §2.4, W4) ----
+    //
+    // XrEventDataReferenceSpaceChangePending is one struct carrying two entirely different events, and
+    // telling them apart is the single most actionable finding of report 28.
+    //
+    //  - OUR space (LOCAL / LOCAL_FLOOR) moved: a recenter. The app's SEAT was re-established; content
+    //    named against it has to be re-expressed, and the ladder above decides how.
+    //  - STAGE moved: the ROOM frame the headset streams every pose in was redefined — a Space
+    //    re-setup, a boundary redraw, a switch to a different recognised Space. With a usable delta
+    //    the runtime has already compensated (our deployed wivrn-xg fork parks the tracking origin so
+    //    head, hands and content all move together): observe it and carry on. WITHOUT one there is no
+    //    transform at any layer, so every world pose in the process now describes a place that is not
+    //    where it says it is — a discontinuity, not a recenter.
+    //  - Anything else is a type we do not hold. Ignored, but never silently (invariant I9).
+    //
+    // Pure so the truth table is gtested rather than inferred from a headset that has to be carried
+    // into another room to produce the interesting row.
+    enum eXRSpaceChangeAction : uint8_t {
+        XR_SPACECHANGE_IGNORE = 0, // not a space we hold
+        XR_SPACECHANGE_RECENTER,   // our seat frame moved
+        XR_SPACECHANGE_WORLD_OK,   // the room frame moved and the runtime compensated
+        XR_SPACECHANGE_WORLD_LOST, // the room frame moved by an unknown amount
+    };
+
+    inline constexpr eXRSpaceChangeAction xrSpaceChangeAction(bool isOurReferenceSpace, bool isStage, bool poseValid) {
+        if (isOurReferenceSpace)
+            return XR_SPACECHANGE_RECENTER;
+        if (isStage)
+            return poseValid ? XR_SPACECHANGE_WORLD_OK : XR_SPACECHANGE_WORLD_LOST;
+        return XR_SPACECHANGE_IGNORE;
     }
 
     // A reconstructed delta this small is the runtime telling us the frame did not really move
