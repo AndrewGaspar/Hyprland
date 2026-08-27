@@ -578,33 +578,62 @@ TEST_CASE(xr_reseat_verb) {
     NLog::log("xr_reseat_verb: reseat replied '{}'", reply);
     std::this_thread::sleep_for(std::chrono::milliseconds(600)); // the frame thread consumes on its next valid-view frame
 
-    // Where doc 03 §8.4 says the group must land, re-derived here from the observed arrangement
-    // rather than borrowed from the engine — the same discipline the restore test uses, so this
-    // would notice the engine and the doc disagreeing instead of following one into the other's
-    // mistake. Seat frame: the group's centroid pushed back along its mean facing normal by the
-    // perpendicular viewing distance; the transform maps that frame onto the head's.
+    // research/28 S1 (2026-08-27): the seat distance is AUTHORED, not measured. This longhand used to
+    // re-derive it as `clamp(|(head − centroid) · n|, 0.3, 5)` — how far the group currently happened
+    // to be — and that is the contract S1 retired, because it makes the verb inherit the corruption it
+    // exists to repair. This very test proved the point when it first ran against the new code: the
+    // shared session had drifted `XR-conf-a` about 6 m out, which dragged the group centroid back and
+    // made the "measured" distance 3.37 m, so the OLD math expected the two perfectly-placed monitors
+    // to be re-seated to 3.4 m out. The compositor put them at their authored 1.5 m — 1.87 m nearer,
+    // along the group normal, and nothing else about the transform differed.
+    //
+    // So the distance now comes from the verb's own reply (the one quantity that is authored rather
+    // than observable), and everything else is still re-derived here independently — centroid, mean
+    // normal, seat yaw and the rigid plant — so this would still catch the engine and the doc
+    // disagreeing. gtest `XRGroupSeatAuthored.OneCorruptedMonitorNoLongerDragsTheWholeGroupBack` pins
+    // this exact scenario numerically.
+    const size_t distPos = reply.find("authored distance ");
+    ASSERT_NOT(distPos, std::string::npos);
+    const float authored = std::stof(reply.substr(distPos + 18));
+    NLog::log("xr_reseat_verb: authored seat distance {:.2f}m", authored);
+    // The fixture declares every anchor:local monitor at z = -1.5 (xr-test.conf's XR-conf-a plus the
+    // two created above), so the authored distance is 1.5 m by construction. Pinning it here is what
+    // makes the assertions below a test of the SEAT rather than a tautology against the reply.
+    EXPECT_MAX_DELTA(authored, 1.5, 0.01);
+    // Centroid + mean facing normal of a group of (pos, quat) pairs. Needed twice now: once to derive
+    // where the seat is, and once afterwards to check the group came back at its authored distance.
+    auto facingOf = [](const std::vector<std::pair<std::vector<float>, std::vector<float>>>& g, float& cx, float& cz, float& nx, float& nz) {
+        cx = cz = nx = nz = 0.f;
+        if (g.empty())
+            return false;
+        for (const auto& [pos, quat] : g) {
+            cx += pos[0];
+            cz += pos[2];
+            // +Z column of the rotation matrix: the quad's normal, the direction its viewer sits in.
+            const float qx = quat[0], qy = quat[1], qz = quat[2], qw = quat[3];
+            const float ex = 2.f * (qx * qz + qw * qy), ez = 1.f - 2.f * (qx * qx + qy * qy);
+            const float el = std::sqrt(ex * ex + ez * ez);
+            if (el < 1e-4f)
+                continue;
+            nx += ex / el;
+            nz += ez / el;
+        }
+        cx /= (float)g.size();
+        cz /= (float)g.size();
+        const float nl = std::sqrt(nx * nx + nz * nz);
+        if (nl < 1e-3f)
+            return false;
+        nx /= nl;
+        nz /= nl;
+        return true;
+    };
+
     float cx = 0.f, cz = 0.f, nx = 0.f, nz = 0.f;
-    for (const auto& [pos, quat] : group) {
-        cx += pos[0];
-        cz += pos[2];
-        // +Z column of the rotation matrix: the quad's normal, the direction its viewer sits in.
-        const float qx = quat[0], qy = quat[1], qz = quat[2], qw = quat[3];
-        const float ex = 2.f * (qx * qz + qw * qy), ez = 1.f - 2.f * (qx * qx + qy * qy);
-        const float el = std::sqrt(ex * ex + ez * ez);
-        if (el < 1e-4f)
-            continue;
-        nx += ex / el;
-        nz += ez / el;
-    }
-    cx /= (float)group.size();
-    cz /= (float)group.size();
-    const float nl = std::sqrt(nx * nx + nz * nz);
-    ASSERT(nl > 1e-3f, true); // a group with no common facing has no seat frame; this one has
-    nx /= nl;
-    nz /= nl;
-    // The head stands at the origin, so `head - centroid` is just -centroid. Clamped 0.3..5 m.
-    const float dist = std::clamp(std::fabs(-cx * nx + -cz * nz), 0.3f, 5.f);
-    const float vx = cx + nx * dist, vz = cz + nz * dist, vYaw = std::atan2(nx, nz);
+    ASSERT(facingOf(group, cx, cz, nx, nz), true); // a group with no common facing has no seat frame; this one has
+    // The seat: the group's centroid pushed back along its mean facing normal by the AUTHORED
+    // distance, facing the group. The head does not enter this derivation at all any more — it enters
+    // the plant below.
+    const float vx = cx + nx * authored, vz = cz + nz * authored, vYaw = std::atan2(nx, nz);
     // headFrame ∘ inv(seat): rotate about the seat frame's origin by (headYaw - seatYaw), then put
     // that origin at the head's floor position (the origin).
     const float th = YAW - vYaw, c = std::cos(th), s = std::sin(th);
@@ -633,6 +662,18 @@ TEST_CASE(xr_reseat_verb) {
         EXPECT(dist3(afterR, beforeR) > 1.f, true);
         // ...and it is the LAYOUT that arrived, not two monitors piled up: the separation is intact.
         EXPECT_MAX_DELTA(dist3(afterL, afterR), dist3(beforeL, beforeR), 0.05);
+
+        // research/28 S1 / scenario S6, and the property the whole change exists for: whatever state
+        // the arrangement was in, it comes back at the distance it was AUTHORED to be viewed from.
+        // Measured from the arrangement as observed AFTER the re-seat, against the head at the origin,
+        // along the group's own new normal — the same perpendicular the seat is defined by.
+        float      ax = 0.f, az = 0.f, anx = 0.f, anz = 0.f;
+        const auto afterGroup = localGroup(st);
+        if (facingOf(afterGroup, ax, az, anx, anz)) {
+            const float landed = std::fabs(-ax * anx + -az * anz);
+            NLog::log("xr_reseat_verb: group centroid came back at {:.3f}m (authored {:.2f}m)", landed, authored);
+            EXPECT_MAX_DELTA(landed, authored, 0.1);
+        }
     }
 
     // Mash it: a second press from the same spot is the identity. (The seat frame is derived from

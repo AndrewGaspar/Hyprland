@@ -780,6 +780,23 @@ Note what the authored distance of a toed-in *arc* is: the distance to the group
 an arc pulls in from its radius. That is exactly the quantity this formula consumes, so deriving it
 from an arrangement and feeding it back reproduces that arrangement's own focus.
 
+**Why the measured form could never have repaired anything**, stated as geometry rather than as a
+story: with the distance measured as `|(head − centroid) · n|`, the seat came out at
+`centroid + n·|(head − centroid)·n|`, which always lies on the plane through the **head**
+perpendicular to `n`. The "frame the arrangement was authored for" was therefore *defined* to be
+wherever the user happened to be standing, projected onto the group's facing axis. A verb whose
+reference is the state it is repairing has nothing to repair toward.
+
+The container suite demonstrated exactly that the first time it ran against the new code, which is
+worth recording because the failure was the feature. In the shared session `XR-conf-a` had drifted
+about 6 m out; that one monitor dragged the group centroid back, so the *measured* distance was
+3.37 m and the old contract would have re-seated two perfectly-placed monitors from 1.5 m to 3.4 m
+out. The authored contract returned them to 1.5 m — 1.87 m nearer, along the group normal, with the
+centroid, the mean normal, the seat yaw and the rigid transform all identical. Pinned numerically in
+`tests/xr/anchor_math.cpp` (`XRGroupSeatAuthored.OneCorruptedMonitorNoLongerDragsTheWholeGroupBack`)
+and asserted end to end by `hyprtester`'s `xr_reseat_verb`, whose own longhand now takes the authored
+distance from the verb's reply and re-derives everything else independently.
+
 Three properties earn their design:
 
 - **It is a fixed point**, now unconditionally. After a re-seat the group sits exactly `dist`

@@ -2447,3 +2447,48 @@ In order, and the first one is not code:
 still a fixed point), S8 (an untracked head produces no durable write), and S12's compositor half (an
 unresolvable STAGE change is loud and treated as a discontinuity). **Still open:** S2, S5's refusal
 half, S7, S11, S12b, S16, S17 — all of which need a binding that names its frame.
+
+### 14.6 Container validation, 2026-08-27 — and the one failure, which was the feature
+
+The `--xr` suite came back **44/45**.
+
+`xr_anchor_restore_across_session` **passes with exact arithmetic**, which is the end-to-end proof of
+H2: an ad-hoc monitor is created from the live head, nudged, the session is recycled with the user
+standing 5 m and 85° away, and the arrangement comes back within 0.1 m of the longhand — through the
+new staging → edge-commit path, including the create-time seed and the session-end commit.
+
+`xr_reseat_verb` **failed, on the retired contract**, and the worked geometry is the best single
+argument for S1 in this report. The shared container session had drifted: `XR-conf-a` — a
+config-declared monitor whose rig is `pos:0,1.4,-1.5` — had been thrown to ≈ `[5.72, 1.4, -5.47]`
+facing 146° away by earlier tests in the same instance (its committed restore offset in the artifacts
+reads 6.25 m). The test's own two monitors sat correctly at their declared ±0.6, −1.5. On the 75°
+swivel:
+
+| | seat | monL lands |
+|---|---|---|
+| retired contract (the test's longhand) | `[0.455, 0.217]` yaw −25.5°, distance **3.369 m** | `[-1.496, 1.400, 1.350]` |
+| authored contract (what shipped) | `[1.260, -1.470]` yaw −25.5°, distance **1.500 m** | `[0.309, 1.400, 1.834]` |
+
+Same centroid, same mean normal, **same seat yaw**, same rigid transform; the 1.87 m the container
+measured is exactly `(3.369 − 1.500)` along the group normal and nothing else. One corrupted monitor
+had dragged the centroid 2.8 m back, and the measured contract would have re-seated the two
+perfectly-placed monitors to 3.4 m out — **symptom B, happening inside the test suite and asserted as
+correct**. The `-25.5°` seat yaw is not a sign error: it is the group's own mean facing, and the
+head's `+75°` enters through the plant (`hf(head) ∘ inv(seat)`), not through the seat.
+
+The tell, in one line: under the retired contract the seat always landed on the plane through the
+**head** perpendicular to the group normal — i.e. "the frame this arrangement was authored for" was
+*defined* as wherever the user happened to be standing. That is invariant I4 violated as geometry.
+
+Fixed on branch `s1-seat-fix`: `xr_reseat_verb`'s longhand now takes the authored distance from the
+verb's own reply (the one quantity that is authored rather than observable) and re-derives everything
+else independently, plus a new assertion that the group's centroid returns to that distance (scenario
+S6). The scenario is pinned numerically in `tests/xr/anchor_math.cpp`
+(`XRGroupSeatAuthored.OneCorruptedMonitorNoLongerDragsTheWholeGroupBack`, which reproduces both
+landings to the centimetre), and doc 03 §8.4 records the geometry.
+
+Also worth keeping from that run, as container-tooling lore: the first attempt was **invalid** because
+a stale `/src` overlay served a pre-tranche compositor — an in-container `--build` rebuilt only the 23
+`hyprtester` objects, because frozen `/src` mtimes make ninja treat the compositor as up to date
+against the persistent `/build` volume. Wiping the `hypxrland-build` volume fixed it. Any future
+tranche validated in the container needs that wipe, or it is testing the previous build.
