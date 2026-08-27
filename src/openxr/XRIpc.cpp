@@ -85,6 +85,10 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     const auto        L2D   = g_pOpenXRManager->layout2DStatus();
     // doc 03 §8.3: is the compositor currently remembering where the user has put their monitors.
     const bool        RESTORE_CAPTURE = g_pOpenXRManager->restoreCaptureActive();
+    // research/28 M0/W4: the runtime's ROOM frame — STAGE, located in our own reference space — and
+    // how often it has moved. Read-only instrumentation for the attended probe that gates Track W;
+    // nothing is anchored in STAGE yet. "unavailable" on a runtime that does not offer one.
+    const auto        WORLD = g_pOpenXRManager->worldFrameStatus();
     auto              handLabel = [](const COpenXRManager::SXRHandInputInfo& hi) -> std::string {
         if (!hi.hands)
             return "controllers";
@@ -127,7 +131,10 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
             "anchorState": "{}",
             "restore": {{
                 "restorable": {},
-                "offset": [{:.3f}, {:.3f}, {:.3f}]
+                "offset": [{:.3f}, {:.3f}, {:.3f}],
+                "staged": {},
+                "stagedOffset": [{:.3f}, {:.3f}, {:.3f}],
+                "lastCommit": "{}"
             }},
             "layout2d": {{
                 "source": "{}",
@@ -152,7 +159,8 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
         }})#",
                                 m.name, m.id, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.quatX, m.quatY, m.quatZ, m.quatW, m.grabbed ? "true" : "false",
                                 m.grabKind, m.hovered ? "true" : "false", m.region, m.plugged ? "true" : "false", m.contentPath, m.linear ? "true" : "false", m.stereo, m.producer, m.chrome ? "true" : "false", m.quads, m.adaptiveEnabled ? "true" : "false", m.adaptivePhase,
-                                m.adaptiveRoamMode, m.adaptiveSeatDist, m.adaptiveT, m.anchorState, m.restorable ? "true" : "false", m.restoreX, m.restoreY, m.restoreZ, m.l2dSource, m.l2dCol, m.l2dRow, m.l2dX, m.l2dY, m.l2dAzDeg, m.l2dElDeg, m.fxAlpha, m.fxAlphaTarget, m.fxAlphaSrc, m.fxBlackAlpha, m.fxBlackAlphaTarget,
+                                m.adaptiveRoamMode, m.adaptiveSeatDist, m.adaptiveT, m.anchorState, m.restorable ? "true" : "false", m.restoreX, m.restoreY, m.restoreZ,
+                                m.staged ? "true" : "false", m.stagedX, m.stagedY, m.stagedZ, m.commit, m.l2dSource, m.l2dCol, m.l2dRow, m.l2dX, m.l2dY, m.l2dAzDeg, m.l2dElDeg, m.fxAlpha, m.fxAlphaTarget, m.fxAlphaSrc, m.fxBlackAlpha, m.fxBlackAlphaTarget,
                                 m.fxBlackAlphaSrc, m.fxKnee, m.fxKneeSrc, m.fxTransitioning ? "true" : "false");
             if (i + 1 < MONS.size())
                 mons += ",\n";
@@ -177,6 +185,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "recenterPolicy": "{}",
     "userPresence": "{}",
     "restoreCapture": {},
+    "worldFrame": {{ "available": {}, "located": {}, "tracked": {}, "pose": [{:.3f}, {:.3f}, {:.3f}], "yawDeg": {:.1f}, "probes": {}, "changes": {}, "unresolvable": {} }},
     "visible": "{}",
     "reprobeWaiting": "{}",
     "reprobePendingMs": {},
@@ -200,7 +209,9 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
 )#",
                            STATE, RUNTIME, SYSTEM, RTGPU, RTJSON, BLOCKED, BLEND, BLACK.configured, BLACK.effective, BLACK.knee, BLACK.active ? "true" : "false",
                            BLACK.gatedOff ? "true" : "false", OVERLAY ? "true" : "false", MONITOR_VIEW ? "shown" : "hidden", SELECTED, FOLLOW, UNPLUG_PEND, RECENTER, PRESENCE,
-                           RESTORE_CAPTURE ? "true" : "false", VISIBLE, REPROBE_WAIT, REPROBE_MS, REPROBE_WATCH ? "true" : "false", MANUAL_DISABLE ? "true" : "false",
+                           RESTORE_CAPTURE ? "true" : "false", WORLD.available ? "true" : "false", WORLD.located ? "true" : "false", WORLD.tracked ? "true" : "false", WORLD.x,
+                           WORLD.y, WORLD.z, WORLD.yawDeg, WORLD.probes, WORLD.changes, WORLD.unresolvable, VISIBLE, REPROBE_WAIT, REPROBE_MS,
+                           REPROBE_WATCH ? "true" : "false", MANUAL_DISABLE ? "true" : "false",
                            INHIBITING_IDLE ? "true" : "false", INHIBIT_MODE, HANDIN.mode, HANDIN.state, GAZE.source, GAZE.hoveredMonitor, GAZE.hoveredName,
                            GAZE.carrying ? "true" : "false", GAZE.carryMonitor, GAZE.dist, HANDS[0].hands ? "hands" : "controllers", HANDS[0].gesture,
                            HANDS[0].filtered ? "true" : "false", HANDS[1].hands ? "hands" : "controllers", HANDS[1].gesture, HANDS[1].filtered ? "true" : "false",
@@ -234,15 +245,25 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     // when something is actually blocking — a healthy session's status is byte-identical to before.
     // It sits above the runtime details because when it is set those are all empty and meaningless.
     const std::string BLOCKEDLINE = BLOCKED.empty() ? "" : std::format("blocked: {}\n", BLOCKED);
+    // research/28 M0: the room frame, in the seat frame's coordinates. At session start the two
+    // coincide, so this line reads ~[0,0,0] yaw 0 and every later reading is the drift between "the
+    // room" and "the origin the runtime re-establishes on every recenter". `changes` counts the
+    // headset's own STAGE redefinitions — the ones our wivrn-xg fork forwards and the compositor used
+    // to discard silently (W4); `unresolvable` counts those that carried no delta, i.e. the ones that
+    // mean world content is now suspect.
+    const std::string WORLDLINE = !WORLD.available ?
+        std::string("unavailable (this runtime offers no STAGE space)") :
+        std::format("[{:.2f}, {:.2f}, {:.2f}] yaw {:.1f} deg ({}{}), {} probe(s), {} change(s), {} unresolvable", WORLD.x, WORLD.y, WORLD.z, WORLD.yawDeg,
+                    WORLD.located ? "located" : "NOT locatable", WORLD.located && !WORLD.tracked ? ", inferred" : "", WORLD.probes, WORLD.changes, WORLD.unresolvable);
     std::string       out =
         std::format("state: {}\n{}runtime: {}\nsystem: {}\nruntime gpu: {}\nruntime json: {}\nblend mode: {}\nblack alpha: {}\noverlay: {}\nmonitor view: {}\nselected: {}\nmonitors "
                     "follow session: {}\nrecenter policy: {}\nvisible: "
                     "{}\npresence: {}\nidle "
-                    "inhibited: {} (mode {})\nplacement capture: {}\nhand input: {} "
+                    "inhibited: {} (mode {})\nplacement capture: {}\nworld frame (STAGE): {}\nhand input: {} "
                     "({})\ngaze ({}): {}\ninput: left {}, right {}\n2d-plane sync: {}\n",
                     STATELINE, BLOCKEDLINE, RUNTIME, SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, RTJSON.empty() ? "(loader default)" : RTJSON, BLEND, BLACKLINE, OVERLAY ? "yes" : "no",
                     MONITOR_VIEW ? "shown" : "hidden", SELECTED.empty() ? "(none)" : SELECTED, FOLLOWLINE, RECENTER, VISIBLE, PRESENCE, INHIBITING_IDLE ? "yes" : "no", INHIBIT_MODE, RESTORE_CAPTURE ? "on" : "off",
-                    HANDIN.state, HANDIN.mode, GAZE.source, GAZELINE, handLabel(HANDS[0]), handLabel(HANDS[1]), L2DLINE);
+                    WORLDLINE, HANDIN.state, HANDIN.mode, GAZE.source, GAZELINE, handLabel(HANDS[0]), handLabel(HANDS[1]), L2DLINE);
     for (const auto& m : MONS) {
         out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} ({}) hovered: {} ({}) plugged: {} content: {}{}", m.name,
                            m.id, m.w, m.h, m.refresh, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.grabbed ? "yes" : "no", m.grabKind, m.hovered ? "yes" : "no", m.region,
@@ -264,9 +285,15 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
         out += std::format("  {}: alpha {} ({}), blackalpha {} ({}, knee {:.2f}), anchorstate {}\n", m.name, ALINE, m.fxAlphaSrc, BLINE, m.fxBlackAlphaSrc, m.fxKnee, m.anchorState);
         // doc 03 §8.3: will this monitor come back where the user left it after a session restart, and
         // from what offset. Only meaningful for anchor:local — the leashed modes ride the user anyway.
-        if (m.anchorMode == "local")
-            out += m.restorable ? std::format("  {}: restore [{:.2f}, {:.2f}, {:.2f}] (head-relative)\n", m.name, m.restoreX, m.restoreY, m.restoreZ)
-                                : std::format("  {}: restore none — a new session re-seats it from its declared rig\n", m.name);
+        // research/28 H2: the MEMORY first (that is what a re-seat plants), then the live staging
+        // value and the last commit verdict — "staged but refused" and "nothing captured at all" are
+        // different diagnoses and used to look identical from here.
+        if (m.anchorMode == "local") {
+            out += m.restorable ? std::format("  {}: restore [{:.2f}, {:.2f}, {:.2f}] (head-relative)", m.name, m.restoreX, m.restoreY, m.restoreZ)
+                                : std::format("  {}: restore none — a new session re-seats it from its declared rig", m.name);
+            out += m.staged ? std::format(", staged [{:.2f}, {:.2f}, {:.2f}], last commit {}\n", m.stagedX, m.stagedY, m.stagedZ, m.commit)
+                            : std::format(", nothing staged, last commit {}\n", m.commit);
+        }
         // report 12: where the 2D plane put it, and from what angles — "auto" = the projection owns
         // it, "pinned" = an explicit user monitor= offset does, "off" = append-right as before.
         if (L2D.enabled && m.l2dSource != "off")

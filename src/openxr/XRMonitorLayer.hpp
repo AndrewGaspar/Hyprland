@@ -122,20 +122,46 @@ class CXRMonitorLayer {
     // config keyword, kept separate from the live (spring-mutating) engine for reconcile diffs.
     OpenXR::CXRAnchor       m_anchor;
     OpenXR::SXRAnchorState  m_declaredAnchor;
-    // ---- cross-session restore (doc 03 §8.3) ----
+    // ---- cross-session restore (doc 03 §8.3, research/28 H2) ----
     // This monitor's anchor:local desk pose expressed in the WEARER's yaw-only floor frame
-    // (xrPoseInHeadFrame), recaptured by the frame thread on every frame the user is actually
-    // wearing the headset with the monitors plugged, and seeded at `openxr create` when the placement
-    // came from the head. Unlike m_anchor's LOCAL pose this survives the death of the reference space
+    // (xrPoseInHeadFrame). Unlike m_anchor's LOCAL pose this survives the death of the reference space
     // it was measured in, so the first plug of a NEXT session can put the whole constellation back
     // around the user instead of replaying coordinates from a frame that no longer exists.
     //
-    // Written on the FRAME thread and on main, both under COpenXRManager::m_layersMu. Plain POD
-    // (SXRPose is 7 floats) — no refcounts, no allocation, nothing the frame-thread rule above
-    // forbids. m_restoreValid stays false until a placement has been observed under real tracking;
-    // the re-seat then falls back to m_declaredAnchor (xrReseatSource).
+    // TWO values, and the split is research/28's invariant I11 ("durable state is never written from
+    // the frame path"). m_restoreStaged is the live measurement — re-derived by the frame thread on
+    // every frame the user is really wearing the headset, and meaningless the moment they are not.
+    // m_restoreOffset is the MEMORY: written only by COpenXRManager::commitRestorePlacements, on the
+    // main thread, on an edge (doff / visibility drop / session end), and only through
+    // xrRestoreCommitGate. The re-seat reads the memory; the memory is what a status query means by
+    // "will this come back where I left it".
+    //
+    // Both are plain POD (SXRPose is 7 floats) under COpenXRManager::m_layersMu — no refcounts, no
+    // allocation, nothing the frame-thread rule above forbids. m_restoreValid stays false until a
+    // placement has been committed; the re-seat then falls back to m_declaredAnchor (xrReseatSource).
     OpenXR::SXRPose         m_restoreOffset;
     bool                    m_restoreValid = false;
+    OpenXR::SXRPose         m_restoreStaged;
+    bool                    m_restoreStagedValid = false;
+    // Why the last commit attempt did (not) take, for `hyprctl openxr status` — a refusal that cannot
+    // be read back is indistinguishable from a capture that never ran (invariant I9).
+    uint8_t                 m_restoreLastCommit  = OpenXR::XR_COMMIT_NOTHING_STAGED;
+
+    // ---- is this monitor's anchorPose still expressed in a live frame? (research/28 §F) ----
+    // m_anchorFrameStale is raised for every layer whenever the reference frame stops meaning what it
+    // meant — a new session, a recenter nothing could reconstruct, the headset's own room frame moving
+    // by an unknown amount — and m_anchorFrameRef records the pose the layer held at that instant. The
+    // capture refuses to stage until something has actually placed the monitor since (a re-seat, a
+    // grab, a verb), which is what stops the frames BEFORE a session's first re-seat from overwriting
+    // the very memory that re-seat is about to consume. See xrAnchorFrameReestablished.
+    OpenXR::SXRPose         m_anchorFrameRef;
+    bool                    m_anchorFrameStale = true;
+    // m_declaredAnchor is a head-relative RIG (an explicit `pos:` — a config `xrmonitor` line, or a
+    // `create` with an anchor spec) rather than the world pose `create` derived from wherever the head
+    // happened to be. Only a rig may vote on the group's authored viewing distance (research/28 S1):
+    // an ad-hoc monitor's "declaration" is dead-frame coordinates, which is the corruption the
+    // authored distance exists to not inherit.
+    bool                    m_declaredRig = false;
     std::optional<Vector2D> m_reqResolution;   // last requested pixel mode (for reconcile diff)
     std::optional<float>    m_reqRefresh;      // last requested refresh (for reconcile diff)
     // report-20 issue E: true iff an explicit user `monitor=NAME,...` rule set this output's
