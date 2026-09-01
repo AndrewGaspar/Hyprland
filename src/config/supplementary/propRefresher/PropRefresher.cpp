@@ -113,7 +113,11 @@ void CPropRefresher::refreshProp(const bool execdAsScheduled) {
         }
     }
 
-    if (m_propsTripped & REFRESH_MONITOR_STATES) {
+    // REFRESH_MONITOR_STATES_OWN, not REFRESH_MONITOR_STATES: the latter is the composite
+    // `own | REFRESH_LAYOUTS`, so testing it would also fire this whole pass for a bare
+    // REFRESH_LAYOUTS refresh — which has its own block below and does not need a rule reload, a VRR
+    // re-assert, a persistent-workspace sweep, or a second recalculateMonitor(). See PropRefresher.hpp.
+    if (m_propsTripped & REFRESH_MONITOR_STATES_OWN) {
         Config::monitorRuleMgr()->scheduleReload();
         Config::monitorRuleMgr()->ensureVRR();
 
