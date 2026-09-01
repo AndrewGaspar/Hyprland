@@ -153,7 +153,15 @@ void CPropRefresher::refreshProp(const bool execdAsScheduled) {
 
     m_scheduled           = false;
     m_scheduledRefreshSeq = 0;
+    // Latch BEFORE clearing: props_refreshed listeners need to know which classes this refresh
+    // actually carried (lastRefreshedProps()), and m_propsTripped has to be 0 before the emit so a
+    // listener that schedules another refresh gets a fresh mask rather than inheriting ours.
+    m_lastRefreshedProps  = m_propsTripped;
     m_propsTripped        = 0;
 
     Event::bus()->m_events.config.props_refreshed.emit(execdAsScheduled);
+}
+
+Config::Supplementary::PropRefreshBits CPropRefresher::lastRefreshedProps() const {
+    return m_lastRefreshedProps;
 }
