@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "../helpers/math/Math.hpp"
+#include "../config/supplementary/propRefresher/PropRefresher.hpp" // ePropRefreshProp (xrRefreshConcernsXR)
 #include "XRAnchor.hpp" // OpenXR::SXRAnchorState + eXRAnchorMode/eXRHand (unconditional pure math)
 
 namespace OpenXR {
@@ -454,6 +455,50 @@ namespace OpenXR {
     //   5. The floor applies last, so even a genuinely-changing config (or a stop/start flap) cannot
     //      out-run the documented cadence.
     eXRReloadAction xrReloadAction(const SXRReloadInputs& in);
+
+    // ---- refresh-class filtering: the gate ABOVE the storm gate --------------------------------
+    //
+    // xrReloadAction above contains the storm once onConfigReload() is already running — it is the
+    // second line of defense and still guards everything that gets past here. This one runs first and
+    // decides whether onConfigReload() should run AT ALL. config.props_refreshed fires for every
+    // prop refresh whatever
+    // tripped it — an `hl.device{}` eval, an IME churning virtual keyboards, a gaps retune — and
+    // onConfigReload() is not cheap: a dozen publish* passes, reloadXRRules(), refreshMonitorRuleOwnership(),
+    // reassertMonitorModeRules() (which re-add()s a monitor rule per live layer), updateMonitorsPlugged(),
+    // requestLayout2DSync(). None of that has anything to say about a keyboard layout.
+    //
+    // THE DIRECTION OF THE TEST MATTERS. This is a DENY-list, not an allow-list: a refresh is skipped
+    // only when every class it carries is on the known-irrelevant list. Anything unrecognized — a
+    // future refresh class, a composite, REFRESH_ALL — falls through to "concerns XR". A filter that
+    // guesses wrong in the other direction silently stops applying config, which is the failure mode
+    // every openxr:* keyword special-case in ConfigManager::parseKeyword exists to fix.
+    //
+    // AND A MASK OF ZERO CONCERNS XR. This is the load-bearing one: NOT ONE openxr:* value in
+    // ConfigValues.cpp declares a refresh class (checked — all 108 of them), so under the Lua config
+    // `hyprctl eval 'hl.config{openxr={black_alpha=0.35}}'` calls scheduleRefresh(0). The refresh does
+    // no work and trips no class, and the props_refreshed emit at the end of it IS the entire mechanism
+    // by which every documented hot-tune knob in doc 05 applies live. Filtering mask 0 would kill all
+    // of them at once.
+    inline constexpr Config::Supplementary::PropRefreshBits XR_IRRELEVANT_REFRESH_CLASSES =
+        Config::Supplementary::REFRESH_INPUT_DEVICES |      // keyboard layouts, pointer/touch/tablet cfgs
+        Config::Supplementary::REFRESH_SCREEN_SHADER |      // screen shader reload + full frames
+        Config::Supplementary::REFRESH_BLUR_FB |            // blur framebuffer invalidation
+        Config::Supplementary::REFRESH_CURSOR_ZOOMS |       // cursor:zoom_factor per monitor
+        Config::Supplementary::REFRESH_CONFIG_WATCHER |     // inotify watch list rebuild
+        Config::Supplementary::REFRESH_GRADIENTS_GROUPBAR;  // groupbar gradient textures
+    //
+    // Deliberately NOT on the list, and why:
+    //   REFRESH_LAYOUTS        — implied by REFRESH_MONITOR_STATES (`_OWN | REFRESH_LAYOUTS`), so
+    //                            excluding it would be a subtle coupling to that composite; and a
+    //                            layout recalc is a monitor-geometry event, which is layout2d's world.
+    //   REFRESH_RULES /
+    //   REFRESH_WINDOW_STATES  — a windowrule change moves a stereo declaration (WP X1,
+    //                            publishStereoPairTuning) and feeds the xrrule transparency snapshot.
+    //   REFRESH_MONITOR_STATES — the whole point: monitor rules were just re-applied.
+
+    // Should COpenXRManager::onConfigReload() run for a refresh carrying these classes?
+    // `classes` is CPropRefresher::lastRefreshedProps(). See the deny-list rationale above.
+    bool xrRefreshConcernsXR(Config::Supplementary::PropRefreshBits classes);
 
     // May a (re-)arm request push out a re-probe timer that is ALREADY pending?
     // Only if it would fire SOONER. A reload re-arming an armed timer with the same-or-longer delay

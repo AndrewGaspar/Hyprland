@@ -564,6 +564,17 @@ OpenXR::eXRReloadAction OpenXR::xrReloadAction(const SXRReloadInputs& in) {
     return XR_RELOAD_START;
 }
 
+bool OpenXR::xrRefreshConcernsXR(Config::Supplementary::PropRefreshBits classes) {
+    // A refresh that tripped NOTHING is the openxr:* hot-tune path: no openxr value declares a
+    // refresh class, so `hl.config{openxr={...}}` schedules a mask of 0 whose ONLY observable effect
+    // is this event. It must always reach onConfigReload().
+    if (classes == 0)
+        return true;
+
+    // Deny-list: skip only when EVERY class carried is known not to touch anything XR reads.
+    return (classes & ~XR_IRRELEVANT_REFRESH_CLASSES) != 0;
+}
+
 bool OpenXR::xrShouldRearmReprobe(bool armed, int64_t leftMs, int64_t wantMs) {
     if (!armed)
         return true;

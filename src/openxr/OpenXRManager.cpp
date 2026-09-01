@@ -137,7 +137,7 @@ void COpenXRManager::init() {
     // React to reloads. `hyprctl keyword openxr:enabled 1` fires props_refreshed rather than
     // a full reload, so listen to both; onConfigReload() is idempotent.
     m_configReloadListener   = Event::bus()->m_events.config.reloaded.listen([this] { onConfigReload(); });
-    m_propsRefreshedListener = Event::bus()->m_events.config.props_refreshed.listen([this] { onConfigReload(); });
+    m_propsRefreshedListener = Event::bus()->m_events.config.props_refreshed.listen([this] { onPropsRefreshed(); });
 
     // Situational per-monitor transparency (doc 05 §xrrule): the re-evaluation triggers. Each one
     // only REQUESTS an evaluation — requestEffectEval() coalesces a burst into a single pass at the
@@ -4633,6 +4633,29 @@ void COpenXRManager::markSwapchainsDirtyIfChromeChanged() {
     std::scoped_lock lock(m_layersMu);
     for (auto& l : m_layers)
         l->m_swapchainDirty.store(true, std::memory_order_release);
+}
+
+void COpenXRManager::onPropsRefreshed() {
+    // config.props_refreshed is CHATTY — it fires for every prop refresh whatever tripped it. Ask the
+    // refresher which classes this one actually carried and stay out of the ones that say nothing
+    // about XR (a keyboard-layout re-apply, a blur-FB invalidation, a groupbar gradient rebuild).
+    //
+    // This is the FIRST line of defense and it is coarse; the xrReloadAction() storm gate inside
+    // onConfigReload() is the second, and it still guards every refresh that gets past here. Deny-list
+    // semantics, and a mask of 0 always passes — see xrRefreshConcernsXR().
+    const auto& refresher = Config::Supplementary::refresher();
+    const auto  classes   = refresher ? refresher->lastRefreshedProps() : (Config::Supplementary::PropRefreshBits)0;
+
+    if (!OpenXR::xrRefreshConcernsXR(classes)) {
+        // Cheap enough to count unconditionally; logged sparsely so a genuine storm still shows up in
+        // the log without the filter itself becoming the noise it was added to remove.
+        if ((++m_refreshesFiltered % 64) == 1)
+            Log::logger->log(Log::DEBUG, "[OPENXR] ignoring config prop refresh (classes {:#x}, nothing XR reads) — {} filtered so far", classes, m_refreshesFiltered);
+        return;
+    }
+
+    ++m_refreshesApplied;
+    onConfigReload();
 }
 
 void COpenXRManager::onConfigReload(bool forceProbe) {
