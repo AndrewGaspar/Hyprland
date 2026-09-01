@@ -507,6 +507,22 @@ class COpenXRManager {
     // reload that changes nothing probe-relevant costs nothing (reload-storm containment, 2026-08-21).
     void onConfigReload(bool forceProbe = false);
 
+    // The config.props_refreshed listener. NOT the same thing as onConfigReload(): props_refreshed is
+    // a chatty hook that fires for every prop refresh whatever tripped it, so this asks the refresher
+    // which classes the refresh carried (CPropRefresher::lastRefreshedProps) and drops the ones that
+    // touch nothing XR reads — keyboard/pointer configs above all, which an IME churning virtual
+    // keyboards can raise many times a minute. Deny-list, and a zero mask always passes: no openxr:*
+    // value declares a refresh class, so `hl.config{openxr={...}}` refreshes with mask 0 and this
+    // event is the whole mechanism by which the hot-tune knobs apply. See OpenXR::xrRefreshConcernsXR.
+    void onPropsRefreshed();
+
+    // Counters for the filter above: how many prop refreshes were dropped vs. handed to
+    // onConfigReload(). Not in `hyprctl openxr status` yet — onPropsRefreshed() logs the filtered
+    // count sparsely (every 64th) so a live storm is still measurable from the compositor log
+    // without the filter becoming the noise it was added to remove.
+    uint64_t m_refreshesFiltered = 0;
+    uint64_t m_refreshesApplied  = 0;
+
     // Sticky user disable (`hyprctl openxr disable` / `enable`). The IPC verbs funnel here rather
     // than calling stop()/start() directly, so the latch and the lifecycle can never disagree.
     void userDisable();
