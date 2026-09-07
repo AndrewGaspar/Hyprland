@@ -5,8 +5,10 @@
 #include "../helpers/signal/Signal.hpp"
 #include "./eventLoop/EventLoopTimer.hpp"
 #include <cstdint>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 class CSessionLockSurface;
 class CSessionLock;
@@ -14,6 +16,22 @@ class CWLSurfaceResource;
 
 namespace Desktop::View {
     class CSessionLock;
+}
+
+namespace SessionLock {
+    // One lock surface as the keyboard-focus picker sees it. A plain struct on purpose: choosing
+    // WHICH lock surface should hold focus is the whole policy, and it is worth testing without a
+    // wl_surface, a monitor or a live protocol object behind it.
+    struct SFocusCandidate {
+        uint64_t monitorID = 0;
+        bool     mapped    = false; // committed a frame; an unmapped surface cannot take focus
+        bool     focusable = false; // still has a live wl_surface behind it
+    };
+
+    // Index of the lock surface that should hold keyboard focus, or nullopt when none can take it.
+    // Prefers the surface on preferredMonitorID (the focused monitor) so the caret stays where the
+    // user is looking; otherwise the first usable one, in creation order.
+    std::optional<size_t> pickFocusCandidate(const std::vector<SFocusCandidate>& candidates, std::optional<uint64_t> preferredMonitorID);
 }
 
 struct SSessionLockSurface {
@@ -68,6 +86,7 @@ class CSessionLockManager {
     void                    forceLock();
 
     void                    removeSessionLockSurface(SSessionLockSurface*);
+    void                    refocusKeyboard();
 
     void                    onLockscreenRenderedOnMonitor(uint64_t id);
 

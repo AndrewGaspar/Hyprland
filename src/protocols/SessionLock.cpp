@@ -1,5 +1,6 @@
 #include "SessionLock.hpp"
 #include "../managers/SeatManager.hpp"
+#include "../managers/SessionLockManager.hpp"
 #include "FractionalScale.hpp"
 #include "LockNotify.hpp"
 #include "core/Compositor.hpp"
@@ -51,10 +52,17 @@ CSessionLockSurface::CSessionLockSurface(SP<CExtSessionLockSurfaceV1> resource_,
         m_surface->unmap();
         m_listeners.surfaceCommit.reset();
         m_listeners.surfaceDestroy.reset();
-        if (Desktop::focusState()->surface() == m_surface)
-            Desktop::focusState()->surface().reset();
+
+        const bool HELDFOCUS = Desktop::focusState()->surface() == m_surface;
 
         m_surface.reset();
+
+        // The wl_surface died under a live role object. focusState()->surface() hands back a
+        // temporary, so the .reset() that used to stand here cleared nothing: hand focus to a lock
+        // surface that still exists instead, or the lock swallows every key from here on. Safe
+        // after m_surface.reset() — the manager no longer sees us as a focusable candidate.
+        if (HELDFOCUS && g_pSessionLockManager)
+            g_pSessionLockManager->refocusKeyboard();
     });
 
     if (m_monitor) {
