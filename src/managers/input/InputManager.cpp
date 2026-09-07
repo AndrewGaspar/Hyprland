@@ -364,7 +364,13 @@ void CInputManager::mouseMoveUnified(uint32_t time, bool refocus, bool mouse, st
         const auto PSESSIONLOCKSURFACE = g_pSessionLockManager->getSessionLockSurfaceForMonitor(PMONITOR->m_id);
         const auto foundLockSurface    = PSESSIONLOCKSURFACE ? PSESSIONLOCKSURFACE->surface->surface() : nullptr;
 
-        if (!pointerOnly)
+        // Only ever hand keyboard focus to a lock surface that actually exists. Clearing it because
+        // THIS monitor's lock surface has not mapped yet — the normal state during a multi-output
+        // plug, where the client creates one surface per output and they map one by one — silently
+        // kills keyboard input for the rest of the lock: nothing re-arms lock focus except another
+        // pointer motion that happens to land on a monitor whose surface is up. The lock manager
+        // owns "who should hold focus" (refocusKeyboard) and does it without needing the cursor.
+        if (!pointerOnly && foundLockSurface)
             Desktop::focusState()->rawSurfaceFocus(foundLockSurface);
 
         // search for interactable abovelock surfaces for pointer focus, or use session lock surface if not found
