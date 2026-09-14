@@ -3848,6 +3848,27 @@ void COpenXRManager::maybeArmReprobe() {
         return;
     }
 
+    // Event-driven leg FIRST (don-the-headset dead-air fix): inotify-watch the runtime dir so a probe
+    // fires the instant the runtime materializes. Idempotent + gated on openxr:reprobe_watch inside.
+    // It comes first because WHETHER IT ARMED decides whether a timer is needed at all.
+    setupReprobeWatch();
+
+    const bool watchArmed = reprobeWatchArmed();
+    const bool activity   = watchActivityRecent();
+
+    // Who owns the retry (pure + gtested — OpenXR::xrShouldArmReprobeTimer; live evidence 2026-09-13).
+    // With the watch armed and quiet, the watch IS the steady state: the pid-file trigger is WiVRn's
+    // don signal in both wait modes, so a periodic timer would only dlopen the loader against a
+    // runtime that is provably not there (WiVRn publishes active_runtime.json only while a headset is
+    // connected, so pre-don EVERY probe fails at enumerate and the old loop polled at the 30s cap
+    // forever, bouncing the state — and with it the idle-inhibit fold — for nothing).
+    if (!OpenXR::xrShouldArmReprobeTimer(watchArmed, activity)) {
+        if (m_reprobeTimer)
+            m_reprobeTimer->updateTimeout(std::nullopt); // no timer in the quiet steady state
+        Log::logger->log(Log::DEBUG, "[OPENXR] dormant — waiting for the runtime watch (waiting for {}, no timer)", m_probeWait == XR_WAIT_HEADSET ? "headset" : "runtime");
+        return;
+    }
+
     static auto   PBASE = CConfigValue<Hyprlang::INT>("openxr:reprobe_interval_ms");
     const int64_t base  = std::max<int64_t>(250, (int64_t)*PBASE);
     // Delay policy (pure, gtested — live-evidence bug 1). HEADSET wait (runtime up/reachable, headset
@@ -3855,16 +3876,10 @@ void COpenXRManager::maybeArmReprobe() {
     // backoff there is what produced the observed 30s don dead-air. Recent relevant filesystem
     // activity in the watched dirs also caps the delay at base: the runtime is materializing, and
     // that is precisely when polling hard is right. Only a truly absent, quiet runtime backs off.
-    const bool    activity = watchActivityRecent();
-    const int64_t ms       = OpenXR::xrReprobeDelayMs(m_probeWait == XR_WAIT_HEADSET, activity, m_reprobeAttempt, base, 30000);
-    Log::logger->log(Log::DEBUG, "[OPENXR] dormant — re-probing in {}ms (waiting for {}, attempt {}{})", ms, m_probeWait == XR_WAIT_HEADSET ? "headset" : "runtime", m_reprobeAttempt,
-                     activity ? ", fs activity recent" : "");
+    const int64_t ms = OpenXR::xrReprobeDelayMs(m_probeWait == XR_WAIT_HEADSET, activity, m_reprobeAttempt, base, 30000);
+    Log::logger->log(Log::DEBUG, "[OPENXR] dormant — re-probing in {}ms (waiting for {}, attempt {}{}{})", ms, m_probeWait == XR_WAIT_HEADSET ? "headset" : "runtime",
+                     m_reprobeAttempt, activity ? ", fs activity recent" : "", watchArmed ? "" : ", no watch — timer is the only mechanism");
     armReprobeTimer((int)ms);
-
-    // Event-driven leg (don-the-headset dead-air fix): also inotify-watch the runtime socket dir so a
-    // probe fires the instant the socket appears, not after the grown backoff. Idempotent + gated on
-    // openxr:reprobe_watch inside. The timer above stays as the fallback.
-    setupReprobeWatch();
 }
 
 void COpenXRManager::armReprobeTimer(int ms) {
@@ -3897,12 +3912,10 @@ void COpenXRManager::cancelReprobe(bool resetBackoff) {
     if (resetBackoff) {
         m_reprobeAttempt = 0;
         m_probeWait      = XR_WAIT_NONE;
-        // End of the dormant period (real success / user disable): clear the per-period watch
-        // bookkeeping. A mere STARTING transition keeps it — the watch fd is torn down and re-armed
-        // around every probe, and "did the watch ever fire / did we already log the miss" must span
-        // the whole dormant period, not one probe cycle.
-        m_watchEverFired    = false;
-        m_watchMissLogged   = false;
+        // End of the dormant period (real success / user disable): drop the activity window too. A
+        // mere STARTING transition keeps it — the watch fd is torn down and re-armed around every
+        // probe, and the retry BURST a trigger opened must span the whole dormant period, not one
+        // probe cycle.
         m_lastWatchActivity.reset();
     }
 }
@@ -3913,30 +3926,6 @@ void COpenXRManager::onReprobeExpired() {
     if (m_state != XR_STATE_UNAVAILABLE || !*PENABLED || !*PREPROBE)
         return; // state moved on / disabled since the timer was armed
 
-    // Paranoid silent-miss guard (live-evidence bug 2 hardening): while the watch is armed, every
-    // timer-fired probe also stats the known trigger paths. A trigger file existing while the watch
-    // never fired this dormant cycle means either the expected pre-don steady state (WiVRn keeps
-    // comp_ipc alive in degraded mode — HEADSET wait, log once at DEBUG) or a genuine watch miss
-    // (RUNTIME wait believes there is no runtime, yet its socket exists — WARN once so future
-    // silent-miss classes are diagnosable from a normal log).
-    if (m_watchInotifyFd >= 0 && !m_watchEverFired && !m_watchMissLogged) {
-        struct stat st;
-        for (const auto& spec : m_watchSpecs) {
-            for (const auto& trig : spec.triggerNames) {
-                const std::string path = spec.dir + "/" + trig;
-                if (stat(path.c_str(), &st) == 0) {
-                    Log::logger->log(m_probeWait == XR_WAIT_HEADSET ? Log::DEBUG : Log::WARN,
-                                     "[OPENXR] reprobe-watch: {} exists but the watch has not fired this dormant cycle ({})", path,
-                                     m_probeWait == XR_WAIT_HEADSET ? "expected: pre-created socket, waiting for the headset" : "possible watch miss — timer probe proceeding");
-                    m_watchMissLogged = true;
-                    break;
-                }
-            }
-            if (m_watchMissLogged)
-                break;
-        }
-    }
-
     m_reprobeAttempt++;
     // start() re-attempts from scratch. On success setState() cancels+resets us; on failure it lands
     // back in UNAVAILABLE and setState() re-arms with the grown backoff (or the headset cadence).
@@ -3944,7 +3933,12 @@ void COpenXRManager::onReprobeExpired() {
 }
 
 std::string COpenXRManager::reprobeWaitString() const {
-    if (m_state != XR_STATE_UNAVAILABLE || !m_reprobeTimer || !m_reprobeTimer->armed())
+    // Reported whenever we are DORMANT with re-probing enabled — not only while a timer is pending.
+    // Since the watch became the steady state (no timer while it is armed and quiet), gating this on
+    // an armed timer would blank the wait class in exactly the situation the user asks about.
+    static auto PENABLED = CConfigValue<Hyprlang::INT>("openxr:enabled");
+    static auto PREPROBE = CConfigValue<Hyprlang::INT>("openxr:reprobe");
+    if (m_state != XR_STATE_UNAVAILABLE || !*PENABLED || !*PREPROBE)
         return "";
     return m_probeWait == XR_WAIT_HEADSET ? "headset" : "runtime";
 }
@@ -3957,7 +3951,10 @@ int COpenXRManager::reprobePendingMs() const {
 }
 
 bool COpenXRManager::reprobeWatchArmed() const {
-    return m_watchInotifyFd >= 0;
+    // Both halves: the fd alone is not a watch until it rides the wayland event loop (setupReprobeWatch
+    // closes the fd if wl_event_loop_add_fd fails, but say what we mean — this now gates whether the
+    // fallback timer runs at all).
+    return m_watchInotifyFd >= 0 && m_watchSource != nullptr;
 }
 
 // ---- event-driven re-probe: inotify watch on the runtime socket dir (don-the-headset dead-air) ----
@@ -4122,8 +4119,7 @@ void COpenXRManager::onReprobeWatchReadable() {
 }
 
 void COpenXRManager::triggerWatchedProbe() {
-    m_watchEverFired = true; // silent-miss guard bookkeeping (spans the dormant period)
-    markWatchActivity();
+    markWatchActivity(); // opens/extends the bounded retry burst (the timer's only steady-state job)
     // Debounce (XR_REPROBE_WATCH_DEBOUNCE_MS): coalesce a burst of create events AND give the server a
     // beat to start accept()ing before we probe. The one-shot re-arm just pushes the deadline out.
     const auto dur = std::chrono::milliseconds(OpenXR::XR_REPROBE_WATCH_DEBOUNCE_MS);

@@ -142,7 +142,8 @@ atomics). Details are in docs 01, 02, and 04.
 ```
 DISABLED        openxr:enabled = 0, or stopped; no XR objects exist
 UNAVAILABLE     start attempted but no runtime / no headset, or instance loss;
-                dormant, with a backoff reprobe timer (openxr:reprobe) that retries automatically
+                dormant, retried automatically (openxr:reprobe): an inotify watch on the
+                runtime dir as the steady state, plus a bounded fallback timer
 STARTING        start() in progress on the main thread
 RUNNING_IDLE    session exists; XrSessionState IDLE/READY/SYNCHRONIZED/STOPPING
 RUNNING_VISIBLE XrSessionState VISIBLE — quads composited, pacing active
@@ -154,18 +155,23 @@ STOPPING        stop() in progress: joining the frame thread, tearing down
   `stop()` on the main thread: the startup check, a config-reload listener, and
   `hyprctl openxr enable|disable`.
 - **UNAVAILABLE is dormant, not terminal.** While `openxr:enabled` and `openxr:reprobe` are
-  set, a timer re-attempts `start()` so the session comes up automatically once the runtime
-  starts or the headset is donned. "Waiting for the headset" — xrGetSystem
-  `FORM_FACTOR_UNAVAILABLE`, **or a reachable runtime answering in a degraded mode** (WiVRn's
-  service listens on its socket from startup and only advertises the real extension set once
-  the headset connects) — polls at the fixed base interval; only a truly absent, quiet runtime
-  grows the backoff (up to 30s). Session/instance loss lands here and thus auto-reconnects.
-  An **event-driven** leg (`openxr:reprobe_watch`, default on) also inotify-watches
-  `$XDG_RUNTIME_DIR`: the IPC socket appearing (`monado_comp_ipc` / `wivrn/comp_ipc`) **or the
-  pid file being created/rewritten** (`monado.pid` / `wivrn.pid` — WiVRn's forked compositor
-  server touches it exactly at headset-connect, the only don-time filesystem signal it emits)
-  probes within ~150ms, resets the backoff to base, and keeps it capped at base for 60s of
-  watched-dir activity; the timer stays as the fallback.
+  set, `start()` is re-attempted so the session comes up automatically once the runtime starts
+  or the headset is donned. Session/instance loss lands here and thus auto-reconnects.
+  The **steady-state** mechanism is event-driven (`openxr:reprobe_watch`, default on): an
+  inotify watch on `$XDG_RUNTIME_DIR` where the IPC socket appearing (`monado_comp_ipc` /
+  `wivrn/comp_ipc`) **or the pid file being created/rewritten** (`monado.pid` / `wivrn.pid` —
+  WiVRn's forked compositor server touches it exactly at headset-connect, the only don-time
+  filesystem signal it emits) probes within ~150ms. Because that covers the don in **both**
+  wait modes, no periodic timer runs while the watch is armed and quiet.
+  The `openxr:reprobe_interval_ms` timer is **bounded**: it runs as a retry burst for 60s after
+  a watch trigger or a bring-up/handshake timeout (one event is not always enough — the runtime
+  may only become usable a beat after its trigger file lands), and as the sole mechanism when
+  the watch cannot be armed (no `$XDG_RUNTIME_DIR`, inotify failure, or `reprobe_watch = 0`).
+  In a burst, and whenever "waiting for the headset" — xrGetSystem `FORM_FACTOR_UNAVAILABLE`,
+  **or a reachable runtime answering in a degraded mode** (WiVRn's service listens on its socket
+  from startup and only advertises the real extension set once the headset connects) — probes
+  run at the fixed base interval; only a quiet, timer-only wait for an absent runtime grows the
+  backoff (up to 30s).
 - `RUNNING` sub-states mirror `XrSessionState`, driven by the frame thread's event pump; each
   transition posts the `openxrsessionstate` socket2 event and re-runs the idle-inhibit check.
 - Runtime-initiated `STOPPING` is not manager STOPPING — the frame thread ends the session

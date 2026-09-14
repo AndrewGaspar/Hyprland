@@ -730,17 +730,22 @@ std::vector<SP<IValue>> Values::getConfigValues() {
 
         MS<Bool>("openxr:enabled", "enable the OpenXR integration (session starts when a runtime is available)", false),
         MS<Bool>("openxr:reprobe",
-                 "when enabled but no runtime/headset is available yet, keep re-probing in the background (with a backoff) so the session comes up automatically once the "
-                 "runtime starts or the headset is donned — no need to toggle openxr:enabled. Also drives auto-reconnect after a session/runtime loss (report-17)",
+                 "when enabled but no runtime/headset is available yet, keep re-probing in the background so the session comes up automatically once the runtime starts or "
+                 "the headset is donned — no need to toggle openxr:enabled. Also drives auto-reconnect after a session/runtime loss (report-17). The STEADY-STATE mechanism "
+                 "is the openxr:reprobe_watch inotify watch; the openxr:reprobe_interval_ms timer only runs as a bounded retry burst or when the watch cannot be armed. "
+                 "Setting this to false disables both — nothing retries automatically",
                  true),
         MS<Int>("openxr:reprobe_interval_ms",
-                "base interval for the openxr:reprobe backoff, in milliseconds. Waiting for the runtime grows the delay from this base up to 30s; waiting for the headset "
-                "(runtime up, not donned) polls at this fixed cadence",
+                "base interval for the openxr:reprobe timer, in milliseconds. The timer is NOT the steady-state mechanism: while the runtime watch is armed and quiet no "
+                "timer runs at all (the next probe is event-driven). It runs as a bounded retry burst for 60s after a watch trigger or a bring-up/handshake timeout, and as "
+                "the sole mechanism when the watch cannot be armed (no $XDG_RUNTIME_DIR, inotify failure, openxr:reprobe_watch = false). In a burst, or while waiting for "
+                "the headset (runtime up, not donned), probes run at this fixed cadence; only a quiet, timer-only wait for an absent runtime grows the delay up to 30s",
                 2000, {.min = 250, .max = 60000}),
         MS<Bool>("openxr:reprobe_watch",
-                 "while dormant in 'unavailable', also inotify-watch $XDG_RUNTIME_DIR for the runtime's IPC socket appearing (monado_comp_ipc / wivrn/comp_ipc) and probe "
-                 "immediately when it does, instead of waiting out the reprobe backoff. Kills the up-to-30s stall between donning the headset and the session coming up "
-                 "(WiVRn's socket only appears when the headset connects). The reprobe backoff timer stays as fallback",
+                 "while dormant in 'unavailable', inotify-watch $XDG_RUNTIME_DIR for the runtime materializing — the IPC socket appearing (monado_comp_ipc / "
+                 "wivrn/comp_ipc) or the pid file being created/rewritten (monado.pid / wivrn.pid, WiVRn's only don-time filesystem signal) — and probe immediately when "
+                 "it does. This is the STEADY-STATE mechanism in both wait modes: while it is armed and quiet, no periodic timer runs. Turning it off reverts to the old "
+                 "timer-only behaviour (the openxr:reprobe_interval_ms backoff)",
                  true),
         MS<Bool>("openxr:recenter_on_plug",
                  "on the first time the headset is donned in a session, re-seat anchor:local monitors relative to your current head pose instead of the runtime's (often "

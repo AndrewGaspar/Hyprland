@@ -405,6 +405,34 @@ namespace OpenXR {
     // How long after the last relevant watch event the backoff stays capped at the base interval.
     inline constexpr int64_t XR_REPROBE_ACTIVITY_WINDOW_MS = 60000;
 
+    // ---- who owns the dormant retry: the watch, or the timer? (live evidence 2026-09-13) --------
+    //
+    // WHAT HAPPENED. With no headset connected, WiVRn 26.6.2 publishes no
+    // ~/.config/openxr/1/active_runtime.json at all (it appears at headset-connect), so the loader
+    // finds NO runtime and every probe fails at enumerate. The dormant timer therefore re-probed
+    // forever at the 30s backoff cap, and each probe bounced the manager
+    // UNAVAILABLE -> STARTING -> UNAVAILABLE. Every setState() re-runs the idle-inhibit fold, which
+    // used to restart every inhibitor-obeying ext-idle-notification's timeout (fixed separately in
+    // CIdleNotifyProtocol::setInhibit) — a machine that never locked. Even with that fixed, a
+    // perpetual 30s dlopen-the-loader poll against a runtime that is provably not there is pure
+    // cost: it buys nothing the inotify watch does not already deliver.
+    //
+    // THE RULE THIS ENCODES. Since the pid-file trigger landed (the forked WiVRn compositor writes
+    // $XDG_RUNTIME_DIR/wivrn.pid exactly at headset-connect), the WATCH is the don signal in BOTH
+    // wait modes. So when the watch is armed and quiet, the steady state is NO TIMER AT ALL: the
+    // next probe is event-driven. The timer survives for exactly two jobs —
+    //   1. the watch could not be armed (no $XDG_RUNTIME_DIR, inotify_init1 / wl_event_loop_add_fd
+    //      failure, or openxr:reprobe_watch = false): it is then the only mechanism;
+    //   2. a bounded retry BURST while activityRecent — a watch trigger or a bounded-handshake /
+    //      bring-up timeout inside XR_REPROBE_ACTIVITY_WINDOW_MS. The runtime is materializing and
+    //      a single event is not enough: a probe fired 150ms after wivrn.pid but before the parent
+    //      symlinks active_runtime.json, or before the forked server accepts, must be retried. The
+    //      burst runs at the base cadence (xrReprobeDelayMs already pins it there) and self-limits
+    //      when the window closes.
+    // openxr:reprobe = false is upstream of all of this: the caller cancels everything and never
+    // consults this function.
+    bool xrShouldArmReprobeTimer(bool watchArmed, bool activityRecent);
+
     // ---- reload-storm containment (live evidence, boot 2026-08-21, 02:50-03:00) ---------------
     //
     // WHAT HAPPENED. A ~1 Hz storm of config PROP REFRESHES (config.props_refreshed, not even a

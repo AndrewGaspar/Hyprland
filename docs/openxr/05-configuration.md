@@ -144,9 +144,9 @@ Every variable, grouped by area. The "applies" column notes when a change takes 
 | Variable | Type | Default | Meaning | Applies |
 |---|---|---|---|---|
 | `enabled` | bool | `false` | Master switch (§1). | hot |
-| `reprobe` | bool | `true` | While enabled but no runtime/headset is available yet, keep re-probing in the background so the session comes up automatically once the runtime starts or the headset is donned. Also drives auto-reconnect after a session/runtime loss. | hot |
-| `reprobe_interval_ms` | int | `2000` | Base interval for the reprobe backoff. "Waiting for the runtime" grows the delay from this base up to 30s; "waiting for the headset" (runtime up, not donned) polls at this fixed cadence. | hot |
-| `reprobe_watch` | bool | `true` | While dormant in `unavailable`, also **inotify-watch** `$XDG_RUNTIME_DIR` for the runtime materializing and probe **immediately** when it does — instead of waiting out the backoff. Triggers: the IPC socket appearing (`monado_comp_ipc`, `wivrn/comp_ipc`) **and the pid file being created or rewritten** (`monado.pid`, `wivrn.pid`) — the latter is WiVRn's only don-time filesystem signal (its socket is pre-created at service start and inherited by the compositor server forked at headset-connect). A trigger also resets the backoff to the base interval, and any relevant watched-dir activity keeps it capped at base for the next 60s (the runtime is materializing — poll hard). The `reprobe`/`reprobe_interval_ms` timer stays as the fallback (inotify can miss across mount namespaces, and needs `$XDG_RUNTIME_DIR` set); each timer probe also stats the trigger paths and logs once per dormant period if one exists that the watch never saw (silent-miss guard). | hot (next reprobe cycle) |
+| `reprobe` | bool | `true` | While enabled but no runtime/headset is available yet, keep re-probing in the background so the session comes up automatically once the runtime starts or the headset is donned. Also drives auto-reconnect after a session/runtime loss. This is the master switch over **both** mechanisms below: with `reprobe = false` nothing retries automatically — no watch, no timer — and a config reload is the manual retry. | hot |
+| `reprobe_interval_ms` | int | `2000` | Base interval for the reprobe **timer**. The timer is **not** the steady-state mechanism (see `reprobe_watch`): while the watch is armed and quiet, no timer runs at all. It runs (a) as a **bounded retry burst** for 60s after a watch trigger or a bring-up/handshake timeout — one event is not enough, since the runtime may answer a beat after its trigger file lands — and (b) as the **sole** mechanism when the watch could not be armed. In a burst, and whenever "waiting for the headset" (runtime up, not donned), probes run at this fixed cadence; only a quiet timer-only wait for an absent runtime grows the delay from this base up to 30s. | hot |
+| `reprobe_watch` | bool | `true` | While dormant in `unavailable`, **inotify-watch** `$XDG_RUNTIME_DIR` for the runtime materializing and probe **immediately** when it does. Triggers: the IPC socket appearing (`monado_comp_ipc`, `wivrn/comp_ipc`) **and the pid file being created or rewritten** (`monado.pid`, `wivrn.pid`) — the latter is WiVRn's only don-time filesystem signal (its socket is pre-created at service start and inherited by the compositor server forked at headset-connect). Since the pid-file trigger covers the don in **both** wait modes, this is the **steady-state** mechanism: with the watch armed and nothing happening, there is no periodic timer at all and the next probe is event-driven. A trigger resets the backoff to the base interval and opens a 60s window in which the timer retries at base (the runtime is materializing — poll hard). Turning this off reverts to the old **timer-only** behaviour; the timer is also the sole mechanism when the watch cannot be armed (no `$XDG_RUNTIME_DIR`, or inotify setup fails). | hot (next reprobe cycle) |
 | `gpu` | string | `""` | DRM render node for the XR EGL context (e.g. `/dev/dri/renderD128`). Empty = follow Hyprland's primary GPU. Set it on hybrid/multi-GPU machines where the runtime composites on a different GPU than Hyprland — a detected mismatch is refused at startup rather than crashing the graphics driver (see the session/graphics doc). | start |
 | `ignore_kernel_taint` | bool | `false` | Start XR even when the kernel has **already taken an oops this boot** (`/proc/sys/kernel/tainted` bit 7, `TAINT_DIE`). By default bring-up is refused in that state, because it unavoidably initializes *every* installed GPU vendor driver — a pin cannot prevent it — and entering an already-corrupt one can take the machine down. Development escape hatch only; it still warns at each start, and the real fix is a reboot. See the "sick driver" note below and the session/graphics doc. | start |
 | `runtime_json` | string | `""` | Path to the OpenXR runtime manifest (`openxr_*.json`) the session should handshake against, overriding `XR_RUNTIME_JSON` / `active_runtime.json` **for this compositor's XR session only**. Empty = leave the login environment untouched (loader default). Read on the **main thread** at each session start and applied to the loader's `XR_RUNTIME_JSON` before the handshake; clearing it back to empty restores the runtime the process launched with, so it round-trips cleanly. This is how the XREAL flat↔XR toggle (`scripts/xreal-mode.sh`) selects the xreal-flavor Monado without disturbing a WiVRn `active_runtime`. Set live with `hyprctl keyword openxr:runtime_json <path>` then `hyprctl openxr disable && hyprctl openxr enable` to re-handshake. Surfaced in `status` as `runtime json:`. See the XREAL rig doc (07). | start |
@@ -1156,14 +1156,16 @@ monitor XR-code (ID 3): 2560x1440@90.00 size 1.80m anchor local pos [0.00, 1.40,
   XR-code: 2d [1920, 0] col 0 row 0 (auto) from az -12.4 deg, el -3.1 deg
 ```
 
-While dormant the state line carries the reprobe hint, e.g.
-`state: unavailable (waiting for headset, retrying in 1800ms)`. When the event-driven watch is
-armed (`reprobe_watch`, either wait mode) the hint adds `, watching socket`, e.g.
-`state: unavailable (waiting for headset, retrying in 2000ms, watching socket)` — the delay is just
-the fallback; a socket/pid trigger probes within ~150ms. A WiVRn runtime whose service is up but
-headset undonned reads as `waiting for headset` (its degraded pre-don IPC answers but lacks the
-required extensions — classified as a headset wait, fixed base cadence). While a grace-period
-unplug is pending, the follow line reads e.g. `visible (unplug in 12000ms)`.
+While dormant the state line carries the reprobe hint. In the steady state there is no timer —
+the watch owns the retry — and the hint says so:
+`state: unavailable (waiting for runtime, event-driven (watching socket))`. While a timer *is*
+pending (a bounded retry burst after a trigger, or a watch that could not be armed) it reads
+`state: unavailable (waiting for headset, retrying in 2000ms, watching socket)`; with no watch and
+no pending timer, `no retry pending`. A socket/pid trigger probes within ~150ms either way. A WiVRn
+runtime whose service is up but headset undonned reads as `waiting for headset` (its degraded
+pre-don IPC answers but lacks the required extensions — classified as a headset wait, fixed base
+cadence). While a grace-period unplug is pending, the follow line reads e.g.
+`visible (unplug in 12000ms)`.
 
 `recenter policy:` is `hold` or `follow` (`openxr:recenter`, doc 03 §8.4). It is on the status page
 because the single most confusing thing about recentering is that pressing the headset's button can
@@ -1273,15 +1275,20 @@ Field notes:
 - `monitorView` — `shown` or `hidden`, the session-scoped `xrmonitor view` presentation gate.
   Hidden monitors remain plugged with their workspaces and anchors intact, but submit no quads and
   cannot receive ray-pointer hits.
-- `reprobeWaiting` / `reprobePendingMs` — while dormant in `unavailable`: what the reprobe is
-  waiting for (`runtime` | `headset` | `""`) and ms until the next probe (`-1` when none
-  armed). `headset` covers both xrGetSystem `FORM_FACTOR_UNAVAILABLE` (stock monado, HMD absent)
-  and a reachable-but-degraded runtime (WiVRn service up, headset undonned) — both poll at the
-  fixed base cadence, never the grown backoff.
+- `reprobeWaiting` / `reprobePendingMs` — while dormant in `unavailable` with `openxr:reprobe` on:
+  what the reprobe is waiting for (`runtime` | `headset`; `""` when not dormant or reprobing is
+  off) and ms until the next **timer** probe. `reprobePendingMs` is `-1` whenever no timer is
+  pending — which is the normal steady state, because the watch owns the retry; it is not a sign
+  that nothing will happen. `reprobeWaiting` is deliberately **not** gated on a pending timer: the
+  wait class is exactly what you want to see while the compositor is sitting event-driven.
+  `headset` covers both xrGetSystem `FORM_FACTOR_UNAVAILABLE` (stock monado, HMD absent) and a
+  reachable-but-degraded runtime (WiVRn service up, headset undonned) — both poll at the fixed
+  base cadence, never the grown backoff.
 - `reprobeWatching` — whether the event-driven inotify watch on `$XDG_RUNTIME_DIR` is armed
   (`openxr:reprobe_watch`, `$XDG_RUNTIME_DIR` resolvable). When `true`, a socket/pid trigger
   (`monado_comp_ipc`, `wivrn/comp_ipc`, `monado.pid`, `wivrn.pid` created or rewritten) fires a
-  probe within ~150ms and `reprobePendingMs` is only the fallback timer.
+  probe within ~150ms, and the timer behind `reprobePendingMs` is only a bounded retry burst.
+  When `false`, the timer is the only thing that will ever retry.
 - `inhibitingIdle` — whether XR currently raises the idle-inhibit bit **right now** (the live
   fold of `idleInhibitMode` with `state` / `visible` / `userPresence`; text form:
   `idle inhibited: yes (mode present)`).
