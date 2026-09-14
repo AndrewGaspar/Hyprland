@@ -116,6 +116,18 @@ void CIdleNotifyProtocol::onActivity() {
 }
 
 void CIdleNotifyProtocol::setInhibit(bool inhibited) {
+    // EDGE-TRIGGERED. update() restarts an inhibitor-obeying notification's FULL timeout, so calling
+    // this with the state it already has silently postpones every lock/screensaver. The only caller
+    // is CInputManager::recheckIdleInhibitorStatus(), which re-folds every inhibitor source on each
+    // window map/unmap, focus change, fullscreen toggle and XR state transition — the overwhelming
+    // majority of those re-computes land on the same value. Live evidence: a dormant OpenXR manager
+    // bouncing STARTING/UNAVAILABLE every 30s (re-probe with no runtime present) kept resetting
+    // "false" and the machine never idled. Nothing ever needs a same-value call to restart timers:
+    // real user activity goes through onActivity(), and a notification created while already
+    // inhibited arms itself correctly in its own constructor's update().
+    if (isInhibited == inhibited)
+        return;
+
     isInhibited = inhibited;
     for (auto const& n : m_notifications) {
         if (n->inhibitorsAreObeyed())
