@@ -536,6 +536,18 @@ int64_t OpenXR::xrReprobeDelayMs(bool headsetWait, bool activityRecent, int atte
     return xrReprobeBackoffMs(attempt, baseMs, capMs);
 }
 
+bool OpenXR::xrShouldArmReprobeTimer(bool watchArmed, bool activityRecent) {
+    // Decision table (live evidence 2026-09-13 — see the header for the WiVRn fact that made the old
+    // always-on timer a perpetual no-op poll):
+    //   watch not armed          -> true  (the timer is the ONLY mechanism)
+    //   watch armed + activity   -> true  (bounded retry burst at base cadence while the runtime
+    //                                      materializes; self-limits when the activity window closes)
+    //   watch armed + quiet      -> false (steady state: the next probe is event-driven)
+    if (!watchArmed)
+        return true;
+    return activityRecent;
+}
+
 OpenXR::eXRReloadAction OpenXR::xrReloadAction(const SXRReloadInputs& in) {
     // 1. Sticky disable. A user who typed `hyprctl openxr disable` stays disabled until they type
     //    `enable`, regardless of what openxr:enabled says on the next reload.

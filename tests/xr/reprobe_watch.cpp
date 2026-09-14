@@ -145,3 +145,35 @@ TEST(reprobe_watch, activity_window_is_sane) {
     EXPECT_GE(XR_REPROBE_ACTIVITY_WINDOW_MS, 10000);
     EXPECT_LE(XR_REPROBE_ACTIVITY_WINDOW_MS, 5 * 60000);
 }
+
+// ---- who owns the dormant retry: the watch, or the timer? (live evidence 2026-09-13) ----------
+// While no headset is connected, WiVRn 26.6.2 publishes no ~/.config/openxr/1/active_runtime.json
+// (it appears at headset-connect), so the loader finds NO runtime and every probe fails at
+// enumerate. The old always-armed timer therefore re-probed forever at the 30s backoff cap,
+// bouncing UNAVAILABLE -> STARTING -> UNAVAILABLE and, through the idle-inhibit recheck on every
+// setState(), restarting every inhibitor-obeying idle listener's timeout — the machine never
+// locked. The pid-file trigger (5cb29bcb3) already makes the watch the don signal in BOTH wait
+// modes, so the watch is the steady state and the timer is bounded.
+
+TEST(reprobe_watch, timer_is_the_only_mechanism_without_a_watch) {
+    // No $XDG_RUNTIME_DIR, inotify_init1 / wl_event_loop_add_fd failure, or
+    // openxr:reprobe_watch = false -> nothing is event-driven, so the timer must always run.
+    EXPECT_TRUE(xrShouldArmReprobeTimer(/*watchArmed*/ false, /*activityRecent*/ false));
+    EXPECT_TRUE(xrShouldArmReprobeTimer(false, true));
+}
+
+TEST(reprobe_watch, armed_watch_plus_recent_activity_keeps_a_bounded_retry_burst) {
+    // A watch trigger (or a bounded-handshake / bring-up timeout) inside
+    // XR_REPROBE_ACTIVITY_WINDOW_MS means the runtime is materializing and ONE probe is not enough:
+    // a probe fired 150ms after wivrn.pid but before the parent symlinks active_runtime.json, or
+    // before the forked server accept()s, has to be retried. xrReprobeDelayMs already pins that
+    // burst to the base cadence, and the activity window makes it self-limiting.
+    EXPECT_TRUE(xrShouldArmReprobeTimer(/*watchArmed*/ true, /*activityRecent*/ true));
+    EXPECT_EQ(xrReprobeDelayMs(false, true, 25, 2000, 30000), 2000); // the burst runs at base
+}
+
+TEST(reprobe_watch, armed_and_quiet_watch_means_no_timer_at_all) {
+    // THE FIX. Steady state pre-don: the watch is armed, nothing has happened for 60s, and the next
+    // probe is event-driven. No timer -> no 30s state bounce -> no idle-timer reset storm.
+    EXPECT_FALSE(xrShouldArmReprobeTimer(/*watchArmed*/ true, /*activityRecent*/ false));
+}

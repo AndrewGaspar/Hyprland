@@ -230,13 +230,17 @@ class COpenXRManager {
     // Surfaced alongside presence so the combined plug gate (needs both) is diagnosable in one command.
     std::string visibleStatusString() const;
     // `hyprctl openxr status` dormant re-probe field (report-17 WP-L3 / report-20 issue B1): while
-    // UNAVAILABLE with a re-probe armed, "runtime" (no runtime yet) or "headset" (runtime up, headset
-    // undonned); empty otherwise. reprobePendingMs(): ms until the next probe, or -1 when none armed.
+    // dormant in UNAVAILABLE with openxr:enabled + openxr:reprobe on, "runtime" (no runtime yet) or
+    // "headset" (runtime up, headset undonned); empty otherwise. NOT gated on a pending timer — the
+    // steady state is now event-driven (no timer while the watch is armed and quiet), and the wait
+    // class is exactly what the user is asking about there. reprobePendingMs(): ms until the next
+    // TIMER probe, or -1 when none is armed (event-driven: the watch fires the next probe).
     std::string reprobeWaitString() const;
     int         reprobePendingMs() const;
-    // Whether the event-driven inotify watch on the runtime socket dir is currently armed (don-the-
-    // headset dead-air fix). True only while dormant in UNAVAILABLE with openxr:reprobe_watch on and
-    // $XDG_RUNTIME_DIR resolvable. Surfaced so `hyprctl openxr status` makes the behavior diagnosable.
+    // Whether the event-driven inotify watch on the runtime dir is currently armed (don-the-headset
+    // dead-air fix). True only while dormant in UNAVAILABLE with openxr:reprobe_watch on and
+    // $XDG_RUNTIME_DIR resolvable. Surfaced so `hyprctl openxr status` makes the behavior diagnosable
+    // — and, since it decides whether the fallback timer runs at all, so does "no timer pending".
     bool        reprobeWatchArmed() const;
 
     // --- IPC verb funnel (main thread). ONE implementation, two transports: the xrmonitor
@@ -582,8 +586,10 @@ class COpenXRManager {
         XR_WAIT_RUNTIME,  // xrCreateInstance / system lookup failed -> waiting for the runtime/server
         XR_WAIT_HEADSET,  // xrGetSystem returned FORM_FACTOR_UNAVAILABLE -> runtime up, headset undonned
     };
-    // Arm the re-probe timer (if UNAVAILABLE + openxr:enabled + openxr:reprobe) using the backoff for
-    // the current attempt (RUNTIME) or the fixed cadence (HEADSET). Called on entering UNAVAILABLE.
+    // Arm the runtime watch (if UNAVAILABLE + openxr:enabled + openxr:reprobe) and, only when
+    // OpenXR::xrShouldArmReprobeTimer says a timer is needed (watch unarmed, or a bounded retry burst
+    // while watch activity is recent), the re-probe timer too — using the backoff for the current
+    // attempt (RUNTIME) or the fixed cadence (HEADSET). Called on entering UNAVAILABLE.
     void          maybeArmReprobe();
     void          armReprobeTimer(int ms);
     // Disarm the re-probe timer. resetBackoff clears the consecutive-failure count (on a real start()
@@ -1121,14 +1127,11 @@ class COpenXRManager {
     std::unordered_map<int, OpenXR::SXRReprobeWatch> m_watchByWd;
     SP<CEventLoopTimer>                        m_watchDebounceTimer;
     // Per-dormant-PERIOD bookkeeping (survives the per-probe watch teardown/re-arm; cleared only by
-    // cancelReprobe(resetBackoff=true) — real success / user disable). m_lastWatchActivity: last
-    // relevant inotify event, drives the fast-cadence activity window. m_watchEverFired /
-    // m_watchMissLogged: the timer-probe silent-miss guard (a trigger path existing on disk while the
-    // watch has never fired is logged once — WARN on RUNTIME wait, DEBUG on the expected WiVRn
-    // pre-don HEADSET wait).
+    // cancelReprobe(resetBackoff=true) — real success / user disable). m_lastWatchActivity: the last
+    // relevant inotify event (or bring-up/handshake timeout). It drives the fast-cadence activity
+    // window AND, since the watch became the steady state, the bounded retry burst that is now the
+    // fallback timer's only other job.
     std::optional<Time::steady_tp>             m_lastWatchActivity;
-    bool                                       m_watchEverFired  = false;
-    bool                                       m_watchMissLogged = false;
 
     // Populated from xrInstanceProperties/xrSystemProperties once a session exists.
     std::string       m_runtimeName;

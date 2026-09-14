@@ -221,12 +221,20 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
 
     const std::string FOLLOWLINE = UNPLUG_PEND >= 0 ? std::format("{} (unplug in {}ms)", FOLLOW, UNPLUG_PEND) : FOLLOW;
     // report-20 issue B1: append the dormant re-probe hint to the state line, e.g.
-    // "unavailable (waiting for headset, retrying in 1800ms)".
+    // "unavailable (waiting for headset, retrying in 1800ms)". Since the watch became the steady-state
+    // mechanism there is usually NO timer pending while dormant (REPROBE_MS < 0), and the honest hint
+    // is "event-driven" rather than a fabricated "retrying in 0ms", e.g.
+    // "unavailable (waiting for runtime, event-driven (watching socket))".
+    const std::string REPROBEHINT = REPROBE_MS >= 0 ?
+        std::format("retrying in {}ms{}", REPROBE_MS, REPROBE_WATCH ? ", watching socket" : "") :
+        REPROBE_WATCH ?
+        std::string("event-driven (watching socket)") :
+        std::string("no retry pending");
     const std::string STATELINE = MANUAL_DISABLE ?
         std::format("{} (manually disabled — `hyprctl openxr enable` to resume)", STATE) :
         REPROBE_WAIT.empty() ?
         STATE :
-        std::format("{} (waiting for {}, retrying in {}ms{})", STATE, REPROBE_WAIT, REPROBE_MS < 0 ? 0 : REPROBE_MS, REPROBE_WATCH ? ", watching socket" : "");
+        std::format("{} (waiting for {}, {})", STATE, REPROBE_WAIT, REPROBEHINT);
     const std::string GAZELINE = GAZE.carrying ? std::format("carrying {} at {:.2f}m", GAZE.carryMonitor, GAZE.dist)
                                                 : (GAZE.hoveredMonitor >= 0 ? std::format("looking at {}", GAZE.hoveredName) : "idle");
     // "black alpha: 0.20 (knee 0.10)" when the luma key is live; "off" when unconfigured; and an
