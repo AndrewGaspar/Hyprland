@@ -99,6 +99,52 @@ run() {
 
 have_jq() { command -v jq >/dev/null 2>&1; }
 
+# ---- monitor rules, across both config front ends ----
+# Under the Lua config front end `hyprctl keyword` does nothing and STILL exits 0 ("keyword can't work
+# with non-legacy parsers. Use eval."), so a bare `keyword monitor` — including the `lease` flip — silently
+# fails. Detect the running session's front end once (systeminfo is not free on the compositor side, so it
+# is cached; call this from the main shell, not a $(…) subshell, or the cache is lost) and emit
+# `hyprctl eval 'hl.monitor({…})'` under Lua, the classic keyword line otherwise. A binary too old to
+# report configProvider is classic-only, so "not lua" is the safe fallback.
+HYPR_CONFIG_LUA=""
+hypr_config_is_lua() {
+    if [[ -z $HYPR_CONFIG_LUA ]]; then
+        if hyprctl systeminfo 2>/dev/null | grep -q '^configProvider: lua'; then HYPR_CONFIG_LUA=1; else HYPR_CONFIG_LUA=0; fi
+    fi
+    [[ $HYPR_CONFIG_LUA -eq 1 ]]
+}
+
+# monitor_rule_cmd <output> <mode> <position> <scale> [lease]  -> fills MONITOR_CMD (an argv array).
+# Lua values are [[long strings]], which take spaces, commas and the modeline's +/- verbatim. Under Lua
+# every rule names `lease` EXPLICITLY: hl.monitor merges onto the output's existing rule (a classic line
+# replaces it), so a reclaim that omitted the field would leave a previous `lease = true` in force.
+# `hyprctl eval` reports only Lua-level errors, not a rejected rule field, so success is checked the same
+# way as before — by watching the output (monitor_width / connector state), never hyprctl's answer.
+MONITOR_CMD=()
+monitor_rule_cmd() {
+    local out=$1 mode=$2 pos=$3 scale=$4 lease=${5:-}
+    if hypr_config_is_lua; then
+        local lua_lease=false
+        [[ $lease == lease ]] && lua_lease=true
+        MONITOR_CMD=(hyprctl eval "hl.monitor({ output = [[$out]], mode = [[$mode]], position = [[$pos]], scale = [[$scale]], lease = $lua_lease })")
+    else
+        local value="$out,$mode,$pos,$scale"
+        [[ $lease == lease ]] && value+=",lease"
+        MONITOR_CMD=(hyprctl keyword monitor "$value")
+    fi
+}
+
+# set_monitor: through run() (printed, dry-run aware). set_monitor_quiet: the best-effort revert/recovery
+# paths, which already ran outside run() and must never abort the script.
+set_monitor() {
+    monitor_rule_cmd "$@"
+    run "${MONITOR_CMD[@]}"
+}
+set_monitor_quiet() {
+    monitor_rule_cmd "$@"
+    "${MONITOR_CMD[@]}" >/dev/null 2>&1 || true
+}
+
 # Dependency-free check (no lsusb needed): is the XReal glasses' USB device enumerated?
 # Scans sysfs idVendor/idProduct so a genuinely-unplugged or USB-wedged headset is caught
 # before we (re)start monado. NOTE: this guards the unplugged/wedged case only; it would NOT
@@ -470,7 +516,7 @@ cmd_xr() {
                     echo "   Current DRM modes: $(tr '\n' ' ' < "$(sys_connector_dir "$mon")/modes" 2>/dev/null)" >&2
                     echo "   Reverting glasses to 2D and aborting (desktop restored). Retry, or replug if the glasses wedged." >&2
                     [[ -n $XREAL_CTL ]] && "$XREAL_CTL" mode 2d >/dev/null 2>&1 || true
-                    hyprctl keyword monitor "$mon,${FLAT_MODE},auto,1" >/dev/null 2>&1 || true
+                    set_monitor_quiet "$mon" "${FLAT_MODE}" auto 1
                     exit 1
                 }
                 sleep 0.25
@@ -478,11 +524,11 @@ cmd_xr() {
             echo "  $mon advertises ${SBS_WIDTH}-wide (DRM connector) — offering the lease."
         fi
         echo "  flipping $mon to LEASE — offered to Monado direct mode; it leaves the desktop."
-        run hyprctl keyword monitor "$mon,preferred,auto,1,lease"
+        set_monitor "$mon" preferred auto 1 lease
     elif [[ $MONO -eq 1 ]]; then
-        run hyprctl keyword monitor "$mon,${FLAT_MODE},auto,1"
+        set_monitor "$mon" "${FLAT_MODE}" auto 1
     elif [[ $DRY_RUN -eq 1 ]]; then
-        run hyprctl keyword monitor "$mon,${SBS_WIDTH}x1080@60,auto,1.0"
+        set_monitor "$mon" "${SBS_WIDTH}x1080@60" auto 1.0
     else
         # After the HID 3D switch the glasses re-present a NATIVE 3840-wide EDID mode, but the connector
         # first drops and returns (~2s). PREFER that native mode; fall back to a forced CVT modeline only
@@ -505,10 +551,10 @@ cmd_xr() {
             fi
             [[ -n $modestr ]] || modestr="${SBS_WIDTH}x1080@60"
             echo "  native wide mode advertised ($modestr) — using it."
-            run hyprctl keyword monitor "$mon,${modestr},auto,1.0"
+            set_monitor "$mon" "${modestr}" auto 1.0
         else
             echo "  no native ${SBS_WIDTH} mode appeared — forcing the CVT modeline (glasses hardware-split L/R)…"
-            run hyprctl keyword monitor "$mon,modeline ${SBS_MODELINE},auto,1.0"
+            set_monitor "$mon" "modeline ${SBS_MODELINE}" auto 1.0
         fi
         # Verify the connector actually came up ${SBS_WIDTH}-wide and still connected; else revert + bail.
         i=0; local w=0
@@ -518,7 +564,7 @@ cmd_xr() {
             i=$((i+1)); [[ $i -le 12 ]] || {
                 echo "!! $mon did not come up ${SBS_WIDTH}-wide (width=$w, connected=$(connector_is_connected "$mon" && echo yes || echo no))." >&2
                 echo "   Reverting $mon to $FLAT_MODE + glasses to 2D and aborting SBS (desktop restored)." >&2
-                hyprctl keyword monitor "$mon,${FLAT_MODE},auto,1" >/dev/null 2>&1 || true
+                set_monitor_quiet "$mon" "${FLAT_MODE}" auto 1
                 [[ -n $XREAL_CTL ]] && "$XREAL_CTL" mode 2d >/dev/null 2>&1 || true
                 echo "   Retry, or use: xreal-mode.sh xr --mono" >&2
                 exit 1
@@ -633,13 +679,13 @@ cmd_flat() {
     #    recovered; nudge it through dpms if it looks wedged.
     local mon
     if mon="$(detect_monitor)"; then
-        run hyprctl keyword monitor "$mon,${FLAT_MODE},auto,1"
+        set_monitor "$mon" "${FLAT_MODE}" auto 1
         if [[ $DRY_RUN -eq 0 ]]; then
             sleep 0.5
             local w; w="$(monitor_width "$mon")"
             if [[ "$w" != "$MONO_WIDTH" ]] || ! connector_is_connected "$mon"; then
                 echo "  ($mon width=$w — re-issuing $FLAT_MODE + dpms nudge to recover)"
-                hyprctl keyword monitor "$mon,${FLAT_MODE},auto,1" >/dev/null 2>&1 || true
+                set_monitor_quiet "$mon" "${FLAT_MODE}" auto 1
                 hyprctl dispatch dpms off "$mon" >/dev/null 2>&1 || true
                 hyprctl dispatch dpms on "$mon" >/dev/null 2>&1 || true
                 sleep 0.5; w="$(monitor_width "$mon")"
