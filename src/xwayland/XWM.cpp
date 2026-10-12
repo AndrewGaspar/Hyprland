@@ -402,7 +402,8 @@ void CXWM::handleClientMessage(xcb_client_message_event_t* e) {
         }
 
         auto id       = e->data.data32[0];
-        auto resource = wl_client_get_object(g_pXWayland->m_server->m_xwaylandClient, id);
+        auto client   = g_pXWayland->m_server->m_xwaylandClient;
+        auto resource = client ? wl_client_get_object(client, id) : nullptr;
         if (resource) {
             auto surf = CWLSurfaceResource::fromResource(resource);
             associate(XSURF, surf);
@@ -859,13 +860,12 @@ int CXWM::onEvent(int fd, uint32_t mask) {
 
     if ((mask & WL_EVENT_HANGUP) || (mask & WL_EVENT_ERROR)) {
         Log::logger->log(Log::ERR, "XWayland has yeeten the xwm off?!");
-        Log::logger->log(Log::CRIT, "XWayland has yeeten the xwm off?!");
-        // Attempt to create fresh instance
-        g_pEventLoopManager->doLater([]() {
-            g_pXWayland->m_wm.reset();
-            g_pXWayland->m_server.reset();
-            g_pXWayland = makeUnique<CXWayland>(true);
-        });
+        // Stop polling the dead connection; the restart below replaces this XWM.
+        if (m_eventSource) {
+            wl_event_source_remove(m_eventSource);
+            m_eventSource = nullptr;
+        }
+        g_pXWayland->onServerDied("the XWM connection hung up");
         return 0;
     }
 

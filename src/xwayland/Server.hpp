@@ -2,10 +2,8 @@
 
 #include <array>
 #include <hyprutils/os/FileDescriptor.hpp>
+#include <wayland-server-core.h>
 #include "../helpers/signal/Signal.hpp"
-
-struct wl_event_source;
-struct wl_client;
 
 // TODO: add lazy mode
 class CXWaylandServer {
@@ -20,9 +18,12 @@ class CXWaylandServer {
     bool start();
 
     // called on ready
-    int        ready(int fd, uint32_t mask);
+    int  ready(int fd, uint32_t mask);
 
-    void       die();
+    void die();
+
+    // libwayland destroyed Xwayland's client (protocol error, or Xwayland exited)
+    void       onClientDestroyed();
 
     wl_client* m_xwaylandClient = nullptr;
 
@@ -39,6 +40,7 @@ class CXWaylandServer {
     Hyprutils::OS::CFileDescriptor                m_pipeFd;
     std::array<Hyprutils::OS::CFileDescriptor, 2> m_xwmFDs;
     std::array<Hyprutils::OS::CFileDescriptor, 2> m_waylandFDs;
+    wl_listener                                   m_clientDestroyListener = {};
 
     friend class CXWM;
 };

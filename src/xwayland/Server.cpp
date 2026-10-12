@@ -185,6 +185,11 @@ static int xwaylandReady(int fd, uint32_t mask, void* data) {
     return g_pXWayland->m_server->ready(fd, mask);
 }
 
+static void xwaylandClientDestroyed(wl_listener* listener, void* data) {
+    if (g_pXWayland && g_pXWayland->m_server)
+        g_pXWayland->m_server->onClientDestroyed();
+}
+
 static bool safeRemove(const std::string& path) {
     try {
         return std::filesystem::remove(path);
@@ -279,12 +284,32 @@ void CXWaylandServer::die() {
 
     if (m_pipeSource)
         wl_event_source_remove(m_pipeSource);
+    m_pipeSource = nullptr;
+
+    if (m_idleSource)
+        wl_event_source_remove(m_idleSource);
+    m_idleSource = nullptr;
 
     // possible crash. Better to leak a bit.
     //if (xwaylandClient)
     //    wl_client_destroy(xwaylandClient);
 
+    // We stop caring about this client: a later destroy (e.g. at compositor shutdown) must not reach a dead server.
+    if (m_xwaylandClient) {
+        wl_list_remove(&m_clientDestroyListener.link);
+        wl_list_init(&m_clientDestroyListener.link);
+    }
+
     m_xwaylandClient = nullptr;
+}
+
+void CXWaylandServer::onClientDestroyed() {
+    // libwayland frees the client right after this; nothing may compare against or look up objects in it.
+    wl_list_remove(&m_clientDestroyListener.link);
+    wl_list_init(&m_clientDestroyListener.link);
+    m_xwaylandClient = nullptr;
+
+    g_pXWayland->onServerDied("its Wayland connection was destroyed");
 }
 
 bool CXWaylandServer::create() {
@@ -363,6 +388,9 @@ bool CXWaylandServer::start() {
 
     m_waylandFDs[0].take(); // wl_client owns this fd now
 
+    m_clientDestroyListener.notify = ::xwaylandClientDestroyed;
+    wl_client_add_destroy_listener(m_xwaylandClient, &m_clientDestroyListener);
+
     int notify[2] = {-1, -1};
     if (pipe(notify) < 0) {
         Log::logger->log(Log::ERR, "pipe failed");
@@ -390,6 +418,11 @@ bool CXWaylandServer::start() {
         runXWayland(notifyFds[1]);
         _exit(0);
     }
+
+    // Those ends belong to Xwayland now. Holding them here kept both socketpairs open after Xwayland died, so
+    // the XWM never saw a hangup and its restart path never ran — X11 clients then hung on :N forever.
+    m_waylandFDs[1].reset();
+    m_xwmFDs[1].reset();
 
     return true;
 }
