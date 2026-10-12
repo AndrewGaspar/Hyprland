@@ -25,6 +25,7 @@ nothing that parses in one front end and not the other.
 | `xrmonitor = XR-main, 2560x1440@90, anchor:local pos:0,1.4,-1.5` | `hl.xr_monitor({ name = "XR-main", mode = "2560x1440@90", anchor = "local", pos = { 0, 1.4, -1.5 } })` |
 | `xrrule = alpha 0.55, anchorstate:follow` | `hl.xr_rule({ alpha = 0.55, match = { anchorstate = "follow" } })` |
 | `monitor = …, stereo:sbs` | `hl.monitor({ …, stereo = "sbs" })` |
+| `monitor = DP-5, preferred, auto, 1, lease` | `hl.monitor({ output = "DP-5", mode = "preferred", position = "auto", scale = "1", lease = true })` |
 | `windowrule = stereo hsbs always, match:tag stereo-hsbs` | `hl.window_rule({ stereo = "hsbs always", match = { tag = "stereo-hsbs" } })` |
 | `windowrule = viewpoint on, match:class ^(demo)$` | `hl.window_rule({ viewpoint = true, match = { class = "^(demo)$" } })` |
 | `bind = SUPER SHIFT, G, xrmonitor, gazegrab` | `hl.bind("SUPER + SHIFT + G", hl.dsp.xrmonitor("gazegrab"))` |

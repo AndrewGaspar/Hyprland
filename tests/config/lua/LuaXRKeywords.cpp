@@ -9,6 +9,7 @@
 #include <config/shared/xr/XRDeclarationManager.hpp>
 #include <config/shared/monitor/MonitorRuleManager.hpp>
 #include <config/shared/monitor/MonitorRule.hpp>
+#include <config/shared/monitor/Parser.hpp>
 
 #include <openxr/XRMonitorConfig.hpp>
 #include <openxr/XRRule.hpp>
@@ -535,6 +536,101 @@ TEST(ConfigLuaXRSurface, monitorTakesTheStereoToken) {
     const auto  IT    = std::ranges::find_if(rules, [](const auto& r) { return r.m_name == "desc:Nreal Air 2 Ultra 0x88888800"; });
     ASSERT_NE(IT, rules.end());
     EXPECT_EQ(IT->m_stereo, Config::STEREO_SBS);
+}
+
+// `monitor = DP-5, preferred, auto, 1, lease` — the XReal DRM-lease direct-mode flag. Before the Lua
+// field existed a Lua-config session could not mark an output leasable at all. Every downstream lease
+// protection (MonitorRuleManager's m_isBeingLeased / WANT_LEASE pass, CMonitor::onConnect's offer
+// gate) keys on CMonitorRule::m_lease, so parity here is parity there.
+static std::optional<Config::CMonitorRule> luaMonitorRule(const std::string& name) {
+    const auto& rules = Config::monitorRuleMgr()->all();
+    const auto  IT    = std::ranges::find_if(rules, [&name](const auto& r) { return r.m_name == name; });
+    if (IT == rules.end())
+        return std::nullopt;
+    return *IT;
+}
+
+// What the classic `DP-5, preferred, auto, 1[, lease]` line builds: the same shared parser calls the
+// legacy handler makes, in the same order.
+static Config::CMonitorRule classicLeaseRule(bool lease) {
+    Config::CMonitorRuleParser parser("DP-5");
+    EXPECT_TRUE(parser.parseMode("preferred"));
+    EXPECT_TRUE(parser.parsePosition("auto"));
+    EXPECT_TRUE(parser.parseScale("1"));
+    if (lease)
+        parser.setLease();
+    return parser.rule();
+}
+
+TEST(ConfigLuaXRSurface, monitorLeaseTrueMatchesTheClassicLeaseFlag) {
+    CXRLuaFixture fx;
+    Config::monitorRuleMgr()->clear();
+
+    fx.run(R"LUA( hl.monitor({ output = "DP-5", mode = "preferred", position = "auto", scale = "1", lease = true }) )LUA");
+
+    EXPECT_EQ(fx.errors(), "");
+    const auto RULE = luaMonitorRule("DP-5");
+    ASSERT_TRUE(RULE.has_value());
+    EXPECT_TRUE(RULE->m_lease);
+    EXPECT_EQ(RULE->compare(classicLeaseRule(true)), Config::COMPARISON_FULL_MATCH);
+    Config::monitorRuleMgr()->clear();
+}
+
+TEST(ConfigLuaXRSurface, monitorLeaseDefaultsOff) {
+    CXRLuaFixture fx;
+    Config::monitorRuleMgr()->clear();
+
+    fx.run(R"LUA( hl.monitor({ output = "DP-5", mode = "preferred", position = "auto", scale = "1" }) )LUA");
+
+    EXPECT_EQ(fx.errors(), "");
+    const auto RULE = luaMonitorRule("DP-5");
+    ASSERT_TRUE(RULE.has_value());
+    EXPECT_FALSE(RULE->m_lease);
+    EXPECT_EQ(RULE->compare(classicLeaseRule(false)), Config::COMPARISON_FULL_MATCH);
+    Config::monitorRuleMgr()->clear();
+}
+
+TEST(ConfigLuaXRSurface, monitorLeaseFalseIsTheDesktopRule) {
+    CXRLuaFixture fx;
+    Config::monitorRuleMgr()->clear();
+
+    fx.run(R"LUA( hl.monitor({ output = "DP-5", mode = "preferred", position = "auto", scale = "1", lease = false }) )LUA");
+
+    EXPECT_EQ(fx.errors(), "");
+    const auto RULE = luaMonitorRule("DP-5");
+    ASSERT_TRUE(RULE.has_value());
+    EXPECT_FALSE(RULE->m_lease);
+    EXPECT_EQ(RULE->compare(classicLeaseRule(false)), Config::COMPARISON_FULL_MATCH);
+    Config::monitorRuleMgr()->clear();
+}
+
+// hl.monitor merges onto the output's existing rule (unlike a classic line, which builds a fresh one),
+// so `lease = false` has to actively clear the flag — this is how `xreal-mode.sh flat` reclaims the
+// connector under a Lua config. Omitting the field keeps whatever was there.
+TEST(ConfigLuaXRSurface, monitorLeaseFalseReclaimsAndOmittedKeeps) {
+    CXRLuaFixture fx;
+    Config::monitorRuleMgr()->clear();
+
+    fx.run(R"LUA( hl.monitor({ output = "DP-5", mode = "preferred", position = "auto", scale = "1", lease = true }) )LUA");
+    fx.run(R"LUA( hl.monitor({ output = "DP-5", mode = "1920x1080@90" }) )LUA");
+    ASSERT_TRUE(luaMonitorRule("DP-5").has_value());
+    EXPECT_TRUE(luaMonitorRule("DP-5")->m_lease);
+
+    fx.run(R"LUA( hl.monitor({ output = "DP-5", mode = "1920x1080@90", lease = false }) )LUA");
+    EXPECT_EQ(fx.errors(), "");
+    ASSERT_TRUE(luaMonitorRule("DP-5").has_value());
+    EXPECT_FALSE(luaMonitorRule("DP-5")->m_lease);
+    Config::monitorRuleMgr()->clear();
+}
+
+TEST(ConfigLuaXRSurface, monitorLeaseRejectsANonBoolean) {
+    CXRLuaFixture fx;
+    Config::monitorRuleMgr()->clear();
+
+    fx.run(R"LUA( hl.monitor({ output = "DP-5", lease = "yes please" }) )LUA");
+
+    EXPECT_NE(fx.errors().find("field 'lease'"), std::string::npos) << fx.errors();
+    Config::monitorRuleMgr()->clear();
 }
 
 // The per-window stereo layout and the viewpoint-portal authorization, both fork window-rule

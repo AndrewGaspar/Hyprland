@@ -145,6 +145,18 @@ namespace {
          [](ILuaConfigValue* v, CMonitorRuleParser& p) { return p.parseICC(*sc<const Config::STRING*>(v->data())); }},
         {"stereo", []() -> ILuaConfigValue* { return new CLuaConfigString("off"); },
          [](ILuaConfigValue* v, CMonitorRuleParser& p) { return p.parseStereo(*sc<const Config::STRING*>(v->data())); }},
+        // HypXRland XREAL V2.2: the classic `..., lease` flag (offer this output via drm-lease-v1
+        // instead of driving it as a desktop). true goes through the same setLease() as the classic
+        // parser. false must CLEAR it, not just skip: hl.monitor starts from the existing rule for this
+        // output, so a reclaim that merely omitted the field would leave a previous `lease = true` set.
+        {"lease", []() -> ILuaConfigValue* { return new CLuaConfigBool(false); },
+         [](ILuaConfigValue* v, CMonitorRuleParser& p) {
+             if (*sc<const Config::BOOL*>(v->data()))
+                 p.setLease();
+             else
+                 p.rule().m_lease = false;
+             return true;
+         }},
         {"supports_wide_color", []() -> ILuaConfigValue* { return new CLuaConfigInt(0, -1, 1); },
          [](ILuaConfigValue* v, CMonitorRuleParser& p) {
              p.rule().m_supportsWideColor = sc<int>(*sc<const Config::INTEGER*>(v->data()));
