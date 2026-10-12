@@ -37,8 +37,10 @@ CDRMLeaseResource::CDRMLeaseResource(SP<CWpDrmLeaseV1> resource_, SP<CDRMLeaseRe
     });
 
     for (auto const& m : m_requested) {
-        if (!m->m_monitor || m->m_monitor->m_isBeingLeased) {
-            LOGM(Log::ERR, "Rejecting lease: no monitor or monitor is being leased for {}", (m->m_monitor ? m->m_monitor->m_name : "null"));
+        // A withdrawn connector stays a live protocol object until its client destroys it, so a client may
+        // still name it in a request. Per drm-lease-v1 the compositor then answers `finished`, never a lease.
+        if (!m || m->m_dead || !m->m_monitor || m->m_monitor->m_isBeingLeased) {
+            LOGM(Log::ERR, "Rejecting lease: connector withdrawn, no monitor, or monitor is being leased for {}", (m && m->m_monitor ? m->m_monitor->m_name : "null"));
             m_resource->sendFinished();
             return;
         }
@@ -198,8 +200,7 @@ CDRMLeaseConnectorResource::CDRMLeaseConnectorResource(WP<CDRMLeaseDeviceResourc
     m_listeners.destroyMonitor = Event::bus()->m_events.monitor.destroyMon.listen([this](PHLMONITOR m) {
         if (m != m_monitor)
             return;
-        m_resource->sendWithdrawn();
-        m_dead = true;
+        withdraw();
     });
 }
 
@@ -376,8 +377,16 @@ void CDRMLeaseProtocol::reclaim(PHLMONITOR monitor) {
 
     m_offeredOutputs.erase(IT);
 
-    // Tell every bound lease client the connector is gone, mark those connector resources dead, and drop
-    // them so a late lease request can no longer target this monitor (mirrors the monitor-destroy path).
+    // Tell every bound lease client the connector is gone and mark those connector resources dead, so a late
+    // lease request naming one is answered `finished` (mirrors the monitor-destroy path).
+    //
+    // The withdrawn connectors must stay in m_connectors: that SP is the only owner of the server-created
+    // wp_drm_lease_connector_v1 object, and dropping it destroys the wl_resource while the client still holds
+    // it. The client answers `withdrawn` with a `destroy` request on that id — Xwayland binds this device and
+    // does exactly that — and libwayland kills it with "invalid object 4278190080" (0xFF000000, the first
+    // server-allocated id). The connector is freed once its client destroys it (see destroyResource), or when
+    // the client disconnects. Dropping it from m_connectorsSent is fine: that only holds weak references, and
+    // it lets a later offer() of this monitor send a fresh connector.
     for (auto const& m : m_managers) {
         for (auto const& c : m->m_connectorsSent) {
             if (c && !c->m_dead && c->m_monitor == monitor)
@@ -385,7 +394,6 @@ void CDRMLeaseProtocol::reclaim(PHLMONITOR monitor) {
         }
         std::erase_if(m->m_connectorsSent, [](const auto& e) { return e.expired() || e->m_dead; });
     }
-    std::erase_if(m_connectors, [monitor](const auto& e) { return !e || e->m_dead || e->m_monitor == monitor; });
 
     LOGM(Log::DEBUG, "Reclaimed lease offer for {}", monitor->m_name);
 }
