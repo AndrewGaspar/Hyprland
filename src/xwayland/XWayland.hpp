@@ -5,6 +5,7 @@
 #include "../macros.hpp"
 
 #include "XSurface.hpp"
+#include "RestartPolicy.hpp"
 
 #ifndef NO_XWAYLAND
 #include "Server.hpp"
@@ -26,8 +27,18 @@ class CXWayland {
 
     void setCursor(unsigned char* pixData, uint32_t stride, const Vector2D& size, const Vector2D& hotspot);
 
+    // Xwayland went away while the compositor keeps running (its Wayland connection was destroyed, or the
+    // XWM connection hung up). Tears the dead instance down on the next loop iteration and respawns it,
+    // within CXWaylandRestartPolicy's budget. Safe to call more than once per death.
+    void onServerDied(const char* reason);
+
   private:
-    bool m_enabled = false;
+    bool                   startServer();
+    void                   restartServer();
+
+    bool                   m_enabled        = false;
+    bool                   m_restartPending = false;
+    CXWaylandRestartPolicy m_restartPolicy;
 };
 
 inline UP<CXWayland>                             g_pXWayland;
