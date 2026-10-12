@@ -348,7 +348,10 @@ glasses to 2D and drives a single 1920×1080 head-tracked view.
 
 **`xr --direct`** (V2.2 DRM-lease / direct mode) takes the same HID/gpu/runtime steps but, instead of
 setting a DP mode and placing a window, it **flips the HypXRland `lease` monitor-rule flag on DP-5**
-(`hyprctl keyword monitor DP-5,preferred,auto,1,lease`) so HypXRland stops driving DP-5 as a desktop and
+(`hyprctl keyword monitor DP-5,preferred,auto,1,lease` under a classic config;
+`hyprctl eval 'hl.monitor({ output = "DP-5", mode = "preferred", position = "auto", scale = "1", lease = true })'`
+under a Lua config, where `hyprctl keyword` is a silent no-op — the script detects which once, via
+`hyprctl systeminfo`'s `configProvider`) so HypXRland stops driving DP-5 as a desktop and
 **offers the connector via `wp_drm_lease_v1`**. It also writes a systemd drop-in
 (`monado-xreal.service.d/10-xreal-direct.conf`) that **`UnsetEnvironment=`s `XRT_COMPOSITOR_FORCE_WAYLAND`**
 (the base unit sets it `=1`) and sets `XRT_COMPOSITOR_FORCE_WAYLAND_DIRECT=1` +
@@ -375,7 +378,9 @@ the `lease` support (build + relog).
 active session is the xreal runtime (a WiVRn/Quest session is left alone) → stops the xreal Monado unit
 (releasing any DRM lease) + **removes the direct drop-in** → `xreal-ctl mode 2d` → **restores DP-5 to a
 normal 1920×1080 desktop monitor** (re-issuing a `monitor=DP-5,…` rule *without* `lease` reclaims the
-lease offer and reconnects it as a desktop).
+lease offer and reconnects it as a desktop). Under Lua the reclaim must say `lease = false`
+explicitly: `hl.monitor` merges onto the output's existing rule, so omitting the field keeps an
+earlier `lease = true` — the script always emits it.
 
 Machine-agnostic knobs (env): `XREAL_MONITOR` (connector name; else auto-detected from the EDID
 description), `MONADO_XREAL_BUILD` (build dir), `XREAL_CTL`, `XREAL_FLAT_MODE`. Idempotent, safe when
