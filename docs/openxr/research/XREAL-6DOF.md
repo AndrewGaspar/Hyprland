@@ -9,6 +9,44 @@ pin, Basalt practicalities, XREAL's own software, and a GO/NO-GO threshold. The
 user is **not** pursuing this now; the job of this doc is to make a future
 decision takeable in minutes.
 
+> **UPDATE 2026-10-12 — REASSESSMENT: NO-GO → GO for a prototype.**
+> A fresh web survey + local code audit (2026-10-12) finds that **all three original
+> structural blockers are now cleared or have a known solution**, so the verdict
+> flips to **GO for a bounded prototype** (not yet GO for a shipped feature):
+>
+> - **Calibration — SOLVED** (2026-07-14, `XREAL-CAMERA-CALIB.md`): the full factory
+>   stereo calibration is the `SLAM_camera` object in the HID JSON blob the driver
+>   already reads (`fisheye624`, 12 `kc` coeffs, ~137.3 mm baseline,
+>   `rolling_shutter_time = 0` ⇒ global shutter). §3's "no camera calibration
+>   anywhere" is **superseded**. *(CERTAIN — extracted live.)*
+> - **Sync — tractable, one check left**: the device-ns frame timestamp (R1, §2.1)
+>   stands; still pending one simultaneous camera+IMU **epoch** check. *(HIGH.)*
+> - **Pixel layout — PUBLICLY DECODED** (§2.2, new). The "YUYV 640×241" stream is
+>   really **640×482 8-bit grayscale**: rows 0–479 are the image, scrambled as
+>   **128 chunks of 2400 bytes** under a fixed permutation (`CHUNK_MAP[128]`) with a
+>   per-frame rotating start; row 480 = telemetry, row 481 = padding. No unlock
+>   command; the stream is live on enumerate. Three independent public decoders
+>   agree. The old "vendor Y/U/V-lane interleave" guess (§1, §2.1) is **superseded**.
+>   *(HIGH — three independent implementations; not yet re-run on this box.)*
+> - **Prior art exists**: Benjamin Berg + Luka Panio's WIP Monado branch
+>   (`gitlab.freedesktop.org/benzea/monado` `main`, 15 commits 2025-07..2026-04,
+>   no MR) already has a camera source, a ~730-line Basalt tracker, and a
+>   fisheye→KB4 calibration fit for this exact device (§4.1, new). No public
+>   quality numbers.
+> - **Quality ceiling (GO-cond-3) is still NOT met by any public demo** — reframed
+>   from "wait for someone else" to **"measure it ourselves"** (§8). Risk to keep in
+>   view: 6DoF may trade 3DoF's slow **yaw drift** (§2.3, new — mostly a fixable gyro
+>   bias problem) for **cm-scale swim** (vendor stack RPE 1.29 cm / APE 8.44 cm,
+>   ~doubling in low-feature scenes).
+>
+> **Status / plan:** monado branch `xreal-camera-record` (camera source + EuRoC
+> recording via Monado's existing `t_euroc_recorder`) is **in progress**, to build a
+> dataset library *before* SLAM integration; monado branch `xreal-gyro-bias`
+> (stillness-gated online gyro-bias estimation, opt-in) is in progress for the 3DoF
+> drift. **Revised effort: prototype ~1–2 weeks** (port Berg's tracker onto our pin);
+> **daily-usable: open-ended** (quality-tuning bound). Revised WP table in §8.
+> Historical text below is kept, with superseded passages marked.
+
 > **UPDATE 2026-07-14 — R1 empirically resolved (live capture on this box).**
 > Streamed the Ultra's `video2` (+ the `video3` UVC-metadata node) and decoded the
 > 241st row. **It carries a per-frame device-clock timestamp: a 48-bit little-endian
@@ -42,10 +80,24 @@ Evidence base (all read-only this pass):
 - **Academic ground truth**: *XR Reality Check* (arXiv 2508.08642), which
   benchmarks the Air 2 Ultra's tracking against Apple Vision Pro et al.
 - **XREAL developer docs** (NRSDK / XREAL SDK 3.0). URLs cited inline.
+- **2026-10-12 reassessment** (web survey + local code audit): the three public
+  pixel decoders (`DeskUnreal/xreal-vio-vr` `parts/xreal.py`,
+  `sean9061/xreal-air2ultra-camera`, `mazeasdamien/myXreal`), Berg/Panio's WIP
+  Monado branch (`benzea/monado`), upstream Monado MRs, canonical Basalt
+  (`mateosss/basalt`), the Monado SLAM Dataset paper (arXiv 2508.00088), XREAL SDK
+  3.1.0, and a read of the vendored `xreal_air` + `m_imu_3dof.c` for the drift
+  question. Sources at the end.
 
 ---
 
 ## TL;DR / verdict
+
+> **2026-10-12 revised verdict: GO for a prototype.** Items 3 and 4 below are
+> **superseded** (calibration is on-device; the community stack now includes a
+> working pixel decoder and a WIP Monado tracker by Berg/Panio), item 1's "YUYV"
+> reading is superseded by the 640×482-grayscale descramble (§2.2), and item 6's
+> quality ceiling is now something **we measure** rather than a reason to wait.
+> The original 2026-07-14 items follow unchanged for history.
 
 1. **The cameras are real, live, and enumerated — as ONE UVC stream, not two.**
    The Ultra exposes a single UVC video-streaming interface offering exactly one
@@ -74,12 +126,17 @@ Evidence base (all read-only this pass):
    epoch measurement**, not per-frame online `td`. Not yet bit-confirmed (IMU HID was
    root-only; no sudo this pass). Net: this dropped from *the* structural blocker to
    a tractable, mostly-de-risked item.
-3. **Factory calibration over HID is IMU-only — there is NO camera calibration
+3. *[SUPERSEDED 2026-07-14 by `XREAL-CAMERA-CALIB.md`: the blob has a full
+   `SLAM_camera` object; the driver parser just discards it.]*
+   **Factory calibration over HID is IMU-only — there is NO camera calibration
    anywhere we can read.** `xreal_air_hmd.h:76–109`: the factory blob is accel/gyro/
    **mag** bias, scale, cross-axis quats, and `imu_noises[4]` — and nothing else. No
    intrinsics, no fisheye params, no stereo baseline, no `T_imu_cam`. **Camera
    calibration would have to be produced per-device by hand (Kalibr).**
-4. **The community stack is a stub, not a shortcut, and it doesn't even target
+4. *[PARTLY SUPERSEDED 2026-10-12: `xreal-vio-vr` is still a stub apart from its
+   descrambler, but Berg/Panio's `benzea/monado` branch is a real WIP Monado
+   integration — §4.1.]*
+   **The community stack is a stub, not a shortcut, and it doesn't even target
    Monado.** `DeskUnreal/xreal-vio-vr` (GPL-3, ~15 stars, 16 commits, *"Not
    stable — everything is subject to change"*) is a **prototype**: `scripts/run.sh`
    is a one-line TODO, its calibration template is **all placeholders**
@@ -105,7 +162,12 @@ Evidence base (all read-only this pass):
    monitors and a blank wall *is* the low-feature failure case. So the one workload
    we'd want it for — anchored desktop monitors — is close to its worst case.
 
-**VERDICT: NO-GO for now — park it, don't build it.** *(R1 update: one of the three
+**VERDICT (2026-10-12): GO for a prototype** — record a dataset library first
+(`xreal-camera-record`), then port Berg's tracker + Basalt, then *measure* anchored-
+monitor swim against 3DoF+bias-fix before deciding whether it ships. The
+2026-07-14 verdict below is retained for history.
+
+**~~VERDICT~~ (2026-07-14, superseded): NO-GO for now — park it, don't build it.** *(R1 update: one of the three
 original structural blockers — camera↔IMU sync — is now substantially de-risked by
 the confirmed device-clock frame timestamp (§2.1); the verdict is unchanged because
 the other two stand.)* The remaining blockers are structural (**no factory camera
@@ -150,6 +212,17 @@ pixel layout is a **vendor Y/U/V-lane interleave that does not resolve as a clea
 drop-in; the exact de-interleave must be reverse-engineered first. `u_sink_create_..._or_l8`
 still applies for YUYV→L8 once the layout is known.
 
+> **[SUPERSEDED 2026-10-12 — §2.2]** The "Y/U/V-lane interleave" guess was wrong.
+> The YUYV label is a container: the 308,480-byte frame is **640×482 8-bit
+> grayscale** (rows 0–479 image in 128 permuted 2400-byte chunks; row 480 telemetry;
+> row 481 padding). The "YUYV→L8" sink and the SBS splitter are both the wrong tool —
+> the pipeline is *reinterpret as L8 640×482 → unpermute chunks → crop 480 rows →
+> route by camera ID*. One eye per frame (consecutive-frame stereo stands).
+
+**[2026-10-12] Shutter — RESOLVED** by the factory calibration
+(`rolling_shutter_time = 0`, `XREAL-CAMERA-CALIB.md` §1.4): **global shutter /
+global-equivalent**. The "leaning rolling" paragraph below is superseded.
+
 **Shutter type.** Not stated in any descriptor or teardown found. *XR Reality
 Check* explicitly notes manufacturers restrict this disclosure; it uses the
 RealSense D435i (global-shutter) only as a *reference* platform, and does **not**
@@ -163,6 +236,9 @@ rolling shutter readout but it costs accuracy). Treat "global vs rolling" as an
 one combined frame. These reconcile if the paper reports the *de-interleaved* view
 (two 640×240-ish images) at an effective per-eye rate, or reconfigured via the
 vendor XU. Trust the descriptor for what the kernel will actually deliver.
+**[RESOLVED 2026-10-12]** Exactly the first reconciliation: each 60 Hz UVC frame is
+*one* eye's 640×480 grayscale image (sensor rotated 90° → the calibration's
+`[480, 640]` w×h portrait readout), alternating eyes = 30 stereo pairs/s.
 
 ---
 
@@ -237,7 +313,10 @@ two frames of a pair are exposed within **~±15 µs** of each other (offset-0 ti
 nearly equal within a pair, then +33.333 ms to the next pair). This reconciles *XR
 Reality Check*'s "30 fps" with the descriptor's "60 fps". Frame mean-brightness
 alternates cleanly (≈64.6 vs ≈71.9) frame-to-frame, consistent with two cameras of
-slightly different response. **Exact intra-frame pixel packing stays open**: a naïve
+slightly different response. *[2026-10-12: the rest of this paragraph is
+**superseded by §2.2** — the packing is a chunk permutation of 8-bit grayscale, not
+a Y/U/V-lane interleave; the "row-striping" seen here is the 2400-byte chunk
+scramble (2400 B = 3.75 rows of 640).]* **Exact intra-frame pixel packing stays open**: a naïve
 YUYV-luma raster does not resolve to a clean grayscale image (persistent horizontal
 row-striping even after row de-interleave), so the eye image is a **vendor interleave**
 of the Y/U/V lanes, **not** the clean 320+320 side-by-side the original §1 guessed.
@@ -262,10 +341,101 @@ confirmed," but honesty requires flagging that final measurement as still TODO.*
 **A timestamp does not un-block calibration.** This flips *only* the sync sub-blocker.
 Per-device camera calibration (§3) and the low-feature desktop quality ceiling (§8)
 are untouched, so the overall verdict does not move (see revised §8).
+*[2026-10-12: calibration has since been solved (`XREAL-CAMERA-CALIB.md`) and the
+verdict has moved — see the top update block and §8.]*
+
+**[2026-10-12] Byte-map cross-check vs public decoders.** Because 640×241×2 =
+640×482, YUYV "row 240" here is grayscale **row 480** in §2.2's framing, so the
+offsets above carry over unchanged. Public decoders agree on: u64 device-ns
+timestamp @0 (matches); **pair counter @18–19** (u16, i.e. the u8 @18 above plus its
+high byte); a timestamp @**0x3e (=62)** that sean9061 documents as **µs**, not ns
+(our "second device-ns timestamp" reading is therefore *disputed* — re-decode before
+using it). The static `80 02 e0 01 80` @51 reads naturally as u16 **640** + u16
+**480** (+ a byte) — width/height of the descrambled image *(MED, interpretation)*.
+Camera-ID byte: see §2.2.
+
+---
+
+## 2.2 Pixel layout — publicly decoded (2026-10-12 survey)
+
+Three independent public implementations agree on the layout *(HIGH; not yet
+re-run on this box — first task of `xreal-camera-record`)*:
+
+- `DeskUnreal/xreal-vio-vr` **`parts/xreal.py`** — an `xrealultra2dec` GStreamer
+  element (credited **Benjamin Berg + Ani**, 2025-05-07). The only non-stub part of
+  that repo.
+- `sean9061/xreal-air2ultra-camera` **`docs/PROTOCOL.md`** — macOS, MIT, 2026-07.
+- `mazeasdamien/myXreal` — Windows C++, origin of the `CHUNK_MAP` name, 2026-08.
+
+**Layout:**
+
+| item | fact |
+|---|---|
+| container | UVC advertises YUYV 640×241; reinterpret the 308,480 bytes as **640×482 L8** |
+| image | rows **0–479** = 307,200 B = **128 chunks × 2400 B**, shuffled by a **fixed** permutation table `CHUNK_MAP[128]` |
+| rotation | the permutation **start rotates per frame**: start = the chunk whose **first 128 bytes have the smallest sum** (i.e. the black fisheye border) |
+| row 480 | telemetry (§2.1 byte map) |
+| row 481 | padding |
+| orientation | sensors rotated **90°**; the two cameras are mounted **180° opposed** to each other (one needs a 180° flip relative to the other) |
+| enable | **no unlock/XU command** — the stream is live on enumerate (resolves `XREAL-CAMERA-CALIB.md` open question 4) |
+| exposure | UVC `ExposureTimeAbs` **1–159** (0.1–15.9 ms); auto mode is **shutter-priority only** |
+| noise | **8-tap column fixed-pattern noise** — worth a per-column offset correction before feature detection |
+
+**Telemetry (row 480):** u64 device-ns timestamp @0; pair counter @18–19, **shared
+by both frames of a pair**; µs timestamp @0x3e. **Camera-ID byte is disputed:**
+sean9061 says **column 58 = `0x20`/`0x21`**; Berg/DeskUnreal say **byte `0x3b`
+(=59) nonzero ⇒ right**. These may be the same field read at different
+granularity — verify on our captures.
+
+**Arrival order is NOT a reliable camera identity.** One public capture saw 48
+pairs in one order and 10 in the other. Route frames by the telemetry ID byte, never
+by "first frame of a pair = left".
+
+---
+
+## 2.3 3DoF drift — what it actually is (2026-10-12 code audit)
+
+The slow drift seen in today's 3DoF mode is **primarily yaw integrating residual
+gyro bias**, and it is a fixable 3DoF problem independent of 6DoF *(HIGH — code
+read; drift magnitude MED, one hobbyist capture)*:
+
+- `m_imu_3dof.c` `gyro_biasing()` only runs when the debug-GUI **`manually_fire`**
+  flag is set — and **nothing sets it** in normal operation.
+- `xreal_air` applies only the **static factory** gyro bias (not even the
+  temperature-indexed `gyro_bias_temp_data` table the blob carries —
+  `XREAL-CAMERA-CALIB.md` §1.4).
+- Gravity corrects **pitch/roll only**; yaw is unobserved.
+- The magnetometer is read but **unfused** — and prior art deliberately excludes it
+  indoors (desk steel / monitors), so it is not the fix.
+
+**Prior-art numbers:** XREAL 1S ≈ **2.15°/min** still-yaw drift, ≈ **0.03°/s** bias
+walk over a 10-min warm-up (`kevindurb/xreal-linux` `docs/findings.md`, single
+hobbyist capture). **Breezy / XRLinuxDriver**: connect-time calibration + online
+stationary bias estimation (Fusion library); it hardcodes `provides_position=false`
+for XREAL devices.
+
+**Fix in progress:** monado branch **`xreal-gyro-bias`** — stillness-gated online
+bias estimation (Fusion/`FusionOffset`-style), behind an opt-in flag. This is the
+baseline 6DoF must beat: if 3DoF + online bias is stable enough at a desk, 6DoF's
+value is roaming, not drift.
 
 ---
 
 ## 3. Factory calibration (RQ2)
+
+> **[SUPERSEDED 2026-07-14 — see `XREAL-CAMERA-CALIB.md`.]** The camera calibration
+> *is* on the device: a top-level `SLAM_camera` object in the same HID JSON blob
+> (`fisheye624`, `fc`/`cc`, 12 `kc` coeffs, per-camera `imu_p_cam`/`imu_q_cam` (JPL),
+> ~137.3 mm baseline, `rolling_shutter_time = 0`). The `xreal_air` parser keeps only
+> `IMU` and discards the rest. Kalibr is demoted to an optional backstop. The
+> analysis below is kept for history only.
+>
+> **Model-conversion note (2026-10-12):** Monado's `t_tracking.h` distortion enum has
+> **no fisheye624**, and VIT 2.0 offers only NONE/RT4/RT5/RT8/**KB4**. Options: fit
+> KB4 to the factory fisheye624 (Berg's approach, §4.1 — tinyceres over a 21×21 grid,
+> as Rift S does), or hand Basalt a calib file using its native `Fisheye624`
+> (in `basalt-headers` since 2025-06-30). Berg's code treats `kc` as **8** coeffs;
+> our unit's blob has **12** — check before porting.
 
 **IMU: yes. Cameras: no.** The HID factory blob the driver reads
 (`MSG_GET_CAL_DATA_LENGTH 0x14` / `CAL_DATA_GET_NEXT_SEGMENT 0x15`, parsed into
@@ -296,6 +466,12 @@ plumbing gap. This is a first-order blocker distinct from the driver work.
 ---
 
 ## 4. The community stack, dissected (RQ3)
+
+> **[2026-10-12]** The landscape changed: see **§4.1** (Berg/Panio's WIP Monado
+> branch — the real prior art) and **§4.2** (upstream Monado status). The
+> `xreal-vio-vr` dissection below remains accurate except that its
+> `parts/xreal.py` is a **working descrambler** (§2.2); last commit 2025-06-29,
+> otherwise still a stub.
 
 `DeskUnreal/xreal-vio-vr` — GPL-3.0, ~15 stars / 1 fork, 16 commits, **0
 releases**, self-described *"This stack is not plug-and-play. Yet."* and (ROADMAP)
@@ -338,7 +514,51 @@ are pointers, not code we'd adopt.
 **Sibling search** (nreal/xreal SLAM Linux, OpenVINS/VINS-Fusion xreal, "Monado
 SLAM glasses"): no other maintained project wires the Air 2 Ultra cameras to
 Monado. The mature Monado SLAM drivers remain WMR / Rift S / Vive-Index /
-RealSense. The Ultra is unserved on the Monado side.
+RealSense. The Ultra is unserved on the Monado side. *[2026-10-12: **superseded**
+— the 2026-07 search missed Berg/Panio's branch, §4.1. Still true for upstream.]*
+
+### 4.1 Prior art: Berg/Panio WIP Monado branch (2026-10-12)
+
+`gitlab.freedesktop.org/benzea/monado`, branch `main` — **Benjamin Berg + Luka
+Panio**, **15 WIP commits, 2025-07-25 → 2026-04-27, no MR opened**. Exactly the
+driver work §5 sized, for this device *(HIGH that it exists and its shape; quality
+UNKNOWN — no public numbers)*:
+
+- **`xreal_air_camera.c`** — camera source: finds the UVC node **by product
+  string**, descrambles (§2.2).
+- **`xreal_air_tracker.c`** (~730 lines) — `t_slam_create` with `cam_count = 2`,
+  device↔host clock-offset estimation, Basalt→OpenXR pose-frame correction.
+- **`xreal_air_util.cpp`** — **tinyceres** fit of the factory fisheye model to
+  **KB4** on a 21×21 grid (the Rift S approach), so VIT's KB4 suffices.
+- `SLAM_camera` parse from the HID blob (same finding as `XREAL-CAMERA-CALIB.md`).
+
+**Self-declared rough edges (FIXMEs):** made-up IMU noise parameters; *"SLAM frames
+every 2nd frame… is this correct?"*; *"this is completely wrong"* about the stereo
+calibration; April-2026 fixes to focal length and camera z. Treats `kc` as **8**
+coefficients (our blob has 12). Berg's upstream Monado **!2529** (prober fix) notes
+*"Without this, I cannot detect an Xreal Ultra 2"* — i.e. this targets the **Ultra 2**
+(our unit is an Air 2 Ultra; layout appears shared per the public decoders —
+verify).
+
+**Use:** port onto our pin as the R5/R6 starting point rather than writing from the
+WMR template; fix the FIXMEs with our real factory values (12-coeff `kc`, real IMU
+noises from the blob's `imu_noises`).
+
+### 4.2 Upstream Monado status (2026-10-12)
+
+- **Still 3DoF for every XREAL device.** **!2436** (Ultra IMU support, merged
+  2025-07-04, in 25.1.0) explicitly *"does not add any support for the devices depth
+  sensor"*. Open XREAL MRs: **!2435**, **!2580**, **!2964**, **!2833** (One Pro, IMU
+  only). None add cameras.
+- **SLAM**: **!2686** merged 2025-12 (Basalt linear velocity → less prediction lag) —
+  worth having on our pin.
+- `t_tracking.h` distortion enum has **no fisheye624**; VIT 2.0 has
+  NONE/RT4/RT5/RT8/KB4 only (see §3 note).
+
+**XREAL official (2026-10-12):** still **no Linux/PC SDK**. SDK **3.1.0**
+(2025-11-25) is Unity/Android, 6DoF for the **One series + Eye**. The Ultra is
+reportedly **discontinued** *(LOW — secondhand, MoguraVR)*. Nothing to wait for
+from the vendor.
 
 ---
 
@@ -379,6 +599,21 @@ lighter-weight alternative to hand-rolling the device.
 - Runtime pose: `xrt_tracked_slam_get_tracked_pose()` with a 3DoF fallback
   (`slam_over_3dof`, `:1139–1186`).
 
+> **[2026-10-12] Missing-items list, revised** (original kept below for history):
+>
+> 1. **Camera source** — IN PROGRESS (monado `xreal-camera-record`): V4L2 open,
+>    reinterpret as L8 640×482, chunk-unpermute (§2.2), telemetry parse, route by
+>    camera-ID byte. Berg's `xreal_air_camera.c` is the reference.
+> 2. **Frame pipeline** — *revised*: no YUYV→L8 convert, no SBS split (one eye per
+>    frame). Plus EuRoC recording via the existing `t_euroc_recorder` for a dataset
+>    library before any SLAM.
+> 3. **IMU-into-source on the camera clock** — device-ns on both sides; residual =
+>    one simultaneous **epoch check**.
+> 4. **Calibration fill** — **DONE as data** (`SLAM_camera`); code = parse + KB4 fit
+>    (Berg) or Basalt calib file, JPL→Hamilton.
+> 5. **SLAM device wiring** — port Berg's `xreal_air_tracker.c`.
+> 6. ~~Vendor XU handling~~ — **not needed**: stream is live on enumerate.
+
 **What `drivers/xreal_air` is MISSING for 6DoF** (all of it — the driver is a pure
 HID/3DoF device today; camera/uvc/v4l2/slam/sink grep = **empty**):
 
@@ -410,7 +645,22 @@ straightforward once 1–4 exist.
 
 ## 6. Basalt / VIO practicalities (RQ5)
 
-- **Fork status**: the maintained Monado-flavored Basalt is **`CIFASIS/basalt-xr`**
+> **[2026-10-12] Fork status corrected.** The canonical Monado Basalt is now
+> **`gitlab.freedesktop.org/mateosss/basalt`** (active; tags 2026-01-28 and
+> 2026-07-22). **`CIFASIS/basalt-xr` on GitHub is a stale mirror** (last commit
+> 2024-07) — the bullet below is superseded. `basalt-headers` has had a native
+> **`Fisheye624`** camera class since 2025-06-30, so the community fisheye624 patch
+> is no longer needed for the file-based calib route.
+>
+> **Backend choice, with evidence:** the *Monado SLAM Dataset* paper (arXiv
+> 2508.00088) found **Basalt and OKVIS2 most accurate, Basalt fastest**;
+> OpenVINS/HybVIO/DPVO **failed** on easy sequences. But absolute numbers are
+> sobering: **>50% of runs had ATE > 5 cm**, many RTE > 1 cm (the authors call it
+> "too high"). Secondhand user reports of WMR+Basalt describe jank and slow drift.
+> **Recommendation unchanged in substance: Basalt via Monado VIT / `t_slam`** — but
+> expect cm-scale error and plan to measure it (§8).
+
+- **Fork status** *(2026-07-14, superseded above)*: the maintained Monado-flavored Basalt is **`CIFASIS/basalt-xr`**
   (implements the VIT plugin, "improved for tracking XR devices with Monado";
   `ChristophHaag/basalt-monado` is an out-of-date mirror). Loaded via
   `VIT_SYSTEM_LIBRARY_PATH`. License BSD-3.
@@ -419,7 +669,8 @@ straightforward once 1–4 exist.
   half WMR's 640×480), so per-frame cost is *below* the WMR reference. On the
   **AMD HX 370** (this box) or **Lunar Lake** (the other box), 60 fps stereo VIO is
   comfortably within budget — **CPU is not the bottleneck**; sync and calibration
-  are.
+  are. *[2026-10-12: per-eye images are actually 480×640 at 30 stereo pairs/s
+  (§2.2) — same pixel count as WMR; CPU conclusion unchanged.]*
 - **Latency**: VIO pose is inherently a frame or two behind (16–33 ms) plus fusion
   lag; fine for seated desktop, poor for fast head motion (which the Ultra's
   numbers confirm degrade — §7).
@@ -473,7 +724,32 @@ low-feature worst case**, exactly where APE doubles. The workload we'd want 6DoF
 for is close to the device's failure mode. This is why the verdict is NO-GO rather
 than "hard but worth it."
 
-### Effort (if it were pursued anyway)
+**[2026-10-12] Reframed:** these vendor-stack numbers are still the only published
+quality data for this hardware — no public Linux demo (Berg's included) reports
+any. Rather than wait for one, **measure it ourselves**: record a EuRoC dataset
+library at the actual desk (`xreal-camera-record`), run Basalt offline, and compare
+anchored-monitor swim against 3DoF + online gyro bias (§2.3). The risk to watch is
+that 6DoF **swaps slow yaw drift for cm-scale swim** (RPE 1.29 cm / APE 8.44 cm,
+~doubling in low-feature scenes); the Monado SLAM Dataset paper's ">50% ATE > 5 cm"
+(§6) points the same way.
+
+### Effort — revised 2026-10-12
+
+| WP | Item | Status | Size | Risk |
+|----|------|--------|------|------|
+| R1 | Telemetry row + pixel layout | **DONE** (§2.1 live; §2.2 public decoders). *Residual*: camera↔IMU **epoch check** (one simultaneous read) + settle the **camera-ID byte** (col 58 vs 0x3b) on our captures. | residual S | low |
+| R2 | Camera calibration | **DONE** — factory `SLAM_camera` (`XREAL-CAMERA-CALIB.md`); Kalibr = optional backstop | — | — |
+| R3 | Camera source + EuRoC recording (dataset library) | **IN PROGRESS** (monado `xreal-camera-record`) | S–M | low |
+| R4 | Camera/IMU time alignment | = R1 epoch check; device-ns both sides | S | low–med |
+| R5 | SLAM wiring — **port Berg's `xreal_air_tracker.c`** onto our pin, fix its FIXMEs (12-coeff `kc`, real IMU noises, stereo calib) | TODO | M | med |
+| R6 | Basalt (`mateosss/basalt`) deployment + tuning; KB4 fit vs native Fisheye624; offline runs on R3 datasets | TODO | M | **high** (quality) |
+| R7 | HypXRland 6DoF UX (roam/geofence/leash, `XREAL-3DOF.md` V2.3 hook) | TODO | M | low |
+| — | 3DoF yaw-drift fix (online gyro bias, §2.3) — the baseline 6DoF must beat | IN PROGRESS (monado `xreal-gyro-bias`) | S | low |
+
+**Prototype: ~1–2 weeks** (R1 residual + R3 + R5 + first R6 pass, porting Berg's
+work). **Daily-usable: open-ended** — bounded by R6 quality tuning, not plumbing.
+
+### Effort (2026-07-14, superseded — kept for history)
 
 | WP | Item | Size | Risk |
 |----|------|------|------|
@@ -491,7 +767,19 @@ us.
 
 ### GO / NO-GO threshold
 
-**NO-GO today.** Reconsider only when **all three** flip true:
+**[2026-10-12] GO for a prototype.** Condition status:
+
+| # | Condition (2026-07-14) | Status 2026-10-12 | Confidence |
+|---|---|---|---|
+| 1 | Calibration without per-unit Kalibr | **MET** — factory `SLAM_camera` in the HID blob (`XREAL-CAMERA-CALIB.md`) | CERTAIN |
+| 2 | Camera-IMU sync tractable | **MET, one check left** — device-ns frame timestamp; pending one simultaneous camera+IMU epoch check | HIGH |
+| — | *(implicit)* Pixel layout known | **MET** — publicly decoded (§2.2), three independent implementations | HIGH |
+| 3 | Demonstrated desktop-usable quality | **NOT MET by anyone publicly** — **reframed: we measure it** on our own recorded datasets, against 3DoF + online gyro bias | — |
+
+**Ship gate (new):** a 6DoF mode ships only if, at the user's desk, anchored-monitor
+swim is visibly better than 3DoF + bias-fix — i.e. condition 3, evaluated by us.
+
+*(2026-07-14 text, superseded:)* **NO-GO today.** Reconsider only when **all three** flip true:
 
 1. **Calibration is solved without per-unit Kalibr** — XREAL exposes camera
    intrinsics/extrinsics, or the community ships a validated bundled/auto
@@ -515,28 +803,58 @@ failure modes.
 
 ## Open questions
 
+*(Updated 2026-10-12.)*
+
+0. **New, gating the prototype:**
+   - **Camera↔IMU epoch** — one simultaneous read of a frame's @0 timestamp and an
+     IMU HID timestamp (R1 residual).
+   - **Camera-ID byte** — column 58 (`0x20`/`0x21`, sean9061) vs byte `0x3b`
+     nonzero ⇒ right (Berg/DeskUnreal); arrival order is not reliable.
+   - **@0x3e timestamp units** — µs (sean9061) vs our ns reading (§2.1).
+   - **Berg's `kc` = 8 vs our 12** — does the Ultra 2 schema differ, or is it a
+     truncation bug? Does Berg's descramble/tracker apply unchanged to the Air 2
+     Ultra?
+   - **Quality at the desk** — anchored-monitor swim vs 3DoF + online gyro bias.
+
 1. ~~**Camera packing & metadata row**~~ **RESOLVED (R1, §2.1).** The 241st row
    carries a **device-clock nanosecond timestamp** (offset 0, 48-bit LE, epoch =
    power-on), plus a stereo-pair counter and exposure/gain. Eyes arrive as
    **consecutive frames** (60 fps = 30 pairs/s), ~±15 µs apart — **not** side-by-side
-   in one frame. Intra-frame pixel packing is a vendor Y/U/V-lane interleave (does not
-   resolve as clean 320+320) — **still open**, but it does not affect the sync verdict.
-2. **Shutter type** — global or rolling? (Leaning rolling; unconfirmed by any
-   teardown found.)
-3. **Vendor XU `{a29e7641...}`** — what does it gate (camera enable? sync? a
-   calibration blob)? Undocumented; RE-only.
-4. **Is there any readable camera-calibration blob** on the device, or is per-unit
-   Kalibr truly the only route?
-5. **Would XREAL developer support** provide Linux calibration/interface docs on
+   in one frame. ~~Intra-frame pixel packing is a vendor Y/U/V-lane interleave (does not
+   resolve as clean 320+320) — **still open**~~ **RESOLVED 2026-10-12 (§2.2)**:
+   640×482 L8, 128 permuted 2400-byte chunks, rotating start.
+2. ~~**Shutter type**~~ **RESOLVED** — `rolling_shutter_time = 0` ⇒ global
+   (`XREAL-CAMERA-CALIB.md`).
+3. ~~**Vendor XU `{a29e7641...}`**~~ **MOOT** — not needed for calibration
+   (HID blob) or stream enable (live on enumerate, §2.2).
+4. ~~**Is there any readable camera-calibration blob**~~ **RESOLVED** — yes,
+   `SLAM_camera` in the HID JSON blob.
+5. **Would XREAL developer support** *(low value now; vendor ships no PC SDK and the
+   Ultra is reportedly discontinued)* provide Linux calibration/interface docs on
    request (`developer@xreal.com`)? Cheapest possible unblock of §3/§7 — untested.
 
 ## Sources
 
 - arXiv 2508.08642 *XR Reality Check* — https://arxiv.org/html/2508.08642v1
 - `DeskUnreal/xreal-vio-vr` — https://github.com/DeskUnreal/xreal-vio-vr/
-- `CIFASIS/basalt-xr` — https://github.com/CIFASIS/basalt-xr
+- `CIFASIS/basalt-xr` — https://github.com/CIFASIS/basalt-xr *(stale mirror, last 2024-07; see `mateosss/basalt` below)*
 - `ChristophHaag/basalt-monado` — https://github.com/ChristophHaag/basalt-monado
 - Collabora, *Visual-inertial tracking for Monado* — https://www.collabora.com/news-and-blog/blog/2022/04/05/visual-inertial-tracking-support-for-monado-openxr/
 - Mateo de Mayo, *SLAM for Monado* — https://mateosss.github.io/blog/monado-slam
 - XREAL developer docs — https://developer.xreal.com/ , https://docs.xreal.com/XREALDevices/XREAL%20Glasses
 - Vendored Monado @ `c2ddab59` (`drivers/{xreal_air,wmr,twrap,v4l2}`, `vit_interface.h`, `u_sink.h`) and live USB/V4L2 descriptors on the box (cited inline).
+
+**Added 2026-10-12:**
+
+- `XREAL-CAMERA-CALIB.md` (this dir) — factory `SLAM_camera` calibration extraction.
+- Berg/Panio WIP Monado branch — https://gitlab.freedesktop.org/benzea/monado (branch `main`; `xreal_air_camera.c`, `xreal_air_tracker.c`, `xreal_air_util.cpp`)
+- Monado MRs — https://gitlab.freedesktop.org/monado/monado/-/merge_requests/2529 (prober, Ultra 2), !2436 (Ultra IMU, merged), !2435, !2580, !2964, !2833 (open), !2686 (Basalt linear velocity, merged)
+- `DeskUnreal/xreal-vio-vr` `parts/xreal.py` (`xrealultra2dec`) — https://github.com/DeskUnreal/xreal-vio-vr/blob/main/parts/xreal.py
+- `sean9061/xreal-air2ultra-camera` `docs/PROTOCOL.md` — https://github.com/sean9061/xreal-air2ultra-camera
+- `mazeasdamien/myXreal` (`CHUNK_MAP`) — https://github.com/mazeasdamien/myXreal
+- Canonical Basalt for Monado — https://gitlab.freedesktop.org/mateosss/basalt (+ `basalt-headers` `Fisheye624`)
+- *Monado SLAM Dataset* — arXiv 2508.00088, https://arxiv.org/abs/2508.00088
+- `kevindurb/xreal-linux` `docs/findings.md` (1S yaw drift / bias walk) — https://github.com/kevindurb/xreal-linux
+- Breezy Desktop / XRLinuxDriver — https://github.com/wheaney/XRLinuxDriver
+- XREAL SDK 3.1.0 release notes — https://developer.xreal.com/ ; Ultra discontinuation report (MoguraVR, secondhand)
+- Vendored Monado `src/xrt/auxiliary/math/m_imu_3dof.c` (`gyro_biasing()` / `manually_fire`) and `drivers/xreal_air` (static factory bias only).
