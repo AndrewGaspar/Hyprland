@@ -173,6 +173,22 @@ TEST(XRDefaultMonitorScale, AModeTheDefaultCannotDivideDeclinesInsteadOfErroring
     EXPECT_FLOAT_EQ(*forCreatedMonitor(RULE_AUTO, 2.F, {1024, 768}), 2.F);
 }
 
+TEST(XRDefaultMonitorScale, DecimalScalesTheConsumerSnapsSilentlyAreHonored) {
+    // Live regression (xr_defaults `scale = 1.6` on a 1920x1080 XR-main): 1.6 is 1.60000002f, so
+    // 1920/1.6f is 1199.99998 and failed an exact-division gate — the default declined and the PPI
+    // guess put the monitor at 2.0, while `monitor = XR-main, …, 1.6` applied fine. applyMonitorRule
+    // first snaps to the nearest 1/120 step and keeps it silently when that divides the pane, so the
+    // gate must accept exactly what that rung accepts.
+    EXPECT_FLOAT_EQ(forCreatedMonitor(RULE_AUTO, 1.6F, {1920, 1080}).value_or(RULE_AUTO), 1.6F);
+    EXPECT_FLOAT_EQ(forCreatedMonitor(RULE_AUTO, 1.2F, {1920, 1080}).value_or(RULE_AUTO), 1.2F);
+    EXPECT_FLOAT_EQ(forCreatedMonitor(RULE_AUTO, 1.6F, {2560, 1440}).value_or(RULE_AUTO), 1.6F);
+    // ...and the reload that retuned the same block to 2560x1600 (1600x1000 logical) lost it again.
+    EXPECT_FLOAT_EQ(forCreatedMonitor(RULE_AUTO, 1.6F, {2560, 1600}).value_or(RULE_AUTO), 1.6F);
+    // The snapped rung still has to divide: 1.6 on 1366x768 does not, and 1.25 on 1024x768 neither.
+    EXPECT_FALSE(forCreatedMonitor(RULE_AUTO, 1.6F, {1366, 768}).has_value());
+    EXPECT_FALSE(forCreatedMonitor(RULE_AUTO, DEFAULT_SCALE, {1024, 768}).has_value());
+}
+
 TEST(XRDefaultMonitorScale, AnUnknownModeDeclines) {
     // Before a mode is knowable there is nothing to divide, so claim nothing. The negative sentinels
     // `highres` / `highrr` / `maxwidth` leave in the rule land here too.

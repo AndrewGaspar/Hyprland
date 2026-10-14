@@ -143,6 +143,60 @@ TEST_CASE(xr_monitor_create_unnamed) {
     NLog::green("xr_monitor_create_unnamed: minted {}, {}, reused {}", first, second, again);
 }
 
+// xr_monitor_default_scale_decimal — a defaults-resolved scale that is not exactly representable as
+// a float (1.6 is 1.60000002f) must still land on the monitor. The divisor gate used to demand exact
+// division, so 1920/1.6f = 1199.99998 declined and the headless PPI guess (2.0) stood — live on
+// XR-main with xr_defaults `scale = 1.6`, both at bind and after every reload/mode re-resolution.
+// The keyword re-runs the same reload applicator (reapplyXRDefaults -> registerDeclaredMonitorRule)
+// that a file reload or an HMD-context change does, on both a mode-less create and an explicit mode.
+TEST_CASE(xr_monitor_default_scale_decimal) {
+    XR_SKIP_IF_UNAVAILABLE();
+    struct SScaleGuard {
+        ~SScaleGuard() {
+            getFromSocket("/reload"); // restore the file's openxr:default_monitor_scale
+        }
+    } scaleGuard;
+    SArtifactGuard guard{this->failed, name(), {}};
+
+    if (!gateUp()) {
+        XR::logSkip(name(), "session never reached focused/visible (known env instability)");
+        return;
+    }
+
+    const std::string modeless = XR::monitorName(33);
+    const std::string tall     = XR::monitorName(34);
+    const auto        scaleIs  = [](const std::string& n, float scale) {
+        const std::string marker = "\"name\": \"" + n + "\"";
+        return XR::waitForJson(
+            "j/monitors",
+            [&](const std::string& r) {
+                const auto at = XR::findAfter(r, marker);
+                return at != std::string::npos && std::abs(XR::toFloatOr(XR::fieldAfter(r, at, "scale"), -1.F) - scale) < 0.01F;
+            },
+            std::chrono::milliseconds(10000));
+    };
+
+    ASSERT(getFromSocket("/openxr create " + modeless), std::string("ok"));
+    guard.monitorNames.push_back(modeless);
+    ASSERT(getFromSocket("/openxr create " + tall + " 2560x1600"), std::string("ok"));
+    guard.monitorNames.push_back(tall);
+    ASSERT(scaleIs(modeless, 1.25F), true);
+    ASSERT(scaleIs(tall, 1.25F), true);
+
+    // Re-resolution to a decimal scale: 1920x1080 -> 1200x675, 2560x1600 -> 1600x1000, both clean.
+    ASSERT(getFromSocket("/keyword openxr:default_monitor_scale 1.6"), std::string("ok"));
+    EXPECT(scaleIs(modeless, 1.6F), true);
+    EXPECT(scaleIs(tall, 1.6F), true);
+
+    // ...and a monitor created while it is in force gets it from the start.
+    const std::string fresh = XR::monitorName(35);
+    ASSERT(getFromSocket("/openxr create " + fresh), std::string("ok"));
+    guard.monitorNames.push_back(fresh);
+    EXPECT(scaleIs(fresh, 1.6F), true);
+
+    NLog::green("xr_monitor_default_scale_decimal: 1.6 applied on re-resolution and on create");
+}
+
 // `xrmonitor view` is the in-headset presentation switch: it must remove every monitor quad without
 // stopping the session or unplugging/recreating the backing outputs. Exercise the public IPC surface
 // here; the per-monitor `quads` count proves the frame-thread gate has reached xrEndFrame rather than
