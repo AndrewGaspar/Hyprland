@@ -145,7 +145,9 @@ class COpenXRManager {
     // state (including DISABLED) so monitors created without a session become plain headless
     // outputs whose quads bind lazily on start() (doc 02). WP3 exercises this with a single
     // hard-coded test monitor; the config keyword/dispatcher/hyprctl surfaces are WP4.
-    std::expected<PXRLAYER, std::string> createXRMonitor(const SXRMonitorParams& params);
+    // pinGlobalMode: a runtime `create` pins 1920x1080@60 into the rule when neither the args nor
+    // an xr_defaults block asked for a mode (the pre-xr_defaults behavior); declarations do not.
+    std::expected<PXRLAYER, std::string> createXRMonitor(const SXRMonitorParams& params, bool pinGlobalMode = false);
     void                                 destroyXRMonitor(const std::string& name);
 
     // Plugged-state applicator (research/18 WP-M1/M2): drive every XR-created monitor to the given
@@ -246,7 +248,13 @@ class COpenXRManager {
     // --- IPC verb funnel (main thread). ONE implementation, two transports: the xrmonitor
     // dispatcher and the hyprctl openxr subcommands both call these (doc 05 §3/§4). Return
     // empty-expected on success, an error string otherwise. ---
-    std::expected<void, std::string> cmdCreate(const std::string& args);    // runtime-owned monitor
+    // Runtime-owned monitor. Returns the created monitor's name, which `create` mints (XR-<n>) when
+    // the args name none (doc 05 §3.3).
+    struct SXRCreateResult {
+        std::string name;
+        bool        minted = false;
+    };
+    std::expected<SXRCreateResult, std::string> cmdCreate(const std::string& args);
     std::expected<void, std::string> cmdDestroy(const std::string& target); // <name>|active
     std::expected<void, std::string> cmdSelect(const std::string& arg);     // <name>|next|prev
 
@@ -370,6 +378,8 @@ class COpenXRManager {
         // the chrome is the primary grab affordance and losing it on every monitor is a regression.
         bool        chrome   = false;
         int         quads  = 1;
+        // doc 05 §3.3: where this monitor's mode/scale/width defaults came from, one line.
+        std::string defaults;
         std::string l2dSource = "off";
         int         l2dCol = 0, l2dRow = 0;
         double      l2dX = 0.0, l2dY = 0.0;
@@ -493,6 +503,16 @@ class COpenXRManager {
     // Reconcile the declared (`xrmonitor` keyword) set against live layers (doc 05 §2.5). Runs
     // from onConfigReload() and from init() so declared monitors materialize even while disabled.
     void reconcileDeclaredMonitors();
+
+    // doc 05 §3.3: re-resolve every live monitor's xr_defaults-provenance fields (mode, scale, quad
+    // width) against the current blocks and bound-HMD context. Fields the declaration / create args
+    // set explicitly, a `monitor =` rule owns, or the user changed at runtime are left alone; the
+    // placement distance only ever applies at creation, so nothing moves. Main thread; runs on
+    // config reload, on an HMD-context change, and on `hyprctl eval 'hl.xr_defaults{...}'`.
+    void reapplyXRDefaults();
+
+    // The HMD the most recent session bound (sticky across session end — doc 05 §3.3).
+    const OpenXR::SXRSystemContext& xrSystemContext() const;
 
     // WP-G2: on a config reload, if the chrome GEOMETRY vars (enabled/margin/bar_height/
     // bar_width_frac/corner_size) changed, mark every layer's swapchain dirty so the frame thread
@@ -1132,6 +1152,18 @@ class COpenXRManager {
     // window AND, since the watch became the steady state, the bounded retry burst that is now the
     // fallback timer's only other job.
     std::optional<Time::steady_tp>             m_lastWatchActivity;
+
+    // ---- xr_defaults / `when` (doc 05 §3.3) — main thread only ----
+    // The bound-HMD context every `when` is evaluated against. Refreshed at session bring-up and on
+    // plug-state evaluation while a session runs; NOT cleared when the session ends, so a shelved
+    // headset never reshapes the desktop. A change re-runs declaration reconcile + reapplyXRDefaults.
+    OpenXR::SXRSystemContext m_xrContext;
+    void                     refreshXRSystemContext();
+    // openxr:default_* + the headless mode, the base under every xr_defaults block.
+    OpenXR::SXRDefaultsGlobals xrDefaultsGlobals() const;
+    // Resolve one layer (its profile + explicit fields). An unknown profile — the block was deleted
+    // by a reload after the monitor was created — falls back to the base layers with a warning.
+    OpenXR::SXRResolvedDefaults resolveLayerDefaults(const CXRMonitorLayer& layer) const;
 
     // Populated from xrInstanceProperties/xrSystemProperties once a session exists.
     std::string       m_runtimeName;

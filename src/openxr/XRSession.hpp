@@ -96,6 +96,12 @@ class CXRSession {
     bool       m_stageEnumerated = false; // STAGE appeared in xrEnumerateReferenceSpaces
     bool       m_usingLocalFloor = false;
     bool       m_hasLocalFloor = false, m_hasHandInteraction = false, m_hasHandTracking = false;
+    // xr_defaults `when` capability predicates (doc 05 §3.3). m_hasEyeGazeExt = the runtime ADVERTISES
+    // XR_EXT_eye_gaze_interaction (deliberately not enabled — nothing consumes eye gaze yet, and
+    // enabling it can trigger a permission prompt on some runtimes). m_supportsHandTracking = the
+    // XrSystemHandTrackingPropertiesEXT answer, queried only when XR_EXT_hand_tracking is enabled.
+    bool m_hasEyeGazeExt        = false;
+    bool m_supportsHandTracking = false;
     // The two probe-only extensions behind the wrong-GPU guard in start(), each advertised AND
     // enabled. XR_MND_query_egl_device answers "which GPU does the runtime composite on" (the
     // question the guard actually asks); XR_KHR_vulkan_enable2 answers "which GPU should a Vulkan

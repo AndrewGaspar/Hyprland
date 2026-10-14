@@ -272,6 +272,8 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
                     STATELINE, BLOCKEDLINE, RUNTIME, SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, RTJSON.empty() ? "(loader default)" : RTJSON, BLEND, BLACKLINE, OVERLAY ? "yes" : "no",
                     MONITOR_VIEW ? "shown" : "hidden", SELECTED.empty() ? "(none)" : SELECTED, FOLLOWLINE, RECENTER, VISIBLE, PRESENCE, INHIBITING_IDLE ? "yes" : "no", INHIBIT_MODE, RESTORE_CAPTURE ? "on" : "off",
                     WORLDLINE, HANDIN.state, HANDIN.mode, GAZE.source, GAZELINE, handLabel(HANDS[0]), handLabel(HANDS[1]), L2DLINE);
+    // doc 05 §3.3: the HMD every `when` is matched against (sticky across session end).
+    out += std::format("hmd context: {}\n", OpenXR::describeXRSystemContext(g_pOpenXRManager->xrSystemContext()));
     for (const auto& m : MONS) {
         out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} ({}) hovered: {} ({}) plugged: {} content: {}{}", m.name,
                            m.id, m.w, m.h, m.refresh, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.grabbed ? "yes" : "no", m.grabKind, m.hovered ? "yes" : "no", m.region,
@@ -291,6 +293,8 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
             : (m.fxTransitioning && m.fxBlackAlpha != m.fxBlackAlphaTarget ? std::format("{:.2f} -> {:.2f}", m.fxBlackAlpha, m.fxBlackAlphaTarget)
                                                                           : std::format("{:.2f}", m.fxBlackAlpha));
         out += std::format("  {}: alpha {} ({}), blackalpha {} ({}, knee {:.2f}), anchorstate {}\n", m.name, ALINE, m.fxAlphaSrc, BLINE, m.fxBlackAlphaSrc, m.fxKnee, m.anchorState);
+        // doc 05 §3.3: which rung of the xr_defaults ladder each field came from.
+        out += std::format("  {}: defaults {}\n", m.name, m.defaults);
         // doc 03 §8.3: will this monitor come back where the user left it after a session restart, and
         // from what offset. Only meaningful for anchor:local — the leashed modes ride the user anyway.
         // research/28 H2: the MEMORY first (that is what a re-seat plants), then the live staging
@@ -430,8 +434,12 @@ static std::string openxrRequest(eHyprCtlOutputFormat format, std::string reques
 
     // Monitor lifecycle verbs (WP4). Same manager funnel as the xrmonitor dispatcher (doc 05 §4).
     if (SUBCOMMAND == "create") {
+        // A minted name (no name in the args, doc 05 §3.3) is reported so scripts can address the
+        // monitor; a named create keeps its historical bare "ok".
         auto r = g_pOpenXRManager->cmdCreate(ARGS);
-        return r ? "ok" : r.error();
+        if (!r)
+            return r.error();
+        return r->minted ? "ok " + r->name : std::string("ok");
     }
     if (SUBCOMMAND == "destroy") {
         auto r = g_pOpenXRManager->cmdDestroy(ARGS);

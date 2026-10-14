@@ -93,6 +93,7 @@ bool CXRSession::createInstance() {
     if (m_hasHandTracking)
         exts.push_back("XR_EXT_hand_tracking");
     m_usingLocalFloor = m_hasLocalFloor;
+    m_hasEyeGazeExt   = hasExt("XR_EXT_eye_gaze_interaction");
 
     // XR_MND_query_egl_device (probe-only): the PRIMARY answer to "which GPU does the runtime
     // COMPOSITE on", which start() needs to fail closed on a wrong openxr:gpu BEFORE the frame
@@ -182,6 +183,13 @@ bool CXRSession::getSystem() {
         presenceProps.next = sysProps.next;
         sysProps.next      = &presenceProps;
     }
+    // xr_defaults `when = { hand_tracking = ... }` (doc 05 §3.3): the extension being enabled says
+    // nothing about the device, so ask the system, exactly as for presence above.
+    XrSystemHandTrackingPropertiesEXT handProps = {XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT};
+    if (m_hasHandTracking) {
+        handProps.next = sysProps.next;
+        sysProps.next  = &handProps;
+    }
     if (XR_SUCCEEDED(xrGetSystemProperties(m_instance, m_systemId, &sysProps))) {
         m_systemName    = sysProps.systemName;
         m_maxLayerCount = sysProps.graphicsProperties.maxLayerCount;
@@ -189,6 +197,8 @@ bool CXRSession::getSystem() {
             m_maxLayerCount = 16;
         if (m_hasUserPresence)
             m_supportsUserPresence = presenceProps.supportsUserPresence;
+        if (m_hasHandTracking)
+            m_supportsHandTracking = handProps.supportsHandTracking;
     }
 
     Log::logger->log(Log::DEBUG, "[OPENXR] system id {} ({}), maxLayerCount {}, user_presence {}", (unsigned long long)m_systemId, m_systemName.empty() ? "?" : m_systemName,
