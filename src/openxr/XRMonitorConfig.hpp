@@ -14,6 +14,7 @@
 #include "../helpers/math/Math.hpp"
 #include "../config/supplementary/propRefresher/PropRefresher.hpp" // ePropRefreshProp (xrRefreshConcernsXR)
 #include "XRAnchor.hpp" // OpenXR::SXRAnchorState + eXRAnchorMode/eXRHand (unconditional pure math)
+#include "XRDefaults.hpp" // OpenXR::SXRWhen (xr_monitor `when`) + the xr_defaults resolver
 
 namespace OpenXR {
     // Environment blend mode (doc 01). A HAVE_OPENXR-free mirror of XrEnvironmentBlendMode so the
@@ -620,6 +621,13 @@ struct SXRMonitorParams {
     // True iff an anchor-spec was explicitly given (config keyword always does; the create verb
     // may omit it, in which case the caller places the monitor along the current gaze, doc 05 §3.1).
     bool m_anchorProvided = false;
+
+    // `create profile:<name>` (doc 05 §3.3): layer this xr_defaults profile over the base blocks.
+    // Empty = base defaults only. Never set by the config keyword.
+    std::string m_profile;
+    // hl.xr_monitor `when` (doc 05 §3.3): this declaration only applies while the bound HMD matches.
+    // Empty = always. Two declarations of one name with different `when` coexist.
+    OpenXR::SXRWhen m_when;
 };
 
 namespace OpenXR {
@@ -629,8 +637,11 @@ namespace OpenXR {
     std::expected<SXRMonitorParams, std::string> parseXRMonitorLine(const std::string& args);
 
     // Pure parser for the `xrmonitor create` dispatcher / `hyprctl openxr create` verb (doc 05
-    // §3.1): space-separated `<name> [WxH[@Hz]] [anchor-spec]`, with defaults applied by the
-    // caller (mode defaults to 1920x1080@60, anchor defaults to anchor:local when absent).
+    // §4): space-separated `[name] [WxH[@Hz]] [profile:<p>] [anchor-spec]`, with defaults applied
+    // by the caller (xr_defaults resolution, anchor:local when absent). The name is optional: the
+    // first token is a NAME unless it is mode-shaped (looksLikeXRMode), an `anchor:` token or a
+    // `key:value` token; m_name stays empty and the caller mints `XR-<n>`. `profile:` may appear
+    // anywhere (the anchor grammar has no `profile` key), at most once.
     std::expected<SXRMonitorParams, std::string> parseXRMonitorCreateArgs(const std::string& args);
 
     // ---- the grammar's two halves, exported so every front end drives THE SAME parser ----
@@ -661,4 +672,11 @@ namespace OpenXR {
     // classic keyword feeds it the line's third comma-field; hl.xr_monitor feeds it a string-form
     // `anchor = "..."` so the string form and the table form cannot drift apart.
     std::vector<std::string> tokenizeXRAnchorSpec(const std::string& spec);
+
+    // The xr_monitor declarations in force for `ctx` (doc 05 §3.3): for each name, in order of first
+    // declaration, the LAST declaration whose `when` matches. A name none of whose declarations
+    // match is absent (not declared). `ambiguous` (optional) collects names where more than one
+    // `when`-bearing declaration matched — legal, last wins, but worth a log line.
+    std::vector<SXRMonitorParams> effectiveXRMonitorDeclarations(const std::vector<SXRMonitorParams>& declared, const SXRSystemContext& ctx,
+                                                                 std::vector<std::string>* ambiguous = nullptr);
 }
