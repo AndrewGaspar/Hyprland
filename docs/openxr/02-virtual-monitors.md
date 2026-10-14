@@ -58,10 +58,11 @@ constraint:
 Everything that makes an XR monitor — the `xrmonitor=` config keyword, the
 `xrmonitor create` dispatcher, and `hyprctl openxr create` (surfaces and syntax in
 the configuration page) — parses into an `SXRMonitorParams` (name, optional pixel
-mode, optional size, parsed anchor state) and funnels into one main-thread method:
+mode, optional size, parsed anchor state, optional `create profile:`) and funnels into one
+main-thread method:
 
 ```cpp
-std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMonitorParams& params);
+std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMonitorParams& params, bool pinGlobalMode = false);
 void                                 COpenXRManager::destroyXRMonitor(const std::string& name);
 ```
 
@@ -70,42 +71,46 @@ including when no session exists — that is what makes lazy binding possible:
 
 1. **Validate uniqueness:** the name must not already belong to a monitor
    (`State::monitorState()->allMonitors()`) or an existing layer.
-2. **Construct the layer** with a monotonic `m_seq` (used by the cap policy) and the
-   quad width from `params` or `openxr:default_size` (default 1.6 m). Seed the
-   anchoring engine; when the caller gave no explicit anchor (the create verb may
-   omit one), place the monitor along the current gaze at `openxr:default_distance`
-   (default 1.5 m), falling back to a fixed forward pose when there is no tracking
-   yet. Push the layer into `m_layers` (still unbound).
-3. **Create the headless output** by finding the `AQ_BACKEND_HEADLESS`
+2. **Resolve defaults** through the `hl.xr_defaults` ladder (configuration page §3.3,
+   `OpenXR::resolveXRDefaults`): explicit params > the requested profile's blocks > base
+   blocks matching the bound headset > `openxr:default_*` + 1920x1080@60. The layer keeps
+   the explicit fields, the profile and the per-field provenance so
+   `reapplyXRDefaults()` can re-resolve defaults-owned fields when the headset changes.
+3. **Construct the layer** with a monotonic `m_seq` (used by the cap policy) and the
+   resolved quad width. Seed the anchoring engine; when the caller gave no explicit
+   anchor (the create verb may omit one), place the monitor along the current gaze at
+   the resolved distance, falling back to a fixed forward pose when there is no
+   tracking yet. Push the layer into `m_layers` (still unbound).
+4. **Create the headless output** by finding the `AQ_BACKEND_HEADLESS`
    implementation and calling `impl->createOutput(name)` — the same recipe as
    `hyprctl output create headless`. The `newOutput → monitorState()->add() →
    CMonitor` ctor + `onConnect` chain runs synchronously, so the monitor is
    queryable immediately by name. XR-created outputs are tagged
    `mon->m_xrManagedPlug = true` so the monitor-rule manager never re-enables them
    while the plug lifecycle holds them unplugged.
-4. **Bind** (`bindToMonitor`): cache the monitor weak ref and `m_monitorId`, seed
+5. **Bind** (`bindToMonitor`): cache the monitor weak ref and `m_monitorId`, seed
    `m_pendingSize`, mark `m_swapchainDirty`, and connect the `presented` /
    `modeChanged` / `destroy` listeners. The `destroy` callback runs the external-
    destroy removal barrier (path B below).
-5. **Apply the requested pixel mode**, if any. An explicit user `monitor=NAME,...`
+6. **Apply the requested pixel mode**, if any. An explicit user `monitor=NAME,...`
    rule that already set a resolution **wins** (captured once as
    `m_userProvidedMode`). Otherwise the manager registers a **persistent named
    monitor rule** carrying the requested mode (`registerDeclaredMonitorRule`) so the
    declared resolution survives plug/unplug/reload — without it, every plug edge's
    `onConnect` would re-derive the mode and fall back to the headless default
    (1920x1080@60).
-6. **Plugged-state gate:** with `openxr:monitors_follow_session` active (default
+7. **Plugged-state gate:** with `openxr:monitors_follow_session` active (default
    `visible`), a monitor created while the session is not usable starts life
    **unplugged** — created with a stable id and mode, then immediately `onDisconnect`ed
    through the ordinary hotplug path, so a sessionless or doffed desktop never places
    workspaces on a display that isn't really there. It plugs in on the next
    session/visibility edge.
-7. Emit the `xrmonitoradded` event.
-8. **If a session is running:** decide cross-GPU linear buffers now
+8. Emit the `xrmonitoradded` event.
+9. **If a session is running:** decide cross-GPU linear buffers now
    (`applyCrossGpuLinear`) and mark `m_swapchainDirty` — the frame thread creates the
    swapchain on its next pass, since it re-snapshots `m_layers` every frame and needs
    no extra wakeup.
-9. Recompute the layer-cap active set (`recomputeQuadActive`).
+10. Recompute the layer-cap active set (`recomputeQuadActive`).
 
 **Lazy binding:** on session start the manager walks `m_layers`
 (`bindExistingLayers`): records whose named monitor still exists bind and are marked
