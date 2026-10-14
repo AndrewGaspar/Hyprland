@@ -4755,9 +4755,17 @@ void COpenXRManager::onConfigReload(bool forceProbe) {
     gate.minProbeIntervalMs = base;
 
     switch (OpenXR::xrReloadAction(gate)) {
-        case OpenXR::XR_RELOAD_START: start(); break; // start() reconciles declared monitors itself
-        case OpenXR::XR_RELOAD_STOP: stop(); break;
-        case OpenXR::XR_RELOAD_RECONCILE_ONLY: reconcileDeclaredMonitors(); break;
+        // start() reconciles declared monitors itself at bring-up; re-resolve hl.xr_defaults now
+        // anyway, so edited blocks land on monitors that already exist even if bring-up fails.
+        case OpenXR::XR_RELOAD_START:
+            start();
+            reapplyXRDefaults();
+            break;
+        case OpenXR::XR_RELOAD_STOP:
+            stop();
+            reapplyXRDefaults();
+            break;
+        case OpenXR::XR_RELOAD_RECONCILE_ONLY: reconcileDeclaredMonitors(); break; // ends in reapplyXRDefaults()
     }
 
     // A reparse wiped the rule manager, taking our requested-mode rules with it. reconcile above
