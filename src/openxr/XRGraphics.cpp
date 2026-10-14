@@ -28,6 +28,7 @@
 #include "XRMonitorLayer.hpp"
 #include "XRDmabufImport.hpp"
 #include "XRBoundedCall.hpp" // OpenXR::runBoundedProbe — the throwaway-thread pattern for driver calls
+#include "XRSrgb.hpp" // OpenXR::disableSrgbWriteEncoding — raw writes into the sRGB swapchains
 #include "XRMath.hpp" // OpenXR::xrLumaKeyAlpha / xrLumaKeyPremultiplied (the luma-key reference curve)
 #include <aquamarine/buffer/Buffer.hpp>
 
@@ -513,6 +514,14 @@ bool CXRGraphics::initBlitGL() {
 
     glGenVertexArrays(1, &m_blitVAO);
 
+    // Every pass below (content draw, CPU blit, clears, chrome, fade, snapshot) writes sRGB-ENCODED
+    // desktop bytes into GL_SRGB8_ALPHA8 swapchains; GLES would encode them a second time on write
+    // (washed-out XR monitors). Turn that off once for this context — see XRSrgb.hpp.
+    if (OpenXR::disableSrgbWriteEncoding())
+        Log::logger->log(Log::DEBUG, "[OPENXR] sRGB write encoding disabled (GL_EXT_sRGB_write_control) — swapchain writes are raw");
+    else
+        Log::logger->log(Log::WARN, "[OPENXR] GL_EXT_sRGB_write_control unavailable — sRGB swapchain writes are re-encoded, XR monitors will look washed out");
+
     Log::logger->log(Log::DEBUG, "[OPENXR] blit GL resources initialized");
     return true;
 }
@@ -827,6 +836,8 @@ void CXRGraphics::snapshotSwapchain(CXRMonitorLayer& layer, XR_GLuint srcTex) {
 
     // Copy srcTex (the swapchain image we just wrote content into) -> snapshot, 1:1 (no flip; both
     // share the swapchain's bottom-left origin). Preserves the content-alpha-1 / margin-alpha-0 layout.
+    // A raw byte copy both ways because sRGB write encoding is off (initBlitGL): with it on, GLES
+    // decoded the sRGB source into this UNORM snapshot (lossy in the shadows) and re-encoded on restore.
     GLuint srcFBO = 0, dstFBO = 0;
     glGenFramebuffers(1, &srcFBO);
     glGenFramebuffers(1, &dstFBO);

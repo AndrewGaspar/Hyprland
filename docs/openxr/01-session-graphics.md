@@ -268,6 +268,20 @@ Per-layer swapchains (doc 02) use it with color-attachment + sampled usage, sing
 sample/face/array/mip, sized to the **monitor's pixel mode** (a quad has no per-eye
 resolution).
 
+**sRGB writes are raw.** An sRGB swapchain tells the runtime its texels are sRGB-*encoded*: Monado
+(and WiVRn, which is Monado-based) samples it through a `*_SRGB` Vulkan view, decoding to linear,
+then re-encodes for scanout / the video encoder. The presented desktop buffer (XRGB8888) already
+holds sRGB-encoded bytes, so they must land in the swapchain unchanged. OpenGL ES, though, encodes
+linear→sRGB on *every* write to an sRGB attachment — shader output, `glClear` and
+`glBlitFramebuffer` alike — so by default the desktop was encoded twice (mid-grey 128 stored as 188:
+lifted shadows, washed-out colors versus the same desktop on a 2D output; noticed on XREAL Air 2
+Ultra A/B, 2026-10). `initBlitGL` therefore disables write-side encoding once per context with
+`GL_EXT_sRGB_write_control` (`OpenXR::disableSrgbWriteEncoding`, `XRSrgb.cpp`; pinned by the
+`XRSrgbWrites` gtests), making every write a byte copy. Switching to a `GL_RGBA8` swapchain would
+**not** fix it: the runtime treats UNORM texels as linear and encodes them for output, the same
+double encode one step later. Without the extension (not seen on Mesa or NVIDIA) a WARN is logged
+and the old washed-out behavior remains.
+
 ## Environment blend mode
 
 The mode submitted to `xrEndFrame` decides what a quad is composited *over*:
