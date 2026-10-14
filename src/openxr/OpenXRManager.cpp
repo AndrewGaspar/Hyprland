@@ -2924,14 +2924,14 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
                 return std::unexpected<std::string>("an XR monitor with that name already exists");
     }
 
-    // 2. Resolve the xr_defaults ladder (doc 05 §3.3): explicit args > the requested profile's
-    //    blocks > base blocks > openxr:default_* globals. An unknown profile is the caller's error.
+    // 1b. Resolve the xr_defaults ladder (doc 05 §3.3): explicit args > the requested profile's
+    //     blocks > base blocks > openxr:default_* globals. An unknown profile is the caller's error.
     const OpenXR::SXRExplicitFields EXPLICIT{.resolution = params.m_resolution, .refreshRate = params.m_refreshRate, .size = params.m_sizeMeters};
     auto                            resolved = OpenXR::resolveXRDefaults(Config::xrDeclarationMgr()->defaults(), params.m_profile, m_xrContext, xrDefaultsGlobals(), EXPLICIT);
     if (!resolved)
         return std::unexpected(resolved.error());
 
-    // 3. Construct the layer (still unbound) and register it.
+    // 2. Construct the layer (still unbound) and register it.
     const float sizeMeters = resolved->size.value;
     auto        layer      = std::make_shared<CXRMonitorLayer>(params.m_name, ++m_seqCounter, sizeMeters);
     layer->m_explicit      = EXPLICIT;
