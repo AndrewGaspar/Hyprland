@@ -623,6 +623,34 @@ TEST(ConfigLuaXRSurface, monitorLeaseFalseReclaimsAndOmittedKeeps) {
     Config::monitorRuleMgr()->clear();
 }
 
+// Regression (fishfood 2026-10-13): `xreal-mode off` sent `hl.monitor({ output = X, disabled = true })`,
+// and every later `hl.monitor({ output = X, mode = … })` merged onto that rule and stayed disabled —
+// not even a physical replug recovered it. A mode re-enables; an explicit `disabled` in the same call
+// still wins, and a call without a mode keeps the earlier state.
+TEST(ConfigLuaXRSurface, monitorModeReEnablesADisabledOutput) {
+    CXRLuaFixture fx;
+    Config::monitorRuleMgr()->clear();
+
+    fx.run(R"LUA( hl.monitor({ output = "DP-5", mode = "preferred", position = "auto", scale = "1" }) )LUA");
+    fx.run(R"LUA( hl.monitor({ output = "DP-5", disabled = true }) )LUA");
+    ASSERT_TRUE(luaMonitorRule("DP-5").has_value());
+    EXPECT_TRUE(luaMonitorRule("DP-5")->m_disabled);
+
+    fx.run(R"LUA( hl.monitor({ output = "DP-5", scale = "1" }) )LUA");
+    EXPECT_TRUE(luaMonitorRule("DP-5")->m_disabled);
+
+    fx.run(R"LUA( hl.monitor({ output = "DP-5", mode = "3840x1080@60", position = "auto", scale = "1", stereo = "sbs" }) )LUA");
+    EXPECT_EQ(fx.errors(), "");
+    EXPECT_FALSE(luaMonitorRule("DP-5")->m_disabled);
+
+    fx.run(R"LUA( hl.monitor({ output = "DP-5", mode = "3840x1080@60", disabled = true }) )LUA");
+    EXPECT_TRUE(luaMonitorRule("DP-5")->m_disabled);
+
+    fx.run(R"LUA( hl.monitor({ output = "DP-5", mode = "3840x1080@60", disabled = false }) )LUA");
+    EXPECT_FALSE(luaMonitorRule("DP-5")->m_disabled);
+    Config::monitorRuleMgr()->clear();
+}
+
 TEST(ConfigLuaXRSurface, monitorLeaseRejectsANonBoolean) {
     CXRLuaFixture fx;
     Config::monitorRuleMgr()->clear();
