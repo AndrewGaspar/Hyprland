@@ -164,6 +164,21 @@ class CXRMonitorLayer {
     bool                    m_declaredRig = false;
     std::optional<Vector2D> m_reqResolution;   // last requested pixel mode (for reconcile diff)
     std::optional<float>    m_reqRefresh;      // last requested refresh (for reconcile diff)
+
+    // ---- xr_defaults provenance (doc 05 §3.3) — MAIN THREAD ONLY, size fields under m_layersMu ----
+    // What the declaration / create args said explicitly (outranks every xr_defaults block), the
+    // profile `create profile:<name>` asked for, and the last resolution (for status + re-resolution
+    // diffs). m_reqResolution/m_reqRefresh above are DERIVED from m_resolved (xrRequestedMode).
+    OpenXR::SXRExplicitFields   m_explicit;
+    std::string                 m_profile;
+    OpenXR::SXRResolvedDefaults m_resolved;
+    // A runtime `create` pins the global 1920x1080@60 into its rule (the pre-xr_defaults behavior);
+    // a mode-less `xrmonitor` declaration leaves the mode to monitor rules / the headless default.
+    bool m_pinGlobalMode = false;
+    // The quad width the defaults last applied. A live width that differs means the user resized
+    // it (grab, `xrmonitor scale`): m_sizeUserOwned latches and re-resolution never touches it again.
+    float m_defaultSizeApplied = -1.F;
+    bool  m_sizeUserOwned      = false;
     // report-20 issue E: true iff an explicit user `monitor=NAME,...` rule set this output's
     // resolution. Captured before the manager registers its own declared-mode rule, then refreshed
     // from field provenance on config reload, so adding/removing a user mode applies live without

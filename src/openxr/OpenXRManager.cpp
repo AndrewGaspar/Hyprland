@@ -854,6 +854,10 @@ void COpenXRManager::continueBringup(CXRSession* sess) {
     // dead-frame coordinates, which is the memory the re-seat was about to consume.)
     invalidateAnchorFrames("a new session's reference frame is not the last one's");
 
+    // doc 05 §3.3: a session has now bound a system — re-derive the HMD context `when` matches
+    // against. A change reconciles the declared set and re-resolves xr_defaults (no-op otherwise).
+    refreshXRSystemContext();
+
     // 9. Bind any layers whose monitor still exists (created while disabled — doc 02), then
     //    set up the frame->main channel and spawn the frame thread.
     bindExistingLayers();
@@ -2892,7 +2896,7 @@ bool COpenXRManager::createLayerSwapchain(CXRMonitorLayer& layer, const Vector2D
     return true;
 }
 
-std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMonitorParams& params) {
+std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMonitorParams& params, bool pinGlobalMode) {
     // Runs on the main thread; works in EVERY manager state (doc 02 — that is what makes lazy
     // binding possible).
 
@@ -2920,10 +2924,20 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
                 return std::unexpected<std::string>("an XR monitor with that name already exists");
     }
 
-    // 2. Construct the layer (still unbound) and register it.
-    static auto PSIZE      = CConfigValue<Hyprlang::FLOAT>("openxr:default_size");
-    const float sizeMeters = params.m_sizeMeters.value_or((float)*PSIZE);
+    // 2. Resolve the xr_defaults ladder (doc 05 §3.3): explicit args > the requested profile's
+    //    blocks > base blocks > openxr:default_* globals. An unknown profile is the caller's error.
+    const OpenXR::SXRExplicitFields EXPLICIT{.resolution = params.m_resolution, .refreshRate = params.m_refreshRate, .size = params.m_sizeMeters};
+    auto                            resolved = OpenXR::resolveXRDefaults(Config::xrDeclarationMgr()->defaults(), params.m_profile, m_xrContext, xrDefaultsGlobals(), EXPLICIT);
+    if (!resolved)
+        return std::unexpected(resolved.error());
+
+    // 3. Construct the layer (still unbound) and register it.
+    const float sizeMeters = resolved->size.value;
     auto        layer      = std::make_shared<CXRMonitorLayer>(params.m_name, ++m_seqCounter, sizeMeters);
+    layer->m_explicit      = EXPLICIT;
+    layer->m_profile       = params.m_profile;
+    layer->m_resolved      = *resolved;
+    layer->m_pinGlobalMode = pinGlobalMode;
 
     // Seed the anchoring engine (WP5). widthMeters is the live quad width; height derives from
     // the pixel mode each frame.
@@ -2932,8 +2946,9 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
     // Create verb with no explicit anchor: place along the current gaze at default distance
     // (doc 05 §3.1). Falls back to a sensible default pose when there is no tracking yet.
     if (!params.m_anchorProvided) {
-        static auto       PDEFDIST = CConfigValue<Hyprlang::FLOAT>("openxr:default_distance");
-        const float       dist     = (float)*PDEFDIST;
+        // xr_defaults `distance` (or openxr:default_distance): initial placement only — re-resolution
+        // never moves a monitor that already exists.
+        const float       dist = resolved->distance.value;
         OpenXR::CXRAnchor tmp;
         st.mode        = OpenXR::XR_ANCHOR_LOCAL;
         const auto ctx = currentVerbContext();
@@ -2967,8 +2982,8 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
     // is the world pose applyCenter derived from wherever the head stood — dead-frame coordinates the
     // moment the session ends, and exactly the corruption an authored distance must not inherit.
     layer->m_declaredRig    = params.m_anchorProvided;
-    layer->m_reqResolution  = params.m_resolution;
-    layer->m_reqRefresh     = params.m_refreshRate;
+    std::tie(layer->m_reqResolution, layer->m_reqRefresh) = OpenXR::xrRequestedMode(*resolved, pinGlobalMode);
+    layer->m_defaultSizeApplied                           = resolved->size.source == OpenXR::XR_DEFSRC_EXPLICIT ? -1.F : layer->m_anchor.state().widthMeters;
     {
         std::scoped_lock lock(m_layersMu);
         m_layers.push_back(layer);
@@ -3271,7 +3286,10 @@ void COpenXRManager::registerDeclaredMonitorRule(const PHLMONITOR& mon, const PX
     // reload clears the rule manager, so a scale the user ADDS later — or a retuned default — lands
     // on the next reassert instead of being shadowed by a stale capture. XR-owned scales carry
     // provenance and are skipped, so same-name output recreation also re-derives the default.
-    static auto PDEFAULTSCALE = CConfigValue<Hyprlang::FLOAT>("openxr:default_monitor_scale");
+    // doc 05 §3.3: the default is no longer one global — an xr_defaults block for the bound HMD (or
+    // this monitor's profile) may supply it. Resolved fresh on every call, so a reload or an HMD
+    // change can never leave a stale value cached here; openxr:default_monitor_scale is the base.
+    const float DEFAULTSCALE  = resolveLayerDefaults(*layer).scale.value;
     static auto PNOSCALECHECK = CConfigValue<Hyprlang::INT>("debug:disable_scale_checks");
     const float PINNEDSCALE   = OpenXR::xrPinnedRuleScale(Config::monitorRuleMgr()->all(), [&mon](const std::string& sel) { return mon->matchesStaticSelector(sel); });
 
@@ -3324,7 +3342,7 @@ void COpenXRManager::registerDeclaredMonitorRule(const PHLMONITOR& mon, const PX
     // declared size, and openxr:default_monitor_scale still divides that pane cleanly — so the XR
     // scale default keeps applying and turning depth on does not reflow the session.
     const auto WANTSCALE  = OpenXR::xrDefaultMonitorScale(layer->m_createdByXR, OpenXR::xrRuleScaleIsExplicit(PINNEDSCALE), WANTSTEREO != Config::STEREO_OFF && !WANTDEPTH,
-                                                          effectiveMode, *PNOSCALECHECK, (float)*PDEFAULTSCALE);
+                                                          effectiveMode, *PNOSCALECHECK, DEFAULTSCALE);
     const bool clearScale = !WANTSCALE && rule.m_scaleOwnedByXR;
 
     if (!wantMode && !clearMode && !wantOffset && !clearOffset && !WANTSCALE && !clearScale && !STEREOCHANGED)
@@ -4204,6 +4222,11 @@ void COpenXRManager::updateMonitorsPlugged(bool allowGrace) {
     // Decision funnel (report-18/19 addenda). Compute the desired plugged state from the mode +
     // session + presence facts, then apply — deferring the plugged->unplugged edge under the anti-flap
     // grace, and the FIRST plug (no-presence fallback) behind the settle window. Main thread only.
+    // doc 05 §3.3: a direct-mode runtime may take its DRM lease after bring-up; by the time the
+    // session reports a visibility edge it certainly holds it. Cheap no-op when nothing changed.
+    if (m_running.load())
+        refreshXRSystemContext();
+
     const bool up  = sessionExists();
     const bool vis = sessionVisible();
 
@@ -5703,7 +5726,14 @@ void COpenXRManager::reconcileDeclaredMonitors() {
     // doc 05 §2.5: D = declared set (this parse), L = live layers created BY config
     // (m_declaredByConfig). Runtime-created layers are never touched.
     // Front-end independent: both `xrmonitor =` (classic) and hl.xr_monitor (Lua) deposit here.
-    const auto& declared = Config::xrDeclarationMgr()->monitors();
+    //
+    // doc 05 §3.3: D is the set IN FORCE for the bound HMD — per name, the last declaration whose
+    // `when` matches. A name with no matching declaration is simply not declared right now.
+    std::vector<std::string> ambiguous;
+    const auto               declared = OpenXR::effectiveXRMonitorDeclarations(Config::xrDeclarationMgr()->monitors(), m_xrContext, &ambiguous);
+    for (const auto& name : ambiguous)
+        Log::logger->log(Log::WARN, "[OPENXR] xrmonitor '{}': several `when`-qualified declarations match {}; the last one wins", name,
+                         OpenXR::describeXRSystemContext(m_xrContext));
 
     // Snapshot current declared layer names.
     std::vector<std::string> liveDeclared;
@@ -5714,44 +5744,37 @@ void COpenXRManager::reconcileDeclaredMonitors() {
                 liveDeclared.push_back(l->m_monitorName);
     }
 
-    // D \ L -> create (declared);  D ∩ L -> diff (mode change / anchor change).
+    // D \ L -> create (declared);  D ∩ L -> diff (anchor / explicit-field change). The pixel mode,
+    // scale and defaults-provenance width are applied by reapplyXRDefaults() at the end, the one
+    // place that turns a resolution into a monitor rule.
     for (const auto& d : declared) {
         auto existing = layerByName(d.m_name);
         if (existing && existing->m_declaredByConfig) {
-            // D ∩ L: diff. Mode change -> apply new rule (emits modeChanged -> swapchain recreate).
-            const bool modeChanged = existing->m_reqResolution != d.m_resolution || existing->m_reqRefresh != d.m_refreshRate;
-            if (modeChanged) {
-                existing->m_reqResolution = d.m_resolution;
-                existing->m_reqRefresh    = d.m_refreshRate;
-            }
-            if (auto mon = existing->m_monitor.lock()) {
-                // report-20 issue E: (re-)register the persistent declared-mode rule every reconcile —
-                // a config reparse (reload) clears our rule from the manager, so this re-installs it
-                // (idempotent otherwise, and a no-op when the user set their own mode). Then, on an
-                // actual declared-mode change, apply the effective rule now so the swapchain recreates.
-                registerDeclaredMonitorRule(mon, existing);
-                if (modeChanged && d.m_resolution && Config::monitorRuleMgr()) {
-                    Config::CMonitorRule rule = Config::monitorRuleMgr()->get(mon);
-                    mon->applyMonitorRule(std::move(rule));
-                }
-            }
+            const OpenXR::SXRExplicitFields EXPLICIT{.resolution = d.m_resolution, .refreshRate = d.m_refreshRate, .size = d.m_sizeMeters};
+            const bool                      hadExplicitSize = existing->m_explicit.size.has_value();
+            existing->m_explicit                            = EXPLICIT;
+
             // Anchor / size change -> re-anchor to the new declared state (doc 05 §2.5 / doc 03).
-            static auto PSIZE             = CConfigValue<Hyprlang::FLOAT>("openxr:default_size");
-            const float wantSize          = d.m_sizeMeters.value_or((float)*PSIZE);
-            const bool  anchorChanged     = !(existing->m_declaredAnchor == d.m_anchor);
-            // Declared-vs-declared, like anchorChanged above: comparing the LIVE width here meant a
+            // An explicit size compares declared-vs-declared: comparing the LIVE width here meant a
             // grab-resized monitor re-entered this branch on every unrelated config reload, resetting
             // its pose along with its size — a live-placement eraser on desktops that reload often.
-            const bool  sizeChanged       = existing->m_declaredAnchor.widthMeters != wantSize;
+            // A size that comes from xr_defaults is reapplyXRDefaults()'s business (it never moves
+            // the monitor), EXCEPT when an explicit size was just removed from the declaration.
+            const float wantSize          = d.m_sizeMeters ? *d.m_sizeMeters : resolveLayerDefaults(*existing).size.value;
+            const bool  anchorChanged     = !(existing->m_declaredAnchor == d.m_anchor);
+            const bool  sizeChanged       = (d.m_sizeMeters || hadExplicitSize) && existing->m_declaredAnchor.widthMeters != wantSize;
             const bool  anchorModeChanged = existing->m_declaredAnchor.mode != d.m_anchor.mode || existing->m_declaredAnchor.device != d.m_anchor.device;
             if (anchorChanged || sizeChanged) {
                 std::scoped_lock       lock(m_layersMu);
                 OpenXR::SXRAnchorState st = d.m_anchor;
-                st.widthMeters            = wantSize;
+                // An anchor-only change keeps a defaults-provenance width the user has since resized.
+                st.widthMeters = !d.m_sizeMeters && !sizeChanged && existing->m_sizeUserOwned ? existing->m_anchor.state().widthMeters : wantSize;
                 existing->m_anchor.initFromState(st);
                 existing->m_declaredAnchor = st;
                 existing->m_declaredRig    = true; // a config `xrmonitor` line is a head-relative rig by construction
-                existing->m_sizeMeters     = wantSize;
+                existing->m_sizeMeters     = st.widthMeters;
+                if (!d.m_sizeMeters && !existing->m_sizeUserOwned)
+                    existing->m_defaultSizeApplied = st.widthMeters;
                 // doc 03 §8.3: the user just re-declared where this monitor goes, so any placement
                 // captured before that is superseded — the next session must re-seat from the NEW rig,
                 // not replay the old arrangement.
@@ -5782,12 +5805,147 @@ void COpenXRManager::reconcileDeclaredMonitors() {
         res.value()->m_declaredByConfig = true;
     }
 
-    // L \ D: destroy declared layers no longer present in the declared set.
+    // L \ D: destroy declared layers no longer present in the declared set — including one whose
+    // only declarations are `when`-qualified for a different HMD than the one now bound.
     for (const auto& name : liveDeclared) {
         const bool stillDeclared = std::ranges::any_of(declared, [&](const SXRMonitorParams& p) { return p.m_name == name; });
         if (!stillDeclared)
             destroyXRMonitor(name);
     }
+
+    reapplyXRDefaults();
+}
+
+const OpenXR::SXRSystemContext& COpenXRManager::xrSystemContext() const {
+    return m_xrContext;
+}
+
+OpenXR::SXRDefaultsGlobals COpenXRManager::xrDefaultsGlobals() const {
+    static auto                PSIZE  = CConfigValue<Hyprlang::FLOAT>("openxr:default_size");
+    static auto                PDIST  = CConfigValue<Hyprlang::FLOAT>("openxr:default_distance");
+    static auto                PSCALE = CConfigValue<Hyprlang::FLOAT>("openxr:default_monitor_scale");
+
+    OpenXR::SXRDefaultsGlobals g;
+    g.size     = sc<float>(*PSIZE);
+    g.distance = sc<float>(*PDIST);
+    g.scale    = sc<float>(*PSCALE);
+    return g;
+}
+
+OpenXR::SXRResolvedDefaults COpenXRManager::resolveLayerDefaults(const CXRMonitorLayer& layer) const {
+    const auto& blocks  = Config::xrDeclarationMgr()->defaults();
+    const auto  globals = xrDefaultsGlobals();
+
+    if (auto r = OpenXR::resolveXRDefaults(blocks, layer.m_profile, m_xrContext, globals, layer.m_explicit); r)
+        return *r;
+
+    // The only failure is an unknown profile: its blocks were deleted by a reload after this monitor
+    // was created with `profile:`. The monitor keeps existing; it just falls back to the base layers.
+    Log::logger->log(Log::WARN, "[OPENXR] XR monitor '{}': xr_defaults profile '{}' no longer exists; using the base defaults", layer.m_monitorName, layer.m_profile);
+    return OpenXR::resolveXRDefaults(blocks, "", m_xrContext, globals, layer.m_explicit).value_or(OpenXR::SXRResolvedDefaults{});
+}
+
+void COpenXRManager::reapplyXRDefaults() {
+    // MAIN THREAD (doc 05 §3.3). Snapshot outside the lock — the rule manager runs listeners of its own.
+    std::vector<std::pair<PHLMONITOR, PXRLAYER>> live;
+    {
+        std::scoped_lock lock(m_layersMu);
+        for (auto& l : m_layers) {
+            if (!l || l->m_pendingRemoval.load(std::memory_order_acquire))
+                continue;
+            live.emplace_back(l->m_monitor.lock(), l);
+        }
+    }
+
+    for (auto& [mon, layer] : live) {
+        const auto resolved = resolveLayerDefaults(*layer);
+
+        // Mode. Only the XR-owned rule changes; a user `monitor =` mode still wins inside
+        // registerDeclaredMonitorRule (m_userProvidedMode), exactly as it always did.
+        const auto [res, hz]   = OpenXR::xrRequestedMode(resolved, layer->m_pinGlobalMode);
+        const bool modeChanged = layer->m_reqResolution != res || layer->m_reqRefresh != hz;
+        layer->m_reqResolution = res;
+        layer->m_reqRefresh    = hz;
+
+        // Quad width. Never for an explicit size; never once the user has resized the quad (detected
+        // here by the live width drifting from what the defaults last applied, which covers a grab
+        // resize without every resize path having to know about provenance).
+        bool sizeChanged = false;
+        {
+            std::scoped_lock lock(m_layersMu);
+            const float      live = layer->m_anchor.state().widthMeters;
+            if (resolved.size.source != OpenXR::XR_DEFSRC_EXPLICIT && !layer->m_sizeUserOwned && layer->m_defaultSizeApplied > 0.F &&
+                std::abs(live - layer->m_defaultSizeApplied) > 1e-4F) {
+                layer->m_sizeUserOwned = true;
+                Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}': quad width was resized at runtime; xr_defaults no longer own it", layer->m_monitorName);
+            }
+
+            if (resolved.size.source != OpenXR::XR_DEFSRC_EXPLICIT && !layer->m_sizeUserOwned && std::abs(live - resolved.size.value) > 1e-4F) {
+                // Width only: applyScale keeps the anchor pose, so the quad grows/shrinks in place.
+                layer->m_anchor.applyScale(true, resolved.size.value - live);
+                const float now                     = layer->m_anchor.state().widthMeters;
+                layer->m_sizeMeters                 = now;
+                layer->m_defaultSizeApplied         = now;
+                layer->m_declaredAnchor.widthMeters = now;
+                sizeChanged                         = true;
+            } else if (resolved.size.source != OpenXR::XR_DEFSRC_EXPLICIT && !layer->m_sizeUserOwned)
+                layer->m_defaultSizeApplied = live;
+        }
+
+        layer->m_resolved = resolved;
+
+        if (modeChanged || sizeChanged)
+            Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}': xr_defaults re-resolved (mode {} via {}, scale {} via {}, size {}m via {})", layer->m_monitorName,
+                             res ? std::format("{}x{}@{}", res->x, res->y, hz.value_or(60.F)) : std::string("unrequested"), OpenXR::xrDefaultSourceName(resolved.resolution.source),
+                             resolved.scale.value, OpenXR::xrDefaultSourceName(resolved.scale.source), resolved.size.value, OpenXR::xrDefaultSourceName(resolved.size.source));
+
+        if (!mon || !Config::monitorRuleMgr())
+            continue;
+
+        // Re-register: carries the new mode and the re-resolved default scale (the whole-logical-
+        // pixel gate and the adopted/stereo exclusions live in there, unchanged). add() schedules an
+        // ensureMonitorStatus pass that compares before applying, so an unchanged monitor costs no
+        // modeset. A mode change is applied now so the swapchain recreates on the next frame — the
+        // same path a changed declared mode has always taken on reload.
+        registerDeclaredMonitorRule(mon, layer);
+        if (modeChanged) {
+            Config::CMonitorRule rule = Config::monitorRuleMgr()->get(mon);
+            mon->applyMonitorRule(std::move(rule));
+        }
+        if (sizeChanged)
+            requestLayout2DSync();
+    }
+}
+
+void COpenXRManager::refreshXRSystemContext() {
+    // MAIN THREAD. Only meaningful with a session that has bound a system; otherwise the previous
+    // context stays (sticky — doc 05 §3.3).
+    if (!m_session)
+        return;
+
+    OpenXR::SXRSystemContext ctx;
+    ctx.bound        = true;
+    ctx.systemName   = m_session->systemName();
+    ctx.eyeGaze      = m_session->m_hasEyeGazeExt;
+    ctx.handTracking = m_session->m_hasHandTracking && m_session->m_supportsHandTracking;
+    ctx.passthrough  = std::ranges::contains(m_session->m_blendModes, OpenXR::XR_BLEND_ALPHA);
+
+    // The direct-mode HMD panel: whatever connector a wp_drm_lease client holds right now. The only
+    // lessee on an XR desktop is the runtime's direct-mode compositor (Monado + XREAL), so this is
+    // the HMD whenever there is a lease at all; WiVRn/remote headsets lease nothing.
+    for (const auto& m : State::monitorState()->allMonitors()) {
+        if (m && m->m_isBeingLeased)
+            ctx.leasedDisplays.push_back({.description = m->m_description, .shortDescription = m->m_shortDescription});
+    }
+
+    if (ctx == m_xrContext)
+        return;
+
+    Log::logger->log(Log::DEBUG, "[OPENXR] bound HMD context: {}", OpenXR::describeXRSystemContext(ctx));
+    m_xrContext = std::move(ctx);
+
+    // `when` may now select different declarations and different xr_defaults blocks.
+    reconcileDeclaredMonitors(); // ends in reapplyXRDefaults()
 }
 
 void COpenXRManager::recomputeQuadActive() {
@@ -5825,26 +5983,47 @@ void COpenXRManager::recomputeQuadActive() {
     }
 }
 
-std::expected<void, std::string> COpenXRManager::cmdCreate(const std::string& args) {
+std::expected<COpenXRManager::SXRCreateResult, std::string> COpenXRManager::cmdCreate(const std::string& args) {
     auto parsed = OpenXR::parseXRMonitorCreateArgs(args);
     if (!parsed.has_value())
         return std::unexpected(parsed.error());
 
-    // Defaults (doc 05 §3.1): mode 1920x1080@60; anchor:local placed along gaze at default
-    // distance/size (WP4 keeps WP3's static pose — full placement solve is WP5).
-    // The refresh default is applied whether or not a resolution was given, so `create NAME
-    // 2560x1440` pins @60 into the rule we register instead of inheriting whatever refresh the
-    // matched rule happened to carry.
-    if (!parsed->m_resolution)
-        parsed->m_resolution = Vector2D{1920, 1080};
-    if (!parsed->m_refreshRate)
-        parsed->m_refreshRate = 60.f;
+    // An unknown profile is the caller's mistake; say so before minting or creating anything.
+    if (!parsed->m_profile.empty() && !OpenXR::xrDefaultsHasProfile(Config::xrDeclarationMgr()->defaults(), parsed->m_profile))
+        return std::unexpected(std::format("create: unknown xr_defaults profile '{}'", parsed->m_profile));
 
-    auto res = createXRMonitor(*parsed);
+    // doc 05 §3.3: no name -> the lowest free XR-<n> (n >= 2) that is neither a live monitor nor a
+    // declared name — a declaration for another HMD still reserves its name, so switching headsets
+    // never finds a keybind-minted monitor squatting on it.
+    SXRCreateResult result;
+    if (parsed->m_name.empty()) {
+        std::vector<std::string> taken;
+        for (const auto& m : State::monitorState()->allMonitors()) {
+            if (m)
+                taken.push_back(m->m_name);
+        }
+        {
+            std::scoped_lock lock(m_layersMu);
+            for (auto& l : m_layers)
+                taken.push_back(l->m_monitorName);
+        }
+        for (const auto& d : Config::xrDeclarationMgr()->monitors())
+            taken.push_back(d.m_name);
+
+        parsed->m_name = OpenXR::mintXRMonitorName(taken);
+        result.minted  = true;
+    }
+
+    // Defaults (doc 05 §3.3): the mode/size/distance come from the xr_defaults ladder inside
+    // createXRMonitor. pinGlobalMode keeps the pre-xr_defaults contract that a runtime monitor
+    // pins 1920x1080@60 into its rule when nothing asked for a mode; an explicit mode without a
+    // refresh still means @60 rather than whatever refresh the matched rule happened to carry.
+    auto res = createXRMonitor(*parsed, /*pinGlobalMode=*/true);
     if (!res)
         return std::unexpected(res.error());
     // Runtime-created: NOT declared, so reload reconciliation never touches it (doc 05 §2.5).
-    return {};
+    result.name = parsed->m_name;
+    return result;
 }
 
 std::expected<void, std::string> COpenXRManager::cmdDestroy(const std::string& target) {
@@ -5976,6 +6155,13 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
         info.anchorState        = OpenXR::xrAnchorStateName(layerAnchorState(l));
         // 2D-plane sync (report 12): where the projection put this monitor and the angles it used, so
         // "why does my cursor cross there" is answerable in one command.
+        {
+            const auto& r = l->m_resolved;
+            info.defaults = std::format("mode {}x{}@{} ({}){}, scale {} ({}), size {}m ({}){}{}", r.resolution.value.x, r.resolution.value.y, r.refreshRate.value,
+                                        OpenXR::xrDefaultSourceName(r.resolution.source), l->m_userProvidedMode ? " overridden by monitor rule" : "", r.scale.value,
+                                        OpenXR::xrDefaultSourceName(r.scale.source), r.size.value, OpenXR::xrDefaultSourceName(r.size.source),
+                                        l->m_sizeUserOwned ? " overridden by a runtime resize" : "", l->m_profile.empty() ? "" : std::format(", profile {}", l->m_profile));
+        }
         info.l2dSource          = l->m_l2dUserPinned ? "pinned" : (l->m_l2dPlaced ? "auto" : "off");
         info.l2dCol             = l->m_l2dCol;
         info.l2dRow             = l->m_l2dRow;
@@ -6923,6 +7109,8 @@ std::expected<void, std::string> COpenXRManager::cmdScale(const std::string& arg
         std::scoped_lock lock(m_layersMu);
         layer->m_anchor.applyScale(isDelta, *f);
         layer->m_sizeMeters = layer->m_anchor.state().widthMeters;
+        // doc 05 §3.3: the user sized it — xr_defaults re-resolution must never undo that.
+        layer->m_sizeUserOwned = true;
     }
     requestLayout2DSync();
     return {};

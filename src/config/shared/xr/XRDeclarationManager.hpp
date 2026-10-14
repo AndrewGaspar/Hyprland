@@ -32,9 +32,16 @@ namespace Config {
         // rebuild from scratch.
         void clear();
 
-        // `xrmonitor` is NAME-KEYED: a later declaration of the same name replaces the earlier one
-        // within a single parse (doc 05 §2). Insertion order is otherwise preserved.
+        // `xrmonitor` is keyed by NAME + `when`: a later declaration of the same name and the same
+        // `when` replaces the earlier one within a single parse (doc 05 §2). Declarations of one
+        // name with DIFFERENT `when`s coexist; which one is in force is decided against the bound
+        // HMD by OpenXR::effectiveXRMonitorDeclarations (doc 05 §3.3). Insertion order is otherwise
+        // preserved.
         void addMonitor(SXRMonitorParams&& params);
+
+        // `hl.xr_defaults` blocks (doc 05 §3.3). No key: CONFIG ORDER is load-bearing (field-wise
+        // last-wins within a layer). Append only.
+        void addDefaults(OpenXR::SXRDefaultsBlock&& block);
 
         // `xrrule` has NO key: every rule is evaluated and CONFIG ORDER is load-bearing — a later
         // matching rule overrides an earlier one PER EFFECT (doc 05 §xrrule). Append only.
@@ -48,9 +55,14 @@ namespace Config {
             return m_rules;
         }
 
+        const std::vector<OpenXR::SXRDefaultsBlock>& defaults() const {
+            return m_defaults;
+        }
+
       private:
-        std::vector<SXRMonitorParams> m_monitors;
-        std::vector<OpenXR::SXRRule>  m_rules;
+        std::vector<SXRMonitorParams>         m_monitors;
+        std::vector<OpenXR::SXRRule>          m_rules;
+        std::vector<OpenXR::SXRDefaultsBlock> m_defaults;
     };
 
     UP<CXRDeclarationManager>& xrDeclarationMgr();

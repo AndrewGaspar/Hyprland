@@ -822,8 +822,12 @@ static SDispatchResult xrmonitorDispatch(const std::string& args) {
         return {.success = false, .error = r.error()};
     };
 
-    if (verb == "create")
-        return wrapExp(g_pOpenXRManager->cmdCreate(rest));
+    if (verb == "create") {
+        auto r = g_pOpenXRManager->cmdCreate(rest);
+        if (!r)
+            return {.success = false, .error = r.error()};
+        return {};
+    }
     if (verb == "destroy")
         return wrapExp(g_pOpenXRManager->cmdDestroy(rest));
     if (verb == "select")
