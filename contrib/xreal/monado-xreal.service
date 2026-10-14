@@ -13,7 +13,7 @@
 
 [Unit]
 Description=Monado (XREAL Air flavor) OpenXR runtime for HypXRland
-Documentation=https://github.com/hyprwm/Hyprland docs/openxr/07-xreal.md
+Documentation=https://github.com/AndrewGaspar/Hyprland/blob/hypxrland/docs/openxr/07-xreal.md
 After=graphical-session.target
 PartOf=graphical-session.target
 
