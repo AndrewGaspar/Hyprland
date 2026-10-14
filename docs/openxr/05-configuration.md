@@ -190,9 +190,9 @@ Caveats:
 
 | Variable | Type | Default | Meaning | Applies |
 |---|---|---|---|---|
-| `default_size` | float (m) | `1.6` | Default quad width for a new XR monitor with no explicit `size:`. | hot |
-| `default_distance` | float (m) | `1.5` | Default placement distance for a new / re-centered monitor. | hot |
-| `default_monitor_scale` | float | `1.25` | Scale given to an **XR-created** monitor that has no explicit scale of its own. A headless output has no EDID, so Hyprland's PPI heuristic reads a 1920x1080 quad as a tiny dense panel and picks `2.0` — cramped through a headset. An explicit `monitor = <name>, …, <scale>` still wins (§3.1); `0` opts out and restores the PPI guess. Applies to the next monitor created — and, on a config reload, to existing XR monitors whose scale nobody else owns. Your real monitors are never touched. | hot |
+| `default_size` | float (m) | `1.6` | Default quad width for a new XR monitor with no explicit `size:`. The base under any `hl.xr_defaults` `size` (§3.3). | hot |
+| `default_distance` | float (m) | `1.5` | Default placement distance for a new / re-centered monitor. The base under any `hl.xr_defaults` `distance` for a new monitor (§3.3); `center` always uses this global. | hot |
+| `default_monitor_scale` | float | `1.25` | Scale given to an **XR-created** monitor that has no explicit scale of its own. A headless output has no EDID, so Hyprland's PPI heuristic reads a 1920x1080 quad as a tiny dense panel and picks `2.0` — cramped through a headset. An explicit `monitor = <name>, …, <scale>` still wins (§3.1); `0` opts out and restores the PPI guess. Applies to the next monitor created — and, on a config reload, to existing XR monitors whose scale nobody else owns. Your real monitors are never touched. The base under any `hl.xr_defaults` `scale` (§3.3). | hot |
 | `recenter_on_plug` | bool | `true` | On the **first** don of a session, re-seat `anchor:local` monitors relative to your current head pose instead of the runtime's (often arbitrary) `LOCAL_FLOOR` origin. A monitor you have placed comes back where you left it *relative to you*; one that has never been placed under tracking lands at its configured height/distance (doc 03 §8.3). Multi-monitor layouts are recentered rigidly (relative arrangement preserved). A brief doff-and-don within the same session does not re-seat. It is also the permission for the recenter fallback: when the runtime reports a reference-space change it refuses to describe *and* tracking did not straddle it (doc 03 §8.1), the group is re-seated the same way rather than left holding coordinates in a dead frame. | hot |
 | `recenter` | string | `hold` | What the **headset's own recenter button** does to your monitors (doc 03 §8.4). `hold` (default) = they stay where they are **in the room**; recentering moves the runtime's origin, which you cannot see, so the monitors correctly do not move. `follow` = a runtime reference-space change **also** re-seats the whole `anchor:local` group rigidly onto your current head — the recenter button becomes "bring my monitors to me". **The tradeoff:** the runtime does not say whether a reference-space change was deliberate, so under `follow` an *involuntary* one re-seats too — putting the headset back on, a guardian re-derive. If that is unwelcome, keep `hold` and bind `xrmonitor reseat` (§4), which re-seats only when you ask. Accepts `reseat`/`me` as synonyms for `follow`; anything unrecognized is `hold`. | hot |
 | `monitors_follow_session` | string | `visible` | When XR monitors behave like **unplugged external monitors** (held disabled — workspaces evacuate to your remaining monitors, then return by name on replug, exactly like a physical display): `off` = never; `session` = while no OpenXR session exists; `visible` (default) = while the headset is not actually **worn**. The `visible` plug gate needs BOTH session visibility AND — when the runtime exposes `XR_EXT_user_presence` (e.g. WiVRn) — user presence, so a session created with the headset on the shelf never plugs. Legacy values parse: `false/0` → `off`, `true/1` → `session`. | hot |
@@ -599,7 +599,9 @@ xrmonitor = XR-video, 1920x1080@60, anchor:local pos:0.3,1.05,-1.2 yaw:0, size:1
 ### In Lua
 
 `hl.xr_monitor` takes a table whose fields are the grammar's own key names. `name` is the identity
-field (the analogue of `hl.monitor`'s `output`), `mode` is the same `WxH[@Hz]` token, `anchor` is
+field (the analogue of `hl.monitor`'s `output`), `mode` is the same `WxH[@Hz]` token (optional in
+Lua: leave it and `size` out to take them from `hl.xr_defaults`, §3.3), `when` restricts the
+declaration to one headset (§3.3), `anchor` is
 the anchor mode — bare (`"local"`) or fully qualified (`"anchor:local"`), both accepted — and every
 remaining `key:value` sub-token of the classic spec is a field of the same name. Vector fields
 (`pos`, `offset`, `roam_offset`) take `{ x, y, z }` or the `"x,y,z"` string.
@@ -646,7 +648,7 @@ starts. A dynamic `hyprctl keyword xrmonitor ...` also reconciles (batched, so a
 
 ### 3.1 Pixel-mode precedence (`monitor =` vs the requested mode)
 
-An XR monitor's pixel mode can be asked for in three places. The order, highest first:
+An XR monitor's pixel mode can be asked for in four places. The order, highest first:
 
 1. **An explicit mode in a `monitor =` rule matching the name** — `monitor = XR-code,
    2560x1440@90, auto, 1.25`. If such a rule exists *when the monitor is created*, it owns the
@@ -659,24 +661,33 @@ An XR monitor's pixel mode can be asked for in three places. The order, highest 
    **and config reloads**, for declared and runtime-created monitors alike. Non-mode fields of a
    matching `monitor =` rule (scale, transform, VRR, …) are preserved — only the mode is taken
    over.
-3. **The headless default**, 1920x1080@60, when no mode was requested anywhere.
+3. **A matching `hl.xr_defaults` `mode`** — the requested profile's blocks over the base blocks,
+   for the headset that is bound (§3.3). Durable the same way as rung 2, and re-resolved when the
+   headset changes.
+4. **The headless default**, 1920x1080@60, when no mode was requested anywhere. (A runtime
+   `create` pins it into its rule; a mode-less declaration leaves it to the headless output.)
 
 Refresh is optional wherever a mode is: `2560x1440` means `2560x1440@60`.
 
 ### 3.2 Scale precedence (`openxr:default_monitor_scale`)
 
-Scale is deliberately *not* an `xrmonitor` / `create` argument. It has its own two-rung ladder,
+Scale is deliberately *not* an `xrmonitor` / `create` argument. It has its own three-rung ladder,
 highest first:
 
 1. **An explicit scale in a `monitor =` rule matching the name** — `monitor = XR-code, preferred,
    auto, 1.6`. It owns the scale outright, and keeps it across plug/unplug cycles and config
    reloads. (`auto` is *not* an explicit scale — it defers, exactly like `preferred` does for the
    mode.)
-2. **`openxr:default_monitor_scale`** (default `1.25`), for monitors the compositor created. It
-   rides the same persistent named rule as the mode from §3.1, so it is equally durable.
+2. **A matching `hl.xr_defaults` `scale`** — the requested profile's blocks over the base blocks,
+   for the headset that is bound (§3.3). Re-resolved when the headset changes.
+3. **`openxr:default_monitor_scale`** (default `1.25`), for monitors the compositor created.
 
-Set `openxr:default_monitor_scale = 0` to opt out entirely and hand the decision back to
-Hyprland's PPI heuristic.
+Rungs 2 and 3 ride the same persistent named rule as the mode from §3.1, so they are equally
+durable, and both are subject to the whole-logical-pixel gate and the adopted/stereo exclusions
+below.
+
+Set `openxr:default_monitor_scale = 0` (or a block's `scale = 0`) to opt out and hand the
+decision back to Hyprland's PPI heuristic.
 
 Why the default exists: a headless output has no EDID, so `getDefaultScale()` reads a 1920x1080 XR
 quad as a tiny high-density panel and picks `2.0`. That is legible on a desk and unusably cramped
@@ -696,6 +707,166 @@ same requirement any `monitor =` scale has. `1.25` is clean on every 16:9 mode �
 divide the compositor simply declines and the PPI guess stands, rather than handing you a red
 "invalid scale" notification for a number you never typed. Set that monitor's scale explicitly with
 a `monitor =` line if you want a different one.
+
+### 3.3 Per-headset defaults, profiles and `when` (`hl.xr_defaults`)
+
+The `openxr:default_*` globals are one answer for every headset. An XREAL Air 2 Ultra (a 1080p
+panel with a ~46° horizontal field of view, driven by Monado in direct mode) and a Quest 3 over
+WiVRn (room for a wall-sized 1440p desktop) want very different ones. `hl.xr_defaults` declares
+defaults that depend on the headset the XR session bound, and named **profiles** — shapes a
+`create profile:<name>` can ask for.
+
+**Lua only.** There is no classic `.conf` keyword: upstream removes `.conf` support in 0.57.
+
+```lua
+hl.xr_defaults({
+    profile  = "tall",          -- optional: a named profile (absent = a base block)
+    when     = { ... },         -- optional: only while this headset is bound (absent = always)
+    mode     = "1080x1920@90",  -- optional: "WxH" or "WxH@Hz" (no @Hz = @60)
+    scale    = 1.6,             -- optional: monitor scale; 0 = Hyprland's PPI guess
+    size     = 0.8,             -- optional: quad width, meters
+    distance = 1.2,             -- optional: placement distance for a NEW monitor, meters
+})
+```
+
+Every field is optional. An unknown key, a malformed `mode`, `size`/`distance` that are not
+positive, a negative `scale`, or a bad `when` is a config error that drops that block and keeps
+loading the rest of the config. Blocks are rebuilt from scratch on every reload, so they never pile
+up.
+
+#### `when` — which headset
+
+`when` is a table. Every key in it must match (AND). It is accepted by `hl.xr_defaults` **and**
+`hl.xr_monitor`.
+
+| Key | Value | Matches when |
+|---|---|---|
+| `hmd = "desc:<prefix>"` | string | A DRM connector **currently leased out through `wp_drm_lease_v1`** has an EDID description (or short description) that **starts with** `<prefix>`. These are the same `desc:` semantics as a monitor rule. |
+| `hmd = "<regex>"` | string | Anything not starting with `desc:` is an RE2 regex, **searched** (not full-matched) in the OpenXR `systemName`. WiVRn reports e.g. `Meta Quest 3 on WiVRn`, so `"Quest 3"` matches it. Monado prefixes its names with `Monado: `. Anchor with `^…$` when you need to. |
+| `eye_gaze` | bool | The runtime advertises `XR_EXT_eye_gaze_interaction`. The extension is not enabled, and per-device support is not queried. |
+| `hand_tracking` | bool | `XR_EXT_hand_tracking` is enabled **and** the system's `XrSystemHandTrackingPropertiesEXT.supportsHandTracking` says yes. |
+| `passthrough` | bool | The runtime offers the `alpha` environment blend mode (§2 `blend_mode`). |
+
+Any other key is a config error.
+
+**How `desc:` identifies the headset, and where it falls short.** OpenXR does not tell an
+application which DRM connector its headset is. What the compositor *does* know is which connector
+it has leased out: the XREAL path declares the panel with a `lease = true` monitor rule, and Monado's
+direct-mode compositor takes the connector through `wp_drm_lease_v1`. So `desc:` matches against the
+connectors that are leased at the moment the context is built. On an XR desktop the only lessee is
+the runtime's direct-mode compositor, so in practice that connector *is* the headset. The limits:
+
+- It only works for **direct-mode** headsets that lease a connector. A streamed headset (WiVRn,
+  ALVR) leases nothing, so match it by name (`hmd = "Quest 3"`).
+- It sees **every** active lease. A second, unrelated lessee (another VR app holding a different
+  panel) would also match. That is unusual enough that it is documented here rather than guarded
+  against.
+- The lease has to exist when the context is built. The context is rebuilt at session bring-up and
+  again on every visibility edge, so a runtime that leases a beat after `xrCreateSession` is still
+  picked up the moment the headset reports visible.
+
+**The context is sticky.** The headset the most recent session bound stays in force after that
+session ends: shelving the headset does not reshape your desktop. It changes only when a session
+binds a **different** system, meaning a different system name, a different set of leased connectors,
+or different capabilities. Before the first session of a compositor's life nothing is bound, and a
+non-empty `when` never matches. A `when`-less block or declaration always matches.
+`hyprctl openxr status` prints the context as `hmd context: system '…', leased […], eye_gaze …,
+hand_tracking …, passthrough …`.
+
+#### Resolution — which value a monitor gets
+
+Each field (mode, scale, size, distance) is resolved on its own, lowest layer first:
+
+1. **Globals**: `openxr:default_monitor_scale`, `openxr:default_size`, `openxr:default_distance`,
+   and the headless 1920x1080@60.
+2. **Base blocks** (no `profile`) whose `when` matches, in config order. For each field, a later
+   block overrides an earlier one, and a block that does not set a field leaves it alone.
+3. **Profile blocks** (`profile` equals the requested profile) whose `when` matches, in config order,
+   field by field. A profile block always beats a base block, wherever each one sits in the config.
+4. **Explicit values**: the mode and `size` in the `hl.xr_monitor` declaration or in the `create`
+   args. These beat every block.
+
+A `monitor =` / `hl.monitor` rule for the output still outranks all four (§3.1, §3.2). Asking for a
+profile that **no block names** is an error from the `create` call. A profile that exists but whose
+blocks' `when` do not match the current headset is not an error. It simply contributes nothing.
+
+#### `when` on `hl.xr_monitor`
+
+```lua
+hl.xr_monitor({ name = "XR-main", mode = "1920x1080", anchor = "local", pos = { 0, 1.4, -1.2 },
+                when = { hmd = "desc:Nreal Air 2 Ultra 0x88888800" } })
+hl.xr_monitor({ name = "XR-main", mode = "2560x1440@90", anchor = "local", pos = { 0, 1.45, -1.6 },
+                when = { hmd = "Quest 3" } })
+```
+
+A declaration with a `when` applies only while its predicate matches the bound headset:
+
+- **Same name, different `when`**: both declarations are kept (the store keys on name + `when`).
+  Re-declaring the same name with the **same** `when` replaces the earlier one, as before.
+- **None match**: the monitor is **not declared** right now. It is not created, and if it was
+  created for the previous headset, it is destroyed when the new headset binds (its workspaces
+  evacuate like an unplug). Add a `when`-less declaration of the same name as a fallback if the
+  monitor should always exist.
+- **Several match** (a `when`-less fallback plus a matching specific one, or two overlapping
+  `when`s): the **last one in config order wins**. If more than one `when`-qualified declaration
+  matches, a warning is logged.
+- **Switching headsets** re-runs the ordinary reload reconcile against the new set, so a changed
+  mode, anchor or size applies exactly as if you had edited the line and reloaded.
+
+Usually you do not need this. It is simpler to give `XR-main` **no** mode or size and let
+`hl.xr_defaults` shape it per headset. Keep `when` on `hl.xr_monitor` for monitors that should
+**exist** on only one headset, or that need a different *placement* per headset.
+
+#### Re-resolution: what happens when you switch headsets
+
+Each monitor remembers where each field came from. When a session binds a different headset, or a
+reload edits the blocks, every live monitor (declared or `create`d) re-resolves **only the fields
+that came from defaults**:
+
+| Field | On re-resolution | Never touched when |
+|---|---|---|
+| mode | Re-requested through the same persistent rule and swapchain-recreate path a changed declared mode takes on reload. | The declaration or create args gave a mode, or a `monitor =` rule names one (§3.1). |
+| scale | Re-derived through the §3.2 rung, so it keeps the whole-logical-pixel gate and the exclusions for adopted and stereo outputs. | A `monitor =` rule gives an explicit scale (§3.2). A display-settings GUI override also still wins. |
+| size (quad width) | The quad grows or shrinks **in place**, with its center and orientation unchanged. | The declaration or create args gave a `size`, **or you resized it at runtime** (a grab-resize, or `xrmonitor scale`). From then on the width is yours for the monitor's lifetime. |
+| distance | **Never.** It only decides where a *new* monitor is placed. An existing monitor is never moved. | Always. |
+
+`hyprctl openxr status` shows the provenance per monitor:
+
+```
+  XR-main: defaults mode 2560x1440@90 (xr_defaults), scale 1.25 (xr_defaults), size 2.23m (xr_defaults)
+  XR-3: defaults mode 1080x1920@90 (profile), scale 1.25 (xr_defaults), size 0.8m (profile), profile tall
+```
+
+The sources are `global`, `xr_defaults` (a base block), `profile`, and `explicit`. An
+`overridden by monitor rule` or `overridden by a runtime resize` suffix marks a field that
+re-resolution will not touch.
+
+One consequence of the sticky context: a compositor that has just started has no bound headset, so
+its declared monitors come up on the globals. At the first bring-up they re-resolve to the
+headset's values. Under `monitors_follow_session = visible` this happens while they are still
+unplugged, so you never see the intermediate shape.
+
+#### Example: an XREAL, a Quest, and a tall profile
+
+```lua
+-- XREAL Air 2 Ultra (Monado direct mode, leased connector): a 1080p panel, ~46 deg wide.
+-- 1.6 divides both 1920x1080 (1200x675) and the tall 1080x1920 (675x1200) into whole pixels.
+hl.xr_defaults({ when = { hmd = "desc:Nreal Air 2 Ultra 0x88888800" }, mode = "1920x1080", scale = 1.6, size = 1.1, distance = 1.2 })
+-- Quest 3 over WiVRn: a big 1440p wall.
+hl.xr_defaults({ when = { hmd = "Quest 3" }, mode = "2560x1440@90", scale = 1.25, size = 2.23 })
+
+-- A portrait panel for a feed or chat. It layers over the headset block, so it keeps that scale.
+hl.xr_defaults({ profile = "tall", mode = "1080x1920@90", size = 0.8 })
+
+-- No mode, no size, and no hl.monitor line for XR-main: each one would outrank the defaults.
+hl.xr_monitor({ name = "XR-main", anchor = "local", pos = { 0.017, 1.457, -1.408 }, yaw = 5.3, pitch = 3.0 })
+
+-- Mint XR-2, XR-3, ... shaped for whichever headset is on.
+hl.bind("SUPER + ALT + N", hl.dsp.xrmonitor("create"),              { description = "Create a new XR monitor" })
+hl.bind("SUPER + ALT + X", hl.dsp.xrmonitor("create profile:tall"), { description = "Create a tall XR monitor" })
+```
+
+A full, loadable version of this lives in `contrib/hyprland-xr.lua`.
 
 ### Mirroring onto a physical screen
 
@@ -929,7 +1100,7 @@ hl.bind("SUPER + CTRL + Home", hl.dsp.xrmonitor("reseat"), { description = "Re-s
 
 | Verb | Args | Effect |
 |---|---|---|
-| `create` | `<name> [WxH[@Hz]] [anchor-spec]` | Create a runtime-owned XR monitor. Mode defaults to 1920x1080@60 and is durable across reloads (§3.1 for how it ranks against a `monitor =` rule); scale defaults to `openxr:default_monitor_scale` (§3.2), so a monitor minted by a keybind or voice command needs no `monitor =` line at all; anchor defaults to `anchor:local` placed at `openxr:default_distance` facing you. |
+| `create` | `[name] [WxH[@Hz]] [profile:<p>] [anchor-spec]` | Create a runtime-owned XR monitor. **Name optional**: without one, the lowest free `XR-<n>` (n ≥ 2) that is neither an existing monitor nor any declared `xrmonitor` name is minted, and `hyprctl openxr create` replies `ok <name>` (a named create still replies `ok`). The first token is the name unless it is mode-shaped (`WxH[@Hz]`), an `anchor:` token or another `key:value` token, so every older form parses unchanged. Mode, scale, quad width and placement distance come from the §3.3 ladder: the args' mode/`size:` win, then the `profile:<p>` blocks (an unknown profile is an error), then the base `hl.xr_defaults` blocks for the bound headset, then 1920x1080@60 / `openxr:default_monitor_scale` / `default_size` / `default_distance`. Mode and scale are durable across reloads (§3.1, §3.2), so a monitor minted by a keybind or voice command needs no `monitor =` line at all. Anchor defaults to `anchor:local`, placed facing you at the resolved distance. |
 | `destroy` | `<name\|active>` | Destroy the named monitor, or the selected one. |
 | `select` | `<name\|next\|prev>` | Set the explicit selection target for the verbs below. |
 | `anchor` | `<name\|active> <mode-spec>` | Re-anchor without moving the quad visually: `local`, `head [offset:x,y,z]`, `body [offset:x,y,z]`, `device:left\|right [offset:x,y,z]`. |
@@ -990,6 +1161,8 @@ selected".
 
 ```ini
 bind  = SUPER,       X,            xrmonitor, create XR-scratch
+bind  = SUPER ALT,   N,            xrmonitor, create                 # mint XR-<n>, shaped by hl.xr_defaults
+bind  = SUPER ALT,   X,            xrmonitor, create profile:tall    # same, with the `tall` profile on top
 bind  = SUPER SHIFT, X,            xrmonitor, destroy active
 bind  = SUPER,       bracketright, xrmonitor, select next
 bind  = SUPER,       bracketleft,  xrmonitor, select prev
@@ -1014,6 +1187,8 @@ bind  = SUPER SHIFT, Home,         xrmonitor, sync
 hyprctl openxr [status]        # default subcommand
 hyprctl -j openxr              # JSON
 hyprctl openxr enable|disable  # start/stop the session (does not touch openxr:enabled)
+hyprctl openxr create [name] [WxH[@Hz]] [profile:<p>] [anchor-spec]
+                               # replies "ok" — or "ok XR-<n>" when it minted the name (§3.3)
 hyprctl openxr <verb> …        # the §4 verbs: create destroy select anchor move rotate
                                #   scale distance center reseat place alpha blackalpha adaptive
                                #   dock undock roam gazegrab gazerelease gazepush handinput
