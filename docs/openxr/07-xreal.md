@@ -381,6 +381,9 @@ normal 1920×1080 desktop monitor** (re-issuing a `monitor=DP-5,…` rule *witho
 lease offer and reconnects it as a desktop). Under Lua the reclaim must say `lease = false`
 explicitly: `hl.monitor` merges onto the output's existing rule, so omitting the field keeps an
 earlier `lease = true` — the script always emits it.
+`disabled` is the exception: like the classic `disable` token it shares the mode slot, so an
+`hl.monitor` call that names a `mode` re-enables an output an earlier `disabled = true` turned off
+(unless the same call also passes `disabled`).
 
 Machine-agnostic knobs (env): `XREAL_MONITOR` (connector name; else auto-detected from the EDID
 description), `MONADO_XREAL_BUILD` (build dir), `XREAL_CTL`, `XREAL_FLAT_MODE`. Idempotent, safe when

@@ -1211,6 +1211,19 @@ static int hlMonitor(lua_State* L) {
     if (existing != Config::monitorRuleMgr()->all().end())
         parser.rule() = *existing;
 
+    // `mode` and `disabled` describe the same thing — the classic grammar spells a disabled output
+    // as `disable` IN the mode slot — so a call that names a mode re-enables the output unless it
+    // also says `disabled` itself. Without this the merge above keeps an earlier `disabled = true`,
+    // and every later mode rule for that output is silently applied as "still disabled".
+    lua_getfield(L, 1, "mode");
+    const bool HAS_MODE = !lua_isnil(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "disabled");
+    const bool HAS_DISABLED = !lua_isnil(L, -1);
+    lua_pop(L, 1);
+    if (HAS_MODE && !HAS_DISABLED)
+        parser.rule().m_disabled = false;
+
     lua_pushnil(L);
     while (lua_next(L, 1) != 0) {
         if (lua_type(L, -2) != LUA_TSTRING) {
