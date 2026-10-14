@@ -405,6 +405,23 @@ def parse_descriptor_fields(root: Path) -> dict[str, dict[str, str]]:
     out["HL.XRMonitorSpec"].pop("return", None)
     out["HL.XRRuleSpec"]["blackalpha"] = "number|'off'"
     out["HL.XRRuleSpec"]["match"] = "HL.XRRuleMatch"
+    # `when` (doc 05 §3.3) — on hl.xr_monitor and hl.xr_defaults. Parsed by hand in the binding (no
+    # descriptor array), so declared here.
+    out["HL.XRMonitorSpec"]["when"] = "HL.XRWhen"
+    out["HL.XRWhen"] = {
+        "hmd": "string",
+        "eye_gaze": "boolean",
+        "hand_tracking": "boolean",
+        "passthrough": "boolean",
+    }
+    out["HL.XRDefaultsSpec"] = {
+        "profile": "string",
+        "when": "HL.XRWhen",
+        "mode": "string",
+        "scale": "number",
+        "size": "number",
+        "distance": "number",
+    }
 
     return out
 
@@ -559,6 +576,7 @@ def generate_stub(root: Path) -> str:
         # `xrrule =` line, which is what `hyprctl openxr layout` prints for pasting back.
         "hl.xr_monitor": "fun(spec: HL.XRMonitorSpec|string): nil",
         "hl.xr_rule": "fun(spec: HL.XRRuleSpec|string): nil",
+        "hl.xr_defaults": "fun(spec: HL.XRDefaultsSpec): nil",
         # the verb + its arguments, exactly the text that follows `xrmonitor,` in a classic bind
         "hl.dsp.xrmonitor": "fun(verb_and_args: string): HL.Dispatcher",
         "hl.window_rule": "fun(spec: HL.WindowRuleSpec): HL.WindowRule",

@@ -210,6 +210,20 @@ hl.xr_rule({
 -- Media players: keep uniform transparency but never luma-key dark scenes.
 hl.xr_rule({ blackalpha = "off", match = { focusclass = "(mpv|vlc)" } })
 
+-- Per-headset monitor defaults (docs 05 §3.3). One desktop, two very different displays: the XReal
+-- (Monado direct mode, leased DRM connector — matched by its EDID description) is a 1080p panel
+-- with a ~46 deg horizontal field of view; the Quest 3 (WiVRn — matched by the OpenXR system name)
+-- has room for a big 1440p wall. A monitor that does not pin a field itself (XR-main below has no
+-- mode or size; `create` with no mode) takes it from the block matching the headset in use, and
+-- re-resolves when you switch headsets. 1.6 divides both 1920x1080 (1200x675) and the tall
+-- 1080x1920 (675x1200) into whole logical pixels.
+hl.xr_defaults({ when = { hmd = "desc:Nreal Air 2 Ultra 0x88888800" }, mode = "1920x1080", scale = 1.6, size = 1.1, distance = 1.2 })
+hl.xr_defaults({ when = { hmd = "Quest 3" }, mode = "2560x1440@90", scale = 1.25, size = 2.23 })
+
+-- A named shape for `create profile:tall` (SUPER+ALT+X): a portrait panel for a feed or chat. It
+-- layers over the headset block, so it keeps that headset's scale.
+hl.xr_defaults({ profile = "tall", mode = "1080x1920@90", size = 0.8 })
+
 -- XR monitor to bring up at launch. Arrange it in-headset by grabbing, then run
 -- `hyprctl openxr layout` and persist the arrangement. That command still prints a paste-ready
 -- CLASSIC `xrmonitor = …` line, which is why hl.xr_monitor also takes one as a string:
@@ -220,20 +234,19 @@ hl.xr_rule({ blackalpha = "off", match = { focusclass = "(mpv|vlc)" } })
 --
 -- XR-main is adaptive: world-docked at the desk, picks up into a body-follow when you walk >1.5m
 -- away, re-docks when you come back.
+--
+-- No `mode` / `size` here, and no `hl.monitor` line for XR-main: both would outrank the
+-- per-headset defaults above. (The compositor keeps whatever it resolves durable across plug
+-- cycles and reloads on its own.)
 hl.xr_monitor({
     name     = "XR-main",
-    mode     = "2560x1440@90",
     anchor   = "local",
     pos      = { 0.017, 1.457, -1.408 },
     yaw      = 5.3,
     pitch    = 3.0,
     adaptive = true,
     roam     = "body",
-    size     = 2.23,
 })
-
--- Pin the declared mode as a persistent monitor rule (survives plug cycles).
-hl.monitor({ output = "XR-main", mode = "2560x1440@90", position = "auto", scale = "1.25" })
 
 -- ---- Autostart -------------------------------------------------------------
 -- `exec-once` has no keyword form in Lua, and it must not: a Lua config is a SCRIPT that is re-run
@@ -276,10 +289,9 @@ hl.bind("SUPER + ALT + C", hl.dsp.exec_cmd("~/.config/hypr/scripts/hypxr-recorde
 hl.bind("SUPER + CTRL + Home", hl.dsp.xrmonitor("reseat"),
         { description = "Re-seat all XR monitors to me" })
 
-hl.bind("SUPER + ALT + N", hl.dsp.exec_cmd("~/.config/hypr/scripts/hypxr-create-monitor.sh"),
-        { description = "Create a new XR monitor" })
-hl.bind("SUPER + ALT + X", hl.dsp.exec_cmd("~/.config/hypr/scripts/hypxr-create-monitor.sh 1080x1920@90 0.5"),
-        { description = "Create a tall XR monitor for X" })
+-- `create` with no name mints the lowest free XR-<n> and takes its shape from hl.xr_defaults.
+hl.bind("SUPER + ALT + N", hl.dsp.xrmonitor("create"), { description = "Create a new XR monitor" })
+hl.bind("SUPER + ALT + X", hl.dsp.xrmonitor("create profile:tall"), { description = "Create a tall XR monitor for X" })
 hl.bind("SUPER + ALT + SHIFT + N", hl.dsp.exec_cmd("~/.config/hypr/scripts/hypxr-destroy-monitor.sh"),
         { description = "Destroy the gazed XR monitor" })
 
