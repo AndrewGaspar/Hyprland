@@ -8,6 +8,8 @@
 #include "../../xr/RemoteClient.hpp"
 
 #include <algorithm>
+#include <fstream>
+#include <sstream>
 #include <chrono>
 #include <cmath>
 #include <string>
@@ -696,6 +698,130 @@ TEST_CASE(xr_reseat_verb) {
     ASSERT(getFromSocket("/keyword openxr:recenter hold"), std::string("ok"));
 
     NLog::green("xr_reseat_verb: the deliberate re-seat brought the layout to the user's new facing, rigidly and idempotently");
+}
+
+// xr_declared_reload_keeps_pose — a config reload must never move an existing declared monitor.
+// Live 2026-10-13: an adaptive (roam body) declared XR-main that had been nudged with `distance`
+// moved 0.3-0.4 m on each `hyprctl reload`, whether the reload changed its pixel mode, an unrelated
+// default, or nothing about it at all. Covers: an unchanged reload, a reload that changes only an
+// unrelated value, and a reload that changes the monitor's declared MODE (which re-registers its rule
+// and recreates the swapchain, but must still leave the pose alone).
+TEST_CASE(xr_declared_reload_keeps_pose) {
+    XR_SKIP_IF_UNAVAILABLE();
+
+    static const std::string CONF_PATH = "xr-test.conf";
+    static const std::string MON       = "XR-conf-drift";
+
+    std::string              original;
+    {
+        std::ifstream in(CONF_PATH);
+        if (in) {
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            original = ss.str();
+        }
+    }
+
+    struct SConfigGuard {
+        const bool& failed;
+        std::string testName;
+        std::string originalContent;
+        bool        modified = false;
+        ~SConfigGuard() {
+            if (XR::g_ctx.remote) {
+                using namespace MonadoWire;
+                XR::g_ctx.remote->setHeadPose(xrt_vec3{0.f, 0.f, 0.f}, xrt_quat{0.f, 0.f, 0.f, 1.f});
+                XR::g_ctx.remote->pulse();
+            }
+            if (modified && !originalContent.empty()) {
+                std::ofstream out(CONF_PATH, std::ios::trunc);
+                if (out)
+                    out << originalContent;
+                getFromSocket("/reload");
+            }
+            if (failed)
+                XR::dumpXrArtifacts(testName);
+        }
+    };
+    SConfigGuard guard{this->failed, name(), original, false};
+
+    if (original.empty()) {
+        XR::logSkip(name(), "could not read xr-test.conf from the cwd (hyprtester must run from hyprtester/)");
+        return;
+    }
+    if (!gateUp()) {
+        XR::logSkip(name(), "session never reached focused/visible (known env instability)");
+        return;
+    }
+
+    using namespace MonadoWire;
+    auto* remote = XR::g_ctx.remote;
+    if (!remote) {
+        XR::logSkip(name(), "no remote client available");
+        return;
+    }
+
+    const auto writeConf = [&](const std::string& extra) {
+        std::ofstream out(CONF_PATH, std::ios::trunc);
+        if (!out)
+            return false;
+        out << original << "\n" << extra;
+        guard.modified = true;
+        return true;
+    };
+    const auto decl = [](const std::string& mode) {
+        // depth_desktop: the live monitor scans out a per-eye pane pair, so every rule re-apply is a
+        // packed-mode modeset — keep that path in the loop.
+        return "xrmonitor = " + MON + ", " + mode + ", anchor:local pos:-0.04,1.6,-1.2 yaw:10 adaptive:on roam:body\nopenxr {\n    depth_desktop = 1\n}\n";
+    };
+    // A yawed (3DoF, like the XReal) head, held while we read so the verb context and the frame loop
+    // agree on where the wearer is looking.
+    const float HALF = 0.5F * 25.F * 3.14159265F / 180.F;
+    const auto  hold = [&](int ms) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            remote->setHeadPose(xrt_vec3{0.f, 1.6f, 0.f}, xrt_quat{0.f, std::sin(HALF), 0.f, std::cos(HALF)});
+            remote->pulse();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    };
+    const auto posNow = [&]() {
+        const std::string st = getFromSocket("j/openxr");
+        return posOf(st, XR::findAfter(st, "\"name\": \"" + MON + "\""));
+    };
+    const auto reloadAndRead = [&](const std::string& extra) {
+        if (!writeConf(extra))
+            return std::vector<float>{};
+        if (getFromSocket("/reload") != "ok")
+            return std::vector<float>{};
+        hold(1500);
+        return posNow();
+    };
+
+    ASSERT(writeConf(decl("1920x1080@60")), true);
+    ASSERT(getFromSocket("/reload"), std::string("ok"));
+    ASSERT(XR::waitForJson("j/openxr", [&](const std::string& r) { return r.contains("\"name\": \"" + MON + "\""); }, std::chrono::milliseconds(10000)), true);
+    hold(1500);
+
+    // Place it the way the live monitor was placed: a runtime nudge away from the declaration.
+    ASSERT(getFromSocket("/openxr select " + MON), std::string("ok"));
+    ASSERT(getFromSocket("/openxr distance +0.5"), std::string("ok"));
+    ASSERT(getFromSocket("/openxr scale 1.2"), std::string("ok"));
+    hold(1000);
+    const auto placed = posNow();
+    ASSERT(placed.size(), (size_t)3);
+
+    const auto unchanged = reloadAndRead(decl("1920x1080@60"));
+    EXPECT(dist3(placed, unchanged) >= 0.F && dist3(placed, unchanged) < 0.01F, true);
+
+    const auto unrelated = reloadAndRead(decl("1920x1080@60") + "openxr {\n    default_distance = 1.9\n}\n");
+    EXPECT(dist3(placed, unrelated) >= 0.F && dist3(placed, unrelated) < 0.01F, true);
+
+    const auto remoded = reloadAndRead(decl("2560x1600@60"));
+    EXPECT(dist3(placed, remoded) >= 0.F && dist3(placed, remoded) < 0.01F, true);
+
+    NLog::log("xr_declared_reload_keeps_pose: placed [{}, {}, {}] -> unchanged {} m, unrelated {} m, remoded {} m", placed[0], placed[1], placed[2], dist3(placed, unchanged),
+              dist3(placed, unrelated), dist3(placed, remoded));
 }
 
 #endif // WITH_XR_TESTS
