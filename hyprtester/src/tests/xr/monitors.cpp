@@ -85,6 +85,64 @@ TEST_CASE(xr_monitor_create_destroy) {
     NLog::green("xr_monitor_create_destroy: create+destroy round-trip verified in both j/monitors and j/openxr");
 }
 
+// xr_monitor_create_unnamed — doc 05 §3.3: `create` with no name mints the lowest free XR-<n>
+// (n >= 2) and reports it ("ok XR-<n>"); a freed name is reused; the mode-only form still applies
+// its mode; an unknown `profile:` is an error that creates nothing. (xr-test.conf is a classic
+// config, so it cannot carry hl.xr_defaults blocks — the resolver layering is covered by
+// tests/xr/xr_defaults.cpp; this case covers the live verb surface.)
+TEST_CASE(xr_monitor_create_unnamed) {
+    XR_SKIP_IF_UNAVAILABLE();
+    SArtifactGuard guard{this->failed, name(), {}};
+
+    if (!gateUp()) {
+        XR::logSkip(name(), "session never reached focused/visible (known env instability)");
+        return;
+    }
+
+    const auto mintedName = [](const std::string& reply) -> std::string { return reply.starts_with("ok XR-") ? reply.substr(3) : std::string{}; };
+    const auto inOpenxr   = [](const std::string& mon, bool present) {
+        const std::string marker = "\"name\": \"" + mon + "\"";
+        return XR::waitForJson("j/openxr", [&](const std::string& r) { return r.contains(marker) == present; }, std::chrono::milliseconds(10000));
+    };
+
+    const std::string first = mintedName(getFromSocket("/openxr create"));
+    ASSERT_NOT(first, std::string{});
+    guard.monitorNames.push_back(first);
+    ASSERT(inOpenxr(first, true), true);
+
+    // Mode-only form: no name, and the name is a different free one. (That the mode applies is
+    // xr_monitor_create_mode's job; the parser half is tests/xr/xr_defaults.cpp.)
+    const std::string second = mintedName(getFromSocket("/openxr create 1280x720"));
+    ASSERT_NOT(second, std::string{});
+    guard.monitorNames.push_back(second);
+    ASSERT_NOT(second, first);
+    // Lowest free: anything below `first` was already taken, so the next mint is above it.
+    EXPECT(std::stoi(second.substr(3)) > std::stoi(first.substr(3)), true);
+    ASSERT(inOpenxr(second, true), true);
+
+    // Free the lower name; the next unnamed create must take it again (lowest free, gaps filled).
+    ASSERT(getFromSocket("/openxr destroy " + first), std::string("ok"));
+    ASSERT(inOpenxr(first, false), true);
+    // The layer is finalized behind the frame-thread removal barrier and the output after it; wait
+    // until neither exists (`monitors all` includes unplugged outputs) so the name is genuinely free.
+    ASSERT(XR::waitForJson("j/monitors all", [&](const std::string& r) { return !r.contains("\"name\": \"" + first + "\""); }, std::chrono::milliseconds(10000)), true);
+    const std::string again = mintedName(getFromSocket("/openxr create"));
+    EXPECT(again, first);
+    if (!again.empty() && again != first)
+        guard.monitorNames.push_back(again);
+
+    // Unknown profile: an error, and nothing is created.
+    const std::string bad = getFromSocket("/openxr create profile:no-such-profile");
+    EXPECT_CONTAINS(bad, "unknown xr_defaults profile");
+
+    // A named create keeps its historical bare "ok".
+    const std::string named = XR::monitorName(31);
+    EXPECT(getFromSocket("/openxr create " + named), std::string("ok"));
+    guard.monitorNames.push_back(named);
+
+    NLog::green("xr_monitor_create_unnamed: minted {}, {}, reused {}", first, second, again);
+}
+
 // `xrmonitor view` is the in-headset presentation switch: it must remove every monitor quad without
 // stopping the session or unplugging/recreating the backing outputs. Exercise the public IPC surface
 // here; the per-monitor `quads` count proves the frame-thread gate has reached xrEndFrame rather than
