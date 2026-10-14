@@ -411,7 +411,17 @@ std::optional<float> OpenXR::xrDefaultMonitorScale(bool createdByXR, bool ruleSc
     // applyMonitorRule compares that against its own round(). Computing it any other way here would
     // let a value through that trips the ERR path we exist to avoid.
     const Vector2D LOGICAL = pixelSize / static_cast<double>(configuredDefault);
-    if (LOGICAL != LOGICAL.round())
+    if (LOGICAL == LOGICAL.round())
+        return configuredDefault;
+
+    // ...and applyMonitorRule's FIRST fallback, which is silent: it snaps the scale to the nearest
+    // 1/120 step and keeps that when it divides the pane, with no ERR and no notification. That rung
+    // is what makes most decimal scales work at all — 1.6 is 1.60000002f, so 1920/1.6f is
+    // 1199.99998 and fails the exact test above, yet `monitor = …, 1.6` applies cleanly. Declining
+    // here sent exactly those scales back to the PPI guess (2.0 on a headless 1920x1080).
+    const double   SNAPPED        = std::round(configuredDefault * 120.0) / 120.0;
+    const Vector2D SNAPPEDLOGICAL = pixelSize / SNAPPED;
+    if (SNAPPEDLOGICAL != SNAPPEDLOGICAL.round())
         return std::nullopt;
     return configuredDefault;
 }
