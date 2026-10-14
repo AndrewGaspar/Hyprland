@@ -378,6 +378,140 @@ TEST(ConfigLuaXRMonitor, wrongArgumentTypeIsAConfigError) {
     EXPECT_NE(fx.errors().find("must be a table"), std::string::npos) << fx.errors();
 }
 
+// ---- hl.xr_monitor `when` (doc 05 §3.3) ----
+
+TEST(ConfigLuaXRMonitor, sameNameWithDifferentWhenCoexists) {
+    CXRLuaFixture fx;
+
+    fx.run(R"LUA(
+        hl.xr_monitor({ name = "XR-main", mode = "1920x1080@60", anchor = "local", pos = { 0, 1, -1 },
+                        when = { hmd = "desc:Nreal Air 2 Ultra 0x88888800" } })
+        hl.xr_monitor({ name = "XR-main", mode = "2560x1440@90", anchor = "local", pos = { 0, 1, -1 },
+                        when = { hmd = "Quest 3" } })
+    )LUA");
+
+    EXPECT_EQ(fx.errors(), "");
+    ASSERT_EQ(declaredMonitors().size(), 2u);
+    EXPECT_EQ(declaredMonitors()[0].m_when.hmdDesc, "Nreal Air 2 Ultra 0x88888800");
+    EXPECT_TRUE(declaredMonitors()[1].m_when.hmdRe != nullptr);
+}
+
+TEST(ConfigLuaXRMonitor, sameNameAndSameWhenStillReplaces) {
+    CXRLuaFixture fx;
+
+    fx.run(R"LUA(
+        hl.xr_monitor({ name = "XR-main", mode = "1920x1080@60", anchor = "local", pos = { 0, 1, -1 }, when = { hmd = "Quest 3" } })
+        hl.xr_monitor({ name = "XR-main", mode = "2560x1440@90", anchor = "local", pos = { 0, 1, -1 }, when = { hmd = "Quest 3" } })
+    )LUA");
+
+    EXPECT_EQ(fx.errors(), "");
+    ASSERT_EQ(declaredMonitors().size(), 1u);
+    EXPECT_EQ(declaredMonitors()[0].m_resolution, (Vector2D{2560, 1440}));
+}
+
+TEST(ConfigLuaXRMonitor, modeIsOptional) {
+    CXRLuaFixture fx;
+
+    fx.run(R"LUA( hl.xr_monitor({ name = "XR-main", anchor = "local", pos = { 0, 1, -1 } }) )LUA");
+
+    EXPECT_EQ(fx.errors(), "");
+    ASSERT_EQ(declaredMonitors().size(), 1u);
+    EXPECT_FALSE(declaredMonitors()[0].m_resolution.has_value()) << "the mode then comes from hl.xr_defaults";
+}
+
+TEST(ConfigLuaXRMonitor, unknownWhenKeyIsRejected) {
+    CXRLuaFixture fx;
+
+    fx.run(R"LUA( hl.xr_monitor({ name = "A", anchor = "local", pos = { 0, 1, -1 }, when = { headset = "Quest" } }) )LUA");
+
+    EXPECT_TRUE(declaredMonitors().empty());
+    EXPECT_NE(fx.errors().find("unknown when key 'headset'"), std::string::npos) << fx.errors();
+}
+
+TEST(ConfigLuaXRMonitor, whenMustBeATable) {
+    CXRLuaFixture fx;
+
+    fx.run(R"LUA( hl.xr_monitor({ name = "A", anchor = "local", pos = { 0, 1, -1 }, when = "Quest" }) )LUA");
+
+    EXPECT_TRUE(declaredMonitors().empty());
+    EXPECT_NE(fx.errors().find("'when' must be a table"), std::string::npos) << fx.errors();
+}
+
+// ---- hl.xr_defaults (doc 05 §3.3) ----
+
+namespace {
+    const std::vector<OpenXR::SXRDefaultsBlock>& declaredDefaults() {
+        return Config::xrDeclarationMgr()->defaults();
+    }
+}
+
+TEST(ConfigLuaXRDefaults, theDocumentedXRealAndQuestBlocks) {
+    CXRLuaFixture fx;
+
+    fx.run(R"LUA(
+        hl.xr_defaults({ size = 1.8 })
+        hl.xr_defaults({ when = { hmd = "desc:Nreal Air 2 Ultra 0x88888800" }, mode = "1920x1080@60", scale = 1.6, size = 1.4, distance = 1.2 })
+        hl.xr_defaults({ when = { hmd = "Quest 3", hand_tracking = true }, mode = "2560x1440", scale = 1.25, size = 2.2 })
+        hl.xr_defaults({ profile = "tall", mode = "1080x1920", size = 0.9 })
+    )LUA");
+
+    EXPECT_EQ(fx.errors(), "");
+    ASSERT_EQ(declaredDefaults().size(), 4u);
+
+    const auto& base = declaredDefaults()[0];
+    EXPECT_TRUE(base.when.empty());
+    EXPECT_TRUE(base.profile.empty());
+    EXPECT_FLOAT_EQ(*base.size, 1.8F);
+    EXPECT_FALSE(base.resolution.has_value());
+
+    const auto& xreal = declaredDefaults()[1];
+    EXPECT_EQ(xreal.when.hmdDesc, "Nreal Air 2 Ultra 0x88888800");
+    EXPECT_EQ(*xreal.resolution, (Vector2D{1920, 1080}));
+    EXPECT_FLOAT_EQ(*xreal.refreshRate, 60.F);
+    EXPECT_FLOAT_EQ(*xreal.scale, 1.6F);
+    EXPECT_FLOAT_EQ(*xreal.distance, 1.2F);
+
+    const auto& quest = declaredDefaults()[2];
+    ASSERT_TRUE(quest.when.handTracking.has_value());
+    EXPECT_TRUE(*quest.when.handTracking);
+    EXPECT_FALSE(quest.refreshRate.has_value()) << "no @Hz: the resolver supplies 60";
+
+    EXPECT_EQ(declaredDefaults()[3].profile, "tall");
+    EXPECT_EQ(*declaredDefaults()[3].resolution, (Vector2D{1080, 1920}));
+}
+
+TEST(ConfigLuaXRDefaults, unknownFieldIsAConfigError) {
+    CXRLuaFixture fx;
+
+    fx.run(R"LUA( hl.xr_defaults({ size = 1.8, width = 2 }) )LUA");
+
+    EXPECT_TRUE(declaredDefaults().empty());
+    EXPECT_NE(fx.errors().find("hl.xr_defaults: unknown field 'width'"), std::string::npos) << fx.errors();
+}
+
+TEST(ConfigLuaXRDefaults, malformedFieldsAreConfigErrors) {
+    CXRLuaFixture fx;
+
+    fx.run(R"LUA(
+        hl.xr_defaults({ mode = "wide" })
+        hl.xr_defaults({ size = -1 })
+        hl.xr_defaults({ scale = "big" })
+        hl.xr_defaults({ profile = "" })
+        hl.xr_defaults({ when = { hmd = "Quest (3" } })
+        hl.xr_defaults({ when = { eye_gaze = "yes" } })
+        hl.xr_defaults("size = 2")
+    )LUA");
+
+    EXPECT_TRUE(declaredDefaults().empty());
+    const auto ERRS = fx.errors();
+    EXPECT_NE(ERRS.find("size must be > 0"), std::string::npos) << ERRS;
+    EXPECT_NE(ERRS.find("'scale' must be a number"), std::string::npos) << ERRS;
+    EXPECT_NE(ERRS.find("'profile' must be a non-empty string"), std::string::npos) << ERRS;
+    EXPECT_NE(ERRS.find("invalid regex"), std::string::npos) << ERRS;
+    EXPECT_NE(ERRS.find("when.eye_gaze must be a boolean"), std::string::npos) << ERRS;
+    EXPECT_NE(ERRS.find("argument must be a table"), std::string::npos) << ERRS;
+}
+
 // ---- hl.xr_rule ----
 
 // The three rules a real session ships with, written both ways.

@@ -1360,6 +1360,47 @@ namespace {
     }
 }
 
+// `when = { hmd = "...", eye_gaze = true, ... }` (doc 05 §3.3), shared by hl.xr_defaults and
+// hl.xr_monitor. Reads the table at `idx`; every key is validated by the shared OpenXR setters, so
+// the matcher and the config surface cannot disagree about what a key means.
+static std::expected<void, std::string> xrParseWhenTable(lua_State* L, int idx, OpenXR::SXRWhen& out) {
+    if (!lua_istable(L, idx))
+        return std::unexpected("'when' must be a table, e.g. { hmd = \"Quest 3\" }");
+
+    const int ABS = lua_absindex(L, idx);
+    lua_pushnil(L);
+    while (lua_next(L, ABS) != 0) {
+        if (lua_type(L, -2) != LUA_TSTRING) {
+            lua_pop(L, 2);
+            return std::unexpected("'when' keys must be strings");
+        }
+
+        const std::string                key = lua_tostring(L, -2);
+        std::expected<void, std::string> r;
+        if (key == "hmd") {
+            if (lua_type(L, -1) != LUA_TSTRING)
+                r = std::unexpected(std::string("when.hmd must be a string (\"desc:<EDID description>\" or a systemName regex)"));
+            else
+                r = OpenXR::setXRWhenHmd(out, lua_tostring(L, -1));
+        } else if (lua_type(L, -1) != LUA_TBOOLEAN) {
+            // Validate the key first so a typo reads as "unknown key", not "must be a boolean".
+            OpenXR::SXRWhen probe;
+            r = OpenXR::setXRWhenCapability(probe, key, false);
+            if (r)
+                r = std::unexpected(std::format("when.{} must be a boolean", key));
+        } else
+            r = OpenXR::setXRWhenCapability(out, key, lua_toboolean(L, -1));
+
+        if (!r) {
+            lua_pop(L, 2);
+            return r;
+        }
+        lua_pop(L, 1);
+    }
+
+    return {};
+}
+
 static int hlXRMonitor(lua_State* L) {
     auto*             self       = sc<CConfigManager*>(lua_touserdata(L, lua_upvalueindex(1)));
     const std::string sourceInfo = Internal::getSourceInfo(L);
@@ -1419,6 +1460,16 @@ static int hlXRMonitor(lua_State* L) {
         if (anchorMode.starts_with("anchor:"))
             anchorMode = anchorMode.substr(std::string_view("anchor:").size());
 
+        lua_getfield(L, 1, "when");
+        if (!lua_isnil(L, -1)) {
+            if (auto r = xrParseWhenTable(L, -1, params.m_when); !r) {
+                self->addError(std::format("{}: hl.xr_monitor: {}", sourceInfo, r.error()));
+                lua_pop(L, 1);
+                return 0;
+            }
+        }
+        lua_pop(L, 1);
+
         // Collect by descriptor index so tokens come out in a fixed order regardless of Lua's
         // table iteration order — an error message that moves between reloads is a bad error
         // message.
@@ -1433,7 +1484,7 @@ static int hlXRMonitor(lua_State* L) {
             }
 
             const std::string_view key = lua_tostring(L, -2);
-            if (key == "name" || key == "mode" || key == "anchor") {
+            if (key == "name" || key == "mode" || key == "anchor" || key == "when") {
                 lua_pop(L, 1);
                 continue;
             }
@@ -1473,6 +1524,82 @@ static int hlXRMonitor(lua_State* L) {
 
     Config::xrDeclarationMgr()->addMonitor(std::move(params));
     xrScheduleReconcile(self, &COpenXRManager::reconcileDeclaredMonitors);
+    return 0;
+}
+
+// hl.xr_defaults({ profile?, when?, mode?, scale?, size?, distance? }) — per-HMD defaults for XR
+// monitors, and named shape profiles for `create profile:<name>` (doc 05 §3.3). Lua only: the
+// classic `.conf` front end is going away upstream, so no keyword twin is added.
+static int hlXRDefaults(lua_State* L) {
+    auto*             self       = sc<CConfigManager*>(lua_touserdata(L, lua_upvalueindex(1)));
+    const std::string sourceInfo = Internal::getSourceInfo(L);
+
+    if (!lua_istable(L, 1)) {
+        self->addError(std::format("{}: hl.xr_defaults: argument must be a table", sourceInfo));
+        return 0;
+    }
+
+    OpenXR::SXRDefaultsBlock block;
+    std::string              err;
+
+    lua_pushnil(L);
+    while (lua_next(L, 1) != 0) {
+        if (lua_type(L, -2) != LUA_TSTRING) {
+            err = "keys must be strings";
+            lua_pop(L, 2);
+            break;
+        }
+
+        const std::string key = lua_tostring(L, -2);
+        if (key == "profile") {
+            if (lua_type(L, -1) != LUA_TSTRING || std::string_view(lua_tostring(L, -1)).empty())
+                err = "'profile' must be a non-empty string";
+            else
+                block.profile = lua_tostring(L, -1);
+        } else if (key == "when") {
+            if (auto r = xrParseWhenTable(L, -1, block.when); !r)
+                err = r.error();
+        } else if (key == "mode") {
+            SXRMonitorParams scratch;
+            if (lua_type(L, -1) != LUA_TSTRING)
+                err = "'mode' must be a string like \"2560x1440@90\"";
+            else if (auto r = OpenXR::parseXRMonitorMode(lua_tostring(L, -1), scratch); !r)
+                err = r.error();
+            else {
+                block.resolution  = scratch.m_resolution;
+                block.refreshRate = scratch.m_refreshRate;
+            }
+        } else if (key == "scale" || key == "size" || key == "distance") {
+            if (lua_type(L, -1) != LUA_TNUMBER)
+                err = std::format("'{}' must be a number", key);
+            else if (key == "scale")
+                block.scale = sc<float>(lua_tonumber(L, -1));
+            else if (key == "size")
+                block.size = sc<float>(lua_tonumber(L, -1));
+            else
+                block.distance = sc<float>(lua_tonumber(L, -1));
+        } else
+            err = std::format("unknown field '{}' (valid: profile, when, mode, scale, size, distance)", key);
+
+        if (!err.empty()) {
+            lua_pop(L, 2);
+            break;
+        }
+        lua_pop(L, 1);
+    }
+
+    if (err.empty()) {
+        if (auto r = OpenXR::validateXRDefaultsBlock(block); !r)
+            err = r.error();
+    }
+
+    if (!err.empty()) {
+        self->addError(std::format("{}: hl.xr_defaults: {}", sourceInfo, err));
+        return 0;
+    }
+
+    Config::xrDeclarationMgr()->addDefaults(std::move(block));
+    xrScheduleReconcile(self, &COpenXRManager::reapplyXRDefaults);
     return 0;
 }
 
@@ -1841,6 +1968,7 @@ void Internal::registerConfigRuleBindings(lua_State* L, CConfigManager* mgr) {
     Internal::setMgrFn(L, mgr, "monitor", hlMonitor);
     Internal::setMgrFn(L, mgr, "xr_monitor", hlXRMonitor);
     Internal::setMgrFn(L, mgr, "xr_rule", hlXRRule);
+    Internal::setMgrFn(L, mgr, "xr_defaults", hlXRDefaults);
     Internal::setMgrFn(L, mgr, "window_rule", hlWindowRule);
     Internal::setMgrFn(L, mgr, "layer_rule", hlLayerRule);
     Internal::setMgrFn(L, mgr, "workspace_rule", hlWorkspaceRule);
