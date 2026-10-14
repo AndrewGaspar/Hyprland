@@ -833,16 +833,38 @@ std::expected<SXRMonitorParams, std::string> OpenXR::parseXRMonitorLine(const st
 }
 
 std::expected<SXRMonitorParams, std::string> OpenXR::parseXRMonitorCreateArgs(const std::string& args) {
-    // Space-separated: <name> [WxH[@Hz]] [anchor-spec]. Defaults are applied by the caller when
-    // fields are absent (doc 05 §3.1).
-    const auto tokens = tokenizeAnchor(args);
-    if (tokens.empty())
-        return std::unexpected<std::string>("create: missing monitor name");
+    // Space-separated: [name] [WxH[@Hz]] [profile:<p>] [anchor-spec]. Defaults are applied by the
+    // caller when fields are absent (doc 05 §3.3/§4) — including minting a name.
+    auto             tokens = tokenizeAnchor(args);
 
     SXRMonitorParams params;
-    params.m_name = tokens[0];
 
-    size_t idx = 1;
+    // `profile:` first, from anywhere: the anchor grammar has no such key, so pulling it out up front
+    // keeps every pre-existing form parsing exactly as it did.
+    bool sawProfile = false;
+    for (auto it = tokens.begin(); it != tokens.end();) {
+        if (!it->starts_with("profile:")) {
+            ++it;
+            continue;
+        }
+        if (sawProfile)
+            return std::unexpected<std::string>("create: profile: given more than once");
+        params.m_profile = it->substr(std::string_view("profile:").size());
+        if (params.m_profile.empty())
+            return std::unexpected<std::string>("create: profile: needs a name");
+        sawProfile = true;
+        it         = tokens.erase(it);
+    }
+
+    size_t idx = 0;
+
+    // Optional name. Every pre-existing form led with one, and none of those names looked like a
+    // mode or a key:value token, so this is backwards compatible; what it adds is that the first
+    // token may now be the mode or the anchor spec directly.
+    if (idx < tokens.size() && !looksLikeXRMode(tokens[idx]) && !tokens[idx].contains(':')) {
+        params.m_name = tokens[idx];
+        ++idx;
+    }
 
     // Optional mode: a token containing 'x' and not starting with "anchor:" is a mode.
     if (idx < tokens.size() && !tokens[idx].starts_with("anchor:") && tokens[idx].find('x') != std::string::npos) {
@@ -860,4 +882,35 @@ std::expected<SXRMonitorParams, std::string> OpenXR::parseXRMonitorCreateArgs(co
     // else: no anchor spec — caller applies the default anchor:local placement.
 
     return params;
+}
+
+std::vector<SXRMonitorParams> OpenXR::effectiveXRMonitorDeclarations(const std::vector<SXRMonitorParams>& declared, const SXRSystemContext& ctx,
+                                                                     std::vector<std::string>* ambiguous) {
+    std::vector<SXRMonitorParams> out;
+    std::vector<size_t>           whenMatches; // per out entry: how many `when`-bearing declarations matched
+
+    for (const auto& d : declared) {
+        if (!matchXRWhen(d.m_when, ctx))
+            continue;
+
+        auto it = std::ranges::find_if(out, [&d](const SXRMonitorParams& p) { return p.m_name == d.m_name; });
+        if (it == out.end()) {
+            out.push_back(d);
+            whenMatches.push_back(d.m_when.empty() ? 0 : 1);
+            continue;
+        }
+
+        *it = d; // later declaration wins, position stays at first appearance
+        if (!d.m_when.empty())
+            ++whenMatches[it - out.begin()];
+    }
+
+    if (ambiguous) {
+        for (size_t i = 0; i < out.size(); ++i) {
+            if (whenMatches[i] > 1)
+                ambiguous->push_back(out[i].m_name);
+        }
+    }
+
+    return out;
 }
