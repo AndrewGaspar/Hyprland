@@ -893,9 +893,15 @@ TEST(ConfigLuaXRSurface, theShippedExampleConfigLoadsClean) {
     // The declarations the example is actually FOR.
     ASSERT_EQ(Config::xrDeclarationMgr()->monitors().size(), 1u);
     EXPECT_EQ(Config::xrDeclarationMgr()->monitors()[0].m_name, "XR-main");
-    EXPECT_EQ(Config::xrDeclarationMgr()->monitors()[0].m_resolution, (Vector2D{2560, 1440}));
+    // XR-main takes its mode and size from the per-headset hl.xr_defaults blocks (doc 05 §3.3).
+    EXPECT_FALSE(Config::xrDeclarationMgr()->monitors()[0].m_resolution.has_value());
+    EXPECT_FALSE(Config::xrDeclarationMgr()->monitors()[0].m_sizeMeters.has_value());
     EXPECT_TRUE(Config::xrDeclarationMgr()->monitors()[0].m_anchor.adaptive.enabled);
     EXPECT_EQ(Config::xrDeclarationMgr()->rules().size(), 3u);
+    ASSERT_EQ(Config::xrDeclarationMgr()->defaults().size(), 3u);
+    EXPECT_EQ(Config::xrDeclarationMgr()->defaults()[0].when.hmdDesc, "Nreal Air 2 Ultra 0x88888800");
+    EXPECT_FLOAT_EQ(*Config::xrDeclarationMgr()->defaults()[0].scale, 1.6F);
+    EXPECT_EQ(Config::xrDeclarationMgr()->defaults()[2].profile, "tall");
 
     CConfigManagerXRLuaTestAccessor::setParsingConfig(mgr, false);
     Config::xrDeclarationMgr()->clear();
