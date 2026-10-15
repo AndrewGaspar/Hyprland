@@ -293,7 +293,9 @@ UnsetEnvironment=XRT_COMPOSITOR_FORCE_WAYLAND
 Environment=XRT_COMPOSITOR_FORCE_WAYLAND_DIRECT=1
 Environment=XRT_COMPOSITOR_WAYLAND_CONNECTOR=$mon
 # Cap the Vulkan queue global priority at MEDIUM (this is also monado's default). monado-service
-# carries cap_sys_nice+ep, so WITHOUT this cap comp_vulkan would request a REALTIME queue on the
+# must NOT carry file capabilities (docs/openxr/07-xreal.md §1.4b: AT_SECURE makes the Vulkan
+# loader ignore VK_DRIVER_FILES → NVIDIA is picked → direct mode fails). Historically it carried
+# cap_sys_nice+ep, and WITHOUT this cap comp_vulkan then requested a REALTIME queue on the
 # shared iGPU that drives the desktop. On 2026-07-15 that starved the whole machine while direct
 # mode fail-looped waiting for the DP lease connector (hard reboot). REALTIME is strictly opt-in;
 # set XRT_COMPOSITOR_VK_GLOBAL_PRIORITY=high|realtime here ONLY with a watchdog / second machine.
