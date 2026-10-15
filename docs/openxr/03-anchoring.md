@@ -562,6 +562,14 @@ distinction is drawn where it is knowable:
 `hold` plus a keybind is the recommended shape. `follow` is for someone who genuinely wants the
 recenter button to mean "bring my monitors to me" and accepts that a re-don means it too.
 
+> **Pending redesign (2026-10-15).** §8.2's re-seat-on-first-plug and §8.3's capture → stage →
+> `xrRestoreCommitGate` pipeline are to be replaced by a don/doff intent state machine. The doff
+> side commits the last *dwell* before the take-off motion, with intrinsic plausibility in place of
+> the drift gate. The don side waits for the head to settle and hides monitors until then. A
+> deliberate re-seat commits immediately. That design is
+> [research/30](research/30-donoff-intent.md), motivated by a live 180° take-off-flip memory that the
+> drift gate then made permanent. Until it ships, §8.2–§8.4 below describe what is built.
+
 ### 8.2 Recenter on plug
 
 Separately, `openxr:recenter_on_plug` re-seats `anchor:local` monitors relative to the head on the
