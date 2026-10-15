@@ -12,7 +12,7 @@ HMD only). Two display paths: the default **fullscreen-window** path (no composi
 `openxr:runtime_json` selector) and, **new in V2.2**, an opt-in **DRM-lease / direct mode**
 (`xreal-mode.sh xr --direct`) in which HypXRland leases the glasses' DP connector to Monado so it owns
 the flip (one fewer compositor hop → lower latency). Flat/window mode is fully preserved — the lease
-knob is off by default. **Out of scope:** 6DoF (the stereo cameras / Basalt VIO path).
+knob is off by default. **6DoF** (stereo cameras + Basalt VIO) is opt-in, see §1.6.
 
 The pieces:
 
@@ -319,6 +319,33 @@ source = ~/code/Hyprland/example/xreal.conf
 
 Edit the `monitor DP-5` window rules in that file to your glasses' connector name if it isn't `DP-5`
 (the AMD box is DP-5; find yours with `hyprctl monitors`).
+
+### 1.6 Opt-in 6DoF (stereo cameras + Basalt VIO, live-validated 2026-10-15)
+
+The xreal_air driver can feed the glasses' two SLAM cameras + 1 kHz IMU into Monado's t_slam /
+VIT tracker running Basalt (fork: github.com/AndrewGaspar/basalt branch `xreal-vit`, which carries
+the non-blocking IMU push + deeper IMU queues needed live). Off unless `XREAL_AIR_SLAM=1`; with it
+off the driver is the plain 3DoF path. Design + offline evaluation: `research/XREAL-6DOF.md`.
+
+1. Build + install Basalt's VIT library to a private prefix (CMake `-DCMAKE_INSTALL_PREFIX=~/.local/opt/basalt-xreal`,
+   Release); it installs `lib/libbasalt.so` and `share/basalt/xreal_air.toml` (grid-35 pipeline config,
+   found automatically next to the library).
+2. Rebuild the xreal Monado flavor (§1.2) with OpenCV installed — `XRT_FEATURE_SLAM` turns on by itself.
+3. Drop-in:
+
+```
+# ~/.config/systemd/user/monado-xreal.service.d/20-xreal-6dof.conf
+[Service]
+Environment=XREAL_AIR_SLAM=1
+Environment=VIT_SYSTEM_LIBRARY_PATH=%h/.local/opt/basalt-xreal/lib/libbasalt.so
+```
+
+The camera calibration comes from the glasses' factory blob at runtime (fisheye624 → KB4 fit,
+JPL → Hamilton extrinsics, frames stamped at mid-exposure). Head pose is blended with the 3DoF
+fusion: SLAM acquisition never moves the view, loss falls back to 3DoF with position held, and
+re-acquisition glides back over 2 s. Expect `Xreal Air SLAM: 6DoF tracking (SLAM acquired, #1)`
+in the journal a few seconds after XR starts. Tunables (`XREAL_AIR_SLAM_*`) are documented in
+`xreal_air_slam.c`; offline replay: `monado-cli xreal-slam-replay <euroc-dataset> <outdir>`.
 
 ---
 
