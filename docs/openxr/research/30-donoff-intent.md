@@ -1283,3 +1283,16 @@ Per monitor, the JSON `restore` object gains **flat** keys `provenance`, `proven
 `provenanceSeatS` rather than the nested `provenance: {source, …}` of §12.2: a nested `"source"` key
 ahead of `layout2d.source` broke every consumer that scans for the first `"source":` after a
 monitor's name (three hyprtester layout2d cases caught it).
+
+## 18. Re-seat height (2026-10-15, after Phases 0/1)
+
+Everything in this document that says "yaw-only floor frame" now means the frame of doc 03 §8.4
+"Height": `xrHeadFrame` stands `XR_NOMINAL_EYE_HEIGHT` (1.6 m) under the eyes, not on the floor, so
+every committed offset — `dwell`, `quiet`, `reseat`, `created`, `legacy` — carries a **head-relative**
+height. The seat a dwell produces already holds the mean eye position (§6.2, `Σpos / n` includes y), so
+`commitSeat` needed no change: a dwell taken seated remembers the monitors relative to the seated eyes,
+whatever posture the user doffs in. That is the property the legacy staging only gets through the
+`m_seatEye` latch. §5.6's hydration (`REHYDRATE_*` = the `RESTORE` body around the settled head) and
+§7's `RESEAT_DONE` commit inherit the change unchanged, and both are vetted by `xrSeatHeadCheck`
+(non-finite, |y| > 3 m, not upright) before anything is planted. The P4 reach test stays horizontal.
+
