@@ -324,7 +324,8 @@ Edit the `monitor DP-5` window rules in that file to your glasses' connector nam
 
 The xreal_air driver can feed the glasses' two SLAM cameras + 1 kHz IMU into Monado's t_slam /
 VIT tracker running Basalt (fork: github.com/AndrewGaspar/basalt branch `xreal-vit`, which carries
-the non-blocking IMU push + deeper IMU queues needed live). Off unless `XREAL_AIR_SLAM=1`; with it
+the non-blocking IMU push + deeper IMU queues needed live, and exports `basalt_vit_restartable` —
+see *Restarts* below). Off unless `XREAL_AIR_SLAM=1`; with it
 off the driver is the plain 3DoF path. Design + offline evaluation: `research/XREAL-6DOF.md`.
 
 1. Build + install Basalt's VIT library to a private prefix (CMake `-DCMAKE_INSTALL_PREFIX=~/.local/opt/basalt-xreal`,
@@ -345,7 +346,44 @@ JPL → Hamilton extrinsics, frames stamped at mid-exposure). Head pose is blend
 fusion: SLAM acquisition never moves the view, loss falls back to 3DoF with position held, and
 re-acquisition glides back over 2 s. Expect `Xreal Air SLAM: 6DoF tracking (SLAM acquired, #1)`
 in the journal a few seconds after XR starts. Tunables (`XREAL_AIR_SLAM_*`) are documented in
-`xreal_air_slam.c`; offline replay: `monado-cli xreal-slam-replay <euroc-dataset> <outdir>`.
+`xreal_air_slam.h`; offline replay: `monado-cli xreal-slam-replay <euroc-dataset> <outdir>`.
+
+**Robustness (live-validated).** Fixes the 2026-10-15 runaway: glasses lying on the desk,
+Basalt integrated ~70 m away, the output followed it and then re-anchored on every pose.
+
+- *Wear-aware hold.* The display on/off edges (wear sensor) are debounced; taken off → 3DoF with the
+  position held from *before* the removal; put on → a **fresh tracker**, anchored at the held
+  position through the usual no-jump blend.
+- *Pose guard.* A single discontinuity = re-initialisation (followed once, re-anchored). Divergence =
+  faster than `MAX_SPEED` for 200 ms, or faster than `STILL_SPEED` for 300 ms while the IMU is at rest,
+  or discontinuities < 2 s apart → the tracker is restarted; suspicious poses are never followed, and
+  the fresh tracker is only followed once the IMU has seen the head move.
+- *Freshness hysteresis.* Lost after `STALE_MS` without a pose; back only once the newest pose has
+  been younger than `FRESH_MS` for `FRESH_HOLD_MS` (stops 6DoF/3DoF flapping under load).
+- *Restarts.* With a Basalt exporting `basalt_vit_restartable` (current `xreal-vit`) the tracker is
+  destroyed + re-created (a few ms) and stopped while the glasses are off. A stock VIT library (which
+  `exit()`s on a second tracker) falls back to **reset in place** (`t_slam_reset`): pre-reset poses
+  are dropped and the tracker keeps running while off, reset every 10 s. The journal says which at
+  start: `Xreal Air SLAM: Tracker restarts: a fresh tracker each time, ...` vs `reset in place ...`.
+
+| `XREAL_AIR_SLAM_*` | Default | Meaning |
+|---|---|---|
+| `STALE_MS` | 300 | no new pose this long = not tracking (3DoF fallback) |
+| `FRESH_MS` / `FRESH_HOLD_MS` | 250 / 250 | re-acquire only once the newest pose is younger than `FRESH_MS` for `FRESH_HOLD_MS` |
+| `WARMUP_MS` | 1500 | let a new tracker settle before the output follows it |
+| `WEAR` | 1 | wear-aware hold + fresh tracker on don |
+| `WEAR_DEBOUNCE_MS` | 400 | how long a wear edge must hold |
+| `DOFF_LOOKBACK_MS` | 1000 | hold the position from this long before the doff edge |
+| `DIVERGENCE` | 1 | divergence detection + restart |
+| `MAX_SPEED` | 3 (m/s) | faster than this for 200 ms = diverged |
+| `STILL_SPEED` | 0.1 (m/s) | faster than this for 300 ms with the IMU at rest = diverged |
+| `RESTART_MIN_MS` | 3000 | at most one divergence restart this often |
+| `RECREATE` | 1 | `0` forces reset-in-place even with a restartable Basalt |
+
+Replay trouble injection (`<start_s>,<len_s>` from the first frame, combinable):
+`XREAL_SLAM_REPLAY_GAP` (drop frames), `_BLACK` (black frames: blind but fed), `_STILL` (freeze the
+IMU at gravity + noise and the view: glasses on a desk), `_DOFF` (display off/on edges). `STILL`+`BLACK`
+reproduces the 2026-10-15 runaway.
 
 ---
 
