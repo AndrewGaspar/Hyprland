@@ -1944,3 +1944,28 @@ TEST(XRReseatVertical, SeatHeadCheckRefusesNonsenseHeads) {
     EXPECT_EQ(xrSeatHeadCheck(SXRPose{{0.f, 1.6f, 0.f}, Quat{0.f, std::numeric_limits<float>::infinity(), 0.f, 1.f}}), XR_SEATHEAD_NONFINITE);
     EXPECT_STRNE(xrSeatHeadName(XR_SEATHEAD_HEIGHT), "ok");
 }
+
+TEST(XRReseatVertical, DeliberateReseatIgnoresHeightButNotTilt) {
+    // The keypress is the repair for a floor estimate that has drifted far off — the live case's eye
+    // read y = -3.16 — so the deliberate check lets any finite, upright head through; the automatic
+    // RESTORE and the capture keep the full bound.
+    EXPECT_EQ(xrSeatHeadCheckDeliberate(levelHeadAt(-56.93f, -3.16f, -15.59f)), XR_SEATHEAD_OK);
+    EXPECT_EQ(xrSeatHeadCheckDeliberate(levelHeadAt(0.f, 40.f, 0.f)), XR_SEATHEAD_OK);
+    EXPECT_EQ(xrSeatHeadCheck(levelHeadAt(-56.93f, -3.16f, -15.59f)), XR_SEATHEAD_HEIGHT);
+    EXPECT_EQ(xrSeatHeadCheckDeliberate(SXRPose{{0.f, -3.16f, 0.f}, qFromPitch(120.f * PI / 180.f)}), XR_SEATHEAD_TILTED);
+    EXPECT_EQ(xrSeatHeadCheckDeliberate(levelHeadAt(0.f, std::nanf(""), 0.f)), XR_SEATHEAD_NONFINITE);
+    EXPECT_EQ(xrSeatHeadCheckDeliberate(levelHeadAt(0.f, std::numeric_limits<float>::infinity(), 0.f)), XR_SEATHEAD_NONFINITE);
+
+    // ...and re-seating to that diverged head does what the user wanted: XR-main lands at its
+    // authored 0.143 m under the eyes the runtime reports, the group rigid around it.
+    const auto           rig  = fiveMonitorRig();
+    const SXRPose        head = levelHeadAt(-56.93f, -3.16f, -15.59f, 26.1f * PI / 180.f);
+    std::vector<SXRPose> live;
+    for (const auto& r : rig)
+        live.push_back(reseatFrom(levelHeadAt(0.f, XR_NOMINAL_EYE_HEIGHT, 0.f), r));
+    const SXRPose rigs[] = {rig[0]};
+    const auto    after  = groupReseat(live, head, xrGroupAuthoredDistance(rigs, 1, 1.5f), xrGroupImpliedEyeHeight(live.data(), live.size(), live.data(), rigs, 1));
+    EXPECT_NEAR(after[0].pos.y - head.pos.y, 1.457f - XR_NOMINAL_EYE_HEIGHT, 1e-3f);
+    for (size_t i = 1; i < live.size(); ++i)
+        EXPECT_NEAR((after[i].pos - after[0].pos).length(), (live[i].pos - live[0].pos).length(), 1e-3f);
+}

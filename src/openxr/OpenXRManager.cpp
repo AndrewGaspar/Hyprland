@@ -2250,6 +2250,7 @@ void COpenXRManager::frameThread() {
         auto reseatHeadVeto     = OpenXR::XR_SEATHEAD_OK;
         bool reseatHeadVetoLog  = false; // say it this frame (a GROUP refusal, or a RESTORE's first deferral)
         bool reseatHeadVetoKind = false; // true = GROUP (dropped), false = RESTORE (stays armed)
+        bool reseatFarHead      = false; // a deliberate re-seat ran against a head beyond the height bound
         // research/30 §8.4: every monitor's pose for this frame's history sample, gathered inside the
         // layer lock as plain values (stable ids, never names) and pushed after it.
         SXRHistFrameMonitors histMons;
@@ -2273,11 +2274,16 @@ void COpenXRManager::frameThread() {
             //
             // Both kinds now carry the group's HEIGHT with the head (xrHeadFrame, doc 03 §8.4), so a
             // nonsense head would plant the room metres up or down rather than merely yawed wrong.
-            // The head is vetted first (xrSeatHeadCheck): a deliberate GROUP request is dropped with
-            // a WARN — the user can press again once tracking is sane — while a RESTORE stays armed,
-            // exactly as it does across an invalid view, and runs on the first plausible frame.
+            // The head is vetted first. The automatic RESTORE gets the full check (xrSeatHeadCheck,
+            // incl. the 3 m height bound) and stays armed, exactly as it does across an invalid view,
+            // until the first plausible frame. The deliberate GROUP is the user's own request and
+            // the repair for a floor that has drifted far off, so only a broken or not-upright head
+            // refuses it (xrSeatHeadCheckDeliberate); a far-off one is re-seated with a WARN.
             const auto reseatKind = (OpenXR::eXRReseatKind)m_reseatArmed.load(std::memory_order_acquire);
-            const auto seatHead   = (viewValid && reseatKind != OpenXR::XR_RESEAT_ARM_NONE) ? OpenXR::xrSeatHeadCheck(viewPose) : OpenXR::XR_SEATHEAD_OK;
+            const bool deliberate = reseatKind == OpenXR::XR_RESEAT_ARM_GROUP;
+            const bool armedNow   = viewValid && reseatKind != OpenXR::XR_RESEAT_ARM_NONE;
+            const auto seatHead   = !armedNow ? OpenXR::XR_SEATHEAD_OK : (deliberate ? OpenXR::xrSeatHeadCheckDeliberate(viewPose) : OpenXR::xrSeatHeadCheck(viewPose));
+            reseatFarHead         = armedNow && deliberate && seatHead == OpenXR::XR_SEATHEAD_OK && OpenXR::xrSeatHeadCheck(viewPose) == OpenXR::XR_SEATHEAD_HEIGHT;
             if (viewValid && reseatKind != OpenXR::XR_RESEAT_ARM_NONE && seatHead != OpenXR::XR_SEATHEAD_OK) {
                 reseatHeadVeto     = seatHead;
                 reseatHeadVetoKind = reseatKind == OpenXR::XR_RESEAT_ARM_GROUP;
@@ -2483,8 +2489,13 @@ void COpenXRManager::frameThread() {
             // remember the wearer's posture at the doff edge: stand up to take a Quest off and the
             // next session's room comes back half a metre low; let a 6DoF floor estimate drift and it
             // remembers the drift. The live head still supplies position and yaw.
-            if (headTrustworthy && OpenXR::xrHeadUpright(viewPose.rot) && m_restoreCapture.load(std::memory_order_relaxed)) {
-                if (!m_seatEyeValid && OpenXR::xrSeatHeadCheck(viewPose) == OpenXR::XR_SEATHEAD_OK) {
+            //
+            // The full head check (xrSeatHeadCheck, incl. the 3 m height bound) gates the capture: a
+            // deliberate re-seat may plant the room around a head whose floor estimate is metres off,
+            // but nothing durable is MEASURED against one — the re-seat commits its own planted
+            // offsets (RESEAT_DONE) and that is the memory until the head is plausible again.
+            if (headTrustworthy && OpenXR::xrSeatHeadCheck(viewPose) == OpenXR::XR_SEATHEAD_OK && m_restoreCapture.load(std::memory_order_relaxed)) {
+                if (!m_seatEyeValid) {
                     m_seatEye      = viewPose.pos;
                     m_seatEyeValid = true;
                 }
@@ -2594,6 +2605,10 @@ void COpenXRManager::frameThread() {
                              OpenXR::xrSeatHeadName(reseatHeadVeto), viewPose.pos.x, viewPose.pos.y, viewPose.pos.z,
                              reseatHeadVetoKind ? "monitors left where they are; try again once tracking has settled" :
                                                   "the restore stays armed and runs on the first frame with a plausible head");
+        if (reseatFarHead && reseatGrouped)
+            Log::logger->log(Log::WARN,
+                             "[OPENXR] re-seat: the head is {:.2f}m from the floor (beyond {:.0f}m — the runtime's floor estimate is off); re-seating anyway: deliberate",
+                             viewPose.pos.y, OpenXR::XR_SEAT_HEAD_MAX_HEIGHT);
         if (reseatUnseatable)
             Log::logger->log(Log::WARN,
                              "[OPENXR] re-seat: the monitor group has no common facing (their normals cancel) — there is no 'in front of' to bring it around to, so nothing moved");
@@ -4785,13 +4800,15 @@ std::expected<std::string, std::string> COpenXRManager::requestReseatToHead(cons
         case OpenXR::XR_RESEAT_READY: break;
     }
 
-    // doc 03 §8.4: a re-seat now carries the group's height with the head, so a head that is not a
-    // person — a diverged 6DoF tracker metres under the floor, a pose mid-take-off — would plant the
-    // room relative to nonsense. Refused here with the reason; the frame thread re-checks against
-    // its own, fresher pose (xrSeatHeadCheck is the one definition both use).
-    if (const auto HV = OpenXR::xrSeatHeadCheck(OpenXR::SXRPose{head.headPos, head.headRot}); HV != OpenXR::XR_SEATHEAD_OK)
+    // doc 03 §8.4: a re-seat now carries the group's height with the head, so a broken locate or a
+    // head that is not upright (mid-take-off, parked on a forehead) is refused here with the reason;
+    // the frame thread re-checks against its own, fresher pose. HEIGHT is not a refusal for this,
+    // the deliberate re-seat: a floor estimate metres off is exactly what the keypress repairs.
+    const OpenXR::SXRPose HEADPOSE{head.headPos, head.headRot};
+    if (const auto HV = OpenXR::xrSeatHeadCheckDeliberate(HEADPOSE); HV != OpenXR::XR_SEATHEAD_OK)
         return std::unexpected<std::string>(std::format("{} (eye [{:.2f}, {:.2f}, {:.2f}]) — not re-seating to it; try again once tracking has settled", OpenXR::xrSeatHeadName(HV),
                                                         head.headPos.x, head.headPos.y, head.headPos.z));
+    const bool FARHEAD = OpenXR::xrSeatHeadCheck(HEADPOSE) == OpenXR::XR_SEATHEAD_HEIGHT;
 
     // Answer the degenerate arrangement HERE rather than letting the user press a key, see nothing
     // happen, and go looking in the log for the frame thread's WARN. Validity depends only on the
@@ -4826,7 +4843,9 @@ std::expected<std::string, std::string> COpenXRManager::requestReseatToHead(cons
 
     Log::logger->log(Log::DEBUG, "[OPENXR] re-seat requested ({}) — {} anchor:local monitor(s) will be replanted around the current head at {:.2f}m, {:+.2f}m vertically", why,
                      eligible, authored, rise);
-    return std::format("re-seated {} monitor{} to the current head (authored distance {:.2f}m, moved {:+.2f}m vertically)", eligible, eligible == 1 ? "" : "s", authored, rise);
+    return std::format("re-seated {} monitor{} to the current head (authored distance {:.2f}m, moved {:+.2f}m vertically){}", eligible, eligible == 1 ? "" : "s", authored, rise,
+                       FARHEAD ? std::format(" — warning: the head reads {:.2f}m from the floor, the runtime's floor estimate is off; re-seated anyway", head.headPos.y) :
+                                 std::string{});
 }
 
 std::expected<std::string, std::string> COpenXRManager::cmdReseat() {

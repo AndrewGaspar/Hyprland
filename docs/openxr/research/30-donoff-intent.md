@@ -1293,6 +1293,7 @@ height. The seat a dwell produces already holds the mean eye position (§6.2, `�
 `commitSeat` needed no change: a dwell taken seated remembers the monitors relative to the seated eyes,
 whatever posture the user doffs in. That is the property the legacy staging only gets through the
 `m_seatEye` latch. §5.6's hydration (`REHYDRATE_*` = the `RESTORE` body around the settled head) and
-§7's `RESEAT_DONE` commit inherit the change unchanged, and both are vetted by `xrSeatHeadCheck`
-(non-finite, |y| > 3 m, not upright) before anything is planted. The P4 reach test stays horizontal.
+§7's `RESEAT_DONE` commit inherit the change unchanged, and both are vetted before anything is planted: hydration by the full `xrSeatHeadCheck`
+(non-finite, |y| > 3 m, not upright), the deliberate re-seat by `xrSeatHeadCheckDeliberate` (height
+is not a refusal there — the keypress is the repair for a floor that drifted far off). The P4 reach test stays horizontal.
 

@@ -732,16 +732,30 @@ TEST_CASE(xr_reseat_verb) {
         afterR = upR;
     }
 
-    // ...and a head that is not a person is refused, with the reason, and nothing moves: a diverged
-    // tracker 4 m up, and glasses lifted past vertical onto the forehead.
+    // A head 4 m up is a runtime whose floor estimate is off — exactly what the keypress repairs —
+    // so the DELIBERATE re-seat goes ahead (with a warning) and the group rises the 3.5 m with it.
+    // Only the automatic don-time restore and the capture keep the 3 m bound.
     remote->setHeadPose(xrt_vec3{0.f, 4.f, 0.f}, swivelled);
     remote->pulse();
     std::this_thread::sleep_for(std::chrono::milliseconds(400));
     {
         const std::string r = getFromSocket("/openxr reseat");
-        NLog::log("xr_reseat_verb: absurd head, reseat replied '{}'", r);
-        EXPECT_CONTAINS(r, std::string("implausibly far from the floor"));
+        NLog::log("xr_reseat_verb: far-off head, reseat replied '{}'", r);
+        ASSERT_STARTS_WITH(r, std::string("re-seated "));
+        EXPECT_CONTAINS(r, std::string("re-seated anyway"));
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+        const std::string st  = getFromSocket("j/openxr");
+        const auto        hiL = poseOf(st, monL), hiR = poseOf(st, monR);
+        ASSERT(hiL.size(), (size_t)3);
+        ASSERT(hiR.size(), (size_t)3);
+        EXPECT_MAX_DELTA(hiL[1] - afterL[1], 3.5, 0.05);
+        EXPECT_MAX_DELTA(hiR[1] - afterR[1], 3.5, 0.05);
+        afterL = hiL;
+        afterR = hiR;
     }
+
+    // ...but a head that is not upright (glasses lifted past vertical onto the forehead) is refused,
+    // with the reason, and nothing moves.
     constexpr float FLIP = 120.f * (float)M_PI / 180.f; // pitched up and back past vertical
     remote->setHeadPose(xrt_vec3{0.f, 0.5f, 0.f}, xrt_quat{std::sin(FLIP / 2.f), 0.f, 0.f, std::cos(FLIP / 2.f)});
     remote->pulse();
