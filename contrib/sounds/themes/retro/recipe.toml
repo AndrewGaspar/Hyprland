@@ -1,0 +1,134 @@
+# retro — band-limited square/triangle chip voices in C major, a ping-pong echo, no room.
+# Arpeggios up for "on", mirrored down for "off". Pulse width (`duty`) is the main timbre knob.
+
+[theme]
+name = "retro"
+description = "Chiptune pulses and triangle slides, C major, short ping-pong echo"
+peak_dbfs = -3.0
+loudness_lufs = -16      # loudness of a level_db = 0 event; interaction sounds sit below it
+scale = { root = "C5", mode = "major" }
+fx = { echo = { delay = 0.075, feedback = 0.35, mix = 0.18, taps = 2 } }
+
+[theme.timbres]
+pulse25 = { wave = "square", duty = 0.25, env = { a = 0.002, h = 0.02, d = 0.06, s = 0.3, r = 0.01 }, filter = { type = "lowpass", cutoff = 6000, q = 0.7 } }
+pulse50 = { wave = "square", duty = 0.5, env = { a = 0.002, h = 0.02, d = 0.06, s = 0.3, r = 0.01 }, filter = { type = "lowpass", cutoff = 5000, q = 0.7 } }
+pulse12 = { wave = "square", duty = 0.125, env = { a = 0.002, h = 0.01, d = 0.04, s = 0.2, r = 0.01 }, filter = { type = "lowpass", cutoff = 6500, q = 0.7 } }
+tri     = { wave = "triangle", env = { a = 0.002, h = 0.03, d = 0.1, s = 0.4, r = 0.015 } }
+hat     = { wave = "noise", filter = { type = "highpass", cutoff = 6000, q = 0.7 }, env = { a = 0.0005, d = 0.008, r = 0.004 } }
+
+# ---------------------------------------------------------------------------------- headset
+[events.don]
+notes = [
+  { t = 0.00, dur = 0.06, timbre = "pulse25", deg = 0, db = -3 },
+  { t = 0.05, dur = 0.06, timbre = "pulse25", deg = 2, db = -3 },
+  { t = 0.10, dur = 0.06, timbre = "pulse25", deg = 4, db = -3 },
+  { t = 0.15, dur = 0.12, timbre = "pulse25", deg = 7, db = -3 },
+  { t = 0.00, dur = 0.27, timbre = "tri", deg = -7, db = -8 },
+]
+
+[events.doff]
+mirror = "don"
+
+# ---------------------------------------------------------------------------------- session
+[events.session-start]   # "power up": triangle slide + square arpeggio
+notes = [
+  { t = 0.00, dur = 0.22, timbre = "tri", deg = -7, to_deg = 0, curve = "exp", db = -4, env = { a = 0.002, h = 0.15, d = 0.1, s = 0.5, r = 0.03 } },
+  { t = 0.18, dur = 0.06, timbre = "pulse12", deg = 4, db = -6 },
+  { t = 0.23, dur = 0.06, timbre = "pulse12", deg = 7, db = -6 },
+  { t = 0.28, dur = 0.14, timbre = "pulse12", deg = 11, db = -6 },
+]
+
+[events.session-stop]
+mirror = "session-start"
+
+# ---------------------------------------------------------------------------------- monitors
+[events.monitor-new]     # the "coin": B -> E a fourth up
+notes = [
+  { t = 0.00, dur = 0.06, timbre = "pulse50", deg = 6, db = -4 },
+  { t = 0.06, dur = 0.20, timbre = "pulse50", deg = 9, db = -4, env = { a = 0.002, h = 0.05, d = 0.08, s = 0.2, r = 0.02 } },
+]
+
+[events.monitor-close]
+mirror = "monitor-new"
+transpose = -5
+
+# ---------------------------------------------------------------------------------- grab / select
+[events.grab]
+level_db = -6
+variants = 3
+jitter = { cents = 0, db = 0.7 }   # chip sounds stay in tune; vary only the level
+fx = { echo = { delay = 0.05, feedback = 0.2, mix = 0.0, taps = 1 } }
+notes = [
+  { t = 0.0, dur = 0.05, timbre = "pulse12", deg = 7, to_deg = 9, glide = 0.02, db = 0 },
+  { t = 0.0, dur = 0.02, timbre = "hat", db = -10 },
+]
+
+[events.release]
+mirror = "grab"
+transpose = -5
+
+[events.select]
+level_db = -10
+fx = { echo = { delay = 0.05, feedback = 0.2, mix = 0.0, taps = 1 } }
+notes = [{ t = 0.0, dur = 0.05, timbre = "tri", deg = 14, env = { a = 0.001, h = 0.01, d = 0.015, r = 0.008 } }]
+
+# ---------------------------------------------------------------------------------- adaptive anchor
+[events.undock]          # pitch slide up, like lifting off
+level_db = -4
+notes = [{ t = 0.0, dur = 0.16, timbre = "pulse25", deg = 0, to_deg = 4, curve = "lin", db = -2, vibrato = { rate = 18, cents = 30 } }]
+
+[events.dock]
+mirror = "undock"
+transpose = -3
+
+# ---------------------------------------------------------------------------------- error
+[events.error]           # the classic low double buzz
+level_db = -3
+notes = [
+  { t = 0.00, dur = 0.10, timbre = "pulse50", deg = -10, db = -2 },
+  { t = 0.12, dur = 0.18, timbre = "pulse50", deg = -11, cents = -50, db = -2 },
+]
+
+# ---------------------------------------------------------------------------------- desktop (beyond XR)
+[events.boot]            # a short fanfare
+max_ms = 1500
+fx = { echo = { delay = 0.09, feedback = 0.35, mix = 0.2, taps = 3 } }
+notes = [
+  { t = 0.00, dur = 0.10, timbre = "pulse25", deg = 0, db = -4 },
+  { t = 0.10, dur = 0.10, timbre = "pulse25", deg = 4, db = -4 },
+  { t = 0.20, dur = 0.10, timbre = "pulse25", deg = 7, db = -4 },
+  { t = 0.30, dur = 0.45, timbre = "pulse25", deg = 9, db = -4, env = { a = 0.002, h = 0.2, d = 0.2, s = 0.3, r = 0.05 } },
+  { t = 0.30, dur = 0.45, timbre = "pulse12", deg = 11, db = -9, env = { a = 0.002, h = 0.2, d = 0.2, s = 0.3, r = 0.05 } },
+  { t = 0.00, dur = 0.75, timbre = "tri", deg = -7, db = -6, env = { a = 0.002, h = 0.5, d = 0.2, s = 0.3, r = 0.05 } },
+]
+
+[events.shutdown]
+mirror = "boot"
+transpose = -5
+
+[events.login]
+max_ms = 1500
+notes = [
+  { t = 0.00, dur = 0.08, timbre = "pulse25", deg = 4, db = -4 },
+  { t = 0.08, dur = 0.08, timbre = "pulse25", deg = 7, db = -4 },
+  { t = 0.16, dur = 0.24, timbre = "pulse25", deg = 11, db = -4, env = { a = 0.002, h = 0.1, d = 0.1, s = 0.3, r = 0.03 } },
+]
+
+[events.logout]
+mirror = "login"
+
+[events.lock]
+notes = [
+  { t = 0.00, dur = 0.07, timbre = "tri", deg = 4, db = -3 },
+  { t = 0.07, dur = 0.12, timbre = "tri", deg = 0, db = -3 },
+]
+
+[events.unlock]
+mirror = "lock"
+
+[events.notify]
+level_db = -2
+notes = [
+  { t = 0.00, dur = 0.07, timbre = "pulse50", deg = 9, db = -4 },
+  { t = 0.09, dur = 0.12, timbre = "pulse50", deg = 11, db = -4 },
+]
