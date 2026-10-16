@@ -222,3 +222,9 @@ edge: label, orientation, height, lowest-corner and centre height above it, over
 verdict (`too far above`, `too deep through`, `not over it`, …). The frame thread writes POD records
 into a 4-slot ring; the main thread formats them from the poll timer and before a gaze release,
 which logs what it re-decides against.
+
+**Clutter.** The live set held 21 planes: duplicates, "unknown" upward patches 1.6–2.3 m up, and
+narrow sofa-arm platforms. Detected planes (declared ones are taken as declared) are now ignored as
+snap candidates when smaller than 0.08 m² or narrower than 0.20 m on their short side, and upward
+ones when less than 0.10 m below the eyes (`xrPlaneClutter`; constants, no options). The trace lists
+them as `clutter: …` and counts rather than lists them.

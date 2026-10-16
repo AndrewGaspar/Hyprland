@@ -606,7 +606,7 @@ TEST(Surfaces, LiveTableTakesTheBigWindowLoweredThroughIt) {
     // center goes under it — no gap in between.
     uint64_t sticky = 0;
     float    first = -1.F, last = -1.F;
-    bool     gap   = false;
+    bool     gap = false;
     for (int i = 0; i <= 100; ++i) {
         const float y  = 1.95F - 0.01F * sc<float>(i);
         const auto  pc = xrSurfacePick(&t, 1, liveWindow(Vec3{0.5F, y, -0.8F}), tun, sticky);
@@ -708,4 +708,61 @@ TEST(Surfaces, LiveKeyboardNudgeThroughTheTableSettlesOnIt) {
     expectVecNear(a.state().anchorPose.pos, snap.pose.pos);
     const Vec3 up = qRotate(a.state().anchorPose.rot, Vec3{0.F, 1.F, 0.F});
     EXPECT_NEAR((a.state().anchorPose.pos - up * LIVE_BOTTOM_EXT).y, 1.13F + tun.lift, 1e-3F);
+}
+
+// ---- clutter (the live set: 21 planes, duplicates, "unknown" patches 1.6-2.3 m up, sofa arms) ----
+
+// A detected upward patch, centred at `c`, w x d metres, as the runtime reports it.
+static SXRPlane detectedPatch(uint64_t id, const Vec3& c, float w, float d) {
+    const SXRVec2 contour[] = {{-w * 0.5F, -d * 0.5F}, {w * 0.5F, -d * 0.5F}, {w * 0.5F, d * 0.5F}, {-w * 0.5F, d * 0.5F}};
+    bool          swapped   = false;
+    SXRPlane      p         = xrCanonicalPlane(SXRPose{c, qFromPitch(-90.F * DEG)}, XR_PLANE_UP, contour, 4, w, d, swapped);
+    p.id                    = id;
+    p.source                = XR_PLANE_SRC_DETECTION;
+    return p;
+}
+
+TEST(Surfaces, ClutterSmallAndHighDetectedPatchesAreIgnored) {
+    const SXRSurfaceQuery q = liveWindow(Vec3{0.5F, 1.45F, -0.8F}); // head at y 1.55
+
+    // the real table is not clutter
+    EXPECT_EQ(xrPlaneClutter(liveTable(), q), XR_SURF_OK);
+    EXPECT_EQ(xrPlaneClutter(liveFloor(), q), XR_SURF_OK);
+    EXPECT_NEAR(xrPlaneArea(liveTable()), 1.68F * 1.23F, 1e-4F);
+
+    // too small: by area, and by a short side under 20 cm even with enough area (a sofa arm)
+    EXPECT_EQ(xrPlaneClutter(detectedPatch(1, Vec3{0.F, 0.9F, -1.F}, 0.25F, 0.25F), q), XR_SURF_CLUTTER_SMALL);
+    EXPECT_EQ(xrPlaneClutter(detectedPatch(2, Vec3{0.F, 0.9F, -1.F}, 0.9F, 0.15F), q), XR_SURF_CLUTTER_SMALL);
+    EXPECT_EQ(xrPlaneClutter(detectedPatch(3, Vec3{0.F, 0.9F, -1.F}, 0.4F, 0.3F), q), XR_SURF_OK);
+
+    // at or above eye level: the "unknown" patches 1.6-2.3 m up, and one just under the eyes
+    EXPECT_EQ(xrPlaneClutter(detectedPatch(4, Vec3{0.F, 2.1F, -1.F}, 1.F, 1.F), q), XR_SURF_CLUTTER_HIGH);
+    EXPECT_EQ(xrPlaneClutter(detectedPatch(5, Vec3{0.F, 1.50F, -1.F}, 1.F, 1.F), q), XR_SURF_CLUTTER_HIGH);
+    EXPECT_EQ(xrPlaneClutter(detectedPatch(6, Vec3{0.F, 1.40F, -1.F}, 1.F, 1.F), q), XR_SURF_OK);
+    // ...a rule about the head: without one, only the size rules apply
+    SXRSurfaceQuery noHead = q;
+    noHead.headValid       = false;
+    EXPECT_EQ(xrPlaneClutter(detectedPatch(4, Vec3{0.F, 2.1F, -1.F}, 1.F, 1.F), noHead), XR_SURF_OK);
+
+    // a declared plane is taken as declared, however small or high
+    auto tiny = xrParseSyntheticPlanes("table pos:0,2.1,-1 size:0.1,0.1");
+    ASSERT_TRUE(tiny.has_value());
+    EXPECT_EQ(xrPlaneClutter(tiny->at(0), q), XR_SURF_OK);
+}
+
+TEST(Surfaces, ClutterNeverWinsThePick) {
+    SXRSurfaceTuning tun;
+    // A narrow patch 4 cm above the table right under the window's bottom edge (which the window's
+    // pitch toward the head puts at z ~ -0.92) — nearer than the table, and higher — is clutter:
+    // the table under the window is still where it goes.
+    const SXRPlane planes[] = {detectedPatch(9, Vec3{0.5F, 1.17F, -0.92F}, 0.9F, 0.15F), liveTable()};
+    const auto     q        = liveWindow(Vec3{0.5F, 1.17F + LIVE_BOTTOM_EXT, -0.8F});
+    ASSERT_TRUE(xrSurfaceEvaluate(planes[1], q, tun, tun.snapDist).ok);
+    SXRSurfaceDiag d;
+    ASSERT_TRUE(xrSurfaceEvaluate(planes[0], q, tun, tun.snapDist, &d).ok); // geometrically it would
+    const auto c = xrSurfacePick(planes, 2, q, tun, 0);
+    ASSERT_TRUE(c.ok);
+    EXPECT_EQ(c.planeId, 0x42U);
+    // with only clutter around, nothing snaps
+    EXPECT_FALSE(xrSurfacePick(planes, 1, q, tun, 0).ok);
 }

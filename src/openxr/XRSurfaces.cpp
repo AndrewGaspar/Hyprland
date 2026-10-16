@@ -208,6 +208,8 @@ namespace OpenXR {
     const char* xrSurfaceVerdictName(eXRSurfaceVerdict v) {
         switch (v) {
             case XR_SURF_OK: return "ok";
+            case XR_SURF_CLUTTER_SMALL: return "clutter: too small";
+            case XR_SURF_CLUTTER_HIGH: return "clutter: at or above eye level";
             case XR_SURF_ORIENT: return "orientation";
             case XR_SURF_TOO_HIGH: return "too far above";
             case XR_SURF_TOO_DEEP: return "too deep through";
@@ -215,6 +217,41 @@ namespace OpenXR {
             case XR_SURF_NONFINITE: return "non-finite";
         }
         return "?";
+    }
+
+    float xrPlaneArea(const SXRPlane& p) {
+        if (p.nPoly < 3)
+            return p.extentX * p.extentY;
+        float a = 0.F;
+        for (size_t i = 0, j = p.nPoly - 1; i < p.nPoly; j = i++)
+            a += p.poly[j].x * p.poly[i].y - p.poly[i].x * p.poly[j].y;
+        return std::fabs(a) * 0.5F;
+    }
+
+    // The plane's short side: its extents', else its contour's bounding box's.
+    static float planeShortSide(const SXRPlane& p) {
+        if (p.extentX > 0.F && p.extentY > 0.F)
+            return std::min(p.extentX, p.extentY);
+        if (p.nPoly < 3)
+            return 0.F;
+        float minX = p.poly[0].x, maxX = p.poly[0].x, minY = p.poly[0].y, maxY = p.poly[0].y;
+        for (size_t i = 1; i < p.nPoly; ++i) {
+            minX = std::min(minX, p.poly[i].x);
+            maxX = std::max(maxX, p.poly[i].x);
+            minY = std::min(minY, p.poly[i].y);
+            maxY = std::max(maxY, p.poly[i].y);
+        }
+        return std::min(maxX - minX, maxY - minY);
+    }
+
+    eXRSurfaceVerdict xrPlaneClutter(const SXRPlane& p, const SXRSurfaceQuery& q) {
+        if (p.source != XR_PLANE_SRC_DETECTION)
+            return XR_SURF_OK;
+        if (xrPlaneArea(p) < XR_SURFACE_MIN_AREA || planeShortSide(p) < XR_SURFACE_MIN_SIDE)
+            return XR_SURF_CLUTTER_SMALL;
+        if (p.orient == XR_PLANE_UP && q.headValid && p.pose.pos.y > q.head.y - XR_SURFACE_HEAD_CLEARANCE)
+            return XR_SURF_CLUTTER_HIGH;
+        return XR_SURF_OK;
     }
 
     SXRSurfaceCandidate xrSurfaceEvaluate(const SXRPlane& p, const SXRSurfaceQuery& q, const SXRSurfaceTuning& t, float enterDist, SXRSurfaceDiag* diag) {
@@ -300,7 +337,7 @@ namespace OpenXR {
     // duplicate, a slightly tilted patch): the nearer wins rather than the higher.
     static constexpr float XR_SURFACE_STACK_EPS = 0.03F;
 
-    SXRSurfaceCandidate xrSurfacePick(const SXRPlane* planes, size_t n, const SXRSurfaceQuery& q, const SXRSurfaceTuning& t, uint64_t stickyId) {
+    SXRSurfaceCandidate    xrSurfacePick(const SXRPlane* planes, size_t n, const SXRSurfaceQuery& q, const SXRSurfaceTuning& t, uint64_t stickyId) {
         SXRSurfaceCandidate best;
         // rank: horizontal before wall, the higher horizontal surface, ray-hit before not, then nearest
         auto better = [](const SXRSurfaceCandidate& a, const SXRSurfaceCandidate& b) {
@@ -318,6 +355,8 @@ namespace OpenXR {
             return a.dist < b.dist;
         };
         for (size_t i = 0; planes && i < n; ++i) {
+            if (xrPlaneClutter(planes[i], q) != XR_SURF_OK)
+                continue;
             const bool sticky = stickyId != 0 && planes[i].id == stickyId;
             auto       c      = xrSurfaceEvaluate(planes[i], q, t, sticky ? std::max(t.exitDist, t.snapDist) : t.snapDist);
             if (!c.ok)

@@ -246,20 +246,26 @@ void COpenXRManager::surfaceTraceDrain() {
         const size_t                                                        np = std::min<size_t>(rec.nPlanes, order.size());
         for (size_t i = 0; i < np; ++i)
             order[i] = &rec.planes[i];
-        std::sort(order.begin(), order.begin() + np, [](const auto* a, const auto* b) { return std::fabs(a->diag.lowest) < std::fabs(b->diag.lowest); });
+        auto isClutter = [](const SXRSurfaceTraceRec::SPlane* p) { return p->verdict == OpenXR::XR_SURF_CLUTTER_SMALL || p->verdict == OpenXR::XR_SURF_CLUTTER_HIGH; };
+        std::sort(order.begin(), order.begin() + np, [&](const auto* a, const auto* b) {
+            if (isClutter(a) != isClutter(b))
+                return !isClutter(a);
+            return std::fabs(a->diag.lowest) < std::fabs(b->diag.lowest);
+        });
+        const size_t clutter = std::count_if(order.begin(), order.begin() + np, isClutter);
 
-        std::string planes;
-        size_t      listed = 0;
+        std::string  planes;
+        size_t       listed = 0;
         for (size_t i = 0; i < np; ++i) {
             const auto& p = *order[i];
-            if (listed >= 6)
+            if (listed >= 6 || isClutter(&p))
                 break;
             planes += std::format(" | {:#x} {} {} h{:.2f}: lowest {:+.3f} center {:+.3f} {} -> {}", p.id, OpenXR::xrPlaneLabelName(p.label), OpenXR::xrPlaneOrientName(p.orient),
                                   p.height, p.diag.lowest, p.diag.centerH, p.diag.contained ? "over" : "not over", OpenXR::xrSurfaceVerdictName(p.verdict));
             ++listed;
         }
         if (np > listed)
-            planes += std::format(" | +{} more", np - listed);
+            planes += std::format(" | +{} more ({} clutter)", np - listed, clutter);
         const std::string name = rec.monitor.data(); // NUL-terminated: copied with room for it
         Log::logger->log(Log::DEBUG, "[OPENXR] surfaces trace: {} {} at [{:.2f}, {:.2f}, {:.2f}] halfW {:.2f} bottom {:.2f} head {}[{:.2f}, {:.2f}, {:.2f}]: {} plane(s), {}{}",
                          name, rec.settle ? "nudged" : "carried", q.content.pos.x, q.content.pos.y, q.content.pos.z, q.halfWidth, q.bottomExt, q.headValid ? "" : "(invalid) ",
@@ -299,11 +305,13 @@ void COpenXRManager::surfaceTraceRecord(const CXRMonitorLayer& l, const OpenXR::
         const bool              stick = sticky != 0 && p.id == sticky;
         auto&                   out   = rec.planes[i];
         OpenXR::xrSurfaceEvaluate(p, q, tun, stick ? std::max(tun.exitDist, tun.snapDist) : tun.snapDist, &out.diag);
-        out.id      = p.id;
-        out.label   = p.label;
-        out.orient  = p.orient;
-        out.verdict = out.diag.verdict;
-        out.height  = p.pose.pos.y;
+        out.id     = p.id;
+        out.label  = p.label;
+        out.orient = p.orient;
+        // clutter is ruled out before the geometry is even looked at (xrSurfacePick)
+        const auto clutter = OpenXR::xrPlaneClutter(p, q);
+        out.verdict        = clutter != OpenXR::XR_SURF_OK ? clutter : out.diag.verdict;
+        out.height         = p.pose.pos.y;
     }
     std::scoped_lock lock(m_surfaceTraceMu);
     m_surfaceTrace[m_surfaceTraceHead] = rec;
