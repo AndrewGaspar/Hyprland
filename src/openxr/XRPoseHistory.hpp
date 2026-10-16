@@ -212,6 +212,7 @@ namespace OpenXR {
         XR_J_FORGET,          // a = monitor id (0 = all), b = count
         XR_J_GEN,             // a = new gen, b = bridge
         XR_J_SHADOW,          // a = shadow seat source, b = agreeing monitors, x = worst disagreement (deg)
+        XR_J_DON_SETTLED,     // research/30 Phase 2: a = token, b = rung, x = settle seconds
     };
 
     struct SXRJournalEntry {

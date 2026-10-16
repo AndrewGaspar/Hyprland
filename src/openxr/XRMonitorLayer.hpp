@@ -361,6 +361,12 @@ class CXRMonitorLayer {
     // What the uniform fade last RENDERED into the swapchain (frame thread only, redraw diff): a
     // change means an animation-only frame must recompose even with no new desktop buffer.
     float              m_fxAlphaDrawn = 1.F;
+    // research/30 Phase 2 (frame thread only): is this an anchor:local monitor (the ones the don gate
+    // hides and fades; refreshed under m_layersMu by the solve every frame), and does the content
+    // snapshot hold the CURRENT content (taken on the last fresh blit), which the don fade needs to
+    // re-apply its alpha on animation-only frames without compounding it into the swapchain.
+    bool m_donLocal  = false;
+    bool m_snapFresh = false;
 
     // Stereo declaration for this monitor (research/24 §5.1 + §6, WP X1/X3), as ONE published word
     // (OpenXR::Stereo::packDecl): which producer made the panes, how the image splits, whether to

@@ -24,11 +24,16 @@ static std::string donoffJson(const COpenXRManager::SXRDonOffStatus& d) {
                        "gazeFrac": {:.3f}, "refusals": [{}], "committed": {}, "shadowSummary": "{}" }},
         "currentDwell": {{ "open": {}, "durationS": {:.1f}, "gazeFrac": {:.3f} }},
         "authoredSinceCommit": {}, "recording": {},
-        "history": {{ "t0SpanS": {:.1f}, "t1SpanS": {:.0f}, "t2SpanS": {:.0f}, "t3SpanS": {:.0f}, "t4SpanS": {:.0f}, "episodes": {} }} }})#",
+        "history": {{ "t0SpanS": {:.1f}, "t1SpanS": {:.0f}, "t2SpanS": {:.0f}, "t3SpanS": {:.0f}, "t4SpanS": {:.0f}, "episodes": {} }},
+        "donGate": {}, "hidden": {},
+        "lastDon": {{ "valid": {}, "decision": "{}", "settle": "{}", "settleMs": {}, "rung": {}, "needPos": {}, "angMaxDeg": {:.1f}, "angMeanDeg": {:.1f}, "pitchDeg": {:.1f},
+                      "rollDeg": {:.1f}, "reason": "{}" }} }})#",
                        d.state, d.sinceMs, d.wearSignal, d.dof, d.originGen, d.placementMemory, d.haveLastDoff ? "true" : "false", d.lastDoffShadow ? "true" : "false",
                        d.lastSeatSource, d.onsetBeforeEdgeMs, d.seatDurationS, d.seatYawDeg, d.yawConcentration, d.gazeFrac, refusals, d.committed, d.shadowSummary,
                        d.dwellOpen ? "true" : "false", d.dwellS, d.dwellGaze, d.authoredSinceCommit, d.recording ? "true" : "false", d.spanS[0], d.spanS[1], d.spanS[2], d.spanS[3],
-                       d.spanS[4], d.episodes);
+                       d.spanS[4], d.episodes, d.donGate ? "true" : "false", d.hidden ? "true" : "false", d.haveLastDon ? "true" : "false", d.lastDonKind, d.lastDonSettle,
+                       d.lastDonSettleMs, d.lastDonRung, d.lastDonNeedPos ? "true" : "false", d.lastDonAngMaxDeg, d.lastDonAngMeanDeg, d.lastDonPitchDeg, d.lastDonRollDeg,
+                       d.lastDonReason);
 }
 
 static std::string openxrStatus(eHyprCtlOutputFormat format) {
@@ -303,6 +308,12 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
         DONOFF.haveLastDoff ? std::format(" — last doff{}: seat {} ({:.0f}s, R̄ {:.2f}){}", DONOFF.lastDoffShadow ? " (shadow)" : "", DONOFF.lastSeatSource, DONOFF.seatDurationS,
                                           DONOFF.yawConcentration, DONOFF.shadowSummary.empty() ? std::string{} : ", " + DONOFF.shadowSummary) :
                               std::string{});
+    // research/30 Phase 2: the don gate and the last settle
+    out += std::format("don settle: {}{}\n",
+                       DONOFF.donGate ? (DONOFF.hidden ? "on — monitors hidden until the head settles" : "on") : "off (placement_memory legacy or don_settle_timeout_ms 0)",
+                       DONOFF.haveLastDon ? std::format(" — last don: {} {} after {} ms (rung {}; {})", DONOFF.lastDonKind, DONOFF.lastDonSettle, DONOFF.lastDonSettleMs,
+                                                        DONOFF.lastDonRung, DONOFF.lastDonReason) :
+                                            std::string{});
     // doc 05 §3.3: the HMD every `when` is matched against (sticky across session end).
     out += std::format("hmd context: {}\n", OpenXR::describeXRSystemContext(g_pOpenXRManager->xrSystemContext()));
     for (const auto& m : MONS) {

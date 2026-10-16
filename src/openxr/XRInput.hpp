@@ -69,6 +69,8 @@ enum class eXRStateEventType : uint8_t {
                      // thread runs the same requestReseatToHead() the `reseat` verb does
     RESEAT_DONE,     // research/30 §7: a GROUP re-seat was planted; the main thread commits exactly
                      // the planted offsets (CXRMonitorLayer::m_reseatPlanted) as the new memory
+    DON_HYDRATED,    // research/30 Phase 2: the don settle decided (a = the gate token); the details
+                     // are in COpenXRManager::m_donHyd (POD under m_donHydMu)
 };
 
 struct SXRStateEvent {

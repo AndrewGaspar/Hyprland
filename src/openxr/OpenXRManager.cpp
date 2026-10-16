@@ -1387,6 +1387,10 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
             // research/30 §7: one SUPER+CTRL+Home must be able to repair a bad memory (D4).
             commitReseatDone();
             break;
+        case eXRStateEventType::DON_HYDRATED:
+            // research/30 Phase 2: the don settle decided; the frame thread already acted on it
+            onDonHydrated(sc<uint32_t>(e.a));
+            break;
         case eXRStateEventType::RECENTERED: {
             // doc 03 §8.4: the runtime moved LOCAL_FLOOR and openxr:recenter = follow, so the user's
             // recenter button means "bring my monitors to me". Re-check the policy HERE (the frame
@@ -1580,6 +1584,11 @@ void COpenXRManager::frameThread() {
     // session start, a reference-space change and a don/doff edge each get one.
     int64_t         stageProbeAt        = 0;
     bool            stageBoundsLogged   = false;
+    // research/30 Phase 2: the don gate's frame-side state starts clean with every session, and a
+    // token the previous session left published must not hide anything in this one
+    m_donFrame           = SXRDonFrame{};
+    m_donFrame.seenToken = m_donGateToken.load(std::memory_order_acquire);
+    m_posTrackedSeen.store(false, std::memory_order_relaxed);
 
     while (m_running.load()) {
         m_session->pollEvents();
@@ -1783,6 +1792,19 @@ void COpenXRManager::frameThread() {
                 viewCount == viewpointViews.size() && (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT);
         }
 
+        // research/30 Phase 2 (§5.3): the don gate's hide and fade, decided ONCE for the frame, before
+        // any blit. While hidden, anchor:local quads are simply not submitted (and nothing is baked
+        // into their swapchains, so the content stays current); after the hydration frame their
+        // uniform alpha eases 0 -> 1. The hydration itself lands later in this loop, on a frame whose
+        // quads were still left out, so the first visible frame is already the fade's first step.
+        const bool donHide  = m_donFrame.hidden;
+        float      donAlpha = 1.F;
+        if (!donHide && m_donFrame.fading) {
+            donAlpha = OpenXR::xrDonFadeAlpha(fs.predictedDisplayTime - m_donFrame.fadeStartPdt, m_donFrame.fadeNs);
+            if (donAlpha >= 1.F)
+                m_donFrame.fading = false;
+        }
+
         // Per-layer: ensure a swapchain, then blit the latest presented buffer into it.
         bool lostInFrame = false; // set if a per-layer xr call reveals a dead/wedged runtime
         for (auto& l : active) {
@@ -1884,12 +1906,16 @@ void COpenXRManager::frameThread() {
             // the content and an animation-only frame can re-apply it from the snapshot alone.
             const float    blackAlpha = l->m_fxBlackAlpha.load(std::memory_order_relaxed);
             const float    blackKnee  = l->m_fxKnee.load(std::memory_order_relaxed);
-            const float    fxAlpha    = l->m_fxAlpha.load(std::memory_order_relaxed);
+            // Phase 2: the don fade multiplies in — but only where the snapshot holds the current
+            // content, because an animation-only frame re-applies the alpha from it; without one the
+            // monitor pops in rather than compounding the fade into whatever image it acquires.
+            const bool  donFadeLayer = l->m_donLocal && !donHide && donAlpha < 1.F && l->m_snapFresh && l->m_contentTex != 0 && l->m_contentTexSize == l->m_swapchainSize;
+            const float fxAlpha      = l->m_fxAlpha.load(std::memory_order_relaxed) * (donFadeLayer ? donAlpha : 1.F);
             // Snapshot the clean content whenever chrome OR any cursor may draw over it, so an
             // animation-only frame (chrome fade or a moving cursor with no new desktop buffer) can
             // restore the content before re-drawing the overlay. A monitor with a uniform fade needs
             // it too: that is what lets the fade animate over a completely static desktop.
-            const bool     snapOn = chromeOn || cursorEnabled || gazeCurEnabled || OpenXR::xrUniformAlphaActive(fxAlpha);
+            const bool    snapOn = chromeOn || cursorEnabled || gazeCurEnabled || OpenXR::xrUniformAlphaActive(fxAlpha) || (l->m_donLocal && (donHide || m_donFrame.fading));
 
             const int64_t nowNs = fs.predictedDisplayTime;
             if (activeNow)
@@ -1975,6 +2001,7 @@ void COpenXRManager::frameThread() {
                     // chrome or the cursor may draw over it — pure overhead otherwise (zero-cost path).
                     if (snapOn)
                         m_graphics->snapshotSwapchain(*l, dst);
+                    l->m_snapFresh = snapOn;
                 } else if (l->m_hasContent) {
                     // Animation-only frame: no new desktop buffer, chrome fading or the cursor moved —
                     // restore the last content into this (possibly different) image, then re-overlay.
@@ -2203,6 +2230,12 @@ void COpenXRManager::frameThread() {
             dt = (float)(fs.predictedDisplayTime - lastPredicted) / 1e9f;
         lastPredicted = fs.predictedDisplayTime;
 
+        // research/30: this frame's head features (the settle detector and the history both read
+        // them), then the don gate. A settling frame arms the RESTORE here, so the consume below runs
+        // it THIS frame, from the settled pose (the hold-window mean) rather than the live head.
+        updateHistFeatures(viewPose, viewValid, viewPosTracked, dt);
+        donGateFrameStep(fs.predictedDisplayTime, viewPose, viewValid, headTrustworthy, viewPosTracked);
+
         const OpenXR::SXRAnchorTuning tune = readAnchorTuning();
 
         // Feed the sampled grip poses (in the reference space) into the anchor solve. In the LOCAL
@@ -2280,9 +2313,16 @@ void COpenXRManager::frameThread() {
             // the repair for a floor that has drifted far off, so only a broken or not-upright head
             // refuses it (xrSeatHeadCheckDeliberate); a far-off one is re-seated with a WARN.
             const auto reseatKind = (OpenXR::eXRReseatKind)m_reseatArmed.load(std::memory_order_acquire);
+            // research/30 Phase 2: a RESTORE armed by the don settle re-seats around the SETTLED head
+            // (yaw-only, mean position of the hold window), never the live sample. Used once: consumed
+            // or refused, the next RESTORE (a discontinuity, say) is about the live head again.
+            const bool             donSeat    = m_donFrame.restorePoseValid && reseatKind == OpenXR::XR_RESEAT_ARM_RESTORE && viewValid;
+            const OpenXR::SXRPose& reseatHead = donSeat ? m_donFrame.restorePose : viewPose;
+            if (donSeat)
+                m_donFrame.restorePoseValid = false;
             const bool deliberate = reseatKind == OpenXR::XR_RESEAT_ARM_GROUP;
             const bool armedNow   = viewValid && reseatKind != OpenXR::XR_RESEAT_ARM_NONE;
-            const auto seatHead   = !armedNow ? OpenXR::XR_SEATHEAD_OK : (deliberate ? OpenXR::xrSeatHeadCheckDeliberate(viewPose) : OpenXR::xrSeatHeadCheck(viewPose));
+            const auto seatHead   = !armedNow ? OpenXR::XR_SEATHEAD_OK : (deliberate ? OpenXR::xrSeatHeadCheckDeliberate(reseatHead) : OpenXR::xrSeatHeadCheck(reseatHead));
             reseatFarHead         = armedNow && deliberate && seatHead == OpenXR::XR_SEATHEAD_OK && OpenXR::xrSeatHeadCheck(viewPose) == OpenXR::XR_SEATHEAD_HEIGHT;
             if (viewValid && reseatKind != OpenXR::XR_RESEAT_ARM_NONE && seatHead != OpenXR::XR_SEATHEAD_OK) {
                 reseatHeadVeto     = seatHead;
@@ -2358,14 +2398,14 @@ void COpenXRManager::frameThread() {
                             OpenXR::SXRAnchorState seat;
                             seat.mode       = OpenXR::XR_ANCHOR_LOCAL;
                             seat.anchorPose = OpenXR::xrPoseInHeadFrame(seatFrame.frame, worlds[i]);
-                            targets[i]->m_anchor.recenterLocalToHead(viewPose, seat);
+                            targets[i]->m_anchor.recenterLocalToHead(reseatHead, seat);
                             // research/30 §7: exactly this offset becomes the memory (RESEAT_DONE below)
                             targets[i]->m_reseatPlanted        = seat.anchorPose;
                             targets[i]->m_reseatPlantedPending = OpenXR::xrPoseFinite(seat.anchorPose);
                         }
                         reseatGrouped = (int)targets.size();
                         reseatDist    = seatFrame.distance;
-                        reseatRise    = viewPose.pos.y - eyeY;
+                        reseatRise    = reseatHead.pos.y - eyeY;
                     }
                 } else {
                     // WHICH offset gets planted is doc 03 §8.3 (xrReseatSource). A config-declared rig
@@ -2383,7 +2423,7 @@ void COpenXRManager::frameThread() {
                             ++reseatRestored;
                         } else
                             ++reseatDeclared;
-                        l->m_anchor.recenterLocalToHead(viewPose, seat);
+                        l->m_anchor.recenterLocalToHead(reseatHead, seat);
                     }
                 }
 
@@ -2395,7 +2435,7 @@ void COpenXRManager::frameThread() {
 
                 // doc 03 §8.4: and the head they were just placed for is the eye height every later
                 // capture measures them against (see the staging block below)
-                m_seatEye      = viewPose.pos;
+                m_seatEye      = reseatHead.pos;
                 m_seatEyeValid = true;
             }
 
@@ -2529,6 +2569,7 @@ void COpenXRManager::frameThread() {
 
             for (size_t i = 0; i < active.size(); ++i) {
                 auto&      l         = active[i];
+                l->m_donLocal        = l->m_anchor.state().mode == OpenXR::XR_ANCHOR_LOCAL; // Phase 2 hide/fade set
                 // Adaptive anchoring needs the head pose for the geofence even though its persistent
                 // mode is LOCAL. When the view is invalid (tracking loss) it falls to the hold-at-
                 // lastWorld branch, which freezes the phase machine + envelope (research/13 §4.2).
@@ -2683,6 +2724,9 @@ void COpenXRManager::frameThread() {
                 continue;
             }
             if (!l->m_quadActive || !l->m_hasContent || !solved[i])
+                continue;
+            // research/30 Phase 2: hidden until the head settles (§5.3); the glyph of Phase 2b goes here
+            if (donHide && l->m_donLocal)
                 continue;
 
             const int w = (int)l->m_swapchainSize.x;
@@ -2939,7 +2983,7 @@ void COpenXRManager::frameThread() {
         recordPoseSample(viewPose, viewValid);
         // research/30 §8: the don/doff history — head features, flags, per-monitor poses. Its own
         // mutex, POD only, after every layer-locked scope of this frame.
-        recordHistorySample(viewPose, viewValid, viewTracked, viewPosTracked, headTrustworthy, dt, histMons, gazeEvaluated, anyRoaming);
+        recordHistorySample(viewPose, viewValid, viewTracked, viewPosTracked, headTrustworthy, histMons, gazeEvaluated, anyRoaming);
 
         // xrEndFrame with zero layers is valid (nothing composited yet) — doc 01.
         XrFrameEndInfo endInfo       = {XR_TYPE_FRAME_END_INFO};
@@ -3996,6 +4040,8 @@ void COpenXRManager::resetPresenceState() {
     // gate). The frame thread's armed flag is cleared too so a stale arm from a prior session cannot
     // re-seat the next one.
     m_reseatArmed.store(OpenXR::XR_RESEAT_ARM_NONE, std::memory_order_release);
+    // research/30 Phase 2: and so does an owed don-settle RESTORE
+    m_donRestore = XR_DONR_NONE;
     // doc 03 §8.3: no session, nothing to capture from. The per-layer offsets themselves deliberately
     // survive — they are what the NEXT session restores the room from.
     publishRestoreCapture();
@@ -4471,7 +4517,10 @@ void COpenXRManager::updateMonitorsPlugged(bool allowGrace) {
                 // RESTORE (doc 03 §8.4): this is the discontinuity case — a brand-new session whose
                 // LOCAL_FLOOR is a frame nothing in the room has ever been measured against, so the
                 // stored head-relative offsets are the only usable description of the arrangement.
-                armReseat(OpenXR::XR_RESEAT_ARM_RESTORE);
+                // research/30 Phase 2: under the don gate the settle runs it instead, from the
+                // settled head (placement_memory = intent, don_settle_timeout_ms > 0).
+                if (!donClaimFirstPlugRestore())
+                    armReseat(OpenXR::XR_RESEAT_ARM_RESTORE);
                 // report 12 §3a: a recenter re-seats every anchor:local monitor around the current
                 // head, so the desk orientation the 2D projection measures against must be re-taken
                 // too — otherwise the plane would describe the arrangement that existed before the
