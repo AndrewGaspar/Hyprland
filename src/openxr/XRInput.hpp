@@ -67,6 +67,8 @@ enum class eXRStateEventType : uint8_t {
                      // may NOT run the re-seat policy itself — deciding it reads a STRING config and
                      // arming it is main-thread bookkeeping — so it hands the edge over and the main
                      // thread runs the same requestReseatToHead() the `reseat` verb does
+    RESEAT_DONE,     // research/30 §7: a GROUP re-seat was planted; the main thread commits exactly
+                     // the planted offsets (CXRMonitorLayer::m_reseatPlanted) as the new memory
 };
 
 struct SXRStateEvent {

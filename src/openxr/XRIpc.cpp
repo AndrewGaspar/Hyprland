@@ -13,6 +13,24 @@
 using namespace Hyprutils::String;
 
 // hyprctl openxr status  (default when no subcommand). The bar-pollable surface (doc 05 §4.3).
+// research/30 §12.2: the `donoff` object of the JSON status.
+static std::string donoffJson(const COpenXRManager::SXRDonOffStatus& d) {
+    std::string refusals;
+    for (size_t i = 0; i < d.refusals.size(); ++i) {
+        refusals += std::format("{}\"{}\"", i ? ", " : "", d.refusals[i]);
+    }
+    return std::format(R"#({{ "state": "{}", "sinceMs": {}, "wearSignal": "{}", "dof": {}, "originGen": {}, "placementMemory": "{}",
+        "lastDoff": {{ "valid": {}, "shadow": {}, "seatSource": "{}", "onsetBeforeEdgeMs": {}, "seatDurationS": {:.1f}, "seatYawDeg": {:.1f}, "yawConcentration": {:.3f},
+                       "gazeFrac": {:.3f}, "refusals": [{}], "committed": {}, "shadowSummary": "{}" }},
+        "currentDwell": {{ "open": {}, "durationS": {:.1f}, "gazeFrac": {:.3f} }},
+        "authoredSinceCommit": {}, "recording": {},
+        "history": {{ "t0SpanS": {:.1f}, "t1SpanS": {:.0f}, "t2SpanS": {:.0f}, "t3SpanS": {:.0f}, "t4SpanS": {:.0f}, "episodes": {} }} }})#",
+                       d.state, d.sinceMs, d.wearSignal, d.dof, d.originGen, d.placementMemory, d.haveLastDoff ? "true" : "false", d.lastDoffShadow ? "true" : "false",
+                       d.lastSeatSource, d.onsetBeforeEdgeMs, d.seatDurationS, d.seatYawDeg, d.yawConcentration, d.gazeFrac, refusals, d.committed, d.shadowSummary,
+                       d.dwellOpen ? "true" : "false", d.dwellS, d.dwellGaze, d.authoredSinceCommit, d.recording ? "true" : "false", d.spanS[0], d.spanS[1], d.spanS[2], d.spanS[3],
+                       d.spanS[4], d.episodes);
+}
+
 static std::string openxrStatus(eHyprCtlOutputFormat format) {
     const auto        STATE   = COpenXRManager::stateToString(g_pOpenXRManager->state());
     const std::string RUNTIME = g_pOpenXRManager->runtimeName();
@@ -89,6 +107,8 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     // how often it has moved. Read-only instrumentation for the attended probe that gates Track W;
     // nothing is anchored in STAGE yet. "unavailable" on a runtime that does not offer one.
     const auto        WORLD = g_pOpenXRManager->worldFrameStatus();
+    // research/30 §12.2: the don/doff FSM, the last doff's seat verdict (or its shadow), the dwell.
+    const auto        DONOFF    = g_pOpenXRManager->donoffStatus();
     auto              handLabel = [](const COpenXRManager::SXRHandInputInfo& hi) -> std::string {
         if (!hi.hands)
             return "controllers";
@@ -99,7 +119,8 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
         std::string mons;
         for (size_t i = 0; i < MONS.size(); ++i) {
             const auto& m = MONS[i];
-            mons += std::format(R"#(        {{
+            mons +=
+                std::format(R"#(        {{
             "name": "{}",
             "id": {},
             "size_m": {:.2f},
@@ -134,7 +155,8 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
                 "offset": [{:.3f}, {:.3f}, {:.3f}],
                 "staged": {},
                 "stagedOffset": [{:.3f}, {:.3f}, {:.3f}],
-                "lastCommit": "{}"
+                "lastCommit": "{}",
+                "provenance": {{ "source": "{}", "ageS": {:.0f}, "seatDurationS": {:.0f} }}
             }},
             "layout2d": {{
                 "source": "{}",
@@ -157,11 +179,12 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
                 "transitioning": {}
             }}
         }})#",
-                                m.name, m.id, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.quatX, m.quatY, m.quatZ, m.quatW, m.grabbed ? "true" : "false",
-                                m.grabKind, m.hovered ? "true" : "false", m.region, m.plugged ? "true" : "false", m.contentPath, m.linear ? "true" : "false", m.stereo, m.producer, m.chrome ? "true" : "false", m.quads, m.adaptiveEnabled ? "true" : "false", m.adaptivePhase,
-                                m.adaptiveRoamMode, m.adaptiveSeatDist, m.adaptiveT, m.anchorState, m.restorable ? "true" : "false", m.restoreX, m.restoreY, m.restoreZ,
-                                m.staged ? "true" : "false", m.stagedX, m.stagedY, m.stagedZ, m.commit, m.l2dSource, m.l2dCol, m.l2dRow, m.l2dX, m.l2dY, m.l2dAzDeg, m.l2dElDeg, m.fxAlpha, m.fxAlphaTarget, m.fxAlphaSrc, m.fxBlackAlpha, m.fxBlackAlphaTarget,
-                                m.fxBlackAlphaSrc, m.fxKnee, m.fxKneeSrc, m.fxTransitioning ? "true" : "false");
+                            m.name, m.id, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.quatX, m.quatY, m.quatZ, m.quatW, m.grabbed ? "true" : "false", m.grabKind,
+                            m.hovered ? "true" : "false", m.region, m.plugged ? "true" : "false", m.contentPath, m.linear ? "true" : "false", m.stereo, m.producer,
+                            m.chrome ? "true" : "false", m.quads, m.adaptiveEnabled ? "true" : "false", m.adaptivePhase, m.adaptiveRoamMode, m.adaptiveSeatDist, m.adaptiveT,
+                            m.anchorState, m.restorable ? "true" : "false", m.restoreX, m.restoreY, m.restoreZ, m.staged ? "true" : "false", m.stagedX, m.stagedY, m.stagedZ,
+                            m.commit, m.provenance, m.provenanceAgeS, m.provenanceSeatS, m.l2dSource, m.l2dCol, m.l2dRow, m.l2dX, m.l2dY, m.l2dAzDeg, m.l2dElDeg, m.fxAlpha,
+                            m.fxAlphaTarget, m.fxAlphaSrc, m.fxBlackAlpha, m.fxBlackAlphaTarget, m.fxBlackAlphaSrc, m.fxKnee, m.fxKneeSrc, m.fxTransitioning ? "true" : "false");
             if (i + 1 < MONS.size())
                 mons += ",\n";
             else
@@ -185,6 +208,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     "recenterPolicy": "{}",
     "userPresence": "{}",
     "restoreCapture": {},
+    "donoff": {},
     "worldFrame": {{ "available": {}, "located": {}, "tracked": {}, "pose": [{:.3f}, {:.3f}, {:.3f}], "yawDeg": {:.1f}, "probes": {}, "changes": {}, "unresolvable": {} }},
     "visible": "{}",
     "reprobeWaiting": "{}",
@@ -209,14 +233,13 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
 )#",
                            STATE, RUNTIME, SYSTEM, RTGPU, RTJSON, BLOCKED, BLEND, BLACK.configured, BLACK.effective, BLACK.knee, BLACK.active ? "true" : "false",
                            BLACK.gatedOff ? "true" : "false", OVERLAY ? "true" : "false", MONITOR_VIEW ? "shown" : "hidden", SELECTED, FOLLOW, UNPLUG_PEND, RECENTER, PRESENCE,
-                           RESTORE_CAPTURE ? "true" : "false", WORLD.available ? "true" : "false", WORLD.located ? "true" : "false", WORLD.tracked ? "true" : "false", WORLD.x,
-                           WORLD.y, WORLD.z, WORLD.yawDeg, WORLD.probes, WORLD.changes, WORLD.unresolvable, VISIBLE, REPROBE_WAIT, REPROBE_MS,
-                           REPROBE_WATCH ? "true" : "false", MANUAL_DISABLE ? "true" : "false",
-                           INHIBITING_IDLE ? "true" : "false", INHIBIT_MODE, HANDIN.mode, HANDIN.state, GAZE.source, GAZE.hoveredMonitor, GAZE.hoveredName,
-                           GAZE.carrying ? "true" : "false", GAZE.carryMonitor, GAZE.dist, HANDS[0].hands ? "hands" : "controllers", HANDS[0].gesture,
-                           HANDS[0].filtered ? "true" : "false", HANDS[1].hands ? "hands" : "controllers", HANDS[1].gesture, HANDS[1].filtered ? "true" : "false",
-                           L2D.enabled ? "true" : "false", L2D.frozen ? "true" : "false", L2D.refValid ? "true" : "false", L2D.refYawDeg, L2D.placed, L2D.rows, L2D.width,
-                           L2D.height, L2D.vertical, L2D.attach, L2D.pxPerDegree, MONS.empty() ? "" : "\n", mons);
+                           RESTORE_CAPTURE ? "true" : "false", donoffJson(DONOFF), WORLD.available ? "true" : "false", WORLD.located ? "true" : "false",
+                           WORLD.tracked ? "true" : "false", WORLD.x, WORLD.y, WORLD.z, WORLD.yawDeg, WORLD.probes, WORLD.changes, WORLD.unresolvable, VISIBLE, REPROBE_WAIT,
+                           REPROBE_MS, REPROBE_WATCH ? "true" : "false", MANUAL_DISABLE ? "true" : "false", INHIBITING_IDLE ? "true" : "false", INHIBIT_MODE, HANDIN.mode,
+                           HANDIN.state, GAZE.source, GAZE.hoveredMonitor, GAZE.hoveredName, GAZE.carrying ? "true" : "false", GAZE.carryMonitor, GAZE.dist,
+                           HANDS[0].hands ? "hands" : "controllers", HANDS[0].gesture, HANDS[0].filtered ? "true" : "false", HANDS[1].hands ? "hands" : "controllers",
+                           HANDS[1].gesture, HANDS[1].filtered ? "true" : "false", L2D.enabled ? "true" : "false", L2D.frozen ? "true" : "false", L2D.refValid ? "true" : "false",
+                           L2D.refYawDeg, L2D.placed, L2D.rows, L2D.width, L2D.height, L2D.vertical, L2D.attach, L2D.pxPerDegree, MONS.empty() ? "" : "\n", mons);
     }
 
     const std::string FOLLOWLINE = UNPLUG_PEND >= 0 ? std::format("{} (unplug in {}ms)", FOLLOW, UNPLUG_PEND) : FOLLOW;
@@ -272,6 +295,12 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
                     STATELINE, BLOCKEDLINE, RUNTIME, SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, RTJSON.empty() ? "(loader default)" : RTJSON, BLEND, BLACKLINE, OVERLAY ? "yes" : "no",
                     MONITOR_VIEW ? "shown" : "hidden", SELECTED.empty() ? "(none)" : SELECTED, FOLLOWLINE, RECENTER, VISIBLE, PRESENCE, INHIBITING_IDLE ? "yes" : "no", INHIBIT_MODE, RESTORE_CAPTURE ? "on" : "off",
                     WORLDLINE, HANDIN.state, HANDIN.mode, GAZE.source, GAZELINE, handLabel(HANDS[0]), handLabel(HANDS[1]), L2DLINE);
+    // research/30 §12.2: one line for the don/doff FSM and the last doff verdict.
+    out += std::format(
+        "don/doff: {} (wear signal {}, {}DoF, origin gen {}, placement_memory {}){}\n", DONOFF.state, DONOFF.wearSignal, DONOFF.dof, DONOFF.originGen, DONOFF.placementMemory,
+        DONOFF.haveLastDoff ? std::format(" — last doff{}: seat {} ({:.0f}s, R̄ {:.2f}){}", DONOFF.lastDoffShadow ? " (shadow)" : "", DONOFF.lastSeatSource, DONOFF.seatDurationS,
+                                          DONOFF.yawConcentration, DONOFF.shadowSummary.empty() ? std::string{} : ", " + DONOFF.shadowSummary) :
+                              std::string{});
     // doc 05 §3.3: the HMD every `when` is matched against (sticky across session end).
     out += std::format("hmd context: {}\n", OpenXR::describeXRSystemContext(g_pOpenXRManager->xrSystemContext()));
     for (const auto& m : MONS) {
@@ -301,8 +330,9 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
         // value and the last commit verdict — "staged but refused" and "nothing captured at all" are
         // different diagnoses and used to look identical from here.
         if (m.anchorMode == "local") {
-            out += m.restorable ? std::format("  {}: restore [{:.2f}, {:.2f}, {:.2f}] (head-relative)", m.name, m.restoreX, m.restoreY, m.restoreZ)
-                                : std::format("  {}: restore none — a new session re-seats it from its declared rig", m.name);
+            out += m.restorable ? std::format("  {}: restore [{:.2f}, {:.2f}, {:.2f}] (head-relative; {}{})", m.name, m.restoreX, m.restoreY, m.restoreZ, m.provenance,
+                                              m.provenanceAgeS >= 0.f ? std::format(", {:.0f}s ago", m.provenanceAgeS) : std::string{}) :
+                                  std::format("  {}: restore none — a new session re-seats it from its declared rig", m.name);
             out += m.staged ? std::format(", staged [{:.2f}, {:.2f}, {:.2f}], last commit {}\n", m.stagedX, m.stagedY, m.stagedZ, m.commit)
                             : std::format(", nothing staged, last commit {}\n", m.commit);
         }
@@ -483,6 +513,19 @@ static std::string openxrRequest(eHyprCtlOutputFormat format, std::string reques
         auto r = g_pOpenXRManager->cmdReseat();
         return r ? *r : r.error();
     }
+    // research/30 §7: drop the remembered placement(s); the next session re-seats from the rig.
+    if (SUBCOMMAND == "forget") {
+        auto r = g_pOpenXRManager->cmdForget(ARGS);
+        return r ? *r : r.error();
+    }
+    // research/30 §12.3 / §13.4: the don/doff diagnostic dump, and opt-in trace recording.
+    if (SUBCOMMAND == "donoff") {
+        if (vars[2] == "record") {
+            auto r = g_pOpenXRManager->cmdDonoffRecord(vars[3]);
+            return r ? *r : r.error();
+        }
+        return g_pOpenXRManager->donoffDump();
+    }
     // hypxrvoice GAP 2: drop a named monitor at a resolved LOCAL_FLOOR point (facing the headset).
     if (SUBCOMMAND == "place") {
         auto r = g_pOpenXRManager->cmdPlace(ARGS);
@@ -552,9 +595,10 @@ static std::string openxrRequest(eHyprCtlOutputFormat format, std::string reques
     if (SUBCOMMAND == "gaze")
         return openxrGaze(format, ARGS);
 
-    return std::format("unknown openxr subcommand '{}'. Valid: status, enable, disable, create, destroy, select, anchor, move, rotate, scale, distance, center, reseat, place, "
-                       "alpha, blackalpha, adaptive, dock, undock, roam, gazegrab, gazerelease, gazepush, handinput, view, gaze, layout, sync-layout",
-                       SUBCOMMAND);
+    return std::format(
+        "unknown openxr subcommand '{}'. Valid: status, enable, disable, create, destroy, select, anchor, move, rotate, scale, distance, center, reseat, forget, donoff, place, "
+        "alpha, blackalpha, adaptive, dock, undock, roam, gazegrab, gazerelease, gazepush, handinput, view, gaze, layout, sync-layout",
+        SUBCOMMAND);
 }
 
 CXRIpc::CXRIpc() = default;

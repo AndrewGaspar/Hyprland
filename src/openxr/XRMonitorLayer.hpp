@@ -20,6 +20,7 @@
 #include "XRStereoPair.hpp"    // OpenXR::Stereo::SPaneGeom / SPairDecl (pure, unguarded)
 #include "XRMonitorConfig.hpp" // SXRMonitorParams / OpenXR::SXRAnchorSpec (unguarded)
 #include "XRRule.hpp"          // SXREffects / SXRResolvedEffects / SXRFxEnv (unguarded)
+#include "XRDonDoff.hpp"       // research/30: SXRRestoreProvenance (pure, unguarded)
 #include "XRViewpointTransport.hpp"
 #include "XRViewpointEligibility.hpp"
 #include "../helpers/memory/Memory.hpp"
@@ -146,6 +147,18 @@ class CXRMonitorLayer {
     // Why the last commit attempt did (not) take, for `hyprctl openxr status` — a refusal that cannot
     // be read back is indistinguishable from a capture that never ran (invariant I9).
     uint8_t                 m_restoreLastCommit  = OpenXR::XR_COMMIT_NOTHING_STAGED;
+    // research/30 §6.4: where m_restoreOffset came from (a dwell, a re-seat, the legacy gate, …) and
+    // when. POD under m_layersMu.
+    OpenXR::SXRRestoreProvenance m_restoreProv;
+    // research/30 §7: the offset a GROUP re-seat just planted, handed to the main thread (RESEAT_DONE)
+    // so the memory becomes exactly what the user now sees. Frame thread writes, main consumes; both
+    // under m_layersMu.
+    OpenXR::SXRPose m_reseatPlanted;
+    bool            m_reseatPlantedPending = false;
+    // research/30 §8.4: the stable id the history knows this monitor by — never 0, never reused,
+    // unaffected by plug/unplug (unlike MONITORID) and by renames. Set once at construction.
+    const uint32_t  m_histId = nextHistId();
+    static uint32_t nextHistId();
 
     // ---- is this monitor's anchorPose still expressed in a live frame? (research/28 §F) ----
     // m_anchorFrameStale is raised for every layer whenever the reference frame stops meaning what it
