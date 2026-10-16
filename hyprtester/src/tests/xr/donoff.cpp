@@ -103,7 +103,11 @@ namespace {
 
     // A dwell facing the monitor, the lift-and-flip take-off, then the session ends. Returns the
     // status JSON read after the session is down.
-    std::string dwellThenFlipThenEnd(CRemoteClient* remote) {
+    std::string dwellThenFlipThenEnd(CRemoteClient* remote, const std::string& mon) {
+        // No previous memory: the legacy drift gate would otherwise refuse a flipped capture by
+        // comparing it with the create-time seed, and this would not test the upright guard at all.
+        // A FIRST commit only ever had the 8 m reach bound (R4), which is how the flip got in.
+        getFromSocket("/openxr forget " + mon);
         swayHold(remote, 0.f, 0.f, 10500);
         liftAndFlip(remote);
         getFromSocket("/openxr disable");
@@ -133,7 +137,7 @@ TEST_CASE(xr_doff_legacy_upright_and_shadow) {
     ASSERT(createAhead(remote, mon), true);
     guard.monitorName = mon;
 
-    const std::string st = dwellThenFlipThenEnd(remote);
+    const std::string st = dwellThenFlipThenEnd(remote, mon);
     const auto        p  = XR::findAfter(st, "\"name\": \"" + mon + "\"");
     ASSERT_NOT(p, std::string::npos);
     const auto off = restoreOffsetOf(st, p);
@@ -167,7 +171,7 @@ TEST_CASE(xr_doff_intent_commits_dwell) {
     ASSERT(createAhead(remote, mon), true);
     guard.monitorName = mon;
 
-    const std::string st = dwellThenFlipThenEnd(remote);
+    const std::string st = dwellThenFlipThenEnd(remote, mon);
     const auto        p  = XR::findAfter(st, "\"name\": \"" + mon + "\"");
     ASSERT_NOT(p, std::string::npos);
     const auto off = restoreOffsetOf(st, p);

@@ -425,7 +425,7 @@ void COpenXRManager::doffCommit(const char* why) {
         }
         if (!ok)
             Log::logger->log(c.legacyValid ? Log::WARN : Log::DEBUG,
-                             "[OPENXR] shadow:   {}: would remember [{:.2f}, {:.2f}, {:.2f}] vs legacy {} [{:.2f}, {:.2f}, {:.2f}] (Δ {:.2f} m, bearing Δ {:.0f}°)", c.name,
+                             "[OPENXR] shadow:   {}: would remember [{:.2f}, {:.2f}, {:.2f}] vs memory ({}) [{:.2f}, {:.2f}, {:.2f}] (Δ {:.2f} m, bearing Δ {:.0f}°)", c.name,
                              c.would.pos.x, c.would.pos.y, c.would.pos.z, c.legacyValid ? OpenXR::xrSeatSourceName(c.legacySrc) : "none", c.legacy.pos.x, c.legacy.pos.y,
                              c.legacy.pos.z, dm, db);
     }
