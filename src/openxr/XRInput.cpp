@@ -851,9 +851,12 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                 if (std::fabs(stick.x) > XR_STICK_DEADZONE)
                     target->anchor->grabResize(stick.x * XR_GRAB_RESIZE_SPEED * solveIn.dt);
                 // Record the carried world pose for the release latch (WP-G4). The solve already
-                // ran this frame, so lastWorld() is this frame's grip ∘ offset composed pose.
+                // ran this frame, so carryWorld() is this frame's grip ∘ offset composed pose — the
+                // CARRIED one, which a surface preview (research/32 C2) does not replace, so a release
+                // re-decides the snap from where the hand actually is. Identical to lastWorld() whenever
+                // nothing is previewed.
                 if (target->anchor->hasLastWorld())
-                    m_grabRing[hand].push(target->anchor->lastWorld(), timeMs);
+                    m_grabRing[hand].push(target->anchor->carryWorld(), timeMs);
             }
         }
     }

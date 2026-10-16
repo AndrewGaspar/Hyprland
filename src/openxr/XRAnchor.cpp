@@ -176,6 +176,8 @@ void CXRAnchor::initFromState(const SXRAnchorState& state) {
     m_seedLeashAtTarget  = false;
     m_adRoamRuntimeSet   = false;
     m_adLeftSinceDock    = false;
+    m_surfaceArm         = SXRSurfaceArm{};
+    m_surfaceSnapPending = false;
     // m_lastWorld / m_hasLastWorld intentionally preserved: switching representation of an
     // existing on-screen quad should not lose where it currently is.
 }
@@ -262,8 +264,16 @@ SXRSolveResult CXRAnchor::solve(const SXRSolveInput& in, const SXRAnchorTuning& 
             res.pose  = world;
         } else
             res.pose = m_grabOffset;
-        res.worldPose  = world;
-        m_lastWorld    = world;
+        res.worldPose = world;
+        m_carryWorld  = world;
+        // research/32 C2: near a surface the carried window is SHOWN where it would land — that is the
+        // preview. The carry itself (m_carryWorld, the release ring) keeps tracking the hand.
+        if (m_surfaceArm.preview) {
+            res.space     = XR_SPACE_LOCAL_FLOOR;
+            res.pose      = m_surfaceArm.previewPose;
+            res.worldPose = m_surfaceArm.previewPose;
+        }
+        m_lastWorld    = res.worldPose;
         m_hasLastWorld = true;
         return res;
     }
@@ -283,8 +293,11 @@ SXRSolveResult CXRAnchor::solve(const SXRSolveInput& in, const SXRAnchorTuning& 
         const Vec3 P           = origin + dir * m_gazeDist;
         const Quat R           = lookAtNoRoll(P, in.view.pos, m_lastWorld.rot);
 
-        res.space      = XR_SPACE_LOCAL_FLOOR;
-        res.pose       = SXRPose{P, R};
+        res.space    = XR_SPACE_LOCAL_FLOOR;
+        res.pose     = SXRPose{P, R};
+        m_carryWorld = res.pose;
+        if (m_surfaceArm.preview) // research/32 C2: the preview, as in the hand-grab override
+            res.pose = m_surfaceArm.previewPose;
         res.worldPose  = res.pose;
         m_lastWorld    = res.pose;
         m_hasLastWorld = true;
@@ -627,6 +640,8 @@ void CXRAnchor::beginGrab(eXRHand hand, const SXRPose& deviceWorld, bool usePinc
     // Capture the quad's current displayed world pose relative to the grabbing hand's device
     // pose (§4.1). `deviceWorld` is the grip pose (controllers/grasp) or the pinch pose (WP-G5).
     m_grabOffset     = poseCompose(poseInverse(deviceWorld), m_lastWorld);
+    m_carryWorld     = m_lastWorld;
+    m_surfaceArm     = SXRSurfaceArm{};
     m_grabbed        = true;
     m_grabHand       = hand;
     m_grabPinch      = usePinch;
@@ -741,6 +756,9 @@ void CXRAnchor::endGrab(const SXRPose& releaseWorld, const SXRSolveInput& in, co
     m_grabbed   = false;
     m_grabPinch = false;
 
+    if (surfaceSnapOnRelease(releaseWorld))
+        return;
+
     SXRVerbContext ctx;
     ctx.view      = in.view;
     ctx.viewValid = true;
@@ -762,6 +780,7 @@ bool CXRAnchor::abortGrab(const SXRSolveInput& in, const SXRAnchorTuning& tune) 
     m_grabbed          = false;
     m_grabPinch        = false;
     m_resizing         = false;
+    m_surfaceArm       = SXRSurfaceArm{}; // an abort never snaps: the hand did not let go
 
     // A MOVE grab is a device lock, so the quad's persistent state is still the PRE-grab pose and
     // dropping the flag alone would teleport it back. m_lastWorld is this frame's composed
@@ -793,6 +812,8 @@ void CXRAnchor::beginGazeGrab(const SXRPose& view, bool follow) {
     m_gazeFrozenDir    = d > 1e-5F ? toQuad / d : poseForward(view.rot);
     m_gazeFollow       = follow;
     m_gazeGrabbed      = true;
+    m_carryWorld       = m_lastWorld;
+    m_surfaceArm       = SXRSurfaceArm{};
 
     // Adaptive: a gaze carry suspends the geofence (the override returns before adaptiveStep). Settle
     // any mid-flight transition to the nearer endpoint + reset the dwell timers, exactly as a hand
@@ -818,6 +839,11 @@ void CXRAnchor::gazeSetDist(float absMeters) {
 
 void CXRAnchor::endGazeGrab(const SXRSolveInput& in, const SXRAnchorTuning& tune) {
     m_gazeGrabbed = false;
+
+    // research/32 C2: a keyboard release does not jerk the head, so the carried pose itself is the
+    // release pose — the same decision the hand release makes from its latched one.
+    if (surfaceSnapOnRelease(m_carryWorld))
+        return;
 
     SXRVerbContext ctx;
     ctx.view      = in.view;
@@ -1033,6 +1059,7 @@ void CXRAnchor::placeLocalAt(const SXRPose& W) {
     m_grabHandActive   = false;
     m_gazeGrabbed      = false;
     m_resizing         = false;
+    m_surfaceArm       = SXRSurfaceArm{};
     m_carryFilter.reset();
     m_adPhase          = XRAD_DOCKED;
     m_dockSeatCaptured = false;
@@ -1153,4 +1180,49 @@ void CXRAnchor::recenterLocalToHead(const SXRPose& view, const SXRAnchorState& s
         m_adRoamRuntimeSet = false;
         m_adLeftSinceDock  = false;
     }
+}
+
+// ---- surfaces (research/32 C2) ----
+
+void CXRAnchor::setSurfaceArm(const SXRSurfaceArm& arm) {
+    m_surfaceArm = arm;
+}
+
+void CXRAnchor::clearSurfaceArm() {
+    m_surfaceArm.havePlane = false;
+    m_surfaceArm.preview   = false;
+}
+
+const SXRSurfaceArm& CXRAnchor::surfaceArm() const {
+    return m_surfaceArm;
+}
+
+SXRPose CXRAnchor::carryWorld() const {
+    return (m_grabbed || m_gazeGrabbed) ? m_carryWorld : m_lastWorld;
+}
+
+eXRHand CXRAnchor::grabHand() const {
+    return m_grabHand;
+}
+
+bool CXRAnchor::takeSurfaceSnap(SXRSurfaceCandidate& out) {
+    if (!m_surfaceSnapPending)
+        return false;
+    m_surfaceSnapPending = false;
+    out                  = m_surfaceSnap;
+    return true;
+}
+
+bool CXRAnchor::surfaceSnapOnRelease(const SXRPose& releaseWorld) {
+    const bool armed = m_surfaceArm.havePlane;
+    const auto c     = armed ? xrSurfaceRelease(m_surfaceArm, releaseWorld, m_surfaceArm.query.head, m_surfaceArm.query.headValid) : SXRSurfaceCandidate{};
+    m_surfaceArm     = SXRSurfaceArm{};
+    if (!c.ok)
+        return false;
+    // A placement on a surface is a world placement: anchor:local, warped there, adaptive re-docked
+    // at it — exactly the voice `place` verb's contract.
+    placeLocalAt(c.pose);
+    m_surfaceSnap        = c;
+    m_surfaceSnapPending = true;
+    return true;
 }
