@@ -156,7 +156,9 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
                 "staged": {},
                 "stagedOffset": [{:.3f}, {:.3f}, {:.3f}],
                 "lastCommit": "{}",
-                "provenance": {{ "source": "{}", "ageS": {:.0f}, "seatDurationS": {:.0f} }}
+                "provenance": "{}",
+                "provenanceAgeS": {:.0f},
+                "provenanceSeatS": {:.0f}
             }},
             "layout2d": {{
                 "source": "{}",
