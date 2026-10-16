@@ -840,6 +840,41 @@ class COpenXRManager {
     SXRSurfaceSnapRecord m_surfaceSnapRec;
     std::string          m_surfaceSnapMonitor; // main
 
+    // frame -> main: the carry trace. While a window is carried (and on every keyboard-nudge
+    // settle) the frame pass writes, at most every XR_SURFACE_TRACE_MS, what each plane looked like
+    // to the snap: POD records into a small ring under m_surfaceTraceMu. The main thread formats and
+    // logs them (Log::DEBUG) from the poll timer, so the frame thread neither formats nor allocates.
+    struct SXRSurfaceTraceRec {
+        struct SPlane {
+            uint64_t                  id      = 0;
+            OpenXR::eXRPlaneLabel     label   = OpenXR::XR_PLANE_LABEL_UNKNOWN;
+            OpenXR::eXRPlaneOrient    orient  = OpenXR::XR_PLANE_ARBITRARY;
+            OpenXR::eXRSurfaceVerdict verdict = OpenXR::XR_SURF_OK;
+            OpenXR::SXRSurfaceDiag    diag;
+            float                     height = 0.F; // the plane's center height (solver frame)
+        };
+        std::array<char, 64>                     monitor{};
+        bool                                     settle = false; // a keyboard nudge, not a carry
+        OpenXR::SXRSurfaceQuery                  query;
+        uint64_t                                 picked  = 0; // 0 = nothing qualified
+        uint64_t                                 armed   = 0; // the plane kept armed (not previewed)
+        uint8_t                                  nPlanes = 0;
+        std::array<SPlane, OpenXR::XR_PLANE_MAX> planes{};
+    };
+    static constexpr int64_t          XR_SURFACE_TRACE_MS = 500;
+    std::mutex                        m_surfaceTraceMu;
+    std::array<SXRSurfaceTraceRec, 4> m_surfaceTrace{}; // ring
+    size_t                            m_surfaceTraceHead   = 0;
+    size_t                            m_surfaceTraceCount  = 0;
+    uint32_t                          m_surfaceTraceLost   = 0; // records overwritten before a drain
+    int64_t                           m_surfaceTraceLastMs = 0; // frame thread only
+    // FRAME: one record of what the snap saw for this window
+    void surfaceTraceRecord(const CXRMonitorLayer& l, const OpenXR::SXRSurfaceQuery& q, bool settle, uint64_t picked, uint64_t armed, uint64_t sticky);
+    // MAIN: format and log the pending records
+    void surfaceTraceDrain();
+    // MAIN, under m_layersMu, before endGazeGrab: what the release re-decides against
+    void surfaceLogGazeRelease(const CXRMonitorLayer& l);
+
     // Signature of every config value a bring-up attempt depends on (openxr:enabled, :gpu,
     // :runtime_json, :blend_mode, :overlay(_z), :ignore_kernel_taint, :reprobe*). MAIN THREAD only —
     // it reads STRING config values. Returns true when it differs from m_lastProbeInputs, and
