@@ -11,6 +11,7 @@
 #include <cmath>
 #include <string>
 #include <thread>
+#include <atomic>
 #include <vector>
 
 // docs/openxr/research/30-donoff-intent.md §13.2 — don/doff intent, Phases 0/1, end to end against
@@ -78,6 +79,7 @@ struct SDonOffGuard {
     std::string monitorName;
     ~SDonOffGuard() {
         getFromSocket("/keyword openxr:placement_memory legacy");
+        getFromSocket("/keyword openxr:don_settle_timeout_ms 3000");
         getFromSocket("/openxr enable");
         XR::waitForXrState("focused", std::chrono::milliseconds(15000));
         if (!monitorName.empty())
@@ -247,6 +249,98 @@ TEST_CASE(xr_reseat_commits_memory_and_forget) {
     // the diagnostic dump answers
     EXPECT(getFromSocket("/openxr donoff").starts_with("don/doff: "), true);
     NLog::green("xr_reseat_commits_memory_and_forget: re-seat committed immediately; forget dropped it");
+}
+
+// research/30 Phase 2: under placement_memory = intent, the first don of a session hides the
+// anchor:local monitors while the head is still being fitted, and re-seats them from the SETTLED head
+// — not the one a few frames after the edge. The head swings ±40° (the fitting) across the whole
+// session start, then rests at yaw 25°: the monitor must come back facing 25°, not a swing extreme.
+TEST_CASE(xr_don_settle_hides_until_still) {
+    XR_SKIP_IF_UNAVAILABLE();
+    const std::string mon = XR::monitorName(34);
+    SDonOffGuard      guard{this->failed, name(), ""};
+    if (!gateUp()) {
+        XR::logSkip(name(), "session never reached focused/visible (known env instability)");
+        return;
+    }
+    auto* remote = XR::g_ctx.remote;
+    if (!remote) {
+        XR::logSkip(name(), "no remote client available");
+        return;
+    }
+    ASSERT(getFromSocket("/keyword openxr:monitors_follow_session visible"), std::string("ok"));
+    ASSERT(getFromSocket("/keyword openxr:recenter_on_plug true"), std::string("ok"));
+    ASSERT(getFromSocket("/keyword openxr:placement_memory legacy"), std::string("ok"));
+    {
+        // the gate is off under the shipped default: the don path is the legacy one
+        const std::string st = getFromSocket("j/openxr");
+        EXPECT(XR::fieldAfter(st, XR::findAfter(st, "\"donoff\""), "donGate"), std::string("false"));
+    }
+    ASSERT(getFromSocket("/keyword openxr:placement_memory intent"), std::string("ok"));
+    ASSERT(getFromSocket("/keyword openxr:don_settle_timeout_ms 6000"), std::string("ok"));
+    ASSERT(createAhead(remote, mon), true);
+    guard.monitorName = mon;
+    {
+        const std::string st = getFromSocket("j/openxr");
+        EXPECT(XR::fieldAfter(st, XR::findAfter(st, "\"donoff\""), "donGate"), std::string("true"));
+    }
+
+    getFromSocket("/openxr disable");
+    ASSERT(XR::waitForXrState("disabled", std::chrono::milliseconds(10000)), true);
+
+    constexpr float   DEG25 = 25.f * static_cast<float>(M_PI) / 180.f;
+    std::atomic<bool> stopSwing{false};
+    std::thread       head([&] {
+        // the fitting: ±40° yaw at 1 Hz, through the session start and well past the don edge
+        remote->animate(
+            [](MonadoWire::r_remote_data& d, float t01) {
+                const float t              = t01 * 3.f;
+                d.head.center.orientation  = yawPitch(DEG25 + 40.f * static_cast<float>(M_PI) / 180.f * std::sin(t * 2.f * static_cast<float>(M_PI)), 0.f);
+                d.head.center.position     = MonadoWire::xrt_vec3{0.f, 0.f, 0.f};
+                d.head.per_view_data_valid = false;
+            },
+            std::chrono::milliseconds(3000), 60);
+        // then at rest facing 25° (sin(2π·3) = 0: continuous with the swing's end)
+        while (!stopSwing.load())
+            swayHold(remote, DEG25, 0.f, 500);
+    });
+
+    getFromSocket("/openxr enable");
+    bool        sawHidden = false;
+    std::string st;
+    const auto  until = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (std::chrono::steady_clock::now() < until) {
+        st                = getFromSocket("j/openxr");
+        const auto donoff = XR::findAfter(st, "\"donoff\"");
+        if (XR::fieldAfter(st, donoff, "hidden") == "true")
+            sawHidden = true;
+        const auto last = XR::findAfter(st, "\"lastDon\"");
+        const auto set  = XR::fieldAfter(st, last, "settle");
+        if (set == "settled" || set == "timeout" || set == "backstop")
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // the re-seat lands and the fade runs
+    st = getFromSocket("j/openxr");
+    stopSwing = true;
+    head.join();
+
+    const auto last = XR::findAfter(st, "\"lastDon\"");
+    NLog::log("xr_don_settle_hides_until_still: lastDon decision {} settle {} after {} ms (rung {}, reason {})", XR::fieldAfter(st, last, "decision"),
+              XR::fieldAfter(st, last, "settle"), XR::fieldAfter(st, last, "settleMs"), XR::fieldAfter(st, last, "rung"), XR::fieldAfter(st, last, "reason"));
+    EXPECT(sawHidden, true);
+    EXPECT(XR::fieldAfter(st, last, "decision"), std::string("rehydrate"));
+    EXPECT(XR::fieldAfter(st, last, "settle"), std::string("settled"));
+    EXPECT(XR::fieldAfter(st, XR::findAfter(st, "\"donoff\""), "state"), std::string("worn"));
+    const auto p = XR::findAfter(st, "\"name\": \"" + mon + "\"");
+    ASSERT_NOT(p, std::string::npos);
+    const auto pos = posOf(st, p);
+    ASSERT(pos.size(), (size_t)3);
+    const float bearing = std::atan2(-pos[0], -pos[2]) * 180.f / static_cast<float>(M_PI);
+    NLog::log("xr_don_settle_hides_until_still: monitor at [{:.2f}, {:.2f}, {:.2f}], bearing {:.1f}°", pos[0], pos[1], pos[2], bearing);
+    // re-seated from the resting head (25°), not from a swing extreme (-15° .. 65°)
+    EXPECT_MAX_DELTA(bearing, 25.f, 6.f);
+    NLog::green("xr_don_settle_hides_until_still: hidden through the fitting, re-seated from the settled head");
 }
 
 #endif
