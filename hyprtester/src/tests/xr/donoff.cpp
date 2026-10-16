@@ -174,10 +174,10 @@ TEST_CASE(xr_doff_intent_commits_dwell) {
     ASSERT_NOT(p, std::string::npos);
     const auto off = restoreOffsetOf(st, p);
     ASSERT(off.size(), (size_t)3);
-    NLog::log("xr_doff_intent_commits_dwell: remembered offset [{:.3f}, {:.3f}, {:.3f}] ({})", off[0], off[1], off[2], XR::fieldAfter(st, p, "source"));
+    NLog::log("xr_doff_intent_commits_dwell: remembered offset [{:.3f}, {:.3f}, {:.3f}] ({})", off[0], off[1], off[2], XR::fieldAfter(st, p, "provenance"));
     EXPECT(off[2] < -0.3f, true);
     EXPECT(std::fabs(off[0]) < 0.3f, true);
-    EXPECT(XR::fieldAfter(st, p, "source"), std::string("dwell"));
+    EXPECT(XR::fieldAfter(st, p, "provenance"), std::string("dwell"));
     EXPECT(XR::fieldAfter(st, 0, "shadow"), std::string("false"));
     EXPECT(XR::fieldAfter(st, 0, "seatSource"), std::string("dwell"));
     NLog::green("xr_doff_intent_commits_dwell: the dwell became the memory");
@@ -205,7 +205,7 @@ TEST_CASE(xr_reseat_commits_memory_and_forget) {
         const std::string st = getFromSocket("j/openxr");
         const auto        p  = XR::findAfter(st, "\"name\": \"" + mon + "\"");
         ASSERT_NOT(p, std::string::npos);
-        EXPECT(XR::fieldAfter(st, p, "source"), std::string("created"));
+        EXPECT(XR::fieldAfter(st, p, "provenance"), std::string("created"));
     }
 
     // turn around: the monitor is now behind the user; the re-seat brings it round and that
@@ -220,8 +220,8 @@ TEST_CASE(xr_reseat_commits_memory_and_forget) {
         ASSERT_NOT(p, std::string::npos);
         const auto off = restoreOffsetOf(st, p);
         ASSERT(off.size(), (size_t)3);
-        NLog::log("xr_reseat_commits_memory_and_forget: after re-seat memory [{:.3f}, {:.3f}, {:.3f}] ({})", off[0], off[1], off[2], XR::fieldAfter(st, p, "source"));
-        EXPECT(XR::fieldAfter(st, p, "source"), std::string("reseat"));
+        NLog::log("xr_reseat_commits_memory_and_forget: after re-seat memory [{:.3f}, {:.3f}, {:.3f}] ({})", off[0], off[1], off[2], XR::fieldAfter(st, p, "provenance"));
+        EXPECT(XR::fieldAfter(st, p, "provenance"), std::string("reseat"));
         EXPECT(off[2] < -0.3f, true);
         EXPECT(std::fabs(off[0]) < 0.3f, true);
     }
@@ -232,7 +232,7 @@ TEST_CASE(xr_reseat_commits_memory_and_forget) {
         const auto        p  = XR::findAfter(st, "\"name\": \"" + mon + "\"");
         ASSERT_NOT(p, std::string::npos);
         EXPECT(XR::fieldAfter(st, p, "restorable"), std::string("false"));
-        EXPECT(XR::fieldAfter(st, p, "source"), std::string("none"));
+        EXPECT(XR::fieldAfter(st, p, "provenance"), std::string("none"));
     }
     EXPECT(getFromSocket("/openxr forget no-such-monitor").starts_with("forget: no XR monitor"), true);
     // the diagnostic dump answers

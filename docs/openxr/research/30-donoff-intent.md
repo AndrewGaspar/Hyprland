@@ -1279,3 +1279,7 @@ re-seat committed as the new memory for 5 monitor(s) (provenance reseat)
 
 `hyprctl openxr status` gains a `don/doff:` line, per-monitor `restore … (head-relative; <provenance>,
 Ns ago)`, and a `donoff` JSON object; `hyprctl openxr donoff` prints episodes, journal and generations.
+Per monitor, the JSON `restore` object gains **flat** keys `provenance`, `provenanceAgeS`,
+`provenanceSeatS` rather than the nested `provenance: {source, …}` of §12.2: a nested `"source"` key
+ahead of `layout2d.source` broke every consumer that scans for the first `"source":` after a
+monitor's name (three hyprtester layout2d cases caught it).
