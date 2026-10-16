@@ -135,7 +135,7 @@ bool CXRSession::createInstance() {
     else if (m_overlayRequested && !m_hasOverlay)
         Log::logger->log(Log::WARN, "[OPENXR] openxr:overlay requested but this runtime does not advertise XR_EXTX_overlay; creating a normal (exclusive) session");
 
-    // research/32 C1: XR_EXT_plane_detection, only for a user who opted into surfaces, and only when
+    // research/32 C1: XR_EXT_plane_detection, unless openxr:surfaces_detect is off, and only when
     // the runtime lists it. Whether the HEADSET can detect planes is a separate question the system
     // properties (getSystem) and xrCreatePlaneDetectorEXT answer; neither is fatal.
 #ifdef XR_EXT_plane_detection
