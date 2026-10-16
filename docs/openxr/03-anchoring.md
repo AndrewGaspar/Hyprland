@@ -577,8 +577,9 @@ Separately, `openxr:recenter_on_plug` re-seats `anchor:local` monitors relative 
 so a monitor declared at e.g. `pos:0,1.5,-1.5` would land wherever that origin happens to be, often
 far from the user. On the first plug the main thread arms the frame thread, which on its next
 valid-view frame calls `recenterLocalToHead(view, seat)` on each local monitor. This reinterprets the
-given offset as head-relative: it plants the whole rig (position and facing) in a yaw-only frame at
-the current head's floor XZ (`xrHeadFrame`), preserving the configured height and distance. Passing
+given offset as head-relative: it plants the whole rig (position and facing) in a yaw-only frame under
+the current head (`xrHeadFrame`), preserving the configured distance and the configured height
+**relative to the eyes** (§8.4 "Height"). Passing
 the same view to every monitor transforms the group rigidly, so the relative arrangement is preserved.
 It warps (no glide), and for an adaptive monitor it re-docks the desk seat at the current head. A
 re-plug after a brief doff does not re-arm — the first-don placement is kept.
@@ -612,6 +613,10 @@ The durable form of a placement is the same pose named against the **wearer** in
 ```
 offset = inv(xrHeadFrame(head)) ∘ anchorPose      // xrPoseInHeadFrame, XRMath.hpp
 ```
+
+(Since 2026-10-15 `xrHeadFrame` sits `XR_NOMINAL_EYE_HEIGHT` under the eyes rather than on the floor,
+so an offset's y is "height above the eyes + 1.6 m" — §8.4 "Height". The staging measures it against
+the eyes the arrangement was placed for, not the live ones.)
 
 That is reference-space independent — when the origin moves, the head and the monitor move with it,
 and the offset does not change (gtest: `CaptureIsReferenceSpaceIndependent`). It is the exact inverse
@@ -769,8 +774,9 @@ head-on — and re-seating means moving that implied viewer onto the actual one
 - **position** = the group's centroid, pushed back along its **mean facing normal** by the group's
   **authored** viewing distance;
 - **orientation** = facing the group (forward = −normal);
-- yaw-only, on the floor (`y = 0`) — the same shape `xrHeadFrame` produces, so it drops straight
-  into `xrPoseInHeadFrame` / `recenterLocalToHead`.
+- yaw-only, at the implied viewer's **eye height** (`xrGroupImpliedEyeHeight`, "Height" below) — the
+  shape of a located head, so it drops straight into `xrPoseInHeadFrame` / `recenterLocalToHead` in
+  place of one.
 
 Every monitor is then re-expressed in that one frame and replanted in the head's, so the transform
 is rigid: **relative layout preserved exactly**, only the group as a whole travels.
@@ -822,6 +828,70 @@ Degenerate groups are refused rather than guessed at. Normals that cancel — a 
 surrounding the user — have no "in front of" to be brought around to, so the frame loop leaves the
 group alone and WARNs. A monitor lying flat (no horizontal normal, e.g. a ceiling panel) travels
 with the group but gets no vote on where its front is.
+
+#### Height (changed 2026-10-15)
+
+Reported live on an XREAL Air 2 Ultra under 6DoF: the SLAM floor estimate had diverged (the eye read
+y = −3.16 m), the monitors floated metres overhead, and SUPER+CTRL+Home re-seated them in yaw only —
+"vertical position seemed to be locked". The cause was the frame every re-seat composes into:
+`xrHeadFrame` stood **on the runtime's floor** (y = 0), so a re-seat kept every monitor's world y. That
+is only right where the head height never changes (3DoF runtimes report a fixed 1.6 m) or the floor is
+real and the user's posture never does (it does: seated vs standing on a Quest).
+
+**The convention.** `xrHeadFrame` now stands `XR_NOMINAL_EYE_HEIGHT` = **1.6 m below the eyes**
+(`XRMath.hpp`). Heights in it are therefore head-relative plus 1.6 m:
+
+- a **declared** `anchor:local` `pos:` y is read as authored for a wearer whose eyes are at 1.6 m —
+  `XR-main pos:0.017,1.457,-1.408` means "0.143 m under my eyes", wherever the eyes are;
+- a **memory** (`m_restoreOffset`, every provenance) is stored in the same convention, so
+  `restore […]` in `hyprctl openxr status` reads y − 1.6 as the offset from the eyes.
+
+1.6 m is what a 3DoF runtime reports (monado's XREAL driver, the OpenXR default eye height), so on
+such a runtime the frame sits exactly on the floor and **nothing moves** relative to the old
+behaviour — the declared heights in existing configs keep their literal meaning there. On a runtime
+with a real or drifting floor, the group now travels with the head.
+
+**RESTORE** (first plug, tracking-gap fallback) needs nothing more: it plants each offset in the new
+frame, so a declared rig lands at its authored height relative to the current eyes and a memory at its
+remembered one.
+
+**GROUP** needs a reference height that is not the live head (invariant I4, exactly as for the
+distance), so the seat frame gets a vertical half, `xrGroupImpliedEyeHeight` (`XRAnchor.hpp`) — the
+eye height of the viewer the arrangement was arranged for, in its live frame:
+
+| first available | implied eyes |
+|---|---|
+| declared rigs in the group | mean over them of `live.y − rig.y + 1.6` — where those monitors' authored eyes are now |
+| `m_seatEye` (the eyes the group was last placed for: a re-seat, else the first capture after a discontinuity) | that y |
+| neither | the group's mean height (an `openxr create` monitor is made at eye level) |
+
+The group then moves rigidly by `head.y − impliedEyes`. It is still a fixed point (after a press the
+implied eyes are the head's), and the layout — including relative heights — is untouched. The verb's
+reply and the frame log name the vertical move (`moved +1.20m vertically`). A seated-to-standing change
+on a Quest followed by a press brings the group up with the user; a declared monitor the user had
+grab-moved up or down comes back to its authored height relative to the eyes, the same way its
+distance comes back to the authored one.
+
+**Staging against the placed eyes.** The legacy §8.3 staging measures each height against
+`m_seatEye`, not the live head (the live head still supplies position and yaw). Against the live head
+the memory would record the wearer's posture at the doff edge: stand up to take a Quest off and the
+next session's room would come back half a metre low; let a 6DoF floor estimate drift and it would
+remember the drift. `m_seatEye` is latched by every re-seat, cleared at every discontinuity
+(`invalidateAnchorFrames`) and re-latched by the first capture after it, and re-expressed by a known
+reference-space change. Under `placement_memory = intent` the dwell seat's mean eye position plays this
+role (research/30 §6.2). A deliberate change of posture is what the re-seat key is for.
+
+**Nonsense heads are refused** (`xrSeatHeadCheck`, `XRPoseHistory.hpp`): non-finite, more than
+`XR_SEAT_HEAD_MAX_HEIGHT` (3 m) from the floor, or not upright (`xrHeadUpright`). The verb answers with
+the reason (`the head is implausibly far from the floor (eye [...]) — not re-seating to it`); the frame
+thread re-checks its own pose, drops a refused `GROUP` with a WARN, and keeps a refused `RESTORE`
+armed (one WARN per deferral) so it runs on the first plausible frame. Note this means the reported
+session itself (eye at −3.16 m) would be refused rather than repaired — planting the room relative to a
+tracker that has lost the floor by three metres only moves the problem to the moment it recovers.
+
+**LOCAL fallback** (no `XR_EXT_local_floor`): the head at the LOCAL origin reads `openxr:floor_offset`
+(default 1.5 m), so a declared rig now lands 0.1 m lower relative to the eyes than before unless
+`floor_offset` is set to 1.6. No shipping runtime we target lacks `LOCAL_FLOOR`.
 
 #### It does not fight the capture
 
