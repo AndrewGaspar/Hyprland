@@ -205,9 +205,28 @@ namespace OpenXR {
         return SXRPose{contact + up * q.bottomExt + Vec3{0.F, t.lift, 0.F}, rot};
     }
 
-    SXRSurfaceCandidate xrSurfaceEvaluate(const SXRPlane& p, const SXRSurfaceQuery& q, const SXRSurfaceTuning& t, float enterDist) {
+    const char* xrSurfaceVerdictName(eXRSurfaceVerdict v) {
+        switch (v) {
+            case XR_SURF_OK: return "ok";
+            case XR_SURF_ORIENT: return "orientation";
+            case XR_SURF_TOO_HIGH: return "too far above";
+            case XR_SURF_TOO_DEEP: return "too deep through";
+            case XR_SURF_OUTSIDE: return "not over it";
+            case XR_SURF_NONFINITE: return "non-finite";
+        }
+        return "?";
+    }
+
+    SXRSurfaceCandidate xrSurfaceEvaluate(const SXRPlane& p, const SXRSurfaceQuery& q, const SXRSurfaceTuning& t, float enterDist, SXRSurfaceDiag* diag) {
         SXRSurfaceCandidate c;
         c.planeId = p.id;
+        SXRSurfaceDiag d;
+        auto           verdict = [&](eXRSurfaceVerdict v) {
+            d.verdict = v;
+            if (diag)
+                *diag = d;
+            return c;
+        };
 
         if (p.orient == XR_PLANE_UP) {
             // The lowest visible corner is how close the window is; where its bottom edge projects is
@@ -217,14 +236,25 @@ namespace OpenXR {
             float lowest = std::numeric_limits<float>::max();
             for (const auto& k : corners)
                 lowest = std::min(lowest, xrPlaneLocal(p, k).z);
-            if (lowest > enterDist || lowest < -t.maxPenetrate)
-                return c;
+            d.lowest  = lowest;
+            d.centerH = xrPlaneLocal(p, q.content.pos).z;
 
             const Vec3 up     = qRotate(q.content.rot, Vec3{0.F, 1.F, 0.F});
             const Vec3 bottom = q.content.pos - up * q.bottomExt;
             const Vec3 local  = xrPlaneLocal(p, bottom);
-            if (!xrPlaneContains(p, SXRVec2{local.x, local.y}))
-                return c;
+            d.contained       = xrPlaneContains(p, SXRVec2{local.x, local.y});
+
+            if (!xrFinite(lowest) || !xrFinite(d.centerH))
+                return verdict(XR_SURF_NONFINITE);
+            if (lowest > enterDist)
+                return verdict(XR_SURF_TOO_HIGH);
+            // Through the surface: a little always counts, and more while the window still straddles
+            // it. A 1.3 m monitor's visible bottom edge sits ~0.6 m under its center, so a fixed limit
+            // alone turned away a window visibly standing in the table it was lowered through.
+            if (lowest < -t.maxPenetrate && d.centerH < 0.F)
+                return verdict(XR_SURF_TOO_DEEP);
+            if (!d.contained)
+                return verdict(XR_SURF_OUTSIDE);
 
             const Vec3 nWin = qRotate(q.content.rot, Vec3{0.F, 0.F, 1.F});
             c.ok            = true;
@@ -236,34 +266,53 @@ namespace OpenXR {
             Vec3 local = xrPlaneLocal(p, q.content.pos);
             if (q.headValid && xrPlaneLocal(p, q.head).z < 0.F)
                 local.z = -local.z; // the normal points away from the user: measure from their side
-            if (local.z > enterDist || local.z < -t.maxPenetrate)
-                return c;
-            if (!xrPlaneContains(p, SXRVec2{local.x, local.y}))
-                return c;
+            d.lowest    = local.z;
+            d.centerH   = local.z;
+            d.contained = xrPlaneContains(p, SXRVec2{local.x, local.y});
+            if (!xrFinite(local.z))
+                return verdict(XR_SURF_NONFINITE);
+            if (local.z > enterDist)
+                return verdict(XR_SURF_TOO_HIGH);
+            if (local.z < -t.maxPenetrate)
+                return verdict(XR_SURF_TOO_DEEP);
+            if (!d.contained)
+                return verdict(XR_SURF_OUTSIDE);
             c.ok      = true;
             c.kind    = XR_SNAP_WALL;
             c.dist    = std::fabs(local.z);
             c.contact = xrPlaneWorld(p, SXRVec2{local.x, local.y});
         } else
-            return c;
+            return verdict(XR_SURF_ORIENT);
 
         if (q.haveRay) {
             const auto hit = xrRayPlane(p, q.rayOrigin, q.rayDir);
             c.rayHit       = hit.hit && hit.inside;
         }
         c.pose = xrSnapPose(c.kind, p, c.contact, q, t);
-        if (!xrPoseFinite(c.pose))
+        if (!xrPoseFinite(c.pose)) {
             c.ok = false;
-        return c;
+            return verdict(XR_SURF_NONFINITE);
+        }
+        return verdict(XR_SURF_OK);
     }
+
+    // Two qualifying horizontal surfaces closer in height than this are one surface (a refined
+    // duplicate, a slightly tilted patch): the nearer wins rather than the higher.
+    static constexpr float XR_SURFACE_STACK_EPS = 0.03F;
 
     SXRSurfaceCandidate xrSurfacePick(const SXRPlane* planes, size_t n, const SXRSurfaceQuery& q, const SXRSurfaceTuning& t, uint64_t stickyId) {
         SXRSurfaceCandidate best;
-        // rank: horizontal before wall, ray-hit before not, then nearest
+        // rank: horizontal before wall, the higher horizontal surface, ray-hit before not, then nearest
         auto better = [](const SXRSurfaceCandidate& a, const SXRSurfaceCandidate& b) {
             const bool aWall = a.kind == XR_SNAP_WALL, bWall = b.kind == XR_SNAP_WALL;
             if (aWall != bWall)
                 return !aWall;
+            // Both qualify, so the window's bottom edge is over both: the lower one is underneath the
+            // higher one (the floor under the table a big window was lowered through). This comes
+            // BEFORE the ray, which runs through the window's center and on past a table's far edge
+            // to the floor behind it — the live case.
+            if (!aWall && std::fabs(a.contact.y - b.contact.y) > XR_SURFACE_STACK_EPS)
+                return a.contact.y > b.contact.y;
             if (a.rayHit != b.rayHit)
                 return a.rayHit;
             return a.dist < b.dist;

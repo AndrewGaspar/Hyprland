@@ -241,4 +241,158 @@ TEST_CASE(xr_surface_off_never_snaps) {
     EXPECT_CONTAINS(st, "\"surfaces\": { \"enabled\": false");
 }
 
+// ---- the keyboard gaze path (live repro 2026-10-16) ----
+// The live user moved a big monitor with SUPER+SHIFT+G (`gazegrab`) and SUPER+ALT+±
+// (`gazepush ±0.1`) toward them over a table whose top was BETWEEN the monitor's center and its
+// bottom edge: deeper "in" the table than the old fixed 25 cm penetration limit, and — for the
+// pushes made without a carry — never evaluated at all. Both legs are scripted here with the head
+// still and straight ahead, against a declared table that starts just short of the monitor and
+// runs toward the head, its top 0.30 m under the monitor's center (the bottom edge ~0.30 m under it).
+
+struct SGazeSurfaceGuard {
+    const bool& failed;
+    std::string testName;
+    std::string monitorName;
+    ~SGazeSurfaceGuard() {
+        getFromSocket("/openxr gazerelease");
+        getFromSocket("/keyword openxr:surfaces 0");
+        getFromSocket("/keyword openxr:gaze_dwell_ms 200");
+        if (!monitorName.empty())
+            getFromSocket("/openxr destroy " + monitorName);
+        if (XR::g_ctx.remote) {
+            XR::g_ctx.remote->setHeadPose(MonadoWire::xrt_vec3{0.f, 0.f, 0.f}, MonadoWire::xrt_quat{0.f, 0.f, 0.f, 1.f});
+            XR::g_ctx.remote->pulse();
+        }
+        if (failed)
+            XR::dumpXrArtifacts(testName);
+    }
+};
+
+// Focused, head at the origin looking down -Z, a 1.5 m local monitor 1.5 m ahead.
+static bool gazeSurfaceSetup(CTestCase* tc, const std::string& mon, SGazeSurfaceGuard& guard) {
+    if (!XR::waitForXrState("focused", std::chrono::milliseconds(15000))) {
+        XR::logSkip(tc->name(), "session never reached focused (known env instability)");
+        return false;
+    }
+    if (!XR::g_ctx.remote) {
+        XR::logSkip(tc->name(), "no remote client available");
+        return false;
+    }
+    XR::g_ctx.remote->setHeadPose(MonadoWire::xrt_vec3{0.f, 0.f, 0.f}, MonadoWire::xrt_quat{0.f, 0.f, 0.f, 1.f});
+    XR::g_ctx.remote->pulse();
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    getFromSocket("/keyword openxr:surfaces 0");
+    if (getFromSocket("/openxr create " + mon + " 1280x720 anchor:local pos:0,0,-1.5 size:1.5") != "ok") {
+        XR::logSkip(tc->name(), "monitor create failed");
+        return false;
+    }
+    guard.monitorName = mon;
+    return XR::waitForJson("j/openxr", [&](const std::string& j) { return surfaceMonitorPos(j, mon).has_value(); }, std::chrono::milliseconds(10000));
+}
+
+// The table: top 0.30 m under `at`'s center, from 0.35 m nearer the head than `at` to 1.15 m nearer.
+static bool declareTableInFrontOf(const std::array<float, 3>& at, float& tableY) {
+    tableY                 = at[1] - 0.30F;
+    const std::string spec = std::format("table pos:{:.3f},{:.3f},{:.3f} size:3,0.8", at[0], tableY, at[2] + 0.75F);
+    if (getFromSocket("/keyword openxr:surfaces_synthetic " + spec) != "ok")
+        return false;
+    if (getFromSocket("/keyword openxr:surfaces 1") != "ok")
+        return false;
+    return XR::waitForJson("j/openxr", [](const std::string& j) { return j.find("\"source\": \"synthetic\"") != std::string::npos; }, std::chrono::milliseconds(5000));
+}
+
+static void pulseFrames(int n) {
+    for (int i = 0; i < n; ++i) {
+        if (XR::g_ctx.remote)
+            XR::g_ctx.remote->pulse();
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+}
+
+static bool expectSnappedOnTable(const std::string& mon, float tableY) {
+    const bool attached = XR::waitForJson("j/openxr", [&](const std::string& j) { return monitorField(j, mon, "attached") == "true"; }, std::chrono::milliseconds(3000));
+    if (!attached)
+        return false;
+    const std::string st     = getFromSocket("j/openxr");
+    const auto        snapAt = XR::findAfter(st, "\"lastSnap\"");
+    if (snapAt == std::string::npos || XR::fieldAfter(st, snapAt, "monitor") != mon || XR::fieldAfter(st, snapAt, "kind") != "stand")
+        return false;
+    const auto contact = XR::parseFloatArray(XR::fieldAfter(st, snapAt, "contact"));
+    return contact.size() == 3 && std::fabs(contact[1] - tableY) < 0.005F && monitorField(st, mon, "mode") == "local";
+}
+
+TEST_CASE(xr_surface_gaze_carry_push_through_table) {
+    XR_SKIP_IF_UNAVAILABLE();
+
+    const std::string mon = XR::monitorName(78);
+    SGazeSurfaceGuard guard{this->failed, name(), ""};
+    if (!gazeSurfaceSetup(this, mon, guard))
+        return;
+
+    // SUPER+SHIFT+G, by name (no dwell needed): the carry starts where the monitor is.
+    ASSERT(getFromSocket("/openxr gazegrab " + mon), std::string("ok"));
+    pulseFrames(10);
+    const auto carried = surfaceMonitorPos(getFromSocket("j/openxr"), mon);
+    ASSERT(carried.has_value(), true);
+    float tableY = 0.F;
+    ASSERT(declareTableInFrontOf(*carried, tableY), true);
+    pulseFrames(10);
+    EXPECT(monitorField(getFromSocket("j/openxr"), mon, "preview"), "false"); // not over it yet
+
+    // SUPER+ALT+minus while carrying: the carry comes toward the head, over the table, its bottom edge
+    // ~0.30 m deep in it. That is a window standing in a table: it previews...
+    bool previewed = false;
+    for (int i = 0; i < 4 && !previewed; ++i) {
+        ASSERT(getFromSocket("/openxr gazepush -0.2"), std::string("ok"));
+        pulseFrames(8);
+        previewed = monitorField(getFromSocket("j/openxr"), mon, "preview") == "true";
+    }
+    ASSERT(previewed, true);
+    NLog::green("xr_surface_gaze_carry_push_through_table: carried monitor previews on the table at y {:.3f}", tableY);
+
+    // ...and the keyboard release (G again) stands it on the table.
+    ASSERT(getFromSocket("/openxr gazegrab"), std::string("ok"));
+    ASSERT(expectSnappedOnTable(mon, tableY), true);
+}
+
+TEST_CASE(xr_surface_gaze_nudge_settles_on_table) {
+    XR_SKIP_IF_UNAVAILABLE();
+
+    const std::string mon = XR::monitorName(79);
+    SGazeSurfaceGuard guard{this->failed, name(), ""};
+    if (!gazeSurfaceSetup(this, mon, guard))
+        return;
+
+    // No carry: SUPER+ALT+minus nudges the monitor the head dwells on.
+    getFromSocket("/keyword openxr:gaze_dwell_ms 120");
+    const bool gazing = XR::waitForJson(
+        "j/openxr",
+        [&](const std::string& r) {
+            const auto gp = XR::findAfter(r, "\"gaze\"");
+            return gp != std::string::npos && XR::fieldAfter(r, gp, "hoveredName") == mon;
+        },
+        std::chrono::milliseconds(4000));
+    if (!gazing) {
+        XR::logSkip(name(), "gaze ray never registered a dwell-stable hover on the monitor (known env instability)");
+        return;
+    }
+    const auto start = surfaceMonitorPos(getFromSocket("j/openxr"), mon);
+    ASSERT(start.has_value(), true);
+    float tableY = 0.F;
+    ASSERT(declareTableInFrontOf(*start, tableY), true);
+    pulseFrames(10);
+    EXPECT(monitorField(getFromSocket("j/openxr"), mon, "attached"), "false");
+
+    // Two nudges bring it over the table, which it then stands on — a one-step carry and release.
+    bool attached = false;
+    for (int i = 0; i < 4 && !attached; ++i) {
+        ASSERT(getFromSocket("/openxr gazepush -0.2"), std::string("ok"));
+        pulseFrames(8);
+        attached = monitorField(getFromSocket("j/openxr"), mon, "attached") == "true";
+    }
+    ASSERT(attached, true);
+    ASSERT(expectSnappedOnTable(mon, tableY), true);
+    NLog::green("xr_surface_gaze_nudge_settles_on_table: nudged monitor stands on the table at y {:.3f}", tableY);
+}
+
 #endif // WITH_XR_TESTS

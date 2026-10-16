@@ -180,9 +180,10 @@ Code: `src/openxr/XRSurfaces.{hpp,cpp}` (pure plane model + snap math), `XRPlane
   recenter, and drops it on an unknown one. `xrCreatePlaneDetectorEXT` → `FEATURE_UNSUPPORTED` is a
   permanent "unsupported" for the session; repeated errors give up after 5.
 - **Interaction.** Each frame a carried window (hand/controller MOVE grab, or gaze carry) is tested
-  against upward planes: lowest visible corner within `snap_distance` above (or 25 cm through) the
-  surface and the bottom-edge centre inside the contour; the aim/gaze ray breaks ties between
-  candidates; horizontal beats a wall. Within it the window is **shown snapped** (the preview is the
+  against upward planes: lowest visible corner within `snap_distance` above (or 25 cm through, or
+  any depth while the content centre is still above it — §8) the surface and the bottom-edge centre
+  inside the contour; horizontal beats a wall, the higher of two horizontal surfaces wins, and the
+  aim/gaze ray breaks the remaining ties. Within it the window is **shown snapped** (the preview is the
   final pose), with 1.5× hysteresis. The release re-decides from the WP-G4 latched pose (the ring now
   records the carried pose, not the preview) against the armed plane: stand (bottom edge + bar on the
   surface, facing the head, `stand_tilt` back), flat (controller trigger held, or carried >45° face-up),
@@ -192,3 +193,22 @@ Code: `src/openxr/XRSurfaces.{hpp,cpp}` (pure plane model + snap math), `XRPlane
 - **Not done.** C3 (`XR_EXT_spatial_plane_tracking`) — a second `IXRPlaneSource`. No visual beyond the
   snapped preview (no ghost/shadow quad). Synthetic planes follow the LOCAL_FLOOR origin literally
   (re-published after each reference-space change), so they are a fixture, not room geometry.
+
+## 8. First live run (2026-10-16, XREAL Air 2 Ultra + Monado planes)
+
+Plane detection worked end to end (19–21 planes, the coffee table as PLATFORM `0x42` at
+y 1.13, 1.68 × 1.23 m; head and planes are in the same LOCAL_FLOOR space — Monado locates both
+through the xdev's tracking origin), yet moving XR-main "through the table" with the keyboard gaze
+binds never landed it. The log shows why, in two parts:
+
+- **The pushes were nudges, not a carry.** `gazepush` ×10 ran with no carry active (`gazegrab` is a
+  toggle and came after them), i.e. the gazed-monitor nudge along the head→monitor ray, which never
+  consulted the planes. Fix: a nudge is a one-step carry — `requestSurfaceSettle()`, and the frame
+  pass settles the window onto a surface it was pushed into exactly as a release would.
+- **The fixed 25 cm penetration limit.** A 1.32 m monitor's visible bottom edge (content half-height
+  + margin + bar) is ~0.59 m under its centre, so it hung 0.27 m under the table top at rest. When the
+  carry did start, it previewed at once (bottom edge 0.134 m under the top) and dropped the preview
+  half a second later — most likely as the bottom edge passed −0.25 m (the log had no numbers to
+  say), with the window still visibly standing in the table. Fix: deeper
+  penetration counts while the content centre is above the surface, and when the window is over two
+  qualifying horizontal surfaces the higher wins even over the plane the gaze ray hits (the ray runs through the window centre and on past the table edge to the floor behind it; the floor under a table is under the table).
