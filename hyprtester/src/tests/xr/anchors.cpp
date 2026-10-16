@@ -404,8 +404,12 @@ TEST_CASE(xr_anchor_restore_across_session) {
     // first plug of the new session, which lands the moment that session becomes visible. Moving the
     // head afterwards would measure a LOCAL anchor that has already been correctly seated to the old
     // spot — indistinguishable from a compositor that had quietly stopped re-seating anything.
+    //
+    // doc 03 §8.4: and come back at a different HEIGHT (sitting lower, or a 6DoF floor estimate that
+    // moved): the restore carries the remembered head-relative height to the new eyes rather than
+    // replaying the old world y.
     constexpr float NEW_YAW = -60.f * (float)M_PI / 180.f;
-    const xrt_vec3  newHead{0.5f, 0.f, -2.f};
+    const xrt_vec3  newHead{0.5f, 0.4f, -2.f};
     const xrt_quat  newRot{0.f, std::sin(NEW_YAW / 2.f), 0.f, std::cos(NEW_YAW / 2.f)};
     remote->setHeadPose(newHead, newRot);
     remote->pulse();
@@ -436,11 +440,15 @@ TEST_CASE(xr_anchor_restore_across_session) {
         const auto back = posOf(st, p);
         ASSERT(back.size(), (size_t)3);
 
-        // Where the captured offset SHOULD land in the new head's yaw-only floor frame — the same
+        // Where the captured offset SHOULD land in the new head's yaw-only frame — the same
         // composition recenterLocalToHead performs, written out longhand so this test would notice the
-        // engine and the doc disagreeing rather than following it into the same mistake.
-        const float c = std::cos(NEW_YAW), sn = std::sin(NEW_YAW);
-        const std::vector<float> expected{newHead.x + relLeft[0] * c + relLeft[2] * sn, relLeft[1], newHead.z - relLeft[0] * sn + relLeft[2] * c};
+        // engine and the doc disagreeing rather than following it into the same mistake. The frame
+        // sits the nominal eye height (1.6 m, XR_NOMINAL_EYE_HEIGHT) under the eyes (doc 03 §8.4).
+        constexpr float          NOMINAL_EYE = 1.6f;
+        const float              c = std::cos(NEW_YAW), sn = std::sin(NEW_YAW);
+        const std::vector<float> expected{newHead.x + relLeft[0] * c + relLeft[2] * sn, newHead.y - NOMINAL_EYE + relLeft[1], newHead.z - relLeft[0] * sn + relLeft[2] * c};
+        // the vertical half on its own: the monitor rose with the head (it was made at eye level)
+        EXPECT_MAX_DELTA(back[1] - left[1], newHead.y, 0.05);
 
         // THE assertion: the room came back the way it was left, rigidly re-seated to the user.
         // Pre-fix this re-seated from the stale creation-time world pose instead.
@@ -598,6 +606,14 @@ TEST_CASE(xr_reseat_verb) {
     ASSERT_NOT(distPos, std::string::npos);
     const float authored = std::stof(reply.substr(distPos + 18));
     NLog::log("xr_reseat_verb: authored seat distance {:.2f}m", authored);
+    // doc 03 §8.4: the group also travels VERTICALLY, to sit at its authored height relative to the
+    // eyes. How far depends on every anchor:local monitor in the shared session (declared rigs vote),
+    // so the amount comes from the reply like the distance does — and the head-relative half of the
+    // contract is pinned independently below by raising the head between two presses.
+    const size_t riseKey = reply.find("moved ");
+    ASSERT_NOT(riseKey, std::string::npos);
+    const float rise = std::stof(reply.substr(riseKey + 6));
+    NLog::log("xr_reseat_verb: vertical move {:+.2f}m", rise);
     // The fixture declares every anchor:local monitor at z = -1.5 (xr-test.conf's XR-conf-a plus the
     // two created above), so the authored distance is 1.5 m by construction. Pinning it here is what
     // makes the assertions below a test of the SEAT rather than a tautology against the reply.
@@ -641,7 +657,7 @@ TEST_CASE(xr_reseat_verb) {
     const float th = YAW - vYaw, c = std::cos(th), s = std::sin(th);
     auto        expected = [&](const std::vector<float>& p) {
         const float px = p[0] - vx, pz = p[2] - vz;
-        return std::vector<float>{px * c + pz * s, p[1], -px * s + pz * c};
+        return std::vector<float>{px * c + pz * s, p[1] + rise, -px * s + pz * c};
     };
 
     std::vector<float> afterL, afterR;
@@ -689,6 +705,55 @@ TEST_CASE(xr_reseat_verb) {
         ASSERT(againR.size(), (size_t)3);
         EXPECT_MAX_DELTA(dist3(againL, afterL), 0.0, 0.05);
         EXPECT_MAX_DELTA(dist3(againR, afterR), 0.0, 0.05);
+    }
+
+    // doc 03 §8.4, the 2026-10-15 report: the height comes WITH the head. Stand up 0.5 m (or let a
+    // 6DoF floor estimate drift by that much) and press again: the whole group rises exactly 0.5 m,
+    // and nothing else about it changes. Pre-fix this was the identity — "vertical position seemed
+    // to be locked".
+    const xrt_quat swivelled{0.f, std::sin(YAW / 2.f), 0.f, std::cos(YAW / 2.f)};
+    remote->setHeadPose(xrt_vec3{0.f, 0.5f, 0.f}, swivelled);
+    remote->pulse();
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    {
+        const std::string up = getFromSocket("/openxr reseat");
+        ASSERT_STARTS_WITH(up, std::string("re-seated "));
+        NLog::log("xr_reseat_verb: after standing up, reseat replied '{}'", up);
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+        const std::string st  = getFromSocket("j/openxr");
+        const auto        upL = poseOf(st, monL), upR = poseOf(st, monR);
+        ASSERT(upL.size(), (size_t)3);
+        ASSERT(upR.size(), (size_t)3);
+        EXPECT_MAX_DELTA(upL[1] - afterL[1], 0.5, 0.05);
+        EXPECT_MAX_DELTA(upR[1] - afterR[1], 0.5, 0.05);
+        EXPECT_MAX_DELTA(std::hypot(upL[0] - afterL[0], upL[2] - afterL[2]), 0.0, 0.05);
+        EXPECT_MAX_DELTA(std::hypot(upR[0] - afterR[0], upR[2] - afterR[2]), 0.0, 0.05);
+        afterL = upL;
+        afterR = upR;
+    }
+
+    // ...and a head that is not a person is refused, with the reason, and nothing moves: a diverged
+    // tracker 4 m up, and glasses lifted past vertical onto the forehead.
+    remote->setHeadPose(xrt_vec3{0.f, 4.f, 0.f}, swivelled);
+    remote->pulse();
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    {
+        const std::string r = getFromSocket("/openxr reseat");
+        NLog::log("xr_reseat_verb: absurd head, reseat replied '{}'", r);
+        EXPECT_CONTAINS(r, std::string("implausibly far from the floor"));
+    }
+    constexpr float FLIP = 120.f * (float)M_PI / 180.f; // pitched up and back past vertical
+    remote->setHeadPose(xrt_vec3{0.f, 0.5f, 0.f}, xrt_quat{std::sin(FLIP / 2.f), 0.f, 0.f, std::cos(FLIP / 2.f)});
+    remote->pulse();
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    {
+        const std::string r = getFromSocket("/openxr reseat");
+        NLog::log("xr_reseat_verb: flipped head, reseat replied '{}'", r);
+        EXPECT_CONTAINS(r, std::string("not upright"));
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        const std::string st = getFromSocket("j/openxr");
+        EXPECT_MAX_DELTA(dist3(poseOf(st, monL), afterL), 0.0, 0.05);
+        EXPECT_MAX_DELTA(dist3(poseOf(st, monR), afterR), 0.0, 0.05);
     }
 
     // The policy the status line reports, and the one that makes the headset's own recenter do this.

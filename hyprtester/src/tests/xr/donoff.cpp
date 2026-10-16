@@ -32,6 +32,10 @@ static std::vector<float> restoreOffsetOf(const std::string& json, size_t blockP
     return XR::parseFloatArray(XR::fieldAfter(json, blockPos, "offset"));
 }
 
+static std::vector<float> posOf(const std::string& json, size_t blockPos) {
+    return XR::parseFloatArray(XR::fieldAfter(json, blockPos, "pos"));
+}
+
 static MonadoWire::xrt_quat yawPitch(float yaw, float pitch) {
     // q = qYaw(yaw) * qPitch(pitch) — yaw about +Y, then pitch about the head's +X
     const float cy = std::cos(yaw / 2.f), sy = std::sin(yaw / 2.f), cp = std::cos(pitch / 2.f), sp = std::sin(pitch / 2.f);
@@ -224,6 +228,11 @@ TEST_CASE(xr_reseat_commits_memory_and_forget) {
         EXPECT(XR::fieldAfter(st, p, "provenance"), std::string("reseat"));
         EXPECT(off[2] < -0.3f, true);
         EXPECT(std::fabs(off[0]) < 0.3f, true);
+        // doc 03 §8.4: the memory's height is HEAD-relative — measured in a frame the nominal eye
+        // height (1.6 m) under the eyes — not the monitor's world y. The head is at y = 0 here.
+        const auto live = posOf(st, p);
+        ASSERT(live.size(), (size_t)3);
+        EXPECT_MAX_DELTA(off[1], live[1] - 0.f + 1.6f, 0.05);
     }
 
     EXPECT(getFromSocket("/openxr forget " + mon).starts_with("forgot 1"), true);

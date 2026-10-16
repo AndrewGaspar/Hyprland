@@ -1180,6 +1180,15 @@ class COpenXRManager {
     // good frame). Atomic: both threads arm, frame reads/clears.
     std::atomic<uint8_t> m_reseatArmed{OpenXR::XR_RESEAT_ARM_NONE};
 
+    // doc 03 §8.4: the eyes the anchor:local arrangement was last PLACED for (by a re-seat, else the
+    // first capture after a discontinuity), in the current reference space. The §8.3 staging measures
+    // each monitor's height against this rather than the live head, so the head-relative memory
+    // describes the arrangement as placed, not the wearer's posture (or a 6DoF floor drift) at the
+    // doff edge. Guarded by m_layersMu; cleared by invalidateAnchorFrames, re-expressed by
+    // applyReferenceSpaceChange. POD — the frame thread reads and writes it.
+    OpenXR::Vec3 m_seatEye;
+    bool         m_seatEyeValid = false;
+
     // Arm a pending re-seat. RESTORE outranks GROUP if both land before the frame thread consumes
     // (doc 03 §8.4): a discontinuity has to be repaired from the stored offsets before "rigidly move
     // the live arrangement" means anything, and the GROUP pass that follows is then the identity.
