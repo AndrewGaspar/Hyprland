@@ -370,8 +370,10 @@ void COpenXRManager::enterDonning(bool restore, bool needPos, const char* why, c
                 damage.push_back(mon);
         }
     }
-    for (auto& mon : damage)
-        g_pHyprRenderer->damageMonitor(mon);
+    for (auto& mon : damage) {
+        if (g_pHyprRenderer)
+            g_pHyprRenderer->damageMonitor(mon);
+    }
 
     // the main-thread backstop (§5.2): the frame thread can only decide on frames it renders
     const auto dur = std::chrono::milliseconds(timeout + OpenXR::XR_SETTLE_BACKSTOP_EXTRA_MS);
