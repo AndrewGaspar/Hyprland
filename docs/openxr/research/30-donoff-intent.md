@@ -1,7 +1,8 @@
 # 30 — Don/doff intent: a state machine for hydrating and dehydrating the room
 
 **Status:** design (2026-10-15), with the user's answers to §15 folded in (§15 now records the
-decisions). Phases 0 and 1 are implemented on branch `xr-donoff-design` (§17); everything else is
+decisions). Phases 0 and 1 are implemented on branch `xr-donoff-design` (§17), Phase 2 on branch
+`xr-don-settle` (§17.2); everything else is
 design only. It replaces the cross-session
 placement capture → staging → commit-gate → recenter-on-plug pipeline documented in
 [doc 03 §8.2–§8.3](../03-anchoring.md#82-recenter-on-plug) and built by
@@ -1220,7 +1221,9 @@ sequence `in → hold → glide → out` across a scripted don.
 
 ---
 
-## 17. Implementation notes — Phases 0 and 1 (branch `xr-donoff-design`)
+## 17. Implementation notes
+
+### 17.1 Phases 0 and 1 (branch `xr-donoff-design`)
 
 What shipped, and where it departs from the text above.
 
@@ -1271,7 +1274,7 @@ with what the legacy commit left in memory. **`intent`:** the staging values are
    it off would need the frame thread to know the mode, i.e. another published atomic, for no
    behavioural gain until Phase 4 deletes it.
 
-**Not in Phases 0/1** (per §14): the settle detector, hide/fade and backstop (Phase 2), the glyph
+**Not in Phases 0/1** (per §14): the settle detector, hide/fade and backstop (Phase 2, now §17.2), the glyph
 (2b), `xrDonDecision` and `don_resume_radius` (Phase 3), the debug presence seam (only Phases 2/3's
 `--xr` cases need it), the trace-replay gtest (no recorded traces exist yet), and persistence.
 
@@ -1292,6 +1295,111 @@ Per monitor, the JSON `restore` object gains **flat** keys `provenance`, `proven
 `provenanceSeatS` rather than the nested `provenance: {source, …}` of §12.2: a nested `"source"` key
 ahead of `layout2d.source` broke every consumer that scans for the first `"source":` after a
 monitor's name (three hyprtester layout2d cases caught it).
+
+### 17.2 Phase 2 — settle, hide, fade on don (branch `xr-don-settle`, 2026-10-16)
+
+**Files.** `src/openxr/XRDonSettle.{hpp,cpp}` (pure `CXRSettleDetector`, `xrHeadRoll`,
+`xrDonFadeAlpha`; gtested in `tests/xr/donoff_settle.cpp`, 16 cases); the manager side is in
+`OpenXRManagerDonDoff.cpp` (`donGateEnabled`, `enterDonning`, `donGateFrameStep`, `onDonHydrated`,
+`onDonBackstop`, `donClaimFirstPlugRestore`) plus small hooks in `OpenXRManager.cpp` (blit alpha,
+submission skip, the RESTORE consume's head, the first-plug arm); hyprtester
+`xr_don_settle_hides_until_still`.
+
+**Gate.** `placement_memory = intent` **and** `don_settle_timeout_ms > 0` (§11). Under the default
+`legacy`, or with the timeout at 0, the don path is byte-identical to Phases 0/1: the first plug arms
+the RESTORE and it runs on the first valid frame. No existing option changed meaning. New options
+(wiki PR): `openxr:don_settle_timeout_ms` (int ms, 3000, 0 = off) and `openxr:don_fade_ms` (int ms,
+180, 0 = pop).
+
+**What the edge decides (Phase 2's slice of §5.4).** `xrDonDecision` and the generation bridge are
+Phase 3, so at `UNWORN → worn↑` the main thread asks two questions only:
+
+1. *Is the recenter-on-plug RESTORE still owed this session?* (`recenter_on_plug` and the first plug
+   has not run it.) Then `DONNING` with kind **RESTORE**: the settle runs in POSE mode and the
+   hydration is today's RESTORE body re-seated around the settled head (the hold-window mean,
+   yaw-only rotation), through the existing consume path (I12). The first plug, which used to arm
+   it, now defers to the gate (`donClaimFirstPlugRestore`): claimed → skipped; plug before the don
+   (`monitors_follow_session = off|session`) → owed to the next don; plug while already `WORN`
+   (e.g. the gate was switched on mid-session) → the legacy arm.
+2. *Is 6DoF expected but `POSITION_TRACKED` absent right now?* Then `DONNING` with kind **RESUME**:
+   nothing will move, the settle runs in TRACKING mode (only "position tracked, continuously, for
+   250 ms"), and the monitors are shown in place. This is the row §5.4 did not have: it is what the
+   live XREAL SLAM report of 2026-10-16 needed ("the monitors weren't quite locked yet" while
+   donning — Monado's 3DoF position hold during SLAM re-acquisition, see below). 6DoF is *expected*
+   when this session has delivered `POSITION_TRACKED`, or the same `systemName` did earlier in this
+   compositor process (a fresh SLAM session starts in its hold). A system that then times out with
+   "position never tracked" and never tracked this session is forgotten, so a 3DoF session after a
+   SLAM one pays at most one wait.
+
+Everything else (a brief in-session doff on a tracked headset, Quest/WiVRn, 3DoF XREAL) is a
+certain RESUME: `UNWORN → WORN`, nothing hidden, zero added latency.
+
+**Settle criteria as built** (constants in `XRDonSettle.hpp`): exactly §5.2's table — min delay
+150 ms, hold 500 ms, ω every sample < 30°/s and mean < 12°/s, |pitch| ≤ 35°, upright and |roll| ≤ 20°,
+tracked under the conditional rule, linear < 0.15 m/s when position-tracked, plus **position
+tracked** when 6DoF is expected. Timeout ladder as specified (rung 1 calmest 300 ms upright+level
+window, rung 2 last upright sample with |pitch| ≤ 60°, rung 3 show in place). Rungs 1 and 2 do not
+require position: at the timeout we stop waiting for SLAM. Rung 3 with a RESTORE owed arms it the
+legacy way (it runs on the first plausible head, exactly today's behaviour), so a session's room is
+never left in a dead frame. The backstop (main thread, timeout + 1 s) shows in place and does the
+same.
+
+**Hide and fade as built (§5.3).** Frame-thread owned (`m_donFrame`). While hidden, anchor:local
+quads are left out of the submitted layer list (and out of the pointer targets); nothing is baked into
+their swapchains, so their content stays current. The hydration lands on a frame whose quads are
+still left out; from the next frame the uniform alpha is multiplied by a smoothstep over
+`don_fade_ms`, applied at the existing `fadeTex` pass and diffed through `m_fxAlphaDrawn`, so
+animation-only frames recompose. The fade needs a content snapshot of the *current* content: hidden
+monitors snapshot every fresh blit, the main thread damages them once at the `DONNING` edge, and a
+monitor whose snapshot is not fresh pops in rather than compounding the fade.
+`head`/`body`/`device` monitors are never hidden. The late-discontinuity cross-fade is Phase 3.
+
+**Deviations.**
+
+1. The TRACKING-mode `DONNING` (resume, hidden only for position tracking) is new; §5.4 only hid
+   when the decision might move monitors.
+2. Rung 3 / backstop with a RESTORE owed arms the legacy RESTORE instead of "show in place without
+   moving": in a new session the anchors are in a dead frame, and the legacy arm is today's
+   behaviour.
+3. The decision is taken at the edge with the *current* `POSITION_TRACKED`; a SLAM that drops out
+   after the edge but before the settle is still waited for (the detector requires it per sample).
+4. `DISCONTINUITY` is still not fed to the FSM (Phase 3); `handleFrameDiscontinuity` arms its RESTORE
+   immediately as before. One arriving while hidden re-seats then; the settle re-seats again.
+
+**Status.** `donoff.donGate`, `donoff.hidden`, and `donoff.lastDon {valid, decision
+(rehydrate|resume), settle (pending|settled|timeout|backstop|cancelled), settleMs, rung, needPos,
+angMaxDeg, angMeanDeg, pitchDeg, rollDeg, reason}`; a `don settle:` text line; journal kind
+`don-settled`. Log lines: `don/doff: hiding N anchor:local monitor(s) until the head settles (…)`,
+`don settled after N ms (ω max …) — re-seated from the settled head | shown in place`, WARN `don
+settle timed out after N ms (<block>) — rung K: …`, WARN `don settle produced nothing …` (backstop).
+
+**Live toggles** (Lua config; `hyprctl keyword` is dead there):
+`hyprctl eval 'hl.config({ openxr = { placement_memory = "intent" } })'` turns Phase 1 *and* 2 on
+(`"legacy"` turns both off); `hyprctl eval 'hl.config({ openxr = { don_settle_timeout_ms = 0 } })'`
+turns only the don gate off (today's timing; `3000` back on);
+`hyprctl eval 'hl.config({ openxr = { don_fade_ms = 0 } })'` keeps the gate but pops the monitors
+in. Each takes effect at the next don edge.
+
+**Monado: does `POSITION_TRACKED` mark the 3DoF hold? Yes.** In the XREAL driver
+(`xreal_air_pose_blend.c`, `xreal_air_pose_blend_update`; same in the vendored subproject and on
+`xreal-slam-robust`), the SLAM path ORs in `POSITION_VALID | POSITION_TRACKED |
+ORIENTATION_VALID | ORIENTATION_TRACKED`, while the hold path (glasses off, SLAM lost, a fresh
+tracker not yet usable) returns `ORIENTATION_VALID | ORIENTATION_TRACKED | POSITION_VALID` only —
+position held, **not** tracked. `xreal_air_slam_get_head_pose` only follows SLAM once
+`xreal_air_slam_guard_usable` holds, which includes the 1.5 s warm-up (`XREAL_AIR_SLAM_WARMUP_MS`),
+so the bit comes back exactly when the room is locked. The plain 3DoF HMD path never sets any
+position bit. A new SLAM world is anchored at the held position (no jump), so the remaining motion
+after the bit returns is the 1 s tilt fade, below the settle thresholds. Nothing Monado-side is
+needed for Phase 2. The one fragility: we read "VALID without TRACKED" as "held", which is the
+OpenXR meaning but not a documented contract of this driver; if the driver ever started reporting
+`POSITION_TRACKED` during warm-up, the settle would show the room ~1.5 s early (no worse than
+Phase 1).
+
+**Phase 2b seam.** The blank wait is `m_donFrame.hidden` on the frame thread (and `DONNING` on the
+main thread). A glyph renderer submits its quads in the same submission loop while `hidden`
+(`OpenXRManager.cpp`, the `donHide && l->m_donLocal` skip marks the spot), and the glide target is the
+settle result's pose (`m_donHyd.r.pose`), published the frame the hydration lands. The detector,
+the decision and the fade need no change for it.
 
 ## 18. Re-seat height (2026-10-15, after Phases 0/1)
 
