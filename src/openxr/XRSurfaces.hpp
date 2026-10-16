@@ -156,13 +156,29 @@ namespace OpenXR {
     // Why a plane did not qualify (or XR_SURF_OK), for the carry trace (research/32 diagnosability).
     enum eXRSurfaceVerdict : uint8_t {
         XR_SURF_OK = 0,
-        XR_SURF_ORIENT,       // ceilings, slopes, and walls with openxr:surfaces_walls off
+        XR_SURF_CLUTTER_SMALL, // a detected patch too small to put a window on
+        XR_SURF_CLUTTER_HIGH,  // a detected upward patch at or above eye level
+        XR_SURF_ORIENT,        // ceilings, slopes, and walls with openxr:surfaces_walls off
         XR_SURF_TOO_HIGH,      // the window is farther above it than the entry distance
         XR_SURF_TOO_DEEP,      // pushed through too far: its center is below the surface as well
         XR_SURF_OUTSIDE,       // the bottom edge (or center, for a wall) is not over the plane
         XR_SURF_NONFINITE,
     };
     const char* xrSurfaceVerdictName(eXRSurfaceVerdict v);
+
+    // Clutter limits for DETECTED planes (declared planes are taken as declared): a patch smaller
+    // than this, or narrower than this on its short side, is not somewhere a window goes; an upward
+    // patch less than XR_SURFACE_HEAD_CLEARANCE below the eyes (or above them) is a shelf top, a
+    // lamp or a mis-detection, not a table to put something on.
+    constexpr float XR_SURFACE_MIN_AREA       = 0.08F; // m^2
+    constexpr float XR_SURFACE_MIN_SIDE       = 0.20F; // m
+    constexpr float XR_SURFACE_HEAD_CLEARANCE = 0.10F; // m
+
+    // The plane's area: its contour's, else the extents rectangle's.
+    float xrPlaneArea(const SXRPlane& p);
+    // XR_SURF_OK, or the clutter verdict that rules a detected plane out for this query (the head
+    // height comes from the query; without a valid head only the size rules apply).
+    eXRSurfaceVerdict xrPlaneClutter(const SXRPlane& p, const SXRSurfaceQuery& q);
 
     // What an evaluation saw: the numbers the carry trace logs.
     struct SXRSurfaceDiag {
@@ -189,11 +205,12 @@ namespace OpenXR {
     // center is above the surface): a large window lowered THROUGH a table is on that table, however
     // far its bottom edge went. `diag`, when given, says what was seen and why it did not qualify.
     SXRSurfaceCandidate xrSurfaceEvaluate(const SXRPlane& p, const SXRSurfaceQuery& q, const SXRSurfaceTuning& t, float enterDist, SXRSurfaceDiag* diag = nullptr);
-    // Every plane; a horizontal surface beats a wall, a higher horizontal surface beats a lower one
-    // (both qualifying means the bottom edge is over both: the floor under a table is under the
-    // table), then the plane the ray points at beats one it does not (it breaks ties between
-    // surfaces at about the same height), then the nearest. `stickyId` (0 = none) is the plane already previewed: it is judged against
-    // exitDist so a preview does not flicker at its threshold.
+    // Every plane that is not clutter (xrPlaneClutter); a horizontal surface beats a wall, a higher
+    // horizontal surface beats a lower one (both qualifying means the bottom edge is over both: the
+    // floor under a table is under the table), then the plane the ray points at beats one it does
+    // not (it breaks ties between surfaces at about the same height), then the nearest. `stickyId`
+    // (0 = none) is the plane already previewed: it is judged against exitDist so a preview does
+    // not flicker at its threshold.
     SXRSurfaceCandidate xrSurfacePick(const SXRPlane* planes, size_t n, const SXRSurfaceQuery& q, const SXRSurfaceTuning& t, uint64_t stickyId);
     // The snapped CONTENT pose for a kind, contact and plane.
     SXRPose xrSnapPose(eXRSnapKind kind, const SXRPlane& p, const Vec3& contact, const SXRSurfaceQuery& q, const SXRSurfaceTuning& t);
