@@ -24,6 +24,7 @@
 #include "../managers/eventLoop/EventLoopManager.hpp"
 #include "../managers/eventLoop/EventLoopTimer.hpp"
 #include "../helpers/time/Time.hpp"
+#include "../render/Renderer.hpp"
 
 #include <hyprutils/memory/Casts.hpp>
 
@@ -85,15 +86,23 @@ void COpenXRManager::publishWearBits(bool worn) {
 
 // ---- frame thread ----
 
-void COpenXRManager::recordHistorySample(const OpenXR::SXRPose& view, bool viewValid, bool viewTracked, bool posTracked, bool trustworthy, float dt,
-                                         const SXRHistFrameMonitors& mons, bool gazeEvaluated, bool roaming) {
-    // FRAME THREAD. POD only: no refcounts, no strings, no config (the tuning is all constants).
+void COpenXRManager::updateHistFeatures(const OpenXR::SXRPose& view, bool viewValid, bool posTracked, float dt) {
+    // FRAME THREAD, once per frame right after the head is located: the settle detector (Phase 2) and
+    // the history sample both read this frame's features.
     if (viewValid) {
         m_histFeatures  = OpenXR::xrHeadFeatures(m_histPrevHead, view, dt, m_histFeatures, posTracked, m_histPrevValid);
         m_histPrevHead  = view;
         m_histPrevValid = true;
     } else
         m_histPrevValid = false;
+    if (viewValid && posTracked && !m_posTrackedSeen.load(std::memory_order_relaxed))
+        m_posTrackedSeen.store(true, std::memory_order_relaxed);
+}
+
+void COpenXRManager::recordHistorySample(const OpenXR::SXRPose& view, bool viewValid, bool viewTracked, bool posTracked, bool trustworthy, const SXRHistFrameMonitors& mons,
+                                         bool gazeEvaluated, bool roaming) {
+    // FRAME THREAD. POD only: no refcounts, no strings, no config (the tuning is all constants). The
+    // features were derived earlier this frame (updateHistFeatures).
 
     const uint8_t         wb = m_wearBits.load(std::memory_order_relaxed);
     OpenXR::SXRHistSample s;
@@ -206,9 +215,23 @@ void COpenXRManager::donDoffInput(OpenXR::eXRDonInput in, const char* why) {
     OpenXR::SXRDonFacts facts;
     facts.committedSinceWorn = m_committedSinceWorn;
     facts.recenterOnPlug     = *PRECENTER != 0;
-    facts.donGate            = false; // Phase 2 (hide + settle) is not built yet
+    facts.donGate            = donGateEnabled();
 
-    const auto prev     = m_donState;
+    // research/30 Phase 2 (§5.4 as far as Phase 2 decides it): at the don edge, does anything have to
+    // be hidden? Either the hydration will MOVE monitors (the session's recenter-on-plug RESTORE is
+    // still owed), or nothing moves but the runtime is known to track position and is not doing so
+    // yet (XREAL SLAM re-acquiring after a doff: the room would swim with every head translation
+    // until it locks). Everything else — the brief in-session doff on a tracked headset — is a
+    // certain RESUME and shows at once, with no added latency.
+    bool       restoreDue = false, needPos = false, trackingPending = false;
+    const auto prev = m_donState;
+    if (in == OpenXR::XR_DIN_WORN_UP && prev == OpenXR::XR_DON_UNWORN && facts.donGate) {
+        restoreDue                  = facts.recenterOnPlug && (m_donRestore == XR_DONR_PENDING || (m_donRestore == XR_DONR_NONE && !m_everPlugged));
+        needPos                     = expectSixDof();
+        trackingPending             = needPos && !newestPosTracked();
+        facts.decisionCertainResume = !restoreDue && !trackingPending;
+    }
+
     const auto step     = OpenXR::xrDonTransition(prev, in, facts);
     auto       setState = [&](OpenXR::eXRDonState next) {
         if (next == m_donState)
@@ -218,7 +241,46 @@ void COpenXRManager::donDoffInput(OpenXR::eXRDonInput in, const char* why) {
         m_donStateSince = Time::steadyNow();
     };
     setState(step.next);
-    if (in == OpenXR::XR_DIN_SESSION_UP || (in == OpenXR::XR_DIN_WORN_UP && step.next == OpenXR::XR_DON_WORN && prev != OpenXR::XR_DON_WORN))
+
+    if (step.actions & OpenXR::XR_DA_PUBLISH_DONNING)
+        enterDonning(restoreDue, needPos, why,
+                     restoreDue ? (trackingPending ? "re-seat owed (first don of the session), position not tracked yet" : "re-seat owed (first don of the session)") :
+                                  "position tracking not back yet");
+    if (in == OpenXR::XR_DIN_WORN_UP && !facts.donGate && m_donRestore == XR_DONR_PENDING) {
+        // the gate deferred the first plug's RESTORE and has since been switched off: run it the
+        // legacy way (first valid frame) rather than lose it
+        m_donRestore = XR_DONR_DONE;
+        armReseat(OpenXR::XR_RESEAT_ARM_RESTORE);
+        Log::logger->log(Log::DEBUG, "[OPENXR] don/doff: the deferred recenter-on-plug re-seat runs now (the don gate is off)");
+    }
+    if (prev == OpenXR::XR_DON_DONNING && (step.next == OpenXR::XR_DON_UNWORN || step.next == OpenXR::XR_DON_NO_SESSION)) {
+        // taken off (or the session ended) before the head settled: show the monitors where they are
+        // (nobody is looking; the next don hides them again) and keep the owed re-seat owed
+        releaseDonGate();
+        if (m_donRestore == XR_DONR_CLAIMED)
+            m_donRestore = step.next == OpenXR::XR_DON_UNWORN ? XR_DONR_PENDING : XR_DONR_NONE;
+        m_lastDon.haveLastDon   = true;
+        m_lastDon.lastDonSettle = "cancelled";
+        Log::logger->log(Log::DEBUG, "[OPENXR] don settle abandoned ({}) — nothing was placed", why);
+    }
+    if (step.actions & OpenXR::XR_DA_SHOW_IN_PLACE) {
+        // the backstop (§5.2): no hydration arrived, so no valid view did either. Show in place; an
+        // owed RESTORE is armed the legacy way and runs on the first frame with a plausible head.
+        releaseDonGate();
+        if (m_donRestore == XR_DONR_CLAIMED) {
+            m_donRestore = XR_DONR_DONE;
+            armReseat(OpenXR::XR_RESEAT_ARM_RESTORE);
+        }
+        m_lastDon.haveLastDon     = true;
+        m_lastDon.lastDonSettle   = "backstop";
+        m_lastDon.lastDonSettleMs = (steadyNs() - m_donGateEdgeNs.load(std::memory_order_relaxed)) / 1'000'000;
+        Log::logger->log(Log::WARN, "[OPENXR] don settle produced nothing in {} ms (no valid head pose) — showing the monitors where they are{}", m_lastDon.lastDonSettleMs,
+                         m_donKind == XR_DONG_RESTORE ? "; the re-seat runs on the first plausible head" : "");
+    }
+    if (in == OpenXR::XR_DIN_SESSION_DOWN && m_posTrackedSeen.load(std::memory_order_relaxed))
+        expectSixDof(); // remembers this system as a 6DoF one for the next session
+    // reaching WORN — straight from the edge, or through a DONNING settle — starts a new wearing
+    if (in == OpenXR::XR_DIN_SESSION_UP || (step.next == OpenXR::XR_DON_WORN && prev != OpenXR::XR_DON_WORN))
         m_committedSinceWorn = false;
     if (step.actions & OpenXR::XR_DA_MARK_AUTHORED)
         ++m_authoredSinceCommit;
@@ -228,6 +290,258 @@ void COpenXRManager::donDoffInput(OpenXR::eXRDonInput in, const char* why) {
         if (m_donState == OpenXR::XR_DON_DOFFING)
             setState(OpenXR::xrDonTransition(m_donState, OpenXR::XR_DIN_COMMIT_DONE, facts).next);
     }
+}
+
+// ---- research/30 Phase 2: settle, hide, fade on don ----
+
+static const char* settleBlockName(uint8_t b) {
+    switch (b) {
+        case OpenXR::XR_SBLK_NO_VIEW: return "no trusted head pose";
+        case OpenXR::XR_SBLK_NO_POSITION: return "position never tracked";
+        case OpenXR::XR_SBLK_NOT_UPRIGHT: return "never upright";
+        case OpenXR::XR_SBLK_NOT_LEVEL: return "never level";
+        case OpenXR::XR_SBLK_MOVING: return "kept moving";
+        default: return "-";
+    }
+}
+
+bool COpenXRManager::donGateEnabled() const {
+    // MAIN THREAD (a STRING config read). Phase 2 rides the research/30 rollout switch: under the
+    // default `legacy` the don path is byte-identical to before, and don_settle_timeout_ms = 0 is the
+    // documented "today's timing" under `intent` too (§11).
+    static auto PTIMEOUT = CConfigValue<Hyprlang::INT>("openxr:don_settle_timeout_ms");
+    return *PTIMEOUT > 0 && placementMemoryIntent();
+}
+
+bool COpenXRManager::expectSixDof() {
+    // MAIN THREAD. Position tracking is EXPECTED when this session has delivered it, or when the same
+    // system did earlier in this compositor's life (a fresh XREAL SLAM session starts in its 3DoF hold
+    // and would otherwise never be waited for on its first don). A system that then fails to deliver
+    // it is forgotten again at the timeout (onDonHydrated), so a 3DoF session pays one wait at most.
+    const bool seen  = m_posTrackedSeen.load(std::memory_order_relaxed);
+    const bool known = !m_systemName.empty() && std::ranges::find(m_posTrackedSystems, m_systemName) != m_posTrackedSystems.end();
+    if (seen && !known && !m_systemName.empty())
+        m_posTrackedSystems.push_back(m_systemName);
+    return seen || known;
+}
+
+bool COpenXRManager::newestPosTracked() {
+    std::scoped_lock lock(m_historyMu);
+    const auto&      t0 = m_history.t0();
+    return !t0.empty() && (t0.back(0).flags & OpenXR::XR_HF_POS_TRACKED);
+}
+
+void COpenXRManager::enterDonning(bool restore, bool needPos, const char* why, const char* reason) {
+    // MAIN THREAD. Publish the settle for the frame thread: everything first, the token last.
+    static auto PTIMEOUT = CConfigValue<Hyprlang::INT>("openxr:don_settle_timeout_ms");
+    static auto PFADE    = CConfigValue<Hyprlang::INT>("openxr:don_fade_ms");
+    const int   timeout  = sc<int>(std::max<int64_t>(1, *PTIMEOUT));
+    m_donKind            = restore ? XR_DONG_RESTORE : XR_DONG_RESUME;
+    m_donNeedPos         = needPos;
+    if (restore)
+        m_donRestore = XR_DONR_CLAIMED;
+    m_donGateKind.store(m_donKind, std::memory_order_relaxed);
+    m_donGateNeedPos.store(needPos, std::memory_order_relaxed);
+    m_donGateTimeoutMs.store(timeout, std::memory_order_relaxed);
+    m_donGateFadeMs.store(sc<int32_t>(std::max<int64_t>(0, *PFADE)), std::memory_order_relaxed);
+    m_donGateEdgeNs.store(steadyNs(), std::memory_order_relaxed);
+    m_donGateToken.store(++m_donToken, std::memory_order_release);
+
+    m_lastDon.haveLastDon     = true;
+    m_lastDon.lastDonSettle   = "pending";
+    m_lastDon.lastDonSettleMs = 0;
+    m_lastDon.lastDonRung     = 0;
+    m_lastDon.lastDonReason   = reason;
+    m_lastDon.lastDonKind     = restore ? "rehydrate" : "resume";
+    m_lastDon.lastDonNeedPos  = needPos;
+
+    // §5.3: the fade re-applies its alpha from the content snapshot, so it needs one taken from the
+    // CURRENT content — damage the hidden monitors once so a fresh buffer arrives while they are
+    // hidden (the frame thread snapshots every hidden monitor's fresh blits).
+    std::vector<PHLMONITOR> damage;
+    int                     hidden = 0;
+    {
+        std::scoped_lock lock(m_layersMu);
+        for (auto& l : m_layers) {
+            if (l->m_pendingRemoval.load(std::memory_order_acquire) || l->m_anchor.state().mode != OpenXR::XR_ANCHOR_LOCAL)
+                continue;
+            ++hidden;
+            if (auto mon = l->m_monitor.lock())
+                damage.push_back(mon);
+        }
+    }
+    for (auto& mon : damage)
+        g_pHyprRenderer->damageMonitor(mon);
+
+    // the main-thread backstop (§5.2): the frame thread can only decide on frames it renders
+    const auto dur = std::chrono::milliseconds(timeout + OpenXR::XR_SETTLE_BACKSTOP_EXTRA_MS);
+    if (!m_donBackstopTimer) {
+        m_donBackstopTimer = makeShared<CEventLoopTimer>(dur, [this](SP<CEventLoopTimer> self, void*) { onDonBackstop(); }, nullptr);
+        if (g_pEventLoopManager)
+            g_pEventLoopManager->addTimer(m_donBackstopTimer);
+    } else
+        m_donBackstopTimer->updateTimeout(dur);
+
+    Log::logger->log(Log::DEBUG, "[OPENXR] don/doff: hiding {} anchor:local monitor(s) until the head settles ({}; {}{}; at most {} ms)", hidden, why, reason,
+                     needPos ? ", 6DoF expected" : "", timeout);
+}
+
+void COpenXRManager::releaseDonGate() {
+    // MAIN THREAD: show the current settle's monitors in place, no hydration
+    m_donGateRelease.store(m_donToken, std::memory_order_release);
+    if (m_donBackstopTimer)
+        m_donBackstopTimer->updateTimeout(std::nullopt);
+}
+
+bool COpenXRManager::donClaimFirstPlugRestore() {
+    // MAIN THREAD, at the first plug of a session with recenter_on_plug. Under the gate the RESTORE
+    // belongs to the don settle (it re-seats from the SETTLED head, not the one 35 ms after the edge).
+    if (!donGateEnabled())
+        return false;
+    switch (m_donRestore) {
+        case XR_DONR_CLAIMED:
+        case XR_DONR_DONE: return true; // the don edge already claimed it (the usual order: worn, then plug)
+        case XR_DONR_NONE:
+        case XR_DONR_PENDING: break;
+    }
+    if (m_donState == OpenXR::XR_DON_DONNING) {
+        // a settle is running for a RESUME: restart it as the RESTORE
+        enterDonning(true, m_donNeedPos, "first plug of the session", "re-seat owed (first don of the session)");
+        return true;
+    }
+    if (m_donState == OpenXR::XR_DON_WORN) {
+        // already shown: re-seat the legacy way rather than hide a room the user is looking at
+        m_donRestore = XR_DONR_DONE;
+        return false;
+    }
+    m_donRestore = XR_DONR_PENDING; // not worn yet (monitors_follow_session = off | session): the next don runs it
+    Log::logger->log(Log::DEBUG, "[OPENXR] first plug of session — the recenter-on-plug re-seat is deferred to the don settle");
+    return true;
+}
+
+void COpenXRManager::onDonHydrated(uint32_t token) {
+    // MAIN THREAD, from DON_HYDRATED (or the backstop finding the record already written)
+    if (token != m_donToken || m_donState != OpenXR::XR_DON_DONNING)
+        return; // a superseded or abandoned settle
+    SXRDonHydration h;
+    {
+        std::scoped_lock lock(m_donHydMu);
+        h = m_donHyd;
+    }
+    if (h.token != token)
+        return;
+    if (m_donBackstopTimer)
+        m_donBackstopTimer->updateTimeout(std::nullopt);
+
+    const auto&     r           = h.r;
+    const bool      restore     = h.kind == XR_DONG_RESTORE;
+    constexpr float R2D         = RAD2DEG;
+    m_lastDon.haveLastDon       = true;
+    m_lastDon.lastDonSettle     = r.state == OpenXR::XR_SETTLE_SETTLED ? "settled" : "timeout";
+    m_lastDon.lastDonSettleMs   = r.settleNs / 1'000'000;
+    m_lastDon.lastDonRung       = r.rung;
+    m_lastDon.lastDonAngMaxDeg  = r.angMax * R2D;
+    m_lastDon.lastDonAngMeanDeg = r.angMean * R2D;
+    m_lastDon.lastDonPitchDeg   = r.pitch * R2D;
+    m_lastDon.lastDonRollDeg    = r.roll * R2D;
+    if (r.state == OpenXR::XR_SETTLE_TIMEOUT)
+        m_lastDon.lastDonReason += std::format("; timed out: {}", settleBlockName(r.block));
+
+    if (restore) {
+        m_donRestore = XR_DONR_DONE;
+        // report 12 §3a: the group was just re-seated, so the 2D plane's latched desk orientation
+        // describes an arrangement that no longer exists (the first plug used to drop it; under the
+        // gate the re-seat happens here instead)
+        m_l2dRef = OpenXR::SXRLayout2DRef{};
+        m_l2dPrev.clear();
+        requestLayout2DSync();
+    }
+    // a system that was expected to track position and never did this session is not a 6DoF one now
+    if (r.block == OpenXR::XR_SBLK_NO_POSITION && !m_posTrackedSeen.load(std::memory_order_relaxed))
+        std::erase(m_posTrackedSystems, m_systemName);
+
+    const char* what = restore ? (r.havePose ? "re-seated from the settled head" : "re-seat armed for the first upright head") : "shown in place";
+    if (r.state == OpenXR::XR_SETTLE_SETTLED)
+        Log::logger->log(Log::DEBUG, "[OPENXR] don settled after {} ms (ω max {:.0f}°/s mean {:.0f}°/s, pitch {:.0f}°, roll {:.0f}°) — {}", m_lastDon.lastDonSettleMs,
+                         m_lastDon.lastDonAngMaxDeg, m_lastDon.lastDonAngMeanDeg, m_lastDon.lastDonPitchDeg, m_lastDon.lastDonRollDeg, what);
+    else
+        Log::logger->log(Log::WARN, "[OPENXR] don settle timed out after {} ms ({}) — rung {}: {}", m_lastDon.lastDonSettleMs, settleBlockName(r.block), sc<int>(r.rung),
+                         r.rung == OpenXR::XR_RUNG_BEST_WINDOW      ? std::format("{}, from the calmest moment it looked ahead", what) :
+                             r.rung == OpenXR::XR_RUNG_LAST_UPRIGHT ? std::format("{}, from the last upright head (reclined?)", what) :
+                                                                      std::format("{}; nothing moved on our own account", what));
+    journal(OpenXR::XR_J_DON_SETTLED, token, r.rung, sc<float>(m_lastDon.lastDonSettleMs) * 1e-3F);
+    donDoffInput(OpenXR::XR_DIN_HYDRATED, "the head settled");
+}
+
+void COpenXRManager::onDonBackstop() {
+    // MAIN THREAD, timeout + 1 s after the DONNING edge
+    if (m_donState != OpenXR::XR_DON_DONNING)
+        return;
+    uint32_t written = 0;
+    {
+        std::scoped_lock lock(m_donHydMu);
+        written = m_donHyd.token;
+    }
+    if (written == m_donToken) {
+        onDonHydrated(written); // the event is still in the queue: the frame thread did decide
+        return;
+    }
+    donDoffInput(OpenXR::XR_DIN_BACKSTOP, "the settle backstop fired");
+}
+
+// FRAME THREAD. POD + atomics only (no refcounts, no strings, no config reads).
+void COpenXRManager::donGateFrameStep(int64_t pdt, const OpenXR::SXRPose& view, bool viewValid, bool trusted, bool posTracked) {
+    auto&          F   = m_donFrame;
+    const uint32_t tok = m_donGateToken.load(std::memory_order_acquire);
+    if (tok != F.seenToken) {
+        F.seenToken = tok;
+        if (tok) {
+            F.kind = m_donGateKind.load(std::memory_order_relaxed);
+            OpenXR::SXRSettleParams p;
+            p.mode      = F.kind == XR_DONG_RESTORE ? OpenXR::XR_SETTLE_POSE : OpenXR::XR_SETTLE_TRACKING;
+            p.timeoutNs = sc<int64_t>(m_donGateTimeoutMs.load(std::memory_order_relaxed)) * 1'000'000LL;
+            p.needPos   = m_donGateNeedPos.load(std::memory_order_relaxed);
+            F.fadeNs    = sc<int64_t>(m_donGateFadeMs.load(std::memory_order_relaxed)) * 1'000'000LL;
+            F.det.reset(m_donGateEdgeNs.load(std::memory_order_relaxed), p);
+            F.hidden = true;
+            F.fading = false;
+        }
+    }
+    if (!F.hidden)
+        return;
+    auto startFade = [&] {
+        F.hidden       = false;
+        F.fading       = F.fadeNs > 0;
+        F.fadeStartPdt = pdt;
+    };
+    if (m_donGateRelease.load(std::memory_order_acquire) == F.seenToken) {
+        startFade();
+        return;
+    }
+    OpenXR::SXRSettleInput in;
+    in.tNs        = steadyNs();
+    in.head       = view;
+    in.valid      = viewValid;
+    in.trusted    = trusted;
+    in.posTracked = posTracked;
+    in.angSpeed   = viewValid ? m_histFeatures.angSpeed : 0.F;
+    in.linSpeed   = viewValid ? m_histFeatures.linSpeed : 0.F;
+    const auto r  = F.det.step(in);
+    if (r.state == OpenXR::XR_SETTLE_WAITING)
+        return;
+    {
+        std::scoped_lock lock(m_donHydMu);
+        m_donHyd = SXRDonHydration{.token = F.seenToken, .kind = F.kind, .r = r};
+    }
+    enqueue(SXRStateEvent{.type = eXRStateEventType::DON_HYDRATED, .a = sc<int32_t>(F.seenToken)});
+    startFade();
+    if (F.kind != XR_DONG_RESTORE)
+        return;
+    // the RESTORE runs through the ordinary consume path, this frame if the view is valid; without a
+    // pose (rung 3) it is the legacy arm, which waits for the first plausible head
+    F.restorePoseValid = r.havePose;
+    F.restorePose      = r.pose;
+    armReseat(OpenXR::XR_RESEAT_ARM_RESTORE);
 }
 
 OpenXR::SXRArrangementView COpenXRManager::arrangementView() {
@@ -533,6 +847,19 @@ COpenXRManager::SXRDonOffStatus COpenXRManager::donoffStatus() {
     s.placementMemory     = placementMemoryIntent() ? "intent" : "legacy";
     s.authoredSinceCommit = m_authoredSinceCommit;
     s.recording           = m_donoffRecording;
+    s.donGate             = donGateEnabled();
+    s.hidden              = m_donState == OpenXR::XR_DON_DONNING;
+    s.haveLastDon         = m_lastDon.haveLastDon;
+    s.lastDonKind         = m_lastDon.lastDonKind;
+    s.lastDonSettle       = m_lastDon.lastDonSettle;
+    s.lastDonReason       = m_lastDon.lastDonReason;
+    s.lastDonSettleMs     = m_lastDon.lastDonSettleMs;
+    s.lastDonRung         = m_lastDon.lastDonRung;
+    s.lastDonAngMaxDeg    = m_lastDon.lastDonAngMaxDeg;
+    s.lastDonAngMeanDeg   = m_lastDon.lastDonAngMeanDeg;
+    s.lastDonPitchDeg     = m_lastDon.lastDonPitchDeg;
+    s.lastDonRollDeg      = m_lastDon.lastDonRollDeg;
+    s.lastDonNeedPos      = m_lastDon.lastDonNeedPos;
     std::scoped_lock lock(m_historyMu);
     const auto&      t0 = m_history.t0();
     s.dof               = !t0.empty() && (t0.back(0).flags & OpenXR::XR_HF_POS_TRACKED) ? 6 : 3;
@@ -566,6 +893,7 @@ static const char* journalKindName(uint8_t k) {
         case OpenXR::XR_J_FORGET: return "forget";
         case OpenXR::XR_J_GEN: return "origin-gen";
         case OpenXR::XR_J_SHADOW: return "shadow";
+        case OpenXR::XR_J_DON_SETTLED: return "don-settled";
         default: return "?";
     }
 }

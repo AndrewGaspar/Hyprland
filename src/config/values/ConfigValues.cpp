@@ -758,6 +758,15 @@ std::vector<SP<IValue>> Values::getConfigValues() {
                    "(`shadow:` lines); intent = the seat is the last place you dwelled while working (onset-cut, stillness-weighted, facing-checked), never compared against "
                    "the old memory (research/30). A re-seat (`xrmonitor reseat`) commits immediately under both",
                    "legacy"),
+        MS<Int>("openxr:don_settle_timeout_ms",
+                "placement_memory = intent only: when you put the headset on and the monitors are about to be placed around your head (the first don of a session with "
+                "recenter_on_plug), or the runtime normally tracks position but has not re-acquired it yet (XREAL SLAM after a doff), the anchor:local monitors are hidden "
+                "until your head has settled — still, level and tracked for half a second — and then fade in, placed from that settled pose. This is the longest wait, in "
+                "milliseconds, before they are shown anyway (research/30 §5.2). 0 = no hide and no wait: the re-seat runs on the first valid frame, exactly as under legacy",
+                3000, {.min = 0, .max = 30000}),
+        MS<Int>("openxr:don_fade_ms",
+                "placement_memory = intent only: how long the hidden monitors take to fade in once the head has settled on don, in milliseconds (0 = appear at once)", 180,
+                {.min = 0, .max = 5000}),
         MS<String>("openxr:recenter",
                    "what the HEADSET's own recenter button does to your monitors: hold (default) = the monitors stay where they are IN THE ROOM, so recentering only moves the "
                    "runtime's origin; follow = a runtime reference-space change ALSO re-seats the anchor:local group rigidly to your current head, i.e. the recenter button "

@@ -24,6 +24,7 @@
 #include "XRInput.hpp" // SXRInputEvent / SXRStateEvent / XRQueueItem / CXRQueue / CXRInput
 #include "XRPoseHistory.hpp" // research/30: the in-memory don/doff history (unguarded, POD)
 #include "XRDonDoff.hpp"     // research/30: seat selection + the don/doff FSM (unguarded, pure)
+#include "XRDonSettle.hpp"   // research/30 Phase 2: the don settle detector (unguarded, pure)
 
 struct wl_event_source;
 
@@ -243,6 +244,17 @@ class COpenXRManager {
         float                    spanS[5]            = {0.f, 0.f, 0.f, 0.f, 0.f};
         size_t                   episodes            = 0;
         bool                     recording           = false;
+        // research/30 Phase 2: the don gate (hide until settled, then fade in)
+        bool        donGate       = false; // placement_memory = intent && don_settle_timeout_ms > 0
+        bool        hidden        = false; // anchor:local monitors hidden right now (DONNING)
+        bool        haveLastDon   = false;
+        std::string lastDonKind   = "none"; // rehydrate | resume
+        std::string lastDonSettle = "none"; // settled | timeout | backstop | cancelled
+        std::string lastDonReason;          // why it hid (and, on a timeout, what kept the hold from completing)
+        int64_t     lastDonSettleMs  = 0;
+        int         lastDonRung      = 0;
+        float       lastDonAngMaxDeg = 0.f, lastDonAngMeanDeg = 0.f, lastDonPitchDeg = 0.f, lastDonRollDeg = 0.f;
+        bool        lastDonNeedPos = false;
     };
     SXRDonOffStatus donoffStatus();
     // `hyprctl openxr donoff`: the last episodes, the edge journal and the generation table. Never
@@ -637,8 +649,8 @@ class COpenXRManager {
         uint8_t                  nMap    = 0;
         bool                     anyGrab = false;
     };
-    void recordHistorySample(const OpenXR::SXRPose& view, bool viewValid, bool viewTracked, bool posTracked, bool trustworthy, float dt, const SXRHistFrameMonitors& mons,
-                             bool gazeEvaluated, bool roaming);
+    void recordHistorySample(const OpenXR::SXRPose& view, bool viewValid, bool viewTracked, bool posTracked, bool trustworthy, const SXRHistFrameMonitors& mons, bool gazeEvaluated,
+                             bool roaming);
     bool placementMemoryIntent() const; // reads the STRING config: main thread only
     // the frame thread's wear facts (visible / presence / worn), published from publishRestoreCapture
     void publishWearBits(bool worn);
@@ -675,6 +687,77 @@ class COpenXRManager {
     SP<CEventLoopTimer>                              m_donoffTraceTimer;
     int64_t                                          m_donoffTraceEdgeNs = 0;
     std::string                                      m_donoffTraceEdgeName;
+
+    // ---- research/30 Phase 2: settle, hide, fade on don ----
+    // Gated on placement_memory = intent && don_settle_timeout_ms > 0 (donGateEnabled, MAIN THREAD:
+    // a STRING config read). The main thread decides AT THE EDGE whether to hide and what the
+    // hydration will do, publishes that as POD atomics under a fresh token, and the frame thread runs
+    // the settle detector, executes the hydration on the settling frame, owns the hide + fade (it has
+    // to land on the exact frame of the hydration, §5.3) and reports back with DON_HYDRATED.
+    //
+    // PHASE 2b SEAM: the blank wait is m_donFrame.hidden (frame thread) and the main thread's DONNING
+    // state; a glyph renderer submits its quads while `hidden` and reads the settle target from the
+    // hydration record (m_donHyd.pose) to glide to. Nothing here has to change for it.
+    enum eXRDonRestore : uint8_t {
+        XR_DONR_NONE = 0, // no recenter-on-plug restore owed this session (or recenter_on_plug off)
+        XR_DONR_PENDING,  // the first plug owed one and the gate deferred it to the next don
+        XR_DONR_CLAIMED,  // a DONNING settle will execute it
+        XR_DONR_DONE,     // executed (or armed the legacy way)
+    };
+    enum eXRDonGateKind : uint8_t {
+        XR_DONG_RESUME  = 0, // nothing moves: shown in place once tracking is back (TRACKING mode)
+        XR_DONG_RESTORE = 1, // the recenter-on-plug RESTORE, from the settled head (POSE mode)
+    };
+    struct SXRDonHydration { // frame -> main, POD under m_donHydMu
+        uint32_t                token = 0;
+        uint8_t                 kind  = XR_DONG_RESUME;
+        OpenXR::SXRSettleResult r;
+    };
+    struct SXRDonFrame { // frame thread only; reset at every frame-thread start
+        uint32_t seenToken    = 0;
+        bool     hidden       = false;
+        bool     fading       = false;
+        int64_t  fadeStartPdt = 0; // XrTime of the hydration frame
+        int64_t  fadeNs       = 0;
+        uint8_t  kind         = XR_DONG_RESUME;
+        // the settled head the armed RESTORE re-seats around, until the consume runs (or refuses) it
+        bool                      restorePoseValid = false;
+        OpenXR::SXRPose           restorePose;
+        OpenXR::CXRSettleDetector det;
+    };
+    bool donGateEnabled() const; // MAIN THREAD (string config)
+    bool expectSixDof();         // MAIN THREAD: this session, or this system earlier in the process, tracked position
+    bool newestPosTracked();     // MAIN THREAD: the newest history sample's POSITION_TRACKED
+    void enterDonning(bool restore, bool needPos, const char* why, const char* reason);
+    void releaseDonGate();
+    bool donClaimFirstPlugRestore(); // first plug under the gate: true = the don settle owns the RESTORE
+    void onDonHydrated(uint32_t token);
+    void onDonBackstop();
+    void updateHistFeatures(const OpenXR::SXRPose& view, bool viewValid, bool posTracked, float dt);                // FRAME THREAD
+    void donGateFrameStep(int64_t pdt, const OpenXR::SXRPose& view, bool viewValid, bool trusted, bool posTracked); // FRAME THREAD
+
+    // main -> frame (published before the token, token last with release)
+    std::atomic<uint32_t> m_donGateToken{0};
+    std::atomic<uint32_t> m_donGateRelease{0}; // == token: show in place now, move nothing
+    std::atomic<uint8_t>  m_donGateKind{XR_DONG_RESUME};
+    std::atomic<bool>     m_donGateNeedPos{false};
+    std::atomic<int32_t>  m_donGateTimeoutMs{3000};
+    std::atomic<int32_t>  m_donGateFadeMs{180};
+    std::atomic<int64_t>  m_donGateEdgeNs{0};
+    // frame -> main
+    std::atomic<bool> m_posTrackedSeen{false}; // POSITION_TRACKED this session
+    std::mutex        m_donHydMu;
+    SXRDonHydration   m_donHyd;
+    // frame thread only
+    SXRDonFrame m_donFrame;
+    // main thread only
+    uint32_t                 m_donToken   = 0;
+    eXRDonRestore            m_donRestore = XR_DONR_NONE;
+    uint8_t                  m_donKind    = XR_DONG_RESUME;
+    bool                     m_donNeedPos = false;
+    SP<CEventLoopTimer>      m_donBackstopTimer;
+    std::vector<std::string> m_posTrackedSystems; // system names that delivered 6DoF earlier in this process
+    SXRDonOffStatus          m_lastDon;           // the don fields of the status block
 
     // Signature of every config value a bring-up attempt depends on (openxr:enabled, :gpu,
     // :runtime_json, :blend_mode, :overlay(_z), :ignore_kernel_taint, :reprobe*). MAIN THREAD only —
