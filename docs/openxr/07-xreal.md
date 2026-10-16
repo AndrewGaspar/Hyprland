@@ -23,7 +23,7 @@ The pieces:
 | udev rule | hidraw access for the `3318:*` HID interfaces | `contrib/xreal/70-xreal.rules` |
 | `xreal-ctl` | standalone HID helper (mode 2d/3d, brightness) for the flat side | `contrib/xreal/` |
 | systemd unit | user unit for the xreal Monado runtime (à la wivrn) | `contrib/xreal/monado-xreal.service` |
-| the toggle | `xreal-mode.sh {xr\|flat\|status}` | `scripts/xreal-mode.sh` |
+| the toggle | `xreal-mode.sh {xr\|2d\|3d\|off\|status}` | `scripts/xreal-mode.sh` (mirror of dotfiles `bin/xreal-mode`) |
 | 3DoF profile | curved-arc layout + keyboard/gaze binds + window rules | `example/xreal.conf` |
 
 ---
@@ -390,12 +390,21 @@ reproduces the 2026-10-15 runaway.
 ## 2. The toggle
 
 ```sh
-scripts/xreal-mode.sh xr           # 3D SBS arc, fullscreen-WINDOW path (default). --mono = 1920×1080 mono
-scripts/xreal-mode.sh xr --direct  # 3D SBS via DRM-LEASE direct mode (V2.2): Monado leases DP-5, owns the flip
-scripts/xreal-mode.sh flat         # back to an ordinary head-locked 1920×1080 monitor on the DP output
-scripts/xreal-mode.sh status       # detection + current DP mode + hyprctl openxr status
+scripts/xreal-mode.sh xr           # OpenXR HMD, DRM-LEASE direct mode (default since 2026-10-11)
+scripts/xreal-mode.sh xr --window  # the old fullscreen-window path
+scripts/xreal-mode.sh 2d           # ordinary head-locked 1920×1080 monitor (`flat` is an alias)
+scripts/xreal-mode.sh 3d           # 3840×1080 SBS stereo desktop (compositor pack); `toggle` = 2d <-> 3d
+scripts/xreal-mode.sh off          # glasses stop being a desktop output
+scripts/xreal-mode.sh status [--json]  # DRM/EDID + USB/HID + systemd derived state (read-only)
 scripts/xreal-mode.sh xr --dry-run # print every action without doing anything
 ```
+
+`scripts/xreal-mode.sh` is a mirror of the canonical `bin/xreal-mode` in the dotfiles
+(omarchy-hyprland-config → `~/.config/hypr/bin/xreal-mode`), with `scripts/lib/hypr-config.sh` beside
+it; its header is the reference. It targets the glasses by EDID description (`XREAL_DESC`), never by
+connector, serialises + paces firmware flips, detaches transitions (`setsid`) and refuses flips while
+the wear sensor has the HID side asleep. `--mono` and `XREAL_MONITOR` are gone. The step-by-step
+below is the original WP-XR1 flow; the ordering rules still hold.
 
 **`xr`** does, in order (see §0 for why this exact order): verify the glasses are present over HID →
 **end any active session + stop monado** (free the HID device so the switch is uncontended and monado
