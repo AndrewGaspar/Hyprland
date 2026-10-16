@@ -466,10 +466,13 @@ void COpenXRManager::start() {
         sess->m_overlayRequested = (*POVERLAY != 0);
         sess->m_overlayZ         = (uint32_t)std::max<int64_t>(0, (int64_t)*POVERLAYZ);
     }
-    // research/32 C1: XR_EXT_plane_detection is requested only for a user who opted into surfaces
-    // (read at session start like the overlay: toggling detection needs a session restart; the
-    // synthetic planes do not).
-    sess->m_planeDetectionRequested = m_surfacesEnabled && m_surfacesDetect;
+    // research/32 C1: XR_EXT_plane_detection is enabled whenever the runtime offers it and
+    // openxr:surfaces_detect allows it — NOT only when openxr:surfaces is already on, because an
+    // extension can only be enabled at instance creation and surfaces are usually switched on
+    // mid-session. Enabling it costs nothing: the detector is created lazily by the first poll,
+    // and the poll only runs while openxr:surfaces is on. surfaces_detect itself stays read at
+    // session start (like the overlay).
+    sess->m_planeDetectionRequested = m_surfacesDetect;
 
     // Task #89 phase 2 blocker B: kick the runtime FIRST-CONTACT handshake (xrCreateInstance +
     // xrGetSystem) FULLY off the main thread and return immediately. beginHandshake() spawns a detached

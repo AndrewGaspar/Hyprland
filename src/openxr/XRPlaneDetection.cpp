@@ -27,7 +27,7 @@ CXRPlaneDetectionSource::CXRPlaneDetectionSource(XrInstance instance, XrSession 
 #ifdef XR_EXT_plane_detection
     if (!enabled) {
         m_why =
-            advertised ? "advertised but not enabled (openxr:surfaces_detect off, or surfaces were off at session start)" : "the runtime does not advertise XR_EXT_plane_detection";
+            advertised ? "advertised but not enabled (openxr:surfaces_detect was off at session start)" : "the runtime does not advertise XR_EXT_plane_detection";
         return;
     }
     if (!(features & XR_PLANE_DETECTION_CAPABILITY_PLANE_DETECTION_BIT_EXT)) {
