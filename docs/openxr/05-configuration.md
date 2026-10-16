@@ -396,6 +396,45 @@ Feedback: the dwell-stable monitor you're looking at is highlighted via the norm
 move-bar lights up in the hover color); a gaze-carried monitor glows in the grab color and shows the
 gaze cursor. A gaze carry and a hand/controller grab can't fight over one monitor — first wins.
 
+### Surfaces — drop monitors onto tables (research/32)
+
+Opt-in. While you carry a monitor (hand/controller move grab or gaze carry) and its bottom edge comes
+within `surfaces_snap_distance` of an upward surface, the monitor is **shown where it will land**
+(standing on the surface, facing you, leaning back `surfaces_stand_tilt`); let go and it stays there,
+`anchor:local`. Carry it tilted face-up past 45°, or hold the controller trigger as you let go, and it
+lies flat instead; near a wall it goes flush onto the wall (`surfaces_walls`). A snapped monitor
+remembers its pose **relative to the plane**: when the runtime refines the plane it moves with it,
+when the plane disappears it stays exactly where it is, and any other move (a grab, a verb, a
+re-seat) ends the relation.
+
+Planes come from `surfaces_synthetic` (declared, for testing and for headsets without plane
+detection) and, when the runtime advertises it, `XR_EXT_plane_detection` (Monado: only headsets whose
+driver feeds planes; otherwise status says `unsupported`). Planes are re-located against the
+reference space on every poll and re-expressed across a recenter, never cached in world coordinates.
+
+| Variable | Type | Default | Meaning | |
+|---|---|---|---|---|
+| `surfaces` | bool | `false` | Master switch. | hot |
+| `surfaces_synthetic` | string | `""` | Declared planes, `;`-separated: `<table\|platform\|floor\|ceiling\|wall\|plane> pos:x,y,z size:w,d [yaw:deg]` — `pos` is the plane's centre in LOCAL_FLOOR metres, `size` its width and depth (width and height for a wall), `yaw` turns it about world up; a wall faces +Z at yaw 0. Re-published against the current origin after every reference-space change. | hot |
+| `surfaces_detect` | bool | `true` | Use the runtime's `XR_EXT_plane_detection` when advertised. The extension is only requested when `surfaces` is on **at session start**. | session start |
+| `surfaces_snap_distance` | float | `0.08` | Metres between the monitor's visible bottom edge (its centre, for a wall) and the surface at which it previews and snaps; it lets go again at 1.5×. | hot |
+| `surfaces_stand_tilt` | float | `12` | Degrees a standing monitor leans back. | hot |
+| `surfaces_walls` | bool | `true` | Also snap flush onto vertical planes. | hot |
+| `surfaces_poll_ms` | int | `750` | How often the plane sources are polled / re-located (main thread). | hot |
+
+```lua
+-- a coffee table 0.44 m high, 0.8 m in front of where the session started
+hl.config({ openxr = { surfaces = true, surfaces_synthetic = "table pos:0,0.44,-0.8 size:1.2,0.6" } })
+```
+
+Live, from a shell (Lua config — `hyprctl keyword` does not exist there):
+
+```sh
+hyprctl eval 'hl.config({ openxr = { surfaces = true, surfaces_synthetic = "table pos:0,0.74,-0.7 size:1.2,0.7; wall pos:0,1.2,-2.5 size:3,2.4" } })'
+hyprctl -j openxr | jq '.surfaces'            # sources, planes, last snap
+hyprctl -j openxr | jq '.monitors[].surface'  # per monitor: attached / planeId / kind / planeLost / preview
+```
+
 ### 2D-plane sync (`layout2d:*`)
 
 Derives Hyprland's **native 2D monitor layout** from where the XR quads actually float, so mouse
@@ -1499,6 +1538,7 @@ Posted on the compositor's socket2 (`.socket2.sock`), standard `EVENT>>DATA` wir
 | `xrmonitorquad` | `<name>,1` / `<name>,0` | A monitor's quad was reactivated / suspended under the runtime layer cap (the monitor keeps rendering as a headless output). |
 | `xrmonitorundocked` | `<name>` | An adaptive monitor picked itself up and began following. |
 | `xrmonitordocked` | `<name>` | An adaptive monitor re-docked to its desk pose. |
+| `xrmonitorsurface` | `<name>,<stand\|flat\|wall>,<label>` | A released monitor was snapped onto a surface (research/32; `label` is the plane's: `table`, `floor`, `wall`, `platform`, `unknown`, …). |
 | `xrlayout2dsync` | `<n>` | 2D-plane sync placed `<n>` XR monitors and the layout actually changed. The stock `monitor.layoutChanged` fires too (via `arrange()`), so a bar can just re-read `hyprctl monitors`; this event says *why*. Not posted when a recompute resolves to the same layout. |
 
 ### Bar recipe (polling)

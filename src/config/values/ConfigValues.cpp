@@ -1031,6 +1031,26 @@ std::vector<SP<IValue>> Values::getConfigValues() {
         MS<Bool>("openxr:gaze_cursor", "draw a distinct cursor dot at the gaze point on the carried monitor while a gaze carry is active (the dwell candidate is shown via the chrome highlight)", true),
         MS<Color>("openxr:gaze_cursor_col", "color of the gaze cursor dot (premultiplied over the quad)", 0xffcc66ff),
 
+        // ---- surfaces: drop windows onto tables (docs/openxr/research/32-surfaces.md) ----
+        MS<Bool>("openxr:surfaces",
+                 "snap a carried XR monitor onto a real (or declared) surface when you let go near one: within openxr:surfaces_snap_distance of a table it is shown where it "
+                 "will land, and on release it stands on the table facing you (hold the controller trigger, or carry it tilted face-up, to lay it flat). Planes come from "
+                 "openxr:surfaces_synthetic and, when the runtime offers it, XR_EXT_plane_detection. Off by default",
+                 false),
+        MS<String>("openxr:surfaces_synthetic",
+                   "declared planes for openxr:surfaces, in LOCAL_FLOOR metres, separated by ';': `<table|platform|floor|ceiling|wall|plane> pos:x,y,z size:w,d [yaw:deg]` "
+                   "(pos = the plane's center; size = width and depth, or width and height for a wall; a wall faces +Z at yaw 0). For testing and for headsets without plane "
+                   "detection, e.g. \"table pos:0,0.74,-0.7 size:1.2,0.7\"",
+                   ""),
+        MS<Bool>("openxr:surfaces_detect", "with openxr:surfaces on, use the runtime's XR_EXT_plane_detection when it advertises the extension (read at session start)", true),
+        MS<Float>("openxr:surfaces_snap_distance",
+                  "how close (metres) a carried monitor's bottom edge — or its center, for a wall — must come to a surface before it previews and snaps; it lets go again at 1.5x "
+                  "this",
+                  0.08, {.min = 0.01, .max = 0.5}),
+        MS<Float>("openxr:surfaces_stand_tilt", "how far back (degrees) a monitor standing on a surface leans", 12.0, {.min = 0.0, .max = 45.0}),
+        MS<Bool>("openxr:surfaces_walls", "openxr:surfaces also snaps monitors flush onto vertical surfaces (walls)", true),
+        MS<Int>("openxr:surfaces_poll_ms", "how often (milliseconds) the plane sources are polled and re-located", 750, {.min = 100, .max = 10000}),
+
         // ---- 2D-plane sync (docs/openxr/research/archive/12-spatial-2d-layout.md) ----
         MS<Bool>("openxr:layout2d:enabled",
                  "derive Hyprland's 2D monitor layout from where the XR quads actually float, so mouse crossing and directional focus match spatial intuition (a monitor to your "

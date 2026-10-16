@@ -25,6 +25,8 @@
 #include "XRPoseHistory.hpp" // research/30: the in-memory don/doff history (unguarded, POD)
 #include "XRDonDoff.hpp"     // research/30: seat selection + the don/doff FSM (unguarded, pure)
 #include "XRDonSettle.hpp"   // research/30 Phase 2: the don settle detector (unguarded, pure)
+#include "XRSurfaces.hpp"    // research/32: the plane model + snap math (unguarded, pure)
+#include "XRPlaneSource.hpp" // research/32: the plane sources (unguarded, pure)
 
 struct wl_event_source;
 
@@ -267,6 +269,25 @@ class COpenXRManager {
     // (research/30 §13.4). Off by default; turns itself off at session end.
     std::expected<std::string, std::string> cmdDonoffRecord(const std::string& args);
 
+    // ---- research/32 surfaces (C0-C2). MAIN THREAD. ----
+    // The `surfaces` block of `hyprctl openxr status`: whether the feature is on, each plane source's
+    // state, the planes as last polled (solver frame), and the last snap a release made.
+    struct SXRSurfaceStatus {
+        bool                          enabled = false;
+        std::string                   runtime;   // the runtime source's status line
+        std::string                   synthetic; // the synthetic source's status line
+        std::vector<OpenXR::SXRPlane> planes;
+        bool                          haveSnap = false;
+        std::string                   snapMonitor;
+        uint64_t                      snapPlane = 0;
+        std::string                   snapLabel = "unknown";
+        std::string                   snapKind  = "none";
+        OpenXR::Vec3                  snapContact;
+        OpenXR::Vec3                  snapPos;
+        int64_t                       snapAgeMs = -1;
+    };
+    SXRSurfaceStatus surfaceStatus();
+
     // Milliseconds until the pending grace-period unplug fires, or -1 when none is armed. Cheap
     // read of the timer for `hyprctl openxr status` observability. Main thread only.
     int  monitorUnplugPendingMs() const;
@@ -437,6 +458,13 @@ class COpenXRManager {
         int         quads  = 1;
         // doc 05 §3.3: where this monitor's mode/scale/width defaults came from, one line.
         std::string defaults;
+        // research/32: the surface this window was snapped onto (plane-relative), and whether it is
+        // being previewed onto one right now.
+        bool        surfaceAttached  = false;
+        bool        surfacePlaneLost = false;
+        uint64_t    surfacePlane     = 0;
+        std::string surfaceKind      = "none";
+        bool        surfacePreview   = false;
         std::string l2dSource = "off";
         int         l2dCol = 0, l2dRow = 0;
         double      l2dX = 0.0, l2dY = 0.0;
@@ -758,6 +786,59 @@ class COpenXRManager {
     SP<CEventLoopTimer>      m_donBackstopTimer;
     std::vector<std::string> m_posTrackedSystems; // system names that delivered 6DoF earlier in this process
     SXRDonOffStatus          m_lastDon;           // the don fields of the status block
+
+    // ---- research/32 surfaces (C0-C2) — OpenXRManagerSurfaces.cpp ----
+    // MAIN: plane sources (synthetic + the session's runtime source) polled on a timer at
+    // openxr:surfaces_poll_ms; every changed set is published, with the tuning, under m_planesMu and a
+    // generation. FRAME: adopts a published set only if it was located in the CURRENT reference space
+    // (m_surfaceEpoch, bumped by every reference-space change on the frame thread itself), re-expresses
+    // its copy across a recenter, arms carried windows, collects snaps and moves attached windows with a
+    // refined plane — all POD, under m_layersMu where it touches layers. No refcount op, no string config.
+    void publishSurfaceTuning(); // MAIN: reload/start — parse the openxr:surfaces* options, (dis)arm the poll
+    void onSurfacePoll();        // MAIN: the poll timer
+    void armSurfaceTimer(int ms);
+    void cancelSurfaceTimer();
+    void surfacesSessionUp();            // MAIN: end of bring-up — attach the session's runtime source
+    void surfacesSessionDown(bool lost); // MAIN: stop(), frame thread joined, before the session dies
+    void publishPlanes(const OpenXR::SXRPlaneSnapshot& s, uint32_t epoch);
+    void surfaceReexpress(const OpenXR::SXRPose& m); // FRAME: a known reference-space change
+    void surfaceDiscontinuity();                     // FRAME: an unknown one — drop the frame copy
+    // FRAME, after processPointer/gaze: per active layer, under m_layersMu.
+    void surfaceFramePass(const std::vector<PXRLAYER>& active, const std::vector<OpenXR::SXRSolveResult>& results, const std::vector<bool>& solved, const OpenXR::SXRPose& view,
+                          bool viewValid, float floorShift);
+    void onSurfaceSnapped(const SXRStateEvent& e); // MAIN: the SURFACE_SNAP event
+
+    UP<OpenXR::CXRSurfaceSources> m_surfaceSources; // main thread only
+    SP<CEventLoopTimer>           m_surfaceTimer;
+    bool                          m_surfacesEnabled  = false; // main: openxr:surfaces as last applied
+    bool                          m_surfacesDetect   = true;  // main: openxr:surfaces_detect as last applied
+    int                           m_surfacePollMs    = 750;
+    uint32_t                      m_surfaceEpochSeen = 0; // main: the epoch the sources last published in
+    std::atomic<bool>             m_surfacesOn{false};    // main -> frame
+    std::atomic<uint32_t>         m_surfaceEpoch{0};      // frame -> main: bumped on every reference-space change
+    std::atomic<int64_t>          m_lastDisplayTime{0};   // frame -> main: the newest predicted display time
+    std::mutex                    m_planesMu;             // guards the three below
+    OpenXR::SXRPlaneSnapshot      m_planesPub;
+    uint32_t                      m_planesPubEpoch = 0;
+    OpenXR::SXRSurfaceTuning      m_surfaceTuningPub;
+    std::atomic<uint32_t>         m_planesPubGen{0};
+    // frame thread only
+    OpenXR::SXRPlaneSnapshot m_planesFrame;
+    OpenXR::SXRSurfaceTuning m_surfaceTuningFrame;
+    uint32_t                 m_planesFrameGen = 0;
+    // frame -> main: the last snap, POD under m_surfaceStatusMu (the SURFACE_SNAP event names it)
+    struct SXRSurfaceSnapRecord {
+        bool                  valid   = false;
+        uint64_t              planeId = 0;
+        OpenXR::eXRPlaneLabel label   = OpenXR::XR_PLANE_LABEL_UNKNOWN;
+        OpenXR::eXRSnapKind   kind    = OpenXR::XR_SNAP_NONE;
+        OpenXR::Vec3          contact;
+        OpenXR::Vec3          pos;
+        int64_t               timeMs = 0;
+    };
+    std::mutex           m_surfaceStatusMu;
+    SXRSurfaceSnapRecord m_surfaceSnapRec;
+    std::string          m_surfaceSnapMonitor; // main
 
     // Signature of every config value a bring-up attempt depends on (openxr:enabled, :gpu,
     // :runtime_json, :blend_mode, :overlay(_z), :ignore_kernel_taint, :reprobe*). MAIN THREAD only —

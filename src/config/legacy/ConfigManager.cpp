@@ -1257,6 +1257,13 @@ std::string CConfigManager::parseKeyword(const std::string& COMMAND, const std::
     // depth desktop, and it is meant to be bindable from inside the headset.
     if (COMMAND == "openxr:depth_desktop" && g_pOpenXRManager)
         g_pOpenXRManager->onConfigReload();
+
+    // openxr:surfaces* (research/32) are parsed on the main thread by onConfigReload()->
+    // publishSurfaceTuning(): the master switch starts/stops the plane poll, the synthetic planes are a
+    // STRING the frame thread must never read, and the tuning reaches it as POD. Same legacy-keyword
+    // gap as the vars above.
+    if (COMMAND.starts_with("openxr:surfaces") && g_pOpenXRManager)
+        g_pOpenXRManager->onConfigReload();
 #endif
 
     // Update window border colors

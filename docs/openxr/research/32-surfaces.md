@@ -158,3 +158,37 @@ optional/deferred.
 3. B1 (WiVRn plane forwarding).
 4. Data: a standing user, a brighter room, a desk scene, and tape-measured table/eye heights for
    absolute accuracy.
+
+## 7. What C0–C2 implemented (2026-10-16)
+
+Code: `src/openxr/XRSurfaces.{hpp,cpp}` (pure plane model + snap math), `XRPlaneSource.{hpp,cpp}`
+(the source interface, the synthetic provider, the merger), `XRPlaneDetection.{hpp,cpp}` (the
+`XR_EXT_plane_detection` consumer), `OpenXRManagerSurfaces.cpp` (threads, publish, frame pass). Tests:
+`tests/xr/surfaces.cpp`, `hyprtester/src/tests/xr/surfaces.cpp`. Options: `openxr:surfaces*` (doc 05).
+
+- **Plane record.** POD, fixed capacity (64-vertex contour, 32 planes): id, pose, extents, contour,
+  label, orientation class (always derived from the normal vs gravity), source, generation. Canonical
+  convention: the plane is its pose's local X-Y plane, +Z is the normal. The `EXT_plane_detection`
+  spec leaves the axis to prose, so the consumer assumes +Z and **verifies it against the orientation
+  the runtime declared**: a pose whose +Y fits the declared class and whose +Z does not is rotated
+  (`xrCanonicalPlane`, logged once). The Monado driver work should still pick +Z.
+- **Threads.** Sources live on the main thread (timer, `openxr:surfaces_poll_ms`, 750 ms default) and
+  each detection step is one short IPC (begin → state → get spread over polls; a completed detection is
+  re-located on every poll, a fresh one begun every 8). The merged set is published under a mutex with
+  a generation and the reference-space **epoch** it was located in; the frame thread bumps the epoch on
+  every recenter/discontinuity and refuses a stale publish, re-expresses its own copy across a known
+  recenter, and drops it on an unknown one. `xrCreatePlaneDetectorEXT` → `FEATURE_UNSUPPORTED` is a
+  permanent "unsupported" for the session; repeated errors give up after 5.
+- **Interaction.** Each frame a carried window (hand/controller MOVE grab, or gaze carry) is tested
+  against upward planes: lowest visible corner within `snap_distance` above (or 25 cm through) the
+  surface and the bottom-edge centre inside the contour; the aim/gaze ray breaks ties between
+  candidates; horizontal beats a wall. Within it the window is **shown snapped** (the preview is the
+  final pose), with 1.5× hysteresis. The release re-decides from the WP-G4 latched pose (the ring now
+  records the carried pose, not the preview) against the armed plane: stand (bottom edge + bar on the
+  surface, facing the head, `stand_tilt` back), flat (controller trigger held, or carried >45° face-up),
+  or flush on a wall. The result is `placeLocalAt` (anchor:local, warp) and a plane-relative
+  attachment: followed when the plane is refined (< 25 cm / 20°), held when it vanishes, dropped when
+  it jumps or anything else moves the window.
+- **Not done.** C3 (`XR_EXT_spatial_plane_tracking`) — a second `IXRPlaneSource`. No visual beyond the
+  snapped preview (no ghost/shadow quad). Synthetic planes follow the LOCAL_FLOOR origin literally
+  (re-published after each reference-space change), so they are a fixture, not room geometry.
