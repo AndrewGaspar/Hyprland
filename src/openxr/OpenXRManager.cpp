@@ -1536,6 +1536,9 @@ void COpenXRManager::applyReferenceSpaceChange(const OpenXR::SXRPose& m) {
         std::scoped_lock lock(m_layersMu);
         for (auto& l : m_layers)
             l->m_anchor.onReferenceSpaceChanged(m);
+        // the eyes the arrangement was placed for are a point in the same space (doc 03 §8.4)
+        if (m_seatEyeValid)
+            m_seatEye = OpenXR::poseCompose(OpenXR::poseInverse(m), OpenXR::SXRPose{m_seatEye, OpenXR::Quat{}}).pos;
     }
     // research/30 §5.5: a KNOWN bridge — a seat measured before this can be re-expressed by M
     bumpOriginGen(OpenXR::XR_BRIDGE_KNOWN, OpenXR::XR_GENC_RECENTER_KNOWN, m);
@@ -1570,6 +1573,9 @@ void COpenXRManager::frameThread() {
     // Same thread-locality argument as the block above — only this thread reads or writes them.
     bool            headTrackedEverSeen = false;
     bool            headTrackedWarned   = false;
+    // doc 03 §8.4: a RESTORE re-seat deferred because the head was not plausible is said ONCE per
+    // deferral, not every frame it stays deferred. Frame-thread local for the same reason as above.
+    bool            reseatDeferLogged   = false;
     // research/28 M0: the STAGE probe's cadence. 0 forces a probe on the next frame, which is how a
     // session start, a reference-space change and a don/doff edge each get one.
     int64_t         stageProbeAt        = 0;
@@ -2238,7 +2244,12 @@ void COpenXRManager::frameThread() {
         // its count by offset source; the GROUP kind moves the whole arrangement at once, or refuses.
         int   reseatRestored = 0, reseatDeclared = 0, reseatGrouped = 0;
         float reseatDist = 0.f; // research/28 S1: the AUTHORED viewing distance a GROUP re-seat used
+        float reseatRise = 0.f; // doc 03 §8.4: where the group's implied eyes sat relative to the head's
         bool  reseatRan = false, reseatUnseatable = false;
+        // doc 03 §8.4: a re-seat the head itself vetoed (xrSeatHeadCheck), logged after the lock
+        auto reseatHeadVeto     = OpenXR::XR_SEATHEAD_OK;
+        bool reseatHeadVetoLog  = false; // say it this frame (a GROUP refusal, or a RESTORE's first deferral)
+        bool reseatHeadVetoKind = false; // true = GROUP (dropped), false = RESTORE (stays armed)
         // research/30 §8.4: every monitor's pose for this frame's history sample, gathered inside the
         // layer lock as plain values (stable ids, never names) and pushed after it.
         SXRHistFrameMonitors histMons;
@@ -2259,10 +2270,30 @@ void COpenXRManager::frameThread() {
             // must: the capture below re-derives every stored offset EVERY FRAME while the headset is
             // worn, so replanting one around the current head gives the monitor its own pose back.
             // It re-seats the LIVE arrangement instead, rigidly, onto the current head.
+            //
+            // Both kinds now carry the group's HEIGHT with the head (xrHeadFrame, doc 03 §8.4), so a
+            // nonsense head would plant the room metres up or down rather than merely yawed wrong.
+            // The head is vetted first (xrSeatHeadCheck): a deliberate GROUP request is dropped with
+            // a WARN — the user can press again once tracking is sane — while a RESTORE stays armed,
+            // exactly as it does across an invalid view, and runs on the first plausible frame.
             const auto reseatKind = (OpenXR::eXRReseatKind)m_reseatArmed.load(std::memory_order_acquire);
-            if (viewValid && reseatKind != OpenXR::XR_RESEAT_ARM_NONE) {
+            const auto seatHead   = (viewValid && reseatKind != OpenXR::XR_RESEAT_ARM_NONE) ? OpenXR::xrSeatHeadCheck(viewPose) : OpenXR::XR_SEATHEAD_OK;
+            if (viewValid && reseatKind != OpenXR::XR_RESEAT_ARM_NONE && seatHead != OpenXR::XR_SEATHEAD_OK) {
+                reseatHeadVeto     = seatHead;
+                reseatHeadVetoKind = reseatKind == OpenXR::XR_RESEAT_ARM_GROUP;
+                if (reseatHeadVetoKind) {
+                    // only drop the GROUP we saw: a RESTORE armed meanwhile must survive
+                    uint8_t expected = OpenXR::XR_RESEAT_ARM_GROUP;
+                    m_reseatArmed.compare_exchange_strong(expected, OpenXR::XR_RESEAT_ARM_NONE, std::memory_order_acq_rel);
+                    reseatHeadVetoLog = true;
+                } else if (!reseatDeferLogged) {
+                    reseatDeferLogged = true;
+                    reseatHeadVetoLog = true;
+                }
+            } else if (viewValid && reseatKind != OpenXR::XR_RESEAT_ARM_NONE) {
                 m_reseatArmed.store(OpenXR::XR_RESEAT_ARM_NONE, std::memory_order_release);
-                reseatRan = true;
+                reseatRan         = true;
+                reseatDeferLogged = false;
 
                 // The eligible set, gathered once. xrReseatEligible is the ONE definition of it (doc
                 // 03 §8.4) — the same predicate the main-thread `reseat` verb counts through, so the
@@ -2276,13 +2307,18 @@ void COpenXRManager::frameThread() {
                 // head-relative `pos:` — the only description of the arrangement that says what the
                 // user AUTHORED rather than where it currently happens to be.
                 std::vector<OpenXR::SXRPose>  rigs;
+                // doc 03 §8.4: the live pose of each monitor in `rigs`, index for index — the pair is
+                // what says where the eyes the arrangement was authored for are now
+                std::vector<OpenXR::SXRPose>  rigLive;
                 for (auto& l : m_layers) {
                     if (!OpenXR::xrReseatEligible(l->m_anchor.state().mode, l->m_pendingRemoval.load(std::memory_order_acquire)))
                         continue;
                     targets.push_back(l.get());
                     worlds.push_back(l->m_anchor.state().anchorPose);
-                    if (l->m_declaredRig && l->m_declaredAnchor.mode == OpenXR::XR_ANCHOR_LOCAL)
+                    if (l->m_declaredRig && l->m_declaredAnchor.mode == OpenXR::XR_ANCHOR_LOCAL) {
                         rigs.push_back(l->m_declaredAnchor.anchorPose);
+                        rigLive.push_back(l->m_anchor.state().anchorPose);
+                    }
                 }
 
                 if (reseatKind == OpenXR::XR_RESEAT_ARM_GROUP) {
@@ -2297,8 +2333,18 @@ void COpenXRManager::frameThread() {
                     // had parked 20 m away re-seated to exactly the 5 m clamp, in front of the user
                     // and unusably far. The declared rigs answer "how far back was this arrangement
                     // meant to be viewed from"; with no rigs to ask, openxr:default_distance does.
+                    //
+                    // So is the HEIGHT (doc 03 §8.4): the declared rigs say how far above or below the
+                    // eyes each was authored, the live poses say where those monitors are, and the
+                    // two together say where the eyes the group was arranged for sit now (with no
+                    // rigs, the eyes it was last placed for — m_seatEye — else its mean height). Mapping
+                    // that onto the actual eyes carries the height with the head — the old floor-
+                    // based frame kept every monitor's world y, which left a group floating 3 m over
+                    // a 6DoF head whose floor estimate had diverged, however often the key was hit.
                     const float authored  = OpenXR::xrGroupAuthoredDistance(rigs.data(), rigs.size(), tune.defaultDistance);
-                    const auto  seatFrame = OpenXR::xrGroupSeatFrame(worlds.data(), worlds.size(), authored);
+                    const float eyeY      = OpenXR::xrGroupImpliedEyeHeight(worlds.data(), worlds.size(), rigLive.data(), rigs.data(), rigs.size(),
+                                                                            m_seatEyeValid ? m_seatEye.y : std::numeric_limits<float>::quiet_NaN());
+                    const auto  seatFrame = OpenXR::xrGroupSeatFrame(worlds.data(), worlds.size(), authored, eyeY);
                     if (!seatFrame.valid)
                         reseatUnseatable = true;
                     else {
@@ -2313,6 +2359,7 @@ void COpenXRManager::frameThread() {
                         }
                         reseatGrouped = (int)targets.size();
                         reseatDist    = seatFrame.distance;
+                        reseatRise    = viewPose.pos.y - eyeY;
                     }
                 } else {
                     // WHICH offset gets planted is doc 03 §8.3 (xrReseatSource). A config-declared rig
@@ -2339,6 +2386,11 @@ void COpenXRManager::frameThread() {
                 // is the permission the capture below has been waiting for.
                 for (auto* l : targets)
                     l->m_anchorFrameStale = false;
+
+                // doc 03 §8.4: and the head they were just placed for is the eye height every later
+                // capture measures them against (see the staging block below)
+                m_seatEye      = viewPose.pos;
+                m_seatEyeValid = true;
             }
 
             // research/30 §8.4: the per-monitor block of this frame's history sample. anchor:local
@@ -2424,8 +2476,22 @@ void COpenXRManager::frameThread() {
             // yaw is the person's yaw + 180°, and staging against it mirrors every offset — the
             // (x, z) -> (-x, -z) captures of 2026-10-13..15. xrHeadUpright (head +Y within 60° of
             // world up) is the gate every durable yaw read now uses.
+            //
+            // doc 03 §8.4: the HEIGHT is measured against the eyes the arrangement was placed for
+            // (m_seatEye, latched by the re-seat that placed it, else by the first capture), not the
+            // live eyes. The memory is head-relative in y now, and against the live head it would
+            // remember the wearer's posture at the doff edge: stand up to take a Quest off and the
+            // next session's room comes back half a metre low; let a 6DoF floor estimate drift and it
+            // remembers the drift. The live head still supplies position and yaw.
             if (headTrustworthy && OpenXR::xrHeadUpright(viewPose.rot) && m_restoreCapture.load(std::memory_order_relaxed)) {
-                const OpenXR::SXRPose headFrameInv = OpenXR::poseInverse(OpenXR::xrHeadFrame(viewPose));
+                if (!m_seatEyeValid && OpenXR::xrSeatHeadCheck(viewPose) == OpenXR::XR_SEATHEAD_OK) {
+                    m_seatEye      = viewPose.pos;
+                    m_seatEyeValid = true;
+                }
+                OpenXR::SXRPose seatHead = viewPose;
+                if (m_seatEyeValid)
+                    seatHead.pos.y = m_seatEye.y;
+                const OpenXR::SXRPose headFrameInv = OpenXR::poseInverse(OpenXR::xrHeadFrame(seatHead));
                 for (auto& l : m_layers) {
                     if (l->m_pendingRemoval.load(std::memory_order_acquire))
                         continue;
@@ -2523,12 +2589,19 @@ void COpenXRManager::frameThread() {
         // placement the user left, replayed around their current head; `declared` is the config rig
         // (or the fallback for a monitor that has never been placed under tracking). Outside the
         // layer lock, POD counters only.
+        if (reseatHeadVetoLog)
+            Log::logger->log(Log::WARN, "[OPENXR] re-seat {}: {} (eye [{:.2f}, {:.2f}, {:.2f}]) — {}", reseatHeadVetoKind ? "refused" : "deferred",
+                             OpenXR::xrSeatHeadName(reseatHeadVeto), viewPose.pos.x, viewPose.pos.y, viewPose.pos.z,
+                             reseatHeadVetoKind ? "monitors left where they are; try again once tracking has settled" :
+                                                  "the restore stays armed and runs on the first frame with a plausible head");
         if (reseatUnseatable)
             Log::logger->log(Log::WARN,
                              "[OPENXR] re-seat: the monitor group has no common facing (their normals cancel) — there is no 'in front of' to bring it around to, so nothing moved");
         else if (reseatGrouped) {
-            Log::logger->log(Log::DEBUG, "[OPENXR] re-seated the arrangement of {} anchor:local monitor(s) onto the current head at its authored {:.2f}m (rigid; relative layout preserved)",
-                             reseatGrouped, reseatDist);
+            Log::logger->log(Log::DEBUG,
+                             "[OPENXR] re-seated the arrangement of {} anchor:local monitor(s) onto the current head at its authored {:.2f}m, moving it {:+.2f}m vertically with the head "
+                             "(rigid; relative layout preserved)",
+                             reseatGrouped, reseatDist, reseatRise);
             enqueue(SXRStateEvent{.type = eXRStateEventType::RESEAT_DONE, .a = reseatGrouped});
         } else if (reseatRan)
             Log::logger->log(Log::DEBUG, "[OPENXR] re-seated {} anchor:local monitor(s) to the head: {} restored from the last wearing, {} from their declared rig", reseatRestored + reseatDeclared,
@@ -4591,6 +4664,7 @@ void COpenXRManager::invalidateAnchorFrames(const char* why) {
             l->m_restoreStagedValid = false; // staged against a head located in the frame that just died
             ++n;
         }
+        m_seatEyeValid = false; // a height in the frame that just died (doc 03 §8.4)
     }
     if (n)
         Log::logger->log(Log::DEBUG, "[OPENXR] {} anchor pose(s) marked as expressed in a dead reference frame ({}) — no placement is remembered from them until something re-places them", n,
@@ -4678,16 +4752,21 @@ std::expected<std::string, std::string> COpenXRManager::requestReseatToHead(cons
     // The eligible set, under the same lock every other main-thread anchor read uses, and through
     // the same predicate the frame loop applies — one definition of "which monitors move". The
     // world poses come along so the answer below can be exact rather than optimistic.
-    std::vector<OpenXR::SXRPose> worlds, rigs;
+    std::vector<OpenXR::SXRPose> worlds, rigs, rigLive;
+    float                        placedEye = std::numeric_limits<float>::quiet_NaN();
     {
         std::scoped_lock lock(m_layersMu);
         for (auto& l : m_layers) {
             if (!OpenXR::xrReseatEligible(l->m_anchor.state().mode, l->m_pendingRemoval.load(std::memory_order_acquire)))
                 continue;
             worlds.push_back(l->m_anchor.state().anchorPose);
-            if (l->m_declaredRig && l->m_declaredAnchor.mode == OpenXR::XR_ANCHOR_LOCAL)
+            if (l->m_declaredRig && l->m_declaredAnchor.mode == OpenXR::XR_ANCHOR_LOCAL) {
                 rigs.push_back(l->m_declaredAnchor.anchorPose);
+                rigLive.push_back(l->m_anchor.state().anchorPose);
+            }
         }
+        if (m_seatEyeValid)
+            placedEye = m_seatEye.y;
     }
     const int eligible = (int)worlds.size();
     // research/28 S1: the same authored distance the frame thread will use a frame from now, so the
@@ -4705,6 +4784,14 @@ std::expected<std::string, std::string> COpenXRManager::requestReseatToHead(cons
         case OpenXR::XR_RESEAT_NO_MONITORS: return std::unexpected<std::string>("no anchor:local monitors — head/body/device-anchored monitors already follow you");
         case OpenXR::XR_RESEAT_READY: break;
     }
+
+    // doc 03 §8.4: a re-seat now carries the group's height with the head, so a head that is not a
+    // person — a diverged 6DoF tracker metres under the floor, a pose mid-take-off — would plant the
+    // room relative to nonsense. Refused here with the reason; the frame thread re-checks against
+    // its own, fresher pose (xrSeatHeadCheck is the one definition both use).
+    if (const auto HV = OpenXR::xrSeatHeadCheck(OpenXR::SXRPose{head.headPos, head.headRot}); HV != OpenXR::XR_SEATHEAD_OK)
+        return std::unexpected<std::string>(std::format("{} (eye [{:.2f}, {:.2f}, {:.2f}]) — not re-seating to it; try again once tracking has settled", OpenXR::xrSeatHeadName(HV),
+                                                        head.headPos.x, head.headPos.y, head.headPos.z));
 
     // Answer the degenerate arrangement HERE rather than letting the user press a key, see nothing
     // happen, and go looking in the log for the frame thread's WARN. Validity depends only on the
@@ -4733,8 +4820,13 @@ std::expected<std::string, std::string> COpenXRManager::requestReseatToHead(cons
     m_l2dPrev.clear();
     requestLayout2DSync();
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] re-seat requested ({}) — {} anchor:local monitor(s) will be replanted around the current head at {:.2f}m", why, eligible, authored);
-    return std::format("re-seated {} monitor{} to the current head (authored distance {:.2f}m)", eligible, eligible == 1 ? "" : "s", authored);
+    // doc 03 §8.4: and how far the group travels vertically to sit at its authored height relative
+    // to the eyes — from the same inputs the frame thread uses, against the newest published head.
+    const float rise = head.headPos.y - OpenXR::xrGroupImpliedEyeHeight(worlds.data(), worlds.size(), rigLive.data(), rigs.data(), rigs.size(), placedEye);
+
+    Log::logger->log(Log::DEBUG, "[OPENXR] re-seat requested ({}) — {} anchor:local monitor(s) will be replanted around the current head at {:.2f}m, {:+.2f}m vertically", why,
+                     eligible, authored, rise);
+    return std::format("re-seated {} monitor{} to the current head (authored distance {:.2f}m, moved {:+.2f}m vertically)", eligible, eligible == 1 ? "" : "s", authored, rise);
 }
 
 std::expected<std::string, std::string> COpenXRManager::cmdReseat() {

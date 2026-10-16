@@ -36,6 +36,26 @@ namespace OpenXR {
         return xrHeadUpY(q) >= 0.5F;
     }
 
+    eXRSeatHead xrSeatHeadCheck(const SXRPose& head, float maxHeight) {
+        if (!xrPoseFinite(head))
+            return XR_SEATHEAD_NONFINITE;
+        if (std::fabs(head.pos.y) > maxHeight)
+            return XR_SEATHEAD_HEIGHT;
+        if (!xrHeadUpright(head.rot))
+            return XR_SEATHEAD_TILTED;
+        return XR_SEATHEAD_OK;
+    }
+
+    const char* xrSeatHeadName(eXRSeatHead v) {
+        switch (v) {
+            case XR_SEATHEAD_OK: return "ok";
+            case XR_SEATHEAD_NONFINITE: return "the head pose is not finite";
+            case XR_SEATHEAD_HEIGHT: return "the head is implausibly far from the floor";
+            case XR_SEATHEAD_TILTED: return "the head is not upright";
+        }
+        return "unknown";
+    }
+
     float xrHeadPitch(const Quat& q) {
         const Vec3 f = poseForward(q);
         return std::asin(std::clamp(f.y, -1.F, 1.F));

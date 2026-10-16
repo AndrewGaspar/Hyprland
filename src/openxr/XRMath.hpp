@@ -353,13 +353,26 @@ namespace OpenXR {
         return m.pos.length() <= posEpsM && qAngleBetween(m.rot, Quat{}) <= rotEpsRad;
     }
 
-    // ---- the wearer's frame (doc 03 §8.2, §8.3) ----
+    // ---- the wearer's frame (doc 03 §8.2, §8.3, §8.4) ----
     //
-    // The yaw-only frame standing on the floor under a head pose. Everything that re-seats a monitor
-    // group "to the user" composes into THIS frame: building it at y = 0 keeps a pose's y a
-    // floor-relative height, and taking yaw only keeps the group level however the head is tilted.
+    // The eye height every head-relative placement is written against. A declared `anchor:local`
+    // `pos:0,1.457,-1.4` is read as "0.143 m below the eyes of a wearer whose eyes are at 1.6 m", and
+    // a captured memory is stored in the same convention, so its y minus this is the offset from the
+    // eye. 1.6 m is what a 3DoF runtime reports as the head height in LOCAL_FLOOR (monado's XREAL
+    // driver, the OpenXR default), so on such a runtime — where the head height never changes — the
+    // frame below sits exactly on the floor and nothing moves relative to the old floor-based frame.
+    inline constexpr float XR_NOMINAL_EYE_HEIGHT = 1.6F;
+
+    // The yaw-only frame "under" a head pose. Everything that re-seats a monitor group "to the user"
+    // composes into THIS frame. Its origin is not the runtime's floor but the floor a wearer of
+    // nominal eye height would stand on: XR_NOMINAL_EYE_HEIGHT below the eyes. That makes a pose's y
+    // in it a HEAD-relative height (plus the nominal eye height), so a re-seat brings the group's
+    // height along with the head — seated vs standing, a 6DoF runtime whose floor estimate drifted, a
+    // session whose LOCAL_FLOOR origin landed somewhere else — rather than replaying an absolute
+    // world height (2026-10-15: "vertical position seemed to be locked"). Taking yaw only keeps the
+    // group level however the head is tilted.
     inline SXRPose xrHeadFrame(const SXRPose& head) {
-        return SXRPose{Vec3{head.pos.x, 0.F, head.pos.z}, qFromYaw(qYawOf(head.rot, 0.F))};
+        return SXRPose{Vec3{head.pos.x, head.pos.y - XR_NOMINAL_EYE_HEIGHT, head.pos.z}, qFromYaw(qYawOf(head.rot, 0.F))};
     }
 
     // A world (LOCAL_FLOOR) pose re-expressed in that frame — the exact inverse of the composition

@@ -1,9 +1,11 @@
 #include <openxr/XRMath.hpp>
 #include <openxr/XRAnchor.hpp>
+#include <openxr/XRPoseHistory.hpp>
 
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <limits>
 #include <initializer_list>
 #include <vector>
 
@@ -880,10 +882,11 @@ TEST(XRAnchorRestore, ConstellationSurvivesASessionRestart) {
     EXPECT_NEAR(sep.length(), 2.f, 1e-4f);
     expectVecNear(sep, qRotate(qFromYaw(137.f * PI / 180.f), Vec3{2.f, 0.f, 0.f}), 1e-4f);
 
-    // 2. The group faces the user: A sits 1.5 m in front of the new head at its configured 1.2 m
-    //    height, with its normal (+Z) pointing back at them.
+    // 2. The group faces the user: A sits 1.5 m in front of the new head at its configured height
+    //    RELATIVE TO THE EYES (1.2 m against the nominal 1.6 m eye: 0.4 m below them — doc 03 §8.4),
+    //    with its normal (+Z) pointing back at them.
     const Vec3 toA = newA.pos - NEW_HEAD.pos;
-    EXPECT_NEAR(newA.pos.y, 1.2f, 1e-4f);
+    EXPECT_NEAR(newA.pos.y - NEW_HEAD.pos.y, 1.2f - XR_NOMINAL_EYE_HEIGHT, 1e-4f);
     EXPECT_NEAR(std::sqrt(toA.x * toA.x + toA.z * toA.z), 1.5f, 1e-4f);
     const Vec3 normalA = qRotate(newA.rot, Vec3{0.f, 0.f, 1.f});
     const Vec3 fwdNew  = qRotate(NEW_HEAD.rot, Vec3{0.f, 0.f, -1.f});
@@ -1233,7 +1236,7 @@ TEST(XRAnchorRestore, UnrestorableMonitorLandsInFrontOfTheUserAnyway) {
     const SXRPose W    = reseatFrom(NEW_HEAD, untracked.anchorPose);
     const Vec3    toW  = W.pos - NEW_HEAD.pos;
     EXPECT_NEAR(std::sqrt(toW.x * toW.x + toW.z * toW.z), 1.5f, 1e-4f);
-    EXPECT_NEAR(W.pos.y, 1.4f, 1e-4f);
+    EXPECT_NEAR(W.pos.y - NEW_HEAD.pos.y, 1.4f - XR_NOMINAL_EYE_HEIGHT, 1e-4f); // 0.2 m below the eyes
 }
 
 // ---- doc 03 §8.4: the deliberate re-seat ("bring my monitors to me") ----
@@ -1338,8 +1341,8 @@ TEST(XRReseatRestore, GroupGeometrySurvivesADeliberateReseat) {
             const Vec3 before = worlds[j].pos - worlds[i].pos;
             const Vec3 after  = seated[j].pos - seated[i].pos;
             EXPECT_NEAR(after.length(), before.length(), 1e-4f);
-            // Heights are absolute (the head frame is built at y = 0), so the group keeps its
-            // vertical arrangement rather than being flattened onto the new eye height.
+            // The group travels vertically with the head as ONE body (doc 03 §8.4): its relative
+            // heights are kept, never flattened onto the new eye height.
             EXPECT_NEAR(after.y, before.y, 1e-4f);
         }
 }
@@ -1359,8 +1362,10 @@ TEST(XRReseatRestore, GroupGeometrySurvivesADeliberateReseat) {
 namespace {
     // Exactly what the frame loop's GROUP branch does: derive the seat frame at the group's AUTHORED
     // viewing distance, then re-express every monitor in it and re-plant that in the head's frame.
-    std::vector<SXRPose> groupReseat(const std::vector<SXRPose>& worlds, const SXRPose& head, float authored) {
-        const auto           seat = xrGroupSeatFrame(worlds.data(), worlds.size(), authored);
+    // `eyeY` is the implied viewer's eye height (xrGroupImpliedEyeHeight); NaN = the group's mean
+    // height, which is what the frame loop falls back to with no rigs and no placement latch.
+    std::vector<SXRPose> groupReseat(const std::vector<SXRPose>& worlds, const SXRPose& head, float authored, float eyeY = std::numeric_limits<float>::quiet_NaN()) {
+        const auto           seat = xrGroupSeatFrame(worlds.data(), worlds.size(), authored, eyeY);
         std::vector<SXRPose> out;
         if (!seat.valid)
             return worlds; // the frame loop leaves the group alone
@@ -1405,12 +1410,14 @@ TEST(XRGroupSeat, WallSeatIsWhereItsViewerStands) {
     // The seat frame of a wall is dead in front of it, at the distance it was AUTHORED to be viewed
     // from — so a user already sitting square to their monitors gets the identity, and the verb
     // honestly reports "re-seated 3 monitors" that did not need to move.
+    // (An ad-hoc wall with nothing else to say about its height is seated at eye level, so the
+    // identity case is a head at the wall's height.)
     const auto    monitors = wallAt(-1.5f);
-    const SXRPose head{{0.f, 1.6f, 0.f}, Quat{}};
+    const SXRPose head{{0.f, 1.4f, 0.f}, Quat{}};
 
     const auto    seat = xrGroupSeatFrame(monitors.data(), monitors.size(), 1.5f);
     ASSERT_TRUE(seat.valid);
-    expectVecNear(seat.frame.pos, Vec3{0.f, 0.f, 0.f}, 1e-4f);
+    expectVecNear(seat.frame.pos, Vec3{0.f, 1.4f, 0.f}, 1e-4f);
     EXPECT_NEAR(qYawOf(seat.frame.rot, 999.f), 0.f, 1e-4f);
     EXPECT_NEAR(seat.distance, 1.5f, 1e-4f);
 
@@ -1434,7 +1441,7 @@ TEST(XRGroupSeat, ArcSeatIsItsFocus) {
 
     const auto seat = xrGroupSeatFrame(monitors.data(), monitors.size(), authored);
     ASSERT_TRUE(seat.valid);
-    expectVecNear(seat.frame.pos, Vec3{0.f, 0.f, 0.f}, 1e-3f);
+    expectVecNear(seat.frame.pos, Vec3{0.f, 1.4f, 0.f}, 1e-3f);
     EXPECT_NEAR(qYawOf(seat.frame.rot, 999.f), 0.f, 1e-3f);
 }
 
@@ -1459,7 +1466,7 @@ TEST(XRGroupSeatAuthored, DeclaredRigsNameTheDistanceTheyWereAuthoredFor) {
     const float arcDist  = xrGroupAuthoredDistance(arc.data(), arc.size(), 99.f);
     EXPECT_GT(arcDist, 1.9f);
     EXPECT_LT(arcDist, 2.2f);
-    expectVecNear(xrGroupSeatFrame(arc.data(), arc.size(), arcDist).frame.pos, Vec3{0.f, 0.f, 0.f}, 1e-3f);
+    expectVecNear(xrGroupSeatFrame(arc.data(), arc.size(), arcDist).frame.pos, Vec3{0.f, 1.4f, 0.f}, 1e-3f);
 
     // No rigs at all — every monitor in the group is ad-hoc — falls back to openxr:default_distance.
     EXPECT_NEAR(xrGroupAuthoredDistance(nullptr, 0, 1.5f), 1.5f, 1e-4f);
@@ -1600,8 +1607,12 @@ TEST(XRGroupSeatAuthored, OneCorruptedMonitorNoLongerDragsTheWholeGroupBack) {
 
     // The landings, to the centimetre. `authored` is what the compositor actually produced in the
     // container; `measured` is what the test's longhand expected. Both are reproduced here exactly.
-    const auto afterNew = groupReseat(live, head, authored);
-    const auto afterOld = groupReseat(live, head, measured);
+    // The height is authored too (doc 03 §8.4): the rigs put every monitor 0.2 m under the nominal
+    // eyes, they still are, so the implied eyes are the head's and nothing moves vertically.
+    const float eyeY = xrGroupImpliedEyeHeight(live.data(), live.size(), live.data(), rigs.data(), rigs.size());
+    EXPECT_NEAR(eyeY, head.pos.y, 1e-4f);
+    const auto afterNew = groupReseat(live, head, authored, eyeY);
+    const auto afterOld = groupReseat(live, head, measured, eyeY);
     expectVecNear(afterNew[0].pos, Vec3{0.309f, 1.4f, 1.834f}, 1e-2f);  // observed in the container
     expectVecNear(afterOld[0].pos, Vec3{-1.496f, 1.4f, 1.350f}, 1e-2f); // the retired expectation
     EXPECT_NEAR((afterNew[0].pos - afterOld[0].pos).length(), 1.87f, 1e-2f);
@@ -1636,9 +1647,8 @@ TEST(XRGroupSeat, PivotInPlaceBringsTheGroupToTheNewFacing) {
         EXPECT_NEAR(std::sqrt(a.x * a.x + a.z * a.z), std::sqrt(b.x * b.x + b.z * b.z), 1e-3f);
     }
     // ...and the middle one now sits along the head's new forward, which is what "bring it to my
-    // current facing" means. Forward at yaw 90 deg is -X. Compared horizontally: the group keeps its
-    // absolute heights (the seat frame is on the floor), so the monitor is below eye level and a 3D
-    // direction would carry that tilt.
+    // current facing" means. Forward at yaw 90 deg is -X. Compared horizontally, so the check does
+    // not depend on the group's height.
     const Vec3 toMiddle = Vec3{after[1].pos.x - head.pos.x, 0.f, after[1].pos.z - head.pos.z}.normalized();
     EXPECT_NEAR(toMiddle.x, -1.f, 1e-3f);
     EXPECT_NEAR(toMiddle.z, 0.f, 1e-3f);
@@ -1687,7 +1697,8 @@ TEST(XRGroupSeat, SingleMonitorWorks) {
 
     const auto                 after = groupReseat(one, head, 2.f);
     ASSERT_EQ(after.size(), size_t{1});
-    expectVecNear(after[0].pos, Vec3{0.f, 1.4f, -2.f}, 1e-3f);
+    // Ad-hoc, with nothing else to say about its height: seated at eye level (doc 03 §8.4).
+    expectVecNear(after[0].pos, Vec3{0.f, 1.6f, -2.f}, 1e-3f);
     // Its normal points back at the head (+Z of the quad toward the viewer).
     const Vec3 normal = qRotate(after[0].rot, Vec3{0.f, 0.f, 1.f});
     EXPECT_NEAR(normal.z, 1.f, 1e-3f);
@@ -1723,4 +1734,213 @@ TEST(XRGroupSeat, MonitorsLyingFlatDoNotVoteOnFacing) {
     ASSERT_EQ(after.size(), monitors.size());
     // The ceiling panel travelled with everything else, keeping its offset from the wall.
     EXPECT_NEAR((after[3].pos - after[1].pos).length(), (monitors[3].pos - monitors[1].pos).length(), 1e-3f);
+}
+
+// ---- doc 03 §8.4: re-seats carry the HEIGHT with the head ----
+//
+// 2026-10-15, XREAL Air 2 Ultra under 6DoF: the SLAM floor estimate diverged (eye at y = -3.16), the
+// monitors floated metres overhead, and SUPER+CTRL+Home brought them round in yaw only — "vertical
+// position seemed to be locked". The head frame was built ON THE FLOOR, so every re-seat replayed
+// world heights. It is now built XR_NOMINAL_EYE_HEIGHT under the eyes: heights are head-relative.
+
+static SXRPose levelHeadAt(float x, float y, float z, float yaw = 0.f) {
+    return SXRPose{{x, y, z}, qFromYaw(yaw)};
+}
+
+// XR-main from the user's hyprland-xr.lua, plus four ad-hoc monitors arranged around it (one above,
+// one each side toed in, one low) — the 5-monitor group of the report, in the frame of a wearer whose
+// eyes are at the nominal height and who stands at the origin facing -Z.
+static std::vector<SXRPose> fiveMonitorRig() {
+    return {
+        {{0.017f, 1.457f, -1.408f}, qFromYaw(5.3f * PI / 180.f)}, // XR-main (declared)
+        {{0.0f, 2.20f, -1.35f}, qFromPitch(-15.f * PI / 180.f)},  // above
+        {{-1.30f, 1.45f, -1.00f}, qFromYaw(40.f * PI / 180.f)},   // left, toed in
+        {{1.30f, 1.45f, -1.00f}, qFromYaw(-40.f * PI / 180.f)},   // right, toed in
+        {{0.0f, 0.95f, -0.90f}, qFromPitch(30.f * PI / 180.f)},   // low, tilted up
+    };
+}
+
+TEST(XRReseatVertical, HeadFrameSitsNominalEyeHeightUnderTheEyes) {
+    // The frame's origin is the floor a wearer of nominal eye height would stand on — so a monitor
+    // at eye level reads y = XR_NOMINAL_EYE_HEIGHT whatever the head's absolute height.
+    for (const float eye : {-2.5f, 0.4f, 1.1f, 1.6f, 1.75f, 2.9f}) {
+        const SXRPose head = levelHeadAt(0.3f, eye, -0.2f, 0.7f);
+        expectVecNear(xrHeadFrame(head).pos, Vec3{0.3f, eye - XR_NOMINAL_EYE_HEIGHT, -0.2f}, 1e-5f);
+        const SXRPose atEyeLevel{head.pos + qRotate(head.rot, Vec3{0.f, 0.f, -1.5f}), head.rot};
+        EXPECT_NEAR(xrPoseInHeadFrame(head, atEyeLevel).pos.y, XR_NOMINAL_EYE_HEIGHT, 1e-5f);
+    }
+}
+
+TEST(XRReseatVertical, ThreeDofEyeHeightChangesNothing) {
+    // A 3DoF runtime (monado's XREAL driver) reports the head at exactly the nominal 1.6 m forever.
+    // There the new frame IS the old floor frame, so a declared rig lands at its literal height —
+    // the daily-driver behaviour is bit-for-bit what shipped.
+    const SXRPose head = levelHeadAt(0.f, XR_NOMINAL_EYE_HEIGHT, 0.f, 0.4f);
+    for (const auto& rig : fiveMonitorRig())
+        EXPECT_NEAR(reseatFrom(head, rig).pos.y, rig.pos.y, 1e-5f);
+}
+
+TEST(XRReseatVertical, RestoreFollowsTheHeadAtAnyHeight) {
+    // The first-plug RESTORE plants a declared rig (or a memory) relative to the head: seated on a
+    // Quest (eyes 1.15 m), standing (1.75 m), a 6DoF floor that drifted (0.4 m) — XR-main is always
+    // 0.143 m under the eyes, and the group keeps its shape.
+    const auto rig = fiveMonitorRig();
+    for (const float eye : {0.4f, 1.15f, 1.75f}) {
+        const SXRPose        head = levelHeadAt(-2.f, eye, 3.f, -1.2f);
+        std::vector<SXRPose> out;
+        for (const auto& r : rig)
+            out.push_back(reseatFrom(head, r));
+        EXPECT_NEAR(out[0].pos.y - eye, 1.457f - XR_NOMINAL_EYE_HEIGHT, 1e-4f);
+        for (size_t i = 1; i < out.size(); ++i) {
+            EXPECT_NEAR(out[i].pos.y - out[0].pos.y, rig[i].pos.y - rig[0].pos.y, 1e-4f);
+            EXPECT_NEAR((out[i].pos - out[0].pos).length(), (rig[i].pos - rig[0].pos).length(), 1e-4f);
+        }
+    }
+}
+
+TEST(XRReseatVertical, GroupReseatRepairsTheReportedFloatingGroup) {
+    // THE report. The group was placed for eyes at 1.6 m; the 6DoF floor then drifted 1.2 m, so the
+    // head now reads 0.4 m and the monitors float 1.2 m too high. Only XR-main is declared. A press
+    // must put XR-main back at its authored 0.143 m under the eyes — in yaw AND height — with the
+    // other four rigidly around it.
+    const auto    rig  = fiveMonitorRig();
+    const SXRPose head = levelHeadAt(-56.93f, 0.4f, -15.59f, 26.1f * PI / 180.f);
+
+    // the live group: the rig as placed in some earlier frame, 20 m and a turn away
+    std::vector<SXRPose> live;
+    const SXRPose        placedFor = levelHeadAt(-40.f, XR_NOMINAL_EYE_HEIGHT, -10.f, 1.9f);
+    for (const auto& r : rig)
+        live.push_back(reseatFrom(placedFor, r));
+
+    const SXRPose rigs[]    = {rig[0]};
+    const SXRPose rigLive[] = {live[0]};
+    const float   eyeY      = xrGroupImpliedEyeHeight(live.data(), live.size(), rigLive, rigs, 1);
+    EXPECT_NEAR(eyeY, XR_NOMINAL_EYE_HEIGHT, 1e-4f); // the eyes the group was arranged for
+
+    const float authored = xrGroupAuthoredDistance(rigs, 1, 1.5f);
+    const auto  after    = groupReseat(live, head, authored, eyeY);
+    ASSERT_EQ(after.size(), live.size());
+
+    // XR-main: at its authored height relative to the CURRENT eyes, not 1.2 m above them
+    EXPECT_NEAR(after[0].pos.y - head.pos.y, 1.457f - XR_NOMINAL_EYE_HEIGHT, 1e-3f);
+    // ...and in front of the user (horizontal bearing ~0, at the authored distance)
+    const Vec3 toMain = Vec3{after[0].pos.x - head.pos.x, 0.f, after[0].pos.z - head.pos.z};
+    const Vec3 fwd    = qRotate(head.rot, Vec3{0.f, 0.f, -1.f});
+    EXPECT_GT(toMain.normalized().dot(Vec3{fwd.x, 0.f, fwd.z}.normalized()), 0.99f);
+
+    // rigid: every pairwise separation, and every relative height, preserved
+    for (size_t i = 0; i < live.size(); ++i)
+        for (size_t j = i + 1; j < live.size(); ++j) {
+            EXPECT_NEAR((after[j].pos - after[i].pos).length(), (live[j].pos - live[i].pos).length(), 1e-3f);
+            EXPECT_NEAR(after[j].pos.y - after[i].pos.y, live[j].pos.y - live[i].pos.y, 1e-3f);
+        }
+
+    // and a second press is the identity: the implied eyes are now the head's
+    const SXRPose rigLive2[] = {after[0]};
+    const float   eyeY2      = xrGroupImpliedEyeHeight(after.data(), after.size(), rigLive2, rigs, 1);
+    EXPECT_NEAR(eyeY2, head.pos.y, 1e-3f);
+    const auto twice = groupReseat(after, head, authored, eyeY2);
+    for (size_t i = 0; i < after.size(); ++i)
+        expectVecNear(twice[i].pos, after[i].pos, 1e-3f);
+}
+
+TEST(XRReseatVertical, SeatedToStandingMovesTheGroupUpOnAPress) {
+    // Quest, real floor: the user sat (eyes 1.15 m), then stood (1.75 m) and pressed re-seat. The
+    // group comes up the 0.6 m with them — a deliberate re-seat means "in front of me as I am now".
+    const auto           rig = fiveMonitorRig();
+    std::vector<SXRPose> seated;
+    for (const auto& r : rig)
+        seated.push_back(reseatFrom(levelHeadAt(0.f, 1.15f, 0.f), r));
+    const SXRPose rigs[]    = {rig[0]};
+    const SXRPose rigLive[] = {seated[0]};
+    const float   eyeY      = xrGroupImpliedEyeHeight(seated.data(), seated.size(), rigLive, rigs, 1);
+    EXPECT_NEAR(eyeY, 1.15f, 1e-4f);
+
+    const SXRPose standing = levelHeadAt(0.f, 1.75f, 0.f);
+    const auto    after    = groupReseat(seated, standing, xrGroupAuthoredDistance(rigs, 1, 1.5f), eyeY);
+    for (size_t i = 0; i < seated.size(); ++i)
+        EXPECT_NEAR(after[i].pos.y - seated[i].pos.y, 0.6f, 1e-3f);
+}
+
+TEST(XRReseatVertical, HeadPitchAndRollNeitherTiltNorLiftTheGroup) {
+    // Looking down at the keyboard or up at the top monitor while pressing the key must give the
+    // same landing as a level head at the same eye position: the frame takes the eyes' height and
+    // the yaw, nothing else.
+    const auto    rig   = fiveMonitorRig();
+    const SXRPose level = levelHeadAt(1.f, 1.3f, -2.f, 0.8f);
+    for (const float pitchDeg : {-50.f, -20.f, 25.f, 50.f}) {
+        const SXRPose pitched{level.pos, qMul(level.rot, qFromPitch(pitchDeg * PI / 180.f))};
+        for (const auto& r : rig)
+            expectVecNear(reseatFrom(pitched, r).pos, reseatFrom(level, r).pos, 1e-4f);
+    }
+    const float   roll = 25.f * PI / 180.f;
+    const SXRPose rolled{level.pos, qMul(level.rot, Quat{0.f, 0.f, std::sin(roll / 2.f), std::cos(roll / 2.f)})};
+    for (const auto& r : rig)
+        expectVecNear(reseatFrom(rolled, r).pos, reseatFrom(level, r).pos, 1e-3f);
+}
+
+TEST(XRReseatVertical, ImpliedEyeHeightLadder) {
+    const std::vector<SXRPose> group{{{0.f, 1.0f, -1.f}, Quat{}}, {{1.f, 2.0f, -1.f}, Quat{}}};
+    // 1. declared rigs vote by their mean: (live - rig) + nominal
+    const SXRPose rigs[]    = {{{0.f, 1.4f, -1.5f}, Quat{}}, {{0.f, 1.2f, -1.5f}, Quat{}}};
+    const SXRPose rigLive[] = {{{0.f, 0.9f, -1.5f}, Quat{}}, {{0.f, 0.9f, -1.5f}, Quat{}}};
+    EXPECT_NEAR(xrGroupImpliedEyeHeight(group.data(), group.size(), rigLive, rigs, 2, 9.f), (-0.5f + -0.3f) / 2.f + XR_NOMINAL_EYE_HEIGHT, 1e-5f);
+    // ...a non-finite pair abstains rather than poisoning the vote
+    const SXRPose badLive[] = {{{0.f, std::nanf(""), -1.5f}, Quat{}}, {{0.f, 0.9f, -1.5f}, Quat{}}};
+    EXPECT_NEAR(xrGroupImpliedEyeHeight(group.data(), group.size(), badLive, rigs, 2), -0.3f + XR_NOMINAL_EYE_HEIGHT, 1e-5f);
+    // 2. no rigs: the eyes the group was last placed for
+    EXPECT_NEAR(xrGroupImpliedEyeHeight(group.data(), group.size(), nullptr, nullptr, 0, 1.33f), 1.33f, 1e-5f);
+    // 3. neither: the group's mean height is eye level
+    EXPECT_NEAR(xrGroupImpliedEyeHeight(group.data(), group.size(), nullptr, nullptr, 0), 1.5f, 1e-5f);
+    // 4. nothing at all
+    EXPECT_NEAR(xrGroupImpliedEyeHeight(nullptr, 0, nullptr, nullptr, 0), XR_NOMINAL_EYE_HEIGHT, 1e-5f);
+}
+
+TEST(XRReseatVertical, PlacedEyeLatchPreservesAdHocHeights) {
+    // An all-ad-hoc group the user arranged with its centre 0.3 m under their eyes: with the
+    // placement latch the re-seat keeps that, instead of hauling the centre up to eye level.
+    const SXRPose        placedFor = levelHeadAt(0.f, 1.2f, 0.f);
+    std::vector<SXRPose> live{
+        {{-0.6f, 0.9f, -1.5f}, Quat{}},
+        {{0.6f, 0.9f, -1.5f}, Quat{}},
+    };
+    const SXRPose head  = levelHeadAt(4.f, 1.7f, 1.f, 2.f);
+    const auto    after = groupReseat(live, head, 1.5f, placedFor.pos.y);
+    for (const auto& a : after)
+        EXPECT_NEAR(a.pos.y - head.pos.y, -0.3f, 1e-4f);
+}
+
+TEST(XRReseatVertical, StagingAgainstThePlacedEyeIgnoresPosture) {
+    // The §8.3 staging measures heights against the eyes the arrangement was placed for (m_seatEye),
+    // with the live head supplying only position and yaw. Standing up before taking a Quest off must
+    // not teach the memory that the monitors are 0.55 m lower relative to the eyes than they are.
+    const SXRPose seated = levelHeadAt(0.f, 1.15f, 0.f, 0.3f);
+    const SXRPose world  = reseatFrom(seated, SXRPose{{0.f, 1.457f, -1.4f}, Quat{}});
+    SXRPose       standing{{0.05f, 1.70f, 0.02f}, seated.rot};
+    SXRPose       stagedAgainst = standing;
+    stagedAgainst.pos.y         = seated.pos.y; // the latch
+    const SXRPose memLatched    = xrPoseInHeadFrame(stagedAgainst, world);
+    const SXRPose memLive       = xrPoseInHeadFrame(standing, world);
+    EXPECT_NEAR(memLatched.pos.y, 1.457f, 1e-4f);
+    EXPECT_NEAR(memLive.pos.y, 1.457f - 0.55f, 1e-4f); // the counterfactual
+}
+
+TEST(XRReseatVertical, SeatHeadCheckRefusesNonsenseHeads) {
+    EXPECT_EQ(xrSeatHeadCheck(levelHeadAt(0.f, 1.6f, 0.f)), XR_SEATHEAD_OK);
+    EXPECT_EQ(xrSeatHeadCheck(levelHeadAt(-56.9f, 0.2f, -15.6f, 2.f)), XR_SEATHEAD_OK); // far away is fine
+    // looking down at the keyboard / up at the top monitor is still a person
+    EXPECT_EQ(xrSeatHeadCheck(SXRPose{{0.f, 1.2f, 0.f}, qFromPitch(-55.f * PI / 180.f)}), XR_SEATHEAD_OK);
+    EXPECT_EQ(xrSeatHeadCheck(SXRPose{{0.f, 1.2f, 0.f}, qFromPitch(50.f * PI / 180.f)}), XR_SEATHEAD_OK);
+    // the report's diverged SLAM head: 3.16 m under the floor
+    EXPECT_EQ(xrSeatHeadCheck(levelHeadAt(-56.93f, -3.16f, -15.59f)), XR_SEATHEAD_HEIGHT);
+    EXPECT_EQ(xrSeatHeadCheck(levelHeadAt(0.f, 3.5f, 0.f)), XR_SEATHEAD_HEIGHT);
+    EXPECT_EQ(xrSeatHeadCheck(levelHeadAt(0.f, 3.0f, 0.f)), XR_SEATHEAD_OK); // the bound is inclusive
+    // glasses parked on the forehead / lifted up and back: no trustworthy yaw
+    EXPECT_EQ(xrSeatHeadCheck(SXRPose{{0.f, 1.6f, 0.f}, qFromPitch(120.f * PI / 180.f)}), XR_SEATHEAD_TILTED);
+    const float roll = 75.f * PI / 180.f;
+    EXPECT_EQ(xrSeatHeadCheck(SXRPose{{0.f, 1.6f, 0.f}, Quat{0.f, 0.f, std::sin(roll / 2.f), std::cos(roll / 2.f)}}), XR_SEATHEAD_TILTED);
+    // a broken locate
+    EXPECT_EQ(xrSeatHeadCheck(levelHeadAt(0.f, std::nanf(""), 0.f)), XR_SEATHEAD_NONFINITE);
+    EXPECT_EQ(xrSeatHeadCheck(SXRPose{{0.f, 1.6f, 0.f}, Quat{0.f, std::numeric_limits<float>::infinity(), 0.f, 1.f}}), XR_SEATHEAD_NONFINITE);
+    EXPECT_STRNE(xrSeatHeadName(XR_SEATHEAD_HEIGHT), "ok");
 }

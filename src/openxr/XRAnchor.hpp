@@ -10,6 +10,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <optional>
 
 #include "XRMath.hpp"
@@ -373,8 +374,9 @@ namespace OpenXR {
     };
 
     // The frame a monitor group is arranged FOR: where a viewer would have to stand, and which way
-    // face, to see the whole arrangement head-on. Yaw-only and on the floor (y = 0), i.e. the same
-    // shape xrHeadFrame produces, so it drops straight into xrPoseInHeadFrame / recenterLocalToHead.
+    // face, to see the whole arrangement head-on. Yaw-only, at the implied viewer's EYE height (see
+    // xrGroupImpliedEyeHeight), i.e. the shape of a located head, so it drops straight into
+    // xrPoseInHeadFrame / recenterLocalToHead in place of one.
     //
     // Position: the group's centroid pushed back along its mean facing normal by the group's
     // AUTHORED viewing distance. Orientation: facing the group (forward = -normal).
@@ -450,14 +452,61 @@ namespace OpenXR {
         return d;
     }
 
-    inline SXRGroupSeat xrGroupSeatFrame(const SXRPose* group, size_t n, float authoredDistance, float minDist = XR_DISTANCE_MIN, float maxDist = XR_DISTANCE_MAX) {
+    // The eye height of the viewer a group was arranged FOR, in the group's LIVE frame — the vertical
+    // half of the seat frame, and the vertical analogue of xrGroupAuthoredDistance (doc 03 §8.4).
+    //
+    // A declared rig's y is a height above the floor of a wearer of nominal eye height
+    // (XR_NOMINAL_EYE_HEIGHT, XRMath.hpp), i.e. `rig.y - XR_NOMINAL_EYE_HEIGHT` is how far above the
+    // eyes the user AUTHORED that monitor. Where that monitor sits now says where those eyes would
+    // have to be: `live.y - rig.y + XR_NOMINAL_EYE_HEIGHT`. `declaredLive[i]` is the live pose of the
+    // monitor whose rig is `declaredRigs[i]`; several declared monitors vote by their mean.
+    //
+    // With no rig to ask (an all-ad-hoc group), `placedEye` answers when finite: the eye height the
+    // arrangement was last PLACED for (a re-seat, or the first capture of the session — the manager's
+    // m_seatEye), which preserves exactly the head-relative heights the user left. With neither, the
+    // group's mean height is taken as eye level — where `openxr create` puts a monitor.
+    //
+    // Never the CURRENT head: a repair may not derive its target from the state it is repairing
+    // (invariant I4) — that is what made the old re-seat keep a group floating metres over a head
+    // whose 6DoF floor estimate had diverged.
+    inline float xrGroupImpliedEyeHeight(const SXRPose* group, size_t n, const SXRPose* declaredLive, const SXRPose* declaredRigs, size_t nDeclared,
+                                         float placedEye = std::numeric_limits<float>::quiet_NaN()) {
+        double sum = 0.0;
+        size_t k   = 0;
+        for (size_t i = 0; declaredLive && declaredRigs && i < nDeclared; ++i) {
+            const float d = declaredLive[i].pos.y - declaredRigs[i].pos.y;
+            if (!xrFinite(d))
+                continue;
+            sum += d;
+            ++k;
+        }
+        if (k)
+            return (float)(sum / (double)k) + XR_NOMINAL_EYE_HEIGHT;
+        if (xrFinite(placedEye))
+            return placedEye;
+        for (size_t i = 0; group && i < n; ++i) {
+            if (!xrFinite(group[i].pos.y))
+                continue;
+            sum += group[i].pos.y;
+            ++k;
+        }
+        return k ? (float)(sum / (double)k) : XR_NOMINAL_EYE_HEIGHT;
+    }
+
+    // `eyeHeight` is the implied viewer's eye height (xrGroupImpliedEyeHeight); NaN takes the group's
+    // mean height. The frame is a HEAD-like pose (eye height, yaw only), so it drops into
+    // xrPoseInHeadFrame exactly as a located head does.
+    inline SXRGroupSeat xrGroupSeatFrame(const SXRPose* group, size_t n, float authoredDistance, float eyeHeight = std::numeric_limits<float>::quiet_NaN(),
+                                         float minDist = XR_DISTANCE_MIN, float maxDist = XR_DISTANCE_MAX) {
         SXRGroupSeat out;
         Vec3         centroid{}, normal{};
         if (!xrGroupFacing(group, n, centroid, normal))
             return out;
 
+        if (!xrFinite(eyeHeight))
+            eyeHeight = xrGroupImpliedEyeHeight(group, n, nullptr, nullptr, 0);
         out.distance  = std::clamp(xrFinite(authoredDistance) ? authoredDistance : minDist, minDist, maxDist);
-        out.frame.pos = Vec3{centroid.x + normal.x * out.distance, 0.F, centroid.z + normal.z * out.distance};
+        out.frame.pos = Vec3{centroid.x + normal.x * out.distance, eyeHeight, centroid.z + normal.z * out.distance};
         // Face the group: forward (-Z) must be -normal, and qYawOf's convention makes that
         // atan2(normal.x, normal.z).
         out.frame.rot = qFromYaw(std::atan2(normal.x, normal.z));

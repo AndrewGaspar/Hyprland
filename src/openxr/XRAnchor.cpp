@@ -1118,9 +1118,10 @@ void CXRAnchor::recenterLocalToHead(const SXRPose& view, const SXRAnchorState& s
     if (m_state.mode != XR_ANCHOR_LOCAL)
         return;
 
-    // Yaw-only head frame at the floor-projected head position. Building the frame at y=0 keeps the
-    // declared offset's y as a floor-relative height (declared `pos:0,1.5,-1.5` -> still 1.5m above
-    // the floor), while its XZ + facing are re-planted relative to where the user is now looking.
+    // Yaw-only head frame under the head, XR_NOMINAL_EYE_HEIGHT below the eyes (doc 03 §8.4). The
+    // declared offset's y is therefore read relative to the eyes (declared `pos:0,1.5,-1.5` -> 0.1 m
+    // under them, wherever they are), and its XZ + facing are re-planted relative to where the user is
+    // now looking.
     // Shared with xrPoseInHeadFrame so a captured head-relative offset (§8.3) round-trips exactly.
     const SXRPose frame = xrHeadFrame(view);
 
