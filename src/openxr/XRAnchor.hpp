@@ -14,6 +14,7 @@
 #include <optional>
 
 #include "XRMath.hpp"
+#include "XRSurfaces.hpp"
 
 namespace OpenXR {
     // ---- enums (doc 03 §2.1) ----
@@ -763,6 +764,23 @@ namespace OpenXR {
             return m_adT;
         }
 
+        // ---- surfaces (research/32 C2) — POD runtime state, under COpenXRManager::m_layersMu ----
+        // The frame thread re-arms a carried window every frame with the plane it is near (or clears
+        // it). While the arm says `preview`, the grab/gaze override submits the SNAPPED pose instead of
+        // the carried one — that is the preview — and the release re-decides against the armed plane
+        // from the latched release pose: snapped, the window is re-anchored anchor:local on the surface
+        // (placeLocalAt) and the snap is left for the frame thread to collect (takeSurfaceSnap).
+        void                 setSurfaceArm(const SXRSurfaceArm& arm);
+        void                 clearSurfaceArm();
+        const SXRSurfaceArm& surfaceArm() const;
+        // The carried pose BEFORE a preview replaced it (== lastWorld() whenever nothing is previewed,
+        // and outside a carry). The release-latch ring records this, so a release re-decides from
+        // where the hand actually is rather than from the preview it is being shown.
+        SXRPose carryWorld() const;
+        eXRHand grabHand() const;
+        // The snap the last release made, once (the frame thread stores the attachment + reports it).
+        bool takeSurfaceSnap(SXRSurfaceCandidate& out);
+
         // ---- accessors (main thread reads for IPC/status) ----
         const SXRAnchorState& state() const {
             return m_state;
@@ -868,6 +886,13 @@ namespace OpenXR {
         float            m_adSeatDist        = 0.F;      // cached geofence distance (status)
         SXRPose          m_adRoamOffset;                 // runtime carry offset (openxr:adaptive_carry_offset)
         bool             m_adRoamRuntimeSet  = false;
+
+        // surfaces (research/32 C2)
+        bool                surfaceSnapOnRelease(const SXRPose& releaseWorld);
+        SXRSurfaceArm       m_surfaceArm;
+        SXRPose             m_carryWorld;
+        bool                m_surfaceSnapPending = false;
+        SXRSurfaceCandidate m_surfaceSnap;
 
         // last composed world pose (LOCAL_FLOOR)
         SXRPose m_lastWorld;
