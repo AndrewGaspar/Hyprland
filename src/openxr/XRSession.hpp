@@ -137,6 +137,16 @@ class CXRSession {
     bool       m_hasOverlay       = false;
     bool       m_isOverlay        = false;
 
+    // research/32 C1: XR_EXT_plane_detection. COpenXRManager::start() sets m_planeDetectionRequested
+    // (openxr:surfaces && openxr:surfaces_detect) BEFORE createInstance(), so the extension is only ever
+    // enabled for a user who opted into surfaces. m_planeDetectionAdvertised = the runtime lists it;
+    // m_hasPlaneDetection = requested AND advertised AND enabled; m_planeDetectionFeatures is the
+    // XrSystemPlaneDetectionPropertiesEXT answer (0 when not queried).
+    bool     m_planeDetectionRequested  = false;
+    bool     m_planeDetectionAdvertised = false;
+    bool     m_hasPlaneDetection        = false;
+    uint64_t m_planeDetectionFeatures   = 0;
+
     // Frame-thread-only after start().
     XrSessionState m_xrState       = XR_SESSION_STATE_UNKNOWN;
     bool           m_sessionBegan  = false;

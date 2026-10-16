@@ -135,6 +135,16 @@ bool CXRSession::createInstance() {
     else if (m_overlayRequested && !m_hasOverlay)
         Log::logger->log(Log::WARN, "[OPENXR] openxr:overlay requested but this runtime does not advertise XR_EXTX_overlay; creating a normal (exclusive) session");
 
+    // research/32 C1: XR_EXT_plane_detection, only for a user who opted into surfaces, and only when
+    // the runtime lists it. Whether the HEADSET can detect planes is a separate question the system
+    // properties (getSystem) and xrCreatePlaneDetectorEXT answer; neither is fatal.
+#ifdef XR_EXT_plane_detection
+    m_planeDetectionAdvertised = hasExt(XR_EXT_PLANE_DETECTION_EXTENSION_NAME);
+    m_hasPlaneDetection        = m_planeDetectionRequested && m_planeDetectionAdvertised;
+    if (m_hasPlaneDetection)
+        exts.push_back(XR_EXT_PLANE_DETECTION_EXTENSION_NAME);
+#endif
+
     XrApplicationInfo appInfo = {};
     strncpy(appInfo.applicationName, "Hyprland", XR_MAX_APPLICATION_NAME_SIZE - 1);
     appInfo.applicationVersion = 1;
@@ -152,8 +162,10 @@ bool CXRSession::createInstance() {
     if (XR_SUCCEEDED(xrGetInstanceProperties(m_instance, &props)))
         m_runtimeName = props.runtimeName;
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] instance created (runtime: {}, local_floor: {}, hand_interaction: {}, hand_tracking: {}, overlay: {}, user_presence: {})",
-                     m_runtimeName.empty() ? "?" : m_runtimeName, m_hasLocalFloor, m_hasHandInteraction, m_hasHandTracking, m_isOverlay, m_hasUserPresence);
+    Log::logger->log(Log::DEBUG,
+                     "[OPENXR] instance created (runtime: {}, local_floor: {}, hand_interaction: {}, hand_tracking: {}, overlay: {}, user_presence: {}, plane_detection: {})",
+                     m_runtimeName.empty() ? "?" : m_runtimeName, m_hasLocalFloor, m_hasHandInteraction, m_hasHandTracking, m_isOverlay, m_hasUserPresence,
+                     m_hasPlaneDetection ? "enabled" : (m_planeDetectionAdvertised ? "advertised" : "no"));
     return true;
 }
 
@@ -190,7 +202,18 @@ bool CXRSession::getSystem() {
         handProps.next = sysProps.next;
         sysProps.next  = &handProps;
     }
+#ifdef XR_EXT_plane_detection
+    XrSystemPlaneDetectionPropertiesEXT planeProps = {XR_TYPE_SYSTEM_PLANE_DETECTION_PROPERTIES_EXT};
+    if (m_hasPlaneDetection) {
+        planeProps.next = sysProps.next;
+        sysProps.next   = &planeProps;
+    }
+#endif
     if (XR_SUCCEEDED(xrGetSystemProperties(m_instance, m_systemId, &sysProps))) {
+#ifdef XR_EXT_plane_detection
+        if (m_hasPlaneDetection)
+            m_planeDetectionFeatures = planeProps.supportedFeatures;
+#endif
         m_systemName    = sysProps.systemName;
         m_maxLayerCount = sysProps.graphicsProperties.maxLayerCount;
         if (m_maxLayerCount < 16) // spec guarantees at least 16
