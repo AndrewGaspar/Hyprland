@@ -22,98 +22,96 @@
 // headset lying on a desk (dead-still, §4.1). So every "hold" here sways the head by under a degree,
 // the way a worn head always does.
 
-namespace {
-    bool gateUp() {
-        if (XR::waitForXrState("focused", std::chrono::milliseconds(15000)))
-            return true;
-        return XR::waitForXrState("visible", std::chrono::milliseconds(2000));
-    }
+static bool gateUp() {
+    if (XR::waitForXrState("focused", std::chrono::milliseconds(15000)))
+        return true;
+    return XR::waitForXrState("visible", std::chrono::milliseconds(2000));
+}
 
-    std::vector<float> restoreOffsetOf(const std::string& json, size_t blockPos) {
-        return XR::parseFloatArray(XR::fieldAfter(json, blockPos, "offset"));
-    }
+static std::vector<float> restoreOffsetOf(const std::string& json, size_t blockPos) {
+    return XR::parseFloatArray(XR::fieldAfter(json, blockPos, "offset"));
+}
 
-    MonadoWire::xrt_quat yawPitch(float yaw, float pitch) {
-        // q = qYaw(yaw) * qPitch(pitch) — yaw about +Y, then pitch about the head's +X
-        const float cy = std::cos(yaw / 2.f), sy = std::sin(yaw / 2.f), cp = std::cos(pitch / 2.f), sp = std::sin(pitch / 2.f);
-        return MonadoWire::xrt_quat{cy * sp, sy * cp, -sy * sp, cy * cp};
-    }
+static MonadoWire::xrt_quat yawPitch(float yaw, float pitch) {
+    // q = qYaw(yaw) * qPitch(pitch) — yaw about +Y, then pitch about the head's +X
+    const float cy = std::cos(yaw / 2.f), sy = std::sin(yaw / 2.f), cp = std::cos(pitch / 2.f), sp = std::sin(pitch / 2.f);
+    return MonadoWire::xrt_quat{cy * sp, sy * cp, -sy * sp, cy * cp};
+}
 
-    // hold a facing for `ms`, with a sub-degree sway so the head is never dead-still
-    void swayHold(CRemoteClient* remote, float yaw, float pitch, int ms) {
-        remote->animate(
-            [yaw, pitch, ms](MonadoWire::r_remote_data& d, float t01) {
-                const float t              = t01 * static_cast<float>(ms) * 1e-3f;
-                const float sway           = 0.6f * static_cast<float>(M_PI) / 180.f * std::sin(t * 2.f * static_cast<float>(M_PI) * 0.7f);
-                d.head.center.orientation  = yawPitch(yaw + sway, pitch + 0.3f * sway);
-                d.head.center.position     = MonadoWire::xrt_vec3{0.f, 0.f, 0.f};
-                d.head.per_view_data_valid = false;
-            },
-            std::chrono::milliseconds(ms), 60);
-    }
+// hold a facing for `ms`, with a sub-degree sway so the head is never dead-still
+static void swayHold(CRemoteClient* remote, float yaw, float pitch, int ms) {
+    remote->animate(
+        [yaw, pitch, ms](MonadoWire::r_remote_data& d, float t01) {
+            const float t              = t01 * static_cast<float>(ms) * 1e-3f;
+            const float sway           = 0.6f * static_cast<float>(M_PI) / 180.f * std::sin(t * 2.f * static_cast<float>(M_PI) * 0.7f);
+            d.head.center.orientation  = yawPitch(yaw + sway, pitch + 0.3f * sway);
+            d.head.center.position     = MonadoWire::xrt_vec3{0.f, 0.f, 0.f};
+            d.head.per_view_data_valid = false;
+        },
+        std::chrono::milliseconds(ms), 60);
+}
 
-    // the take-off: pitch up and back through vertical, the motion that used to mirror the memory
-    void liftAndFlip(CRemoteClient* remote) {
-        remote->animate(
-            [](MonadoWire::r_remote_data& d, float t01) {
-                d.head.center.orientation  = yawPitch(0.f, t01 * 110.f * static_cast<float>(M_PI) / 180.f);
-                d.head.center.position     = MonadoWire::xrt_vec3{0.f, 0.2f * t01, 0.f};
-                d.head.per_view_data_valid = false;
-            },
-            std::chrono::milliseconds(500), 60);
-        remote->animate(
-            [](MonadoWire::r_remote_data& d, float) {
-                d.head.center.orientation  = yawPitch(0.f, 110.f * static_cast<float>(M_PI) / 180.f);
-                d.head.per_view_data_valid = false;
-            },
-            std::chrono::milliseconds(400), 60);
-    }
+// the take-off: pitch up and back through vertical, the motion that used to mirror the memory
+static void liftAndFlip(CRemoteClient* remote) {
+    remote->animate(
+        [](MonadoWire::r_remote_data& d, float t01) {
+            d.head.center.orientation  = yawPitch(0.f, t01 * 110.f * static_cast<float>(M_PI) / 180.f);
+            d.head.center.position     = MonadoWire::xrt_vec3{0.f, 0.2f * t01, 0.f};
+            d.head.per_view_data_valid = false;
+        },
+        std::chrono::milliseconds(500), 60);
+    remote->animate(
+        [](MonadoWire::r_remote_data& d, float) {
+            d.head.center.orientation  = yawPitch(0.f, 110.f * static_cast<float>(M_PI) / 180.f);
+            d.head.per_view_data_valid = false;
+        },
+        std::chrono::milliseconds(400), 60);
+}
 
-    struct SDonOffGuard {
-        const bool& failed;
-        std::string testName;
-        std::string monitorName;
-        ~SDonOffGuard() {
-            getFromSocket("/keyword openxr:placement_memory legacy");
-            getFromSocket("/openxr enable");
-            XR::waitForXrState("focused", std::chrono::milliseconds(15000));
-            if (!monitorName.empty())
-                getFromSocket("/openxr destroy " + monitorName);
-            getFromSocket("/keyword openxr:monitors_follow_session visible");
-            if (XR::g_ctx.remote) {
-                XR::g_ctx.remote->setHeadPose(MonadoWire::xrt_vec3{0.f, 0.f, 0.f}, MonadoWire::xrt_quat{0.f, 0.f, 0.f, 1.f});
-                XR::g_ctx.remote->setControllerActive(CRemoteClient::SIDE_LEFT, false);
-                XR::g_ctx.remote->pulse();
-            }
-            if (failed)
-                XR::dumpXrArtifacts(testName);
+struct SDonOffGuard {
+    const bool& failed;
+    std::string testName;
+    std::string monitorName;
+    ~SDonOffGuard() {
+        getFromSocket("/keyword openxr:placement_memory legacy");
+        getFromSocket("/openxr enable");
+        XR::waitForXrState("focused", std::chrono::milliseconds(15000));
+        if (!monitorName.empty())
+            getFromSocket("/openxr destroy " + monitorName);
+        getFromSocket("/keyword openxr:monitors_follow_session visible");
+        if (XR::g_ctx.remote) {
+            XR::g_ctx.remote->setHeadPose(MonadoWire::xrt_vec3{0.f, 0.f, 0.f}, MonadoWire::xrt_quat{0.f, 0.f, 0.f, 1.f});
+            XR::g_ctx.remote->setControllerActive(CRemoteClient::SIDE_LEFT, false);
+            XR::g_ctx.remote->pulse();
         }
-    };
-
-    // create an ad-hoc monitor straight ahead (yaw 0) and wait for it to exist
-    bool createAhead(CRemoteClient* remote, const std::string& mon) {
-        remote->setHeadPose(MonadoWire::xrt_vec3{0.f, 0.f, 0.f}, MonadoWire::xrt_quat{0.f, 0.f, 0.f, 1.f});
-        remote->setControllerActive(CRemoteClient::SIDE_LEFT, false);
-        remote->pulse();
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
-        if (getFromSocket("/openxr create " + mon + " 1280x720") != "ok")
-            return false;
-        return XR::waitForJson("j/openxr", [&](const std::string& r) { return r.contains("\"name\": \"" + mon + "\""); }, std::chrono::milliseconds(10000));
+        if (failed)
+            XR::dumpXrArtifacts(testName);
     }
+};
 
-    // A dwell facing the monitor, the lift-and-flip take-off, then the session ends. Returns the
-    // status JSON read after the session is down.
-    std::string dwellThenFlipThenEnd(CRemoteClient* remote, const std::string& mon) {
-        // No previous memory: the legacy drift gate would otherwise refuse a flipped capture by
-        // comparing it with the create-time seed, and this would not test the upright guard at all.
-        // A FIRST commit only ever had the 8 m reach bound (R4), which is how the flip got in.
-        getFromSocket("/openxr forget " + mon);
-        swayHold(remote, 0.f, 0.f, 10500);
-        liftAndFlip(remote);
-        getFromSocket("/openxr disable");
-        XR::waitForXrState("disabled", std::chrono::milliseconds(10000));
-        return getFromSocket("j/openxr");
-    }
+// create an ad-hoc monitor straight ahead (yaw 0) and wait for it to exist
+static bool createAhead(CRemoteClient* remote, const std::string& mon) {
+    remote->setHeadPose(MonadoWire::xrt_vec3{0.f, 0.f, 0.f}, MonadoWire::xrt_quat{0.f, 0.f, 0.f, 1.f});
+    remote->setControllerActive(CRemoteClient::SIDE_LEFT, false);
+    remote->pulse();
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    if (getFromSocket("/openxr create " + mon + " 1280x720") != "ok")
+        return false;
+    return XR::waitForJson("j/openxr", [&](const std::string& r) { return r.contains("\"name\": \"" + mon + "\""); }, std::chrono::milliseconds(10000));
+}
+
+// A dwell facing the monitor, the lift-and-flip take-off, then the session ends. Returns the
+// status JSON read after the session is down.
+static std::string dwellThenFlipThenEnd(CRemoteClient* remote, const std::string& mon) {
+    // No previous memory: the legacy drift gate would otherwise refuse a flipped capture by
+    // comparing it with the create-time seed, and this would not test the upright guard at all.
+    // A FIRST commit only ever had the 8 m reach bound (R4), which is how the flip got in.
+    getFromSocket("/openxr forget " + mon);
+    swayHold(remote, 0.f, 0.f, 10500);
+    liftAndFlip(remote);
+    getFromSocket("/openxr disable");
+    XR::waitForXrState("disabled", std::chrono::milliseconds(10000));
+    return getFromSocket("j/openxr");
 }
 
 // The 09:39:06 regression, under the shipped `legacy` memory: the staging gate now refuses a head
