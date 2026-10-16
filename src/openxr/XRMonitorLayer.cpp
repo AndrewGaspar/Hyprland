@@ -18,6 +18,13 @@
 #include "../pointer/PointerManager.hpp"
 #include <aquamarine/buffer/Buffer.hpp>
 
+uint32_t CXRMonitorLayer::nextHistId() {
+    // research/30 §8.4: process-wide, never 0, never reused. Main thread only (layers are created
+    // there), but atomic anyway so the invariant does not depend on that.
+    static std::atomic<uint32_t> next{0};
+    return ++next;
+}
+
 CXRMonitorLayer::CXRMonitorLayer(const std::string& name, uint64_t seq, float sizeMeters) : m_monitorName(name), m_sizeMeters(sizeMeters), m_seq(seq) {
     ;
 }

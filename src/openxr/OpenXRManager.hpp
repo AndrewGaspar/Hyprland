@@ -22,6 +22,8 @@
 #include "XRLayout2D.hpp" // 2D-plane sync: the pure projection (report 12, unguarded)
 #include "XRCursorCross.hpp" // ray-cast cursor edge crossing: the pure math (task #139, unguarded)
 #include "XRInput.hpp" // SXRInputEvent / SXRStateEvent / XRQueueItem / CXRQueue / CXRInput
+#include "XRPoseHistory.hpp" // research/30: the in-memory don/doff history (unguarded, POD)
+#include "XRDonDoff.hpp"     // research/30: seat selection + the don/doff FSM (unguarded, pure)
 
 struct wl_event_source;
 
@@ -216,6 +218,43 @@ class COpenXRManager {
     };
     SXRWorldFrameStatus worldFrameStatus() const;
 
+    // ---- research/30 don/doff intent (Phases 0/1). MAIN THREAD. ----
+    // The `donoff` block of `hyprctl openxr status`: the FSM state, the last doff's verdict (what was
+    // committed, or — under placement_memory = legacy — what the shadow selection WOULD have
+    // committed), the running dwell, and the history's spans.
+    struct SXRDonOffStatus {
+        std::string              state             = "no-session";
+        int64_t                  sinceMs           = 0;
+        std::string              wearSignal        = "visibility";
+        int                      dof               = 3;
+        uint16_t                 originGen         = 0;
+        std::string              placementMemory   = "legacy";
+        bool                     haveLastDoff      = false;
+        bool                     lastDoffShadow    = false;
+        std::string              lastSeatSource    = "none";
+        int64_t                  onsetBeforeEdgeMs = -1;
+        float                    seatDurationS = 0.f, yawConcentration = 0.f, gazeFrac = 0.f, seatYawDeg = 0.f;
+        std::vector<std::string> refusals;
+        int                      committed = 0;
+        std::string              shadowSummary;
+        bool                     dwellOpen = false;
+        float                    dwellS = 0.f, dwellGaze = 0.f;
+        uint32_t                 authoredSinceCommit = 0;
+        float                    spanS[5]            = {0.f, 0.f, 0.f, 0.f, 0.f};
+        size_t                   episodes            = 0;
+        bool                     recording           = false;
+    };
+    SXRDonOffStatus donoffStatus();
+    // `hyprctl openxr donoff`: the last episodes, the edge journal and the generation table. Never
+    // raw T0 samples (that is what `donoff record` is for).
+    std::string donoffDump();
+    // `hyprctl openxr forget [<name>|all]`: drop the remembered placement (the next session re-seats
+    // from the rig). research/30 §7's escape hatch — before it, only a compositor restart could.
+    std::expected<std::string, std::string> cmdForget(const std::string& args);
+    // `hyprctl openxr donoff record on|off`: opt-in JSONL head-pose traces around each wear edge
+    // (research/30 §13.4). Off by default; turns itself off at session end.
+    std::expected<std::string, std::string> cmdDonoffRecord(const std::string& args);
+
     // Milliseconds until the pending grace-period unplug fires, or -1 when none is armed. Cheap
     // read of the timer for `hyprctl openxr status` observability. Main thread only.
     int  monitorUnplugPendingMs() const;
@@ -339,6 +378,12 @@ class COpenXRManager {
         bool        staged   = false;
         float       stagedX = 0.f, stagedY = 0.f, stagedZ = 0.f;
         std::string commit  = "nothing staged";
+        // research/30 §12.2: where the memory came from (dwell | quiet | older-dwell | summary |
+        // reseat | created | legacy | none), how old it is, and how long the seat it was taken from
+        // was worn.
+        std::string provenance      = "none";
+        float       provenanceAgeS  = -1.f;
+        float       provenanceSeatS = 0.f;
         // Adaptive anchoring (research/13 §6.4).
         bool        adaptiveEnabled  = false;
         std::string adaptivePhase    = "docked"; // docked | undocking | roaming | redocking
@@ -562,6 +607,75 @@ class COpenXRManager {
     static const char* stateToString(eXRManagerState state);
 
   private:
+    // ---- research/30 don/doff intent (Phases 0/1) ----
+    // Feed one FSM input and execute its actions. MAIN THREAD.
+    void donDoffInput(OpenXR::eXRDonInput in, const char* why);
+    // The doff / session-end commit: the legacy staging commit plus a shadow selection (placement_memory
+    // = legacy), or the intent selection + commitSeat (= intent). MAIN THREAD, at the edge (I11).
+    void doffCommit(const char* why);
+    // The live anchor:local arrangement as the selection sees it (ids, poses, eligibility, current
+    // memory + provenance, the group seat frame). Takes m_layersMu.
+    OpenXR::SXRArrangementView arrangementView();
+    // Write the verdict's seat into every eligible monitor's memory, with provenance. Takes m_layersMu.
+    int commitSeat(const OpenXR::SXRSeatVerdict& v, const OpenXR::SXRArrangementView& arr);
+    // RESEAT_DONE: the frame thread planted a GROUP re-seat; make exactly that the memory (§7, D4).
+    void commitReseatDone();
+    // a deliberate placement edit (verb, grab release, create): bump the arrangement epoch
+    void noteAuthored(uint32_t histId, const char* why);
+    // research/30 §5.5: the origin generation. Either thread; POD under m_historyMu.
+    void bumpOriginGen(OpenXR::eXRGenBridge bridge, OpenXR::eXRGenCause cause, const OpenXR::SXRPose& M);
+    // the edge journal. Either thread; POD under m_historyMu.
+    void journal(OpenXR::eXRJournalKind kind, uint32_t a = 0, uint32_t b = 0, float x = 0.f, float y = 0.f);
+    // FRAME THREAD: derive the features + flags and push one history sample (after the layer scope).
+    struct SXRHistFrameMonitors {
+        std::array<OpenXR::SXRHistMonitorPose, OpenXR::XR_HIST_MAX_MONITORS> mons{};
+        uint8_t                                                              n       = 0;
+        uint8_t                                                              dropped = 0;
+        // MONITORID -> stable id, to translate the gaze pass's raw hit
+        std::array<int64_t, 16>  monitorIds{};
+        std::array<uint32_t, 16> histIds{};
+        uint8_t                  nMap    = 0;
+        bool                     anyGrab = false;
+    };
+    void recordHistorySample(const OpenXR::SXRPose& view, bool viewValid, bool viewTracked, bool posTracked, bool trustworthy, float dt, const SXRHistFrameMonitors& mons,
+                             bool gazeEvaluated, bool roaming);
+    bool placementMemoryIntent() const; // reads the STRING config: main thread only
+    // the frame thread's wear facts (visible / presence / worn), published from publishRestoreCapture
+    void publishWearBits(bool worn);
+    // CLOCK_MONOTONIC ns — the one clock the history, the edges and the selection all use
+    static int64_t steadyNs();
+    std::string    histMonitorName(uint32_t id); // main thread, takes m_layersMu
+    void           donoffTraceEdge(const char* edge);
+    void           writeDonoffTrace();
+
+    // The history (≈ 3.4 MiB, allocated once with the manager and never reallocated). Written by the
+    // frame thread once per frame, and by either thread for gen/journal records — always under
+    // m_historyMu, which is never nested with m_layersMu or m_poseRingMu. The main thread copies it
+    // whole into m_historySnap (lazily allocated, main-thread only) and decides on the copy.
+    OpenXR::CXRPoseHistory     m_history;
+    std::mutex                 m_historyMu;
+    UP<OpenXR::CXRPoseHistory> m_historySnap;
+    // published by the main thread for the frame thread's sample flags (eXRWearBit)
+    std::atomic<uint8_t>  m_wearBits{0};
+    std::atomic<uint16_t> m_originGen{0};
+    std::atomic<uint32_t> m_arrangeEpoch{0};
+    // frame thread only
+    OpenXR::SXRHeadFeatures m_histFeatures;
+    OpenXR::SXRPose         m_histPrevHead;
+    bool                    m_histPrevValid = false;
+    // main thread only
+    OpenXR::eXRDonState                              m_donState            = OpenXR::XR_DON_NO_SESSION;
+    Time::steady_tp                                  m_donStateSince       = Time::steadyNow();
+    bool                                             m_committedSinceWorn  = false;
+    uint32_t                                         m_authoredSinceCommit = 0;
+    SXRDonOffStatus                                  m_lastDoff;    // the doff fields of the status block
+    std::array<std::pair<uint32_t, std::string>, 32> m_histNames{}; // recently destroyed monitors
+    size_t                                           m_histNamesNext   = 0;
+    bool                                             m_donoffRecording = false;
+    SP<CEventLoopTimer>                              m_donoffTraceTimer;
+    int64_t                                          m_donoffTraceEdgeNs = 0;
+    std::string                                      m_donoffTraceEdgeName;
+
     // Signature of every config value a bring-up attempt depends on (openxr:enabled, :gpu,
     // :runtime_json, :blend_mode, :overlay(_z), :ignore_kernel_taint, :reprobe*). MAIN THREAD only —
     // it reads STRING config values. Returns true when it differs from m_lastProbeInputs, and

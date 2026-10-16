@@ -97,6 +97,10 @@ COpenXRManager::~COpenXRManager() {
     if (m_unplugTimer && g_pEventLoopManager)
         g_pEventLoopManager->removeTimer(m_unplugTimer);
     m_unplugTimer.reset();
+    // research/30: the don/doff trace timer captures `this` the same way
+    if (m_donoffTraceTimer && g_pEventLoopManager)
+        g_pEventLoopManager->removeTimer(m_donoffTraceTimer);
+    m_donoffTraceTimer.reset();
     // Same for the first-plug settle timer (report-19).
     if (m_plugSettleTimer && g_pEventLoopManager)
         g_pEventLoopManager->removeTimer(m_plugSettleTimer);
@@ -853,6 +857,8 @@ void COpenXRManager::continueBringup(CXRSession* sess) {
     // visibility alone — a second and a half in which the old code overwrote every stored offset with
     // dead-frame coordinates, which is the memory the re-seat was about to consume.)
     invalidateAnchorFrames("a new session's reference frame is not the last one's");
+    // research/30 §5.5: and in the history's terms, a new origin generation nothing bridges to
+    bumpOriginGen(OpenXR::XR_BRIDGE_UNKNOWN, OpenXR::XR_GENC_SESSION_START, OpenXR::SXRPose{});
 
     // doc 05 §3.3: a session has now bound a system — re-derive the HMD context `when` matches
     // against. A change reconciles the declared set and re-resolves xr_defaults (no-op otherwise).
@@ -1113,7 +1119,21 @@ void COpenXRManager::stop() {
     // (a WiVRn server restart, `openxr disable`) is the commonest way to leave a headset, and it is
     // exactly the case WayVR's issue #529 is the post-mortem of: state saved only on a clean exit is
     // state lost. Idempotent with the gate-closing commit — a staged value is consumed once.
-    commitRestorePlacements("the session is ending");
+    //
+    // research/30: the FSM's session-end edge runs the commit (legacy + shadow, or intent) unless a
+    // doff commit already ran since the user last wore the headset; then the history closes its
+    // buckets and episode (no summary may straddle two sessions' frames).
+    donDoffInput(OpenXR::XR_DIN_SESSION_DOWN, "the session is ending");
+    {
+        std::scoped_lock lock(m_historyMu);
+        m_history.endSession(steadyNs());
+    }
+    if (m_donoffRecording) {
+        donoffTraceEdge("session-end");
+        writeDonoffTrace();
+        m_donoffRecording = false;
+        Log::logger->log(Log::DEBUG, "[OPENXR] don/doff trace recording turned itself off (session ended)");
+    }
 
     // ...and then: every anchor:local pose in the process is now named against a LOCAL_FLOOR origin
     // that will not exist a moment from now, and the next session's origin is somewhere else
@@ -1294,6 +1314,7 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
             // if the runtime lacks presence support (we never subscribe/forward in that case).
             m_presenceKnown = true;
             m_userPresent   = e.a != 0;
+            journal(OpenXR::XR_J_PRESENCE, m_userPresent ? 1 : 0);
             Log::logger->log(Log::DEBUG, "[OPENXR] user {} — re-evaluating monitor plug state", m_userPresent ? "present (donned)" : "absent (doffed)");
             updateMonitorsPlugged(/*allowGrace=*/true);
             // research/20 phase 2: presence is now an INPUT to shouldInhibitIdle() under
@@ -1322,8 +1343,11 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
             // report 12 §4: re-derive the 2D plane on the RELEASE edge only. Never on grab-begin —
             // the layout must not churn mid-drag, and syncLayout2D() refuses to run while anything
             // is carried anyway. Debounced, so a flurry of releases costs one relayout.
-            if (!e.a)
+            if (!e.a) {
                 requestLayout2DSync();
+                // research/30 §7: a grab release is an authored edit — the next doff's dwell carries it
+                noteAuthored(0, "grab release");
+            }
             break;
         case eXRStateEventType::ADAPTIVE:
             // research/13 §6.4: the terminal dock/undock edge (a = 1 undocked / 0 docked).
@@ -1359,6 +1383,10 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
             break;
         }
         case eXRStateEventType::TRACKING: Log::logger->log(Log::DEBUG, "[OPENXR] device-lock tracking {} (monitor {})", e.a ? "gained" : "lost", e.str); break;
+        case eXRStateEventType::RESEAT_DONE:
+            // research/30 §7: one SUPER+CTRL+Home must be able to repair a bad memory (D4).
+            commitReseatDone();
+            break;
         case eXRStateEventType::RECENTERED: {
             // doc 03 §8.4: the runtime moved LOCAL_FLOOR and openxr:recenter = follow, so the user's
             // recenter button means "bring my monitors to me". Re-check the policy HERE (the frame
@@ -1509,6 +1537,8 @@ void COpenXRManager::applyReferenceSpaceChange(const OpenXR::SXRPose& m) {
         for (auto& l : m_layers)
             l->m_anchor.onReferenceSpaceChanged(m);
     }
+    // research/30 §5.5: a KNOWN bridge — a seat measured before this can be re-expressed by M
+    bumpOriginGen(OpenXR::XR_BRIDGE_KNOWN, OpenXR::XR_GENC_RECENTER_KNOWN, m);
     // report 12 §3a: the whole reference space moved under us, so the latched desk orientation the
     // 2D projection measures world monitors against is now expressed in a space that no longer
     // exists. A plain atomic store plus a wake is all the frame thread may do here
@@ -2039,6 +2069,11 @@ void COpenXRManager::frameThread() {
         // whenever tracking blinks would be far worse than rendering the runtime's best guess), while
         // only TRACKED may feed DURABLE state. §5.4: "render, do not commit, do not first-hydrate".
         bool            viewTracked = false;
+        // research/30: POSITION_TRACKED alone is the 6DoF signal (a 3DoF runtime reports a valid but
+        // untracked, neck-modelled position); gazeEvaluated says whether this frame's gaze hit means
+        // anything (P5 only applies to samples where the gaze pass actually ran).
+        bool            viewPosTracked = false;
+        bool            gazeEvaluated  = false;
         XrSpaceLocation loc         = {XR_TYPE_SPACE_LOCATION};
         if (XR_SUCCEEDED(xrLocateSpace(m_session->m_viewSpace, m_session->m_refSpace, fs.predictedDisplayTime, &loc)) &&
             (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) && (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
@@ -2046,6 +2081,7 @@ void COpenXRManager::frameThread() {
             viewValid = OpenXR::xrPoseFinite(viewPose); // §3.4.2: xrToPose is a raw field copy
             viewTracked =
                 viewValid && (loc.locationFlags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT) && (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT);
+            viewPosTracked = viewValid && (loc.locationFlags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT);
             if (viewValid && !m_session->m_usingLocalFloor)
                 viewPose.pos.y += floorOffset;
         }
@@ -2203,6 +2239,9 @@ void COpenXRManager::frameThread() {
         int   reseatRestored = 0, reseatDeclared = 0, reseatGrouped = 0;
         float reseatDist = 0.f; // research/28 S1: the AUTHORED viewing distance a GROUP re-seat used
         bool  reseatRan = false, reseatUnseatable = false;
+        // research/30 §8.4: every monitor's pose for this frame's history sample, gathered inside the
+        // layer lock as plain values (stable ids, never names) and pushed after it.
+        SXRHistFrameMonitors histMons;
         {
             std::scoped_lock lock(m_layersMu);
             m_lastVerbCtx = OpenXR::SXRVerbContext{viewPose, viewValid, gripLeft, gripRight};
@@ -2268,6 +2307,9 @@ void COpenXRManager::frameThread() {
                             seat.mode       = OpenXR::XR_ANCHOR_LOCAL;
                             seat.anchorPose = OpenXR::xrPoseInHeadFrame(seatFrame.frame, worlds[i]);
                             targets[i]->m_anchor.recenterLocalToHead(viewPose, seat);
+                            // research/30 §7: exactly this offset becomes the memory (RESEAT_DONE below)
+                            targets[i]->m_reseatPlanted        = seat.anchorPose;
+                            targets[i]->m_reseatPlantedPending = OpenXR::xrPoseFinite(seat.anchorPose);
                         }
                         reseatGrouped = (int)targets.size();
                         reseatDist    = seatFrame.distance;
@@ -2299,6 +2341,56 @@ void COpenXRManager::frameThread() {
                     l->m_anchorFrameStale = false;
             }
 
+            // research/30 §8.4: the per-monitor block of this frame's history sample. anchor:local
+            // monitors first (they are what a memory is made of), then lower (older) ids; anything
+            // past the cap is counted, not silently lost. Raw pointers + POD only (frame thread).
+            {
+                std::array<CXRMonitorLayer*, OpenXR::XR_ARR_MAX> cand{};
+                size_t                                           nCand = 0;
+                for (auto& l : m_layers) {
+                    if (l->m_pendingRemoval.load(std::memory_order_acquire))
+                        continue;
+                    if (histMons.nMap < histMons.monitorIds.size()) {
+                        histMons.monitorIds[histMons.nMap] = l->m_monitorId.load(std::memory_order_acquire);
+                        histMons.histIds[histMons.nMap]    = l->m_histId;
+                        ++histMons.nMap;
+                    }
+                    if (l->m_anchor.grabbed())
+                        histMons.anyGrab = true;
+                    if (nCand < cand.size())
+                        cand[nCand++] = l.get();
+                    else
+                        histMons.dropped = 1;
+                }
+                std::sort(cand.begin(), cand.begin() + nCand, [](const CXRMonitorLayer* a, const CXRMonitorLayer* b) {
+                    const bool la = a->m_anchor.state().mode == OpenXR::XR_ANCHOR_LOCAL, lb = b->m_anchor.state().mode == OpenXR::XR_ANCHOR_LOCAL;
+                    if (la != lb)
+                        return la;
+                    return a->m_histId < b->m_histId;
+                });
+                for (size_t i = 0; i < nCand; ++i) {
+                    if (histMons.n >= OpenXR::XR_HIST_MAX_MONITORS) {
+                        histMons.dropped = 1;
+                        break;
+                    }
+                    const auto* l  = cand[i];
+                    auto&       hm = histMons.mons[histMons.n++];
+                    hm.id          = l->m_histId;
+                    hm.mode        = (uint8_t)l->m_anchor.state().mode;
+                    hm.pos         = l->m_anchor.state().anchorPose.pos;
+                    hm.rot         = l->m_anchor.state().anchorPose.rot;
+                    hm.flags       = 0;
+                    if (!OpenXR::xrAnchorFrameReestablished(l->m_anchorFrameStale, l->m_anchor.state().anchorPose, l->m_anchorFrameRef))
+                        hm.flags |= OpenXR::XR_HMF_STALE;
+                    if (l->m_anchor.grabbed())
+                        hm.flags |= OpenXR::XR_HMF_GRABBED;
+                    if (l->m_anchor.adaptiveEnabled() && l->m_anchor.adaptivePhase() != OpenXR::XRAD_DOCKED)
+                        hm.flags |= OpenXR::XR_HMF_ROAMING;
+                    if (OpenXR::xrReseatEligible(l->m_anchor.state().mode, false))
+                        hm.flags |= OpenXR::XR_HMF_ELIGIBLE;
+                }
+            }
+
             // doc 03 §8.3 / research/28 H2: STAGE every anchor:local monitor's placement — its desk
             // pose expressed in the wearer's yaw-only floor frame. This is a live MEASUREMENT, not a
             // memory: it says where the monitor is relative to the user *right now*, and it is
@@ -2326,7 +2418,13 @@ void COpenXRManager::frameThread() {
             // Skipped while an adaptive monitor is anything but DOCKED: its anchorPose is the saved
             // desk pose while the user has walked away from it, so measuring that against their
             // current head would remember the walk, not the desk.
-            if (headTrustworthy && OpenXR::qYawObservable(viewPose.rot) && m_restoreCapture.load(std::memory_order_relaxed)) {
+            //
+            // research/30 R2: "observable" is not enough. A head pitched PAST vertical (glasses lifted
+            // up and back, or parked on the forehead) has a perfectly observable forward vector whose
+            // yaw is the person's yaw + 180°, and staging against it mirrors every offset — the
+            // (x, z) -> (-x, -z) captures of 2026-10-13..15. xrHeadUpright (head +Y within 60° of
+            // world up) is the gate every durable yaw read now uses.
+            if (headTrustworthy && OpenXR::xrHeadUpright(viewPose.rot) && m_restoreCapture.load(std::memory_order_relaxed)) {
                 const OpenXR::SXRPose headFrameInv = OpenXR::poseInverse(OpenXR::xrHeadFrame(viewPose));
                 for (auto& l : m_layers) {
                     if (l->m_pendingRemoval.load(std::memory_order_acquire))
@@ -2428,10 +2526,11 @@ void COpenXRManager::frameThread() {
         if (reseatUnseatable)
             Log::logger->log(Log::WARN,
                              "[OPENXR] re-seat: the monitor group has no common facing (their normals cancel) — there is no 'in front of' to bring it around to, so nothing moved");
-        else if (reseatGrouped)
+        else if (reseatGrouped) {
             Log::logger->log(Log::DEBUG, "[OPENXR] re-seated the arrangement of {} anchor:local monitor(s) onto the current head at its authored {:.2f}m (rigid; relative layout preserved)",
                              reseatGrouped, reseatDist);
-        else if (reseatRan)
+            enqueue(SXRStateEvent{.type = eXRStateEventType::RESEAT_DONE, .a = reseatGrouped});
+        } else if (reseatRan)
             Log::logger->log(Log::DEBUG, "[OPENXR] re-seated {} anchor:local monitor(s) to the head: {} restored from the last wearing, {} from their declared rig", reseatRestored + reseatDeclared,
                              reseatRestored, reseatDeclared);
 
@@ -2659,6 +2758,7 @@ void COpenXRManager::frameThread() {
             // targets. Under m_layersMu (mutates the carried anchor's runtime state is NOT done here —
             // it only reads gazeGrabbed() + publishes atomics; the carry itself is driven by the solve).
             gazeSelectPass(pointerTargets, active, viewPose, viewValid, dt);
+            gazeEvaluated = viewValid;
 
             // WP-G2 chrome visual-state plumbing: publish each active quad's current ray-hover
             // region + grab flag onto the layer for the NEXT frame's chrome draw pass (frame
@@ -2749,6 +2849,9 @@ void COpenXRManager::frameThread() {
         // no input configured we still log the head pose); reads m_gazeHoveredId + the frame-thread
         // gaze selector state, no config/refcount. Pushes under its own small mutex.
         recordPoseSample(viewPose, viewValid);
+        // research/30 §8: the don/doff history — head features, flags, per-monitor poses. Its own
+        // mutex, POD only, after every layer-locked scope of this frame.
+        recordHistorySample(viewPose, viewValid, viewTracked, viewPosTracked, headTrustworthy, dt, histMons, gazeEvaluated, anyRoaming);
 
         // xrEndFrame with zero layers is valid (nothing composited yet) — doc 01.
         XrFrameEndInfo endInfo       = {XR_TYPE_FRAME_END_INFO};
@@ -2967,11 +3070,19 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
             // main thread, at an edge (creation). It is also the moment this monitor's pose becomes
             // meaningful in the current reference frame, so its frame is not stale and the staging
             // value starts life agreeing with the memory.
+            //
+            // research/30 R2: only from an UPRIGHT head. A create issued while the head is tipped past
+            // vertical would seed a mirrored memory; leave it unseeded (the next doff's dwell seeds it).
             layer->m_restoreOffset      = OpenXR::xrPoseInHeadFrame(ctx.view, st.anchorPose);
-            layer->m_restoreValid       = OpenXR::xrPoseFinite(layer->m_restoreOffset);
+            const bool seeded           = OpenXR::xrPoseFinite(layer->m_restoreOffset);
+            layer->m_restoreValid       = seeded && OpenXR::xrHeadUpright(ctx.view.rot);
+            if (layer->m_restoreValid)
+                layer->m_restoreProv = OpenXR::SXRRestoreProvenance{.src = OpenXR::XR_SEAT_CREATED, .committedAtNs = steadyNs()};
             layer->m_restoreStaged      = layer->m_restoreOffset;
             layer->m_restoreStagedValid = layer->m_restoreValid;
-            layer->m_anchorFrameStale   = !layer->m_restoreValid;
+            // the pose itself was placed in THIS frame whatever the head's tilt, so it may be
+            // remembered from (by the next doff's dwell) even when the seed was refused
+            layer->m_anchorFrameStale = !seeded;
         } else
             st.anchorPose = OpenXR::SXRPose{OpenXR::Vec3{0.f, 1.4f, -dist}, OpenXR::Quat{}}; // no tracking yet
     }
@@ -3120,6 +3231,7 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
     requestLayout2DSync();
 
     Log::logger->log(Log::DEBUG, "[OPENXR] created XR monitor '{}' (seq {}, size {}m)", params.m_name, layer->m_seq, sizeMeters);
+    journal(OpenXR::XR_J_MONITOR_CREATED, layer->m_histId); // research/30 §8.4
     return layer;
 }
 
@@ -3161,6 +3273,11 @@ void COpenXRManager::finalizeLayerRemoval(const std::string& name) {
     }
     if (!layer)
         return;
+
+    // research/30 §8.4: the history knows this monitor only by its id; keep the name around for a
+    // while so `donoff` and traces can still say who it was.
+    m_histNames[m_histNamesNext++ % m_histNames.size()] = {layer->m_histId, layer->m_monitorName};
+    journal(OpenXR::XR_J_MONITOR_DESTROYED, layer->m_histId);
 
     // Release any queued/retired presented buffers here, on the main thread — their final SP
     // dec must not happen in ~CXRMonitorLayer if that ever ran off-main (belt-and-braces; the
@@ -4398,6 +4515,10 @@ void COpenXRManager::publishRestoreCapture() {
     // session with no durable placement at all.
     const bool wearing = !m_userPresenceSupported || !m_presenceKnown || m_userPresent;
     const bool want    = sessionVisible() && wearing;
+    // research/30: the same facts, for the history's per-sample flags, and the FSM's session edge
+    publishWearBits(want);
+    if (sessionExists() && m_donState == OpenXR::XR_DON_NO_SESSION)
+        donDoffInput(OpenXR::XR_DIN_SESSION_UP, "session up");
     if (m_restoreCapture.exchange(want, std::memory_order_relaxed) == want)
         return;
     // Worth a line: this gate is the difference between "your layout will come back" and "it will be
@@ -4412,8 +4533,13 @@ void COpenXRManager::publishRestoreCapture() {
     // That sentence describes a commit, and there wasn't one — the last frame before the gate shut
     // simply happened to be the value left lying in the durable slot. Now the gate shutting IS the
     // commit, it runs on the main thread, and it can refuse.
-    if (!want)
-        commitRestorePlacements("the wearing gate closed");
+    //
+    // research/30: the commit now runs through the don/doff FSM (exactly once per edge, S16), which
+    // runs the legacy commit above plus a shadow selection under placement_memory = legacy, or the
+    // intent selection under = intent.
+    journal(OpenXR::XR_J_WORN, want ? 1 : 0, m_userPresenceSupported ? 1 : 0);
+    donDoffInput(want ? OpenXR::XR_DIN_WORN_UP : OpenXR::XR_DIN_WORN_DOWN, want ? "the wearing gate opened" : "the wearing gate closed");
+    donoffTraceEdge(want ? "worn-up" : "worn-down");
 }
 
 void COpenXRManager::commitRestorePlacements(const char* why) {
@@ -4432,6 +4558,7 @@ void COpenXRManager::commitRestorePlacements(const char* why) {
             if (verdict == OpenXR::XR_COMMIT_OK) {
                 l->m_restoreOffset = l->m_restoreStaged;
                 l->m_restoreValid  = true;
+                l->m_restoreProv   = OpenXR::SXRRestoreProvenance{.src = OpenXR::XR_SEAT_LEGACY, .committedAtNs = steadyNs()};
                 ++committed;
             } else {
                 // Invariant I9, and the whole point of the bound: keeping the previous memory is the
@@ -4484,6 +4611,8 @@ void COpenXRManager::handleFrameDiscontinuity(const std::string& why) {
     // exact path (§3.3 #2) — with recenter_on_plug off the old code WARNed and left the anchors in a
     // dead frame while the capture cheerfully went on writing memories from them.
     invalidateAnchorFrames(why.c_str());
+    // research/30 §5.5: nothing bridges this one
+    bumpOriginGen(OpenXR::XR_BRIDGE_UNKNOWN, OpenXR::XR_GENC_DISCONTINUITY, OpenXR::SXRPose{});
 
     static auto PRECENTER = CConfigValue<Hyprlang::INT>("openxr:recenter_on_plug");
     const bool  follow    = m_recenterPolicy.load(std::memory_order_relaxed) == OpenXR::XR_RECENTER_FOLLOW;
@@ -5788,6 +5917,7 @@ void COpenXRManager::reconcileDeclaredMonitors() {
                 // not replay the old arrangement.
                 existing->m_restoreValid       = false;
                 existing->m_restoreStagedValid = false;
+                existing->m_restoreProv        = OpenXR::SXRRestoreProvenance{.src = OpenXR::XR_SEAT_DECLARED}; // research/30 §6.4
                 // research/28 §F: and the pose it now holds is the rig, re-seeded into whatever the
                 // runtime's origin happens to be this session — a declaration, not a placement. It may
                 // not be remembered until something actually places it (which is the same rule that
@@ -6031,6 +6161,7 @@ std::expected<COpenXRManager::SXRCreateResult, std::string> COpenXRManager::cmdC
         return std::unexpected(res.error());
     // Runtime-created: NOT declared, so reload reconciliation never touches it (doc 05 §2.5).
     result.name = parsed->m_name;
+    noteAuthored(res.value()->m_histId, "create"); // research/30 §7
     return result;
 }
 
@@ -6143,6 +6274,10 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
         info.stagedY                     = l->m_restoreStaged.pos.y;
         info.stagedZ                     = l->m_restoreStaged.pos.z;
         info.commit                      = OpenXR::xrRestoreCommitName((OpenXR::eXRRestoreCommit)l->m_restoreLastCommit);
+        info.provenance                  = l->m_restoreValid ? OpenXR::xrSeatSourceName(l->m_restoreProv.src) : "none";
+        info.provenanceAgeS              = l->m_restoreValid && l->m_restoreProv.committedAtNs ? (float)((double)(steadyNs() - l->m_restoreProv.committedAtNs) * 1e-9) : -1.f;
+        info.provenanceSeatS =
+            l->m_restoreProv.seatEndNs > l->m_restoreProv.seatStartNs ? (float)((double)(l->m_restoreProv.seatEndNs - l->m_restoreProv.seatStartNs) * 1e-9) : 0.f;
         // Adaptive anchoring (research/13 §6.4).
         info.adaptiveEnabled  = l->m_anchor.adaptiveEnabled();
         info.adaptivePhase    = OpenXR::xrAdaptivePhaseName(l->m_anchor.adaptivePhase());
@@ -6981,6 +7116,7 @@ std::expected<void, std::string> COpenXRManager::cmdAnchor(const std::string& ar
         requestEffectEval();
     // report 12 §3: re-anchoring changes WHICH frame the monitor is measured in (world vs follow vs
     // excluded-entirely for device), and an explicit offset moves it outright.
+    noteAuthored(layer->m_histId, "anchor"); // research/30 §7: an authored placement edit
     requestLayout2DSync();
     return {};
 }
@@ -7005,6 +7141,7 @@ std::expected<void, std::string> COpenXRManager::cmdMove(const std::string& args
         if (!layer->m_anchor.applyMove(OpenXR::Vec3{*dx, *dy, *dz}, ctx))
             return std::unexpected<std::string>("move: head tracking (or controller for device anchors) unavailable");
     }
+    noteAuthored(layer->m_histId, "move"); // research/30 §7: an authored placement edit
     requestLayout2DSync(); // report 12 §4: a pose verb moved a quad -> re-derive the plane (debounced)
     return {};
 }
@@ -7036,6 +7173,7 @@ std::expected<void, std::string> COpenXRManager::cmdRotate(const std::string& ar
         std::scoped_lock lock(m_layersMu);
         layer->m_anchor.applyRotate(*yaw * DEG2RAD, pitch * DEG2RAD, ctx);
     }
+    noteAuthored(layer->m_histId, "rotate"); // research/30 §7: an authored placement edit
     requestLayout2DSync();
     return {};
 }
@@ -7142,6 +7280,7 @@ std::expected<void, std::string> COpenXRManager::cmdDistance(const std::string& 
         if (!layer->m_anchor.applyDistance(*dm, ctx))
             return std::unexpected<std::string>("distance: head tracking unavailable or no current pose");
     }
+    noteAuthored(layer->m_histId, "distance"); // research/30 §7: an authored placement edit
     requestLayout2DSync();
     return {};
 }
@@ -7161,6 +7300,7 @@ std::expected<void, std::string> COpenXRManager::cmdCenter() {
     // report 12 §3a/§4: `center` is a "this is how I'm sitting now" moment, so it RE-LATCHES the desk
     // orientation the whole world-monitor projection is measured against, then re-derives the plane.
     latchLayout2DReference();
+    noteAuthored(layer->m_histId, "center"); // research/30 §7: an authored placement edit
     requestLayout2DSync();
     return {};
 }
@@ -7199,6 +7339,7 @@ std::expected<void, std::string> COpenXRManager::cmdPlace(const std::string& arg
     // (and any bar) sees the mode transition.
     if (g_pEventManager)
         g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitoranchor", layer->m_monitorName + ",local"});
+    noteAuthored(layer->m_histId, "place"); // research/30 §7: an authored placement edit
     requestLayout2DSync();
     return {};
 }

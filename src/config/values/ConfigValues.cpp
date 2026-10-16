@@ -752,6 +752,12 @@ std::vector<SP<IValue>> Values::getConfigValues() {
                  "arbitrary, under boundaryless/standby) LOCAL_FLOOR origin — the monitors appear in front of you at their configured height/distance. Multi-monitor layouts "
                  "are recentered rigidly (relative arrangement preserved). A brief doff-and-don within the same session does NOT re-seat (report-20)",
                  true),
+        MS<String>("openxr:placement_memory",
+                   "how the compositor decides where your monitors were when you take the headset off (the placement a new session restores around your head): legacy "
+                   "(default) = the last frame before the wearing gate shut, through the 2.5 m drift gate, with the new seat selection running in SHADOW and only logged "
+                   "(`shadow:` lines); intent = the seat is the last place you dwelled while working (onset-cut, stillness-weighted, facing-checked), never compared against "
+                   "the old memory (research/30). A re-seat (`xrmonitor reseat`) commits immediately under both",
+                   "legacy"),
         MS<String>("openxr:recenter",
                    "what the HEADSET's own recenter button does to your monitors: hold (default) = the monitors stay where they are IN THE ROOM, so recentering only moves the "
                    "runtime's origin; follow = a runtime reference-space change ALSO re-seats the anchor:local group rigidly to your current head, i.e. the recenter button "
