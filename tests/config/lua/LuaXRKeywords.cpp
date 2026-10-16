@@ -834,6 +834,27 @@ TEST(ConfigLuaXRSurface, openxrSectionKeysAreSettableFromLua) {
     EXPECT_EQ(fx.errors(), "");
 }
 
+// research/32: the surfaces options, as the docs tell a Lua user to set them (hyprctl eval of this).
+TEST(ConfigLuaXRSurface, surfacesKeysAreSettableFromLua) {
+    CXRLuaFixture fx;
+
+    fx.run(R"LUA(
+        hl.config({
+            openxr = {
+                surfaces               = true,
+                surfaces_synthetic     = "table pos:0,0.74,-0.7 size:1.2,0.7; wall pos:0,1.2,-2.5 size:3,2.4",
+                surfaces_detect        = false,
+                surfaces_snap_distance = 0.06,
+                surfaces_stand_tilt    = 15,
+                surfaces_walls         = false,
+                surfaces_poll_ms       = 500,
+            },
+        })
+    )LUA");
+
+    EXPECT_EQ(fx.errors(), "");
+}
+
 // A bad key must be named, not swallowed — the classic front end errors on an unknown `openxr:`
 // keyword and Lua has to as well, or a typo silently disables half a session.
 TEST(ConfigLuaXRSurface, unknownOpenxrKeyIsAConfigError) {
