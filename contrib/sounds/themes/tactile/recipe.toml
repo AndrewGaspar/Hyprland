@@ -1,0 +1,161 @@
+# tactile — short filtered clicks, latches and low thunks; almost no pitch, almost no room.
+# Physical-object vocabulary (borrowed as an IDEA from earshot's forge: a sharp contact into a few
+# very damped modes reads as a real object, not a "beep"): a noise burst through a band-pass is
+# the contact, a `bell` with millisecond decays is the body, a short sine drop is the thunk.
+
+[theme]
+name = "tactile"
+description = "Dry clicks, latches and soft thunks — a premium switch, not a synth"
+peak_dbfs = -3.0
+loudness_lufs = -16      # loudness of a level_db = 0 event; interaction sounds sit below it
+scale = { root = "A2", mode = "minor" }
+fx = { reverb = { wet = 0.06, rt60 = 0.12, bright = 0.5 } }
+
+[theme.timbres]
+contact  = { wave = "noise", filter = { type = "bandpass", cutoff = 3800, q = 1.6 }, env = { a = 0.0005, d = 0.004, r = 0.003 } }
+contact-soft = { wave = "noise", filter = { type = "bandpass", cutoff = 2200, q = 1.2 }, env = { a = 0.001, d = 0.006, r = 0.004 } }
+shell    = { wave = "bell", partials = [[1, 1, 0.006], [1.52, 0.6, 0.004], [2.61, 0.35, 0.002]] }
+wood     = { wave = "bell", partials = [[1, 1, 0.045], [2.57, 0.4, 0.018], [4.1, 0.2, 0.008]] }
+thunk    = { wave = "sine", env = { a = 0.002, d = 0.04, r = 0.01 } }
+hum      = { wave = "saw", filter = { type = "lowpass", cutoff = 180, to = 900, q = 0.9 }, env = { a = 0.12, d = 0.3, r = 0.08 } }
+
+# ---------------------------------------------------------------------------------- headset
+[events.don]       # snap-on: latch click, a body thunk that rises, a second lighter click
+notes = [
+  { t = 0.000, dur = 0.03, timbre = "contact", db = -2 },
+  { t = 0.000, dur = 0.03, timbre = "shell", freq = 2600, db = -6 },
+  { t = 0.004, dur = 0.12, timbre = "thunk", freq = 95, to_freq = 150, glide = 0.05, db = -1 },
+  { t = 0.090, dur = 0.03, timbre = "contact-soft", db = -8 },
+  { t = 0.090, dur = 0.03, timbre = "shell", freq = 3400, db = -10 },
+]
+
+[events.doff]
+mirror = "don"
+transpose = -3
+
+# ---------------------------------------------------------------------------------- session
+[events.session-start]   # power switch: hard click, then a filtered hum swells open
+notes = [
+  { t = 0.00, dur = 0.03, timbre = "contact", db = -1 },
+  { t = 0.00, dur = 0.06, timbre = "thunk", freq = 70, db = -2 },
+  { t = 0.03, dur = 0.50, timbre = "hum", deg = 0, db = -9 },
+]
+
+[events.session-stop]
+notes = [
+  { t = 0.00, dur = 0.40, timbre = "hum", deg = 0, db = -9, filter = { type = "lowpass", cutoff = 900, to = 160, q = 0.9 }, env = { a = 0.01, d = 0.18, r = 0.08 } },
+  { t = 0.32, dur = 0.03, timbre = "contact-soft", db = -3 },
+  { t = 0.32, dur = 0.06, timbre = "thunk", freq = 60, db = -3 },
+]
+
+# ---------------------------------------------------------------------------------- monitors
+[events.monitor-new]     # a soft "pop" (rising sine) behind a click
+notes = [
+  { t = 0.00, dur = 0.07, wave = "sine", freq = 260, to_freq = 820, glide = 0.035, db = -2, env = { a = 0.001, d = 0.025 } },
+  { t = 0.00, dur = 0.03, timbre = "contact-soft", db = -10 },
+  { t = 0.05, dur = 0.12, timbre = "wood", freq = 1150, db = -10 },
+]
+
+[events.monitor-close]
+mirror = "monitor-new"
+transpose = -4
+
+# ---------------------------------------------------------------------------------- grab / select
+[events.grab]            # the click voice; one level, tiny take-to-take variation only
+level_db = -4
+variants = 4
+jitter = { cents = 40, db = 0.8 }
+notes = [
+  { t = 0.000, dur = 0.03, timbre = "contact", db = 0 },
+  { t = 0.000, dur = 0.03, timbre = "shell", freq = 3000, db = -5 },
+  { t = 0.002, dur = 0.05, timbre = "thunk", freq = 180, to_freq = 130, glide = 0.03, db = -9 },
+]
+
+[events.release]         # the same switch letting go: thinner, lower, quieter
+level_db = -7
+variants = 4
+jitter = { cents = 40, db = 0.8 }
+notes = [
+  { t = 0.000, dur = 0.03, timbre = "contact-soft", db = 0 },
+  { t = 0.000, dur = 0.03, timbre = "shell", freq = 2300, db = -6 },
+]
+
+[events.select]
+level_db = -10
+notes = [
+  { t = 0.0, dur = 0.03, timbre = "contact", db = -2, filter = { type = "bandpass", cutoff = 5200, q = 2.5 } },
+  { t = 0.0, dur = 0.05, timbre = "wood", freq = 1800, db = -8 },
+]
+
+# ---------------------------------------------------------------------------------- adaptive anchor
+[events.undock]          # magnet lets go: click + a short breath of air
+level_db = -4
+notes = [
+  { t = 0.00, dur = 0.03, timbre = "contact-soft", db = -2 },
+  { t = 0.01, dur = 0.16, wave = "noise", db = -12, filter = { type = "bandpass", cutoff = 700, to = 3000, q = 1.2 }, env = { a = 0.05, d = 0.05, r = 0.04 } },
+]
+
+[events.dock]            # magnet clack: thunk + hard click
+level_db = -3
+notes = [
+  { t = 0.00, dur = 0.10, timbre = "thunk", freq = 140, to_freq = 90, glide = 0.04, db = -1 },
+  { t = 0.00, dur = 0.03, timbre = "contact", db = -2 },
+  { t = 0.00, dur = 0.08, timbre = "wood", freq = 620, db = -7 },
+]
+
+# ---------------------------------------------------------------------------------- error
+[events.error]           # two dull buzzing thuds — "blocked", not alarming
+level_db = -2
+notes = [
+  { t = 0.00, dur = 0.09, wave = "square", freq = 110, db = -2, filter = { type = "lowpass", cutoff = 700, q = 0.8 }, env = { a = 0.002, d = 0.04, r = 0.02 } },
+  { t = 0.13, dur = 0.12, wave = "square", freq = 98, db = -2, filter = { type = "lowpass", cutoff = 600, q = 0.8 }, env = { a = 0.002, d = 0.05, r = 0.03 } },
+]
+
+# ---------------------------------------------------------------------------------- desktop (beyond XR)
+[events.boot]            # relays engage in sequence, then the hum settles
+max_ms = 1500
+notes = [
+  { t = 0.00, dur = 0.03, timbre = "contact", db = -3 },
+  { t = 0.00, dur = 0.06, timbre = "thunk", freq = 65, db = -3 },
+  { t = 0.16, dur = 0.03, timbre = "contact-soft", db = -6 },
+  { t = 0.16, dur = 0.05, timbre = "shell", freq = 2100, db = -9 },
+  { t = 0.26, dur = 0.03, timbre = "contact-soft", db = -7 },
+  { t = 0.26, dur = 0.05, timbre = "shell", freq = 2700, db = -10 },
+  { t = 0.10, dur = 1.20, timbre = "hum", deg = 0, db = -10, env = { a = 0.4, d = 0.5, r = 0.3 } },
+  { t = 0.10, dur = 1.20, timbre = "hum", deg = 4, db = -14, env = { a = 0.5, d = 0.5, r = 0.3 } },
+  { t = 0.75, dur = 0.30, timbre = "wood", freq = 880, db = -8 },
+]
+
+[events.shutdown]
+mirror = "boot"
+transpose = -2
+
+[events.login]           # wooden two-knock, a little warmer
+max_ms = 1500
+notes = [
+  { t = 0.00, dur = 0.20, timbre = "wood", freq = 660, db = -2 },
+  { t = 0.14, dur = 0.24, timbre = "wood", freq = 990, db = -3 },
+  { t = 0.00, dur = 0.20, timbre = "thunk", freq = 110, db = -8 },
+]
+
+[events.logout]
+mirror = "login"
+
+[events.lock]            # a heavy latch: two clicks and a thunk
+notes = [
+  { t = 0.000, dur = 0.03, timbre = "contact-soft", db = -4 },
+  { t = 0.035, dur = 0.03, timbre = "contact", db = -1 },
+  { t = 0.035, dur = 0.12, timbre = "thunk", freq = 120, to_freq = 80, glide = 0.05, db = -2 },
+  { t = 0.035, dur = 0.06, timbre = "shell", freq = 1900, db = -8 },
+]
+
+[events.unlock]
+mirror = "lock"
+transpose = 3
+
+[events.notify]          # wood-block double tap
+level_db = -2
+notes = [
+  { t = 0.00, dur = 0.12, timbre = "wood", freq = 1320, db = -2 },
+  { t = 0.10, dur = 0.14, timbre = "wood", freq = 1760, db = -3 },
+]

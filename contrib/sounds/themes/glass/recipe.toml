@@ -1,0 +1,146 @@
+# glass — soft sine/FM/bell chimes in E major pentatonic, a small bright room.
+#
+# Authoring model (see docs/openxr/research/31-audio-design.md §5):
+#   * pitches are scale degrees (`deg`) so the whole theme stays in one key; change [theme.scale]
+#     and every event re-tunes;
+#   * `timbre` names a preset under [theme.timbres] — a theme is a handful of timbres;
+#   * "off" events are `mirror`s of "on" events (time-reversed, pitch sweeps inverted), optionally
+#     transposed, so an author designs roughly half of the events.
+
+[theme]
+name = "glass"
+description = "Soft glassy bells and FM chimes, E major pentatonic, small bright room"
+peak_dbfs = -3.0
+loudness_lufs = -16      # loudness of a level_db = 0 event; interaction sounds sit below it
+scale = { root = "E5", mode = "major-pentatonic" }
+fx = { reverb = { wet = 0.22, rt60 = 0.55, bright = 0.7 } }
+
+[theme.timbres]
+# wave = "bell": inharmonic partials [ratio, amp, decay_s] — glass rings at ~2.3x and ~4.25x
+glass      = { wave = "bell", partials = [[1, 1, 0.34], [2.32, 0.32, 0.16], [4.25, 0.1, 0.05]] }
+glass-long = { wave = "bell", partials = [[1, 1, 0.55], [2.32, 0.3, 0.2], [4.25, 0.1, 0.05]] }
+glass-tick = { wave = "bell", partials = [[1, 1, 0.05], [2.32, 0.4, 0.015]] }
+chime      = { wave = "bell", partials = [[1, 1, 0.22], [2.76, 0.3, 0.06]] }
+pad        = { wave = "fm", fm = { ratio = 2.0, index = 1.2, decay = 0.3 }, env = { a = 0.12, d = 0.3 } }
+sub        = { wave = "sine", env = { a = 0.06, d = 0.25 } }
+
+# ---------------------------------------------------------------------------------- headset
+[events.don]
+notes = [
+  { t = 0.00, dur = 0.42, timbre = "glass", deg = 0, db = -2, pan = -0.15 },
+  { t = 0.07, dur = 0.40, timbre = "glass", deg = 2, db = -3 },
+  { t = 0.14, dur = 0.42, timbre = "glass", deg = 4, db = -4, pan = 0.15 },
+  { t = 0.00, dur = 0.50, timbre = "sub", deg = -5, db = -14 },
+]
+
+[events.doff]
+mirror = "don"
+transpose = -2
+
+# ---------------------------------------------------------------------------------- session
+[events.session-start]
+notes = [
+  { t = 0.00, dur = 0.55, timbre = "pad", deg = -5, db = -10 },
+  { t = 0.05, dur = 0.30, timbre = "chime", deg = 0, db = -4 },
+  { t = 0.13, dur = 0.30, timbre = "chime", deg = 2, db = -5 },
+  { t = 0.21, dur = 0.34, timbre = "chime", deg = 5, db = -5 },
+]
+
+[events.session-stop]
+mirror = "session-start"
+
+# ---------------------------------------------------------------------------------- monitors
+[events.monitor-new]
+notes = [
+  { t = 0.00, dur = 0.22, wave = "sine", deg = 2, to_deg = 5, curve = "ease", glide = 0.09, db = -4, env = { a = 0.01, d = 0.10 } },
+  { t = 0.08, dur = 0.24, timbre = "chime", deg = 7, db = -9 },
+]
+
+[events.monitor-close]
+mirror = "monitor-new"
+transpose = -3
+
+# ---------------------------------------------------------------------------------- grab / select
+[events.grab]
+level_db = -6
+variants = 3                       # the daemon cycles takes so repeats never machine-gun
+jitter = { cents = 25, db = 1.0 }
+fx = { reverb = { wet = 0.08, rt60 = 0.2, bright = 0.8 } }
+notes = [
+  { t = 0.0, dur = 0.07, wave = "sine", deg = 4, to_deg = 5, glide = 0.03, env = { a = 0.002, d = 0.025 } },
+  { t = 0.0, dur = 0.05, wave = "sine", deg = 11, db = -14, env = { a = 0.001, d = 0.01 } },
+]
+
+[events.release]
+mirror = "grab"
+transpose = -2
+
+[events.select]
+level_db = -9
+fx = { reverb = { wet = 0.1, rt60 = 0.25, bright = 0.8 } }
+notes = [{ t = 0.0, dur = 0.09, timbre = "glass-tick", deg = 7 }]
+
+# ---------------------------------------------------------------------------------- adaptive anchor
+[events.undock]
+level_db = -4
+notes = [
+  { t = 0.00, dur = 0.22, wave = "noise", db = -10, filter = { type = "bandpass", cutoff = 900, to = 4200, q = 3 }, env = { a = 0.08, d = 0.08 } },
+  { t = 0.12, dur = 0.22, timbre = "chime", deg = 4, db = -2 },
+]
+
+[events.dock]
+mirror = "undock"
+transpose = -5
+
+# ---------------------------------------------------------------------------------- error
+[events.error]
+level_db = -2
+fx = { reverb = { wet = 0.12, rt60 = 0.35, bright = 0.4 } }
+notes = [
+  { t = 0.00, dur = 0.16, wave = "fm", deg = 1, cents = -30, db = -2, fm = { ratio = 1.41, index = 2.5, decay = 0.08 }, env = { a = 0.003, d = 0.07 } },
+  { t = 0.14, dur = 0.22, wave = "fm", deg = -2, cents = -30, db = -2, fm = { ratio = 1.41, index = 2.5, decay = 0.08 }, env = { a = 0.003, d = 0.09 } },
+]
+
+# ---------------------------------------------------------------------------------- desktop (beyond XR)
+[events.boot]
+max_ms = 1500
+fx = { reverb = { wet = 0.3, rt60 = 0.9, bright = 0.6 } }
+notes = [
+  { t = 0.00, dur = 1.30, timbre = "pad", deg = -10, db = -8, fm = { ratio = 1.0, index = 0.8, decay = 0.6 }, env = { a = 0.35, d = 0.6 } },
+  { t = 0.10, dur = 0.90, timbre = "glass-long", deg = -5, db = -4 },
+  { t = 0.28, dur = 0.90, timbre = "glass-long", deg = 0, db = -5 },
+  { t = 0.46, dur = 0.85, timbre = "glass-long", deg = 2, db = -6 },
+  { t = 0.64, dur = 0.80, timbre = "glass-long", deg = 4, db = -6 },
+]
+
+[events.shutdown]
+mirror = "boot"
+transpose = -5
+
+[events.login]
+max_ms = 1500
+notes = [
+  { t = 0.00, dur = 0.50, timbre = "glass", deg = 0, db = -3 },
+  { t = 0.12, dur = 0.50, timbre = "glass", deg = 4, db = -4 },
+  { t = 0.24, dur = 0.55, timbre = "glass", deg = 7, db = -5 },
+]
+
+[events.logout]
+mirror = "login"
+
+[events.lock]
+level_db = -3
+notes = [
+  { t = 0.00, dur = 0.20, timbre = "chime", deg = 4, db = -3 },
+  { t = 0.09, dur = 0.28, timbre = "chime", deg = 0, db = -2 },
+]
+
+[events.unlock]
+mirror = "lock"
+
+[events.notify]
+level_db = -2
+notes = [
+  { t = 0.00, dur = 0.30, timbre = "chime", deg = 5, db = -3 },
+  { t = 0.11, dur = 0.32, timbre = "chime", deg = 7, db = -3 },
+]
