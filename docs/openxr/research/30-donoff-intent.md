@@ -1,7 +1,7 @@
 # 30 — Don/doff intent: a state machine for hydrating and dehydrating the room
 
 **Status:** design (2026-10-15), with the user's answers to §15 folded in (§15 now records the
-decisions). Phases 0 and 1 are being implemented on branch `xr-donoff-design`; everything else is
+decisions). Phases 0 and 1 are implemented on branch `xr-donoff-design` (§17); everything else is
 design only. It replaces the cross-session
 placement capture → staging → commit-gate → recenter-on-plug pipeline documented in
 [doc 03 §8.2–§8.3](../03-anchoring.md#82-recenter-on-plug) and built by
@@ -44,7 +44,7 @@ touches has a `file:line` reference against `hypxrland` at `21e863220`.
    is followed by 250 ms, 2 s, 15 s and 2 min tiers out to about 34 h, plus a semantic tier of dwell
    episodes. Each tier holds summaries that preserve dwell and stability statistics, not subsamples.
    Every record also carries the poses of up to 8 monitors, keyed by stable numeric ids (§8.4,
-   user decision Q8). The total is about 3.3 MiB. The frame thread writes POD under its own mutex.
+   user decision Q8). The total is about 3.4 MiB. The frame thread writes POD under its own mutex.
    No history is persisted. Persisting committed memories is a later, opt-in phase whose
    serialization story is still open (§8.6, Q9).
 7. **Seat yaw is stillness-weighted** (user decision Q4). Each sample's yaw votes with a weight that
@@ -594,15 +594,15 @@ Commit sites:
 | tier | resolution | capacity (pow2) | span | record | size |
 |---|---|---|---|---|---|
 | **T0** raw | every frame | 2048 | ≈ 17 s @120 Hz, 23 s @90 Hz, 34 s @60 Hz | `SXRHistSample` 352 B (64 B head + 8 × 36 B monitors) | 704 KiB |
-| **T1** | 250 ms buckets | 1024 | ≈ 4.3 min | `SXRHistSummary` 640 B (128 B head + 8 × 64 B monitors) | 640 KiB |
-| **T2** | 2 s | 1024 | ≈ 34 min | 640 B | 640 KiB |
-| **T3** | 15 s | 1024 | ≈ 4.3 h | 640 B | 640 KiB |
-| **T4** | 2 min | 1024 | ≈ 34 h | 640 B | 640 KiB |
-| **E** dwell episodes | per episode | 256 | days, typically | `SXRDwellEpisode` ≈ 420 B (incl. an 8-monitor arrangement snapshot) | ≈ 105 KiB |
-| **G** origin generations | per event | 64 | session-ish | 48 B | 3 KiB |
+| **T1** | 250 ms buckets | 1024 | ≈ 4.3 min | `SXRHistSummary` 648 B (136 B head + 8 × 64 B monitors) | 648 KiB |
+| **T2** | 2 s | 1024 | ≈ 34 min | 648 B | 648 KiB |
+| **T3** | 15 s | 1024 | ≈ 4.3 h | 648 B | 648 KiB |
+| **T4** | 2 min | 1024 | ≈ 34 h | 648 B | 648 KiB |
+| **E** dwell episodes | per episode | 256 | days, typically | `SXRDwellEpisode` 664 B (incl. an 8-monitor arrangement snapshot and the raw sums, so a tail can be cut after close) | 166 KiB |
+| **G** origin generations | per event | 64 | session-ish | 40 B | 2.5 KiB |
 | **J** edge journal (presence, visibility, session, don decisions, commits, authored edits, monitor create/destroy) | per event | 256 | days | 32 B | 8 KiB |
 
-Total ≈ **3.3 MiB**, fixed, allocated once (one heap block owned by `COpenXRManager`, never
+Total ≈ **3.4 MiB** (3,558,824 B as built), fixed, allocated once (one heap block owned by `COpenXRManager`, never
 reallocated). The per-monitor columns are ~80 % of it; the user's call (Q8) was that more
 information is better while it is this cheap. For comparison, the existing voice/gaze ring is
 8192 × `SXRPoseSample` ≈ 512 KiB (`OpenXRManager.hpp:987-999`). Its 91 s full-rate window serves a
@@ -649,7 +649,7 @@ struct SXRHistMonitorSummary {     // 64 B — merges exactly (sums / min / max 
     Quat     rotSum;               // Σ of hemisphere-canonical (w ≥ 0) quats; mean = normalize(sum)
     uint8_t  mode, flagsOr, flagsAnd, _pad;
 };
-struct SXRHistSummary {            // 128 B + 8 × 64 B = 640 B — the merge of N samples or N lower-tier summaries
+struct SXRHistSummary {            // 136 B + 8 × 64 B = 648 B — the merge of N samples or N lower-tier summaries
     int64_t  t0Ns, t1Ns;
     uint32_t n;                    // samples covered
     uint32_t wornUs, trustedUs, levelUs, stillUs, dwellUs, gazeOnMonitorUs; // time-weighted, integer, merge exactly
@@ -666,7 +666,7 @@ struct SXRHistSummary {            // 128 B + 8 × 64 B = 640 B — the merge of
     uint8_t  nMonitors, monitorsDropped;
     SXRHistMonitorSummary monitors[XR_HIST_MAX_MONITORS];
 };
-struct SXRDwellEpisode {           // ≈ 420 B
+struct SXRDwellEpisode {           // 664 B
     int64_t  tStartNs, tEndNs;
     Vec3     seatPos; float seatYaw, yawConcentration;
     Vec3     posMin, posMax;
@@ -676,6 +676,7 @@ struct SXRDwellEpisode {           // ≈ 420 B
     uint16_t gen; uint8_t dof; uint8_t endReason; // open | walk | doff | gen | session
     uint8_t  nMonitors;
     SXRHistMonitorPose arrangement[XR_HIST_MAX_MONITORS]; // the monitors as they stood when it closed
+    SXREpisodeAccum    acc;        // the raw sums (double), so the take-off tail can be cut exactly after close
 };
 ```
 
@@ -730,7 +731,7 @@ arrangement (§6.3); the recorded poses are for status, traces, replay assertion
 * **What a pose means.** For `anchor:local` the world pose (LOCAL_FLOOR, the sample's `gen`); for the
   other modes the anchor's own offset in its view/body/grip space (that is what is stable for them).
   The `mode` byte says which.
-* **Cost.** ≈ 2.7 MiB of the 3.3 MiB total (§8.1). Within one generation an `anchor:local` monitor
+* **Cost.** ≈ 2.8 MiB of the 3.4 MiB total (§8.1). Within one generation an `anchor:local` monitor
   only moves on authored edits, so T0 is highly redundant; that redundancy is accepted for simplicity
   (fixed-size records, no delta coding, trivially copyable snapshots).
 
@@ -741,7 +742,7 @@ arrangement (§6.3); the recorded poses are for status, traces, replay assertion
   `recordPoseSample` (`OpenXRManager.cpp:7526`) already does for the gaze ring.
 * **Lock:** `std::mutex m_historyMu`, a sibling of `m_poseRingMu`, never nested with `m_layersMu`.
   Readers copy what they need out under the lock. `xrSelectSeat` runs on a **snapshot** taken under
-  the lock (the whole 3.3 MiB block, one memcpy per doff edge, a few hundred µs into a buffer
+  the lock (the whole 3.4 MiB block, one memcpy per doff edge, a few hundred µs into a buffer
   allocated once), then releases it
   before `commitSeat` takes `m_layersMu`.
 * **Session end:** the commit at `:1116` runs after the frame thread is joined, so the lock is
@@ -938,7 +939,7 @@ It never prints raw T0 samples (use trace recording for that).
 
 **History** (`donoff_history.cpp`):
 * Tier spans after N pushes at 60/90/120 Hz. `static_assert` on record sizes and on total footprint
-  < 3.5 MiB.
+  < 3.6 MiB.
 * Merge exactness: random sample streams, then check that the T4 `dwellUs/levelUs/n` equal brute-force
   sums over the raw stream. The **stillness-weighted** circular-mean yaw and its concentration, across
   the ±π wrap, equal the brute-force weighted mean. Per-monitor summaries equal brute-force per-id
@@ -1116,7 +1117,7 @@ The draft's ten open questions, with the user's answers and what each changed.
 7. **Two histories.** The voice/gaze ring and T0 stay separate (§8.1).
 8. **Record per-monitor poses in the history.** "More info is better since it should be cheap to
    retain." Every T0 sample, every tier summary and every episode now carries up to 8 monitors' poses
-   under stable numeric ids. Layout, memory budget (≈ 3.3 MiB), decimation (merge by id), the cap,
+   under stable numeric ids. Layout, memory budget (≈ 3.4 MiB), decimation (merge by id), the cap,
    and create/destroy/rename representation are in §8.1–§8.4.
 9. **Persistence across compositor restarts: later, opt-in.** The user wants to think hard about
    the serialization story first. Phase 5 stays a later phase; §8.6 lists the questions (format,
@@ -1207,3 +1208,74 @@ The timeline is a pure function `xrDonGlyphFrame(tSinceDonNs, tHydratedNs, haveT
 target, params) → {pose[3], alpha[3], monitorAlpha}` and is gtested frame by frame (fade-in, glide
 endpoints, the no-target path, the cap). A `--xr` case asserts the status `donoff.glyph` phase
 sequence `in → hold → glide → out` across a scripted don.
+
+---
+
+## 17. Implementation notes — Phases 0 and 1 (branch `xr-donoff-design`)
+
+What shipped, and where it departs from the text above.
+
+**Files.** `src/openxr/XRPoseHistory.{hpp,cpp}` and `src/openxr/XRDonDoff.{hpp,cpp}` (pure,
+unconditional, gtested in `tests/xr/donoff_{history,seat,fsm}.cpp`); the manager adapter is its own
+TU, `src/openxr/OpenXRManagerDonDoff.cpp`; hyprtester cases in `hyprtester/src/tests/xr/donoff.cpp`.
+
+**In both `placement_memory` modes** (deliberately not gated on `intent`):
+
+* the `upright` guard (`xrHeadUpright`, head +Y within 60° of world up) replaces `qYawObservable`
+  in the legacy staging gate and gates the `create` seed. This is the R2 fix at its source: a legacy
+  memory can no longer be mirrored by the take-off.
+* a `GROUP` re-seat commits its planted offsets as the memory immediately (`RESEAT_DONE` event,
+  provenance `reseat`), and `hyprctl openxr forget [<name>|all]` drops memories. D4 is about deliberate
+  actions, and the drift gate's own premise ("a re-seat makes the two equal") becomes true again.
+* the history, the FSM, the journal, the generation table, the `donoff` status block and verb, and
+  `donoff record`.
+
+**`legacy` (default):** the staging + drift gate commit as before; at the same edge `xrSelectSeat`
+runs on a snapshot and its verdict is logged with a `shadow:` prefix and compared monitor by monitor
+with what the legacy commit left in memory. **`intent`:** the staging values are discarded and
+`commitSeat` writes the selected seat. The option is read on the main thread at each commit, so
+`hyprctl keyword openxr:placement_memory intent` takes effect at the next doff without a reload.
+
+**Deviations, and why.**
+
+1. `SXRHistSample::tNs` is the steady clock (`CLOCK_MONOTONIC` ns), not `predictedDisplayTime`. The
+   doff edge is stamped on the main thread, and only one clock can be compared with it without a
+   per-runtime translation.
+2. `SXRDwellEpisode` also stores the raw episode sums (`SXREpisodeAccum`, doubles). The frame thread
+   usually closes the episode itself when `WORN` falls, *before* the main thread has found the motion
+   onset, so the take-off tail has to be subtractable from a closed episode. Cost: 664 B per episode
+   instead of ~420 B (166 KiB total).
+3. The history's `WORN` flag folds in dead-stillness only on runtimes **without** presence (that is
+   where §4.1 makes it a wear signal), and `QUIET` relies on that `WORN` rather than testing
+   `DEAD_STILL` separately. If a runtime's fusion output were perfectly smooth while worn, a raw
+   dead-still test would otherwise block every quiet window on presence-capable headsets; the trace
+   corpus should confirm the tremor floor before this is tightened.
+4. Any generation change closes the running episode (the doc re-expresses a `KNOWN` one by M
+   instead). Selection still bridges `KNOWN` generations through the G table, so the only cost is that
+   a dwell straddling a recenter becomes two episodes.
+5. Summary-run candidates (T2/T3) qualify on `levelUs` and `stillUs` ≥ 60 % of the bucket rather than
+   `dwellUs`, because `dwellUs` only counts time the detector had already flagged — exactly the case
+   these candidates exist to catch.
+6. The ranking rule treats `dwell`, `older-dwell` and `reseat` provenance (or an arrangement authored
+   since the last commit) as strong; `created`, `legacy`, `quiet` and `summary` are weak.
+7. The legacy staging block still runs under `intent` (its values are discarded at the edge). Turning
+   it off would need the frame thread to know the mode, i.e. another published atomic, for no
+   behavioural gain until Phase 4 deletes it.
+
+**Not in Phases 0/1** (per §14): the settle detector, hide/fade and backstop (Phase 2), the glyph
+(2b), `xrDonDecision` and `don_resume_radius` (Phase 3), the debug presence seam (only Phases 2/3's
+`--xr` cases need it), the trace-replay gtest (no recorded traces exist yet), and persistence.
+
+**Log lines to watch in shadow mode** (all `[OPENXR]`):
+
+```
+don/doff: worn -> doffing (the wearing gate closed)
+shadow: doff seat (the wearing gate closed; motion onset 1.18s before the edge): dwell 4m12s (yaw -3°, R̄ 0.86, spread 0.06 m, gaze-on-monitor 71%, primary XR-main at bearing -2°) — would remember 5 monitor(s); legacy memory agrees for 5/5 (worst XR-3: 0.04 m, 1°)
+WARN shadow:   XR-2: would remember [-0.13, 0.54, -2.06] vs memory (legacy) [0.16, 0.54, 1.51] (Δ 3.58 m, bearing Δ 176°)
+shadow: doff seat candidate refused: quiet ending 0.4s before the edge — P3 arrangement behind the seat (176°); trying the next
+shadow: doff (…): no trustworthy seat in 30 min of history (…) — the intent path would keep the previous memory
+re-seat committed as the new memory for 5 monitor(s) (provenance reseat)
+```
+
+`hyprctl openxr status` gains a `don/doff:` line, per-monitor `restore … (head-relative; <provenance>,
+Ns ago)`, and a `donoff` JSON object; `hyprctl openxr donoff` prints episodes, journal and generations.
