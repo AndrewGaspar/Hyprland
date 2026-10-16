@@ -1092,8 +1092,11 @@ The draft's ten open questions, with the user's answers and what each changed.
    (§5.4 row 6, Phase 3.)
 2. **What you see while settling: a glyph, not nothing.** A head-locked Omarchy logo with subtle 3D
    depth, which then glides to where the seat's main monitor will appear before the monitors fade in
-   around it. Designed in §16 as its own phase (**2b**); not implemented with Phases 0/1. Asset
-   facts recorded in §16.1.
+   around it. Designed in §16 as its own phase (**2b**); not implemented with Phases 0/1.
+   **Asset (decision 2026-10-16):** the glyph is the *distro's own logo*, resolved the standard
+   freedesktop way so it does the right thing on any distro (os-release `LOGO=` through the icon
+   theme, `ANSI_COLOR` as an optional tint, a user path override first, a generic built-in mark
+   last). We ship no third-party branding. Resolution order in §16.1.
 3. **XREAL SLAM across a doff: unknown, stays open.** Test procedure:
    1. Run Monado with `XREAL_AIR_SLAM=1` (doc 07 §1.6). Turn `hyprctl openxr donoff record on`.
    2. Wear 30 s at the desk. Doff and lay the glasses on the desk **lenses up, cameras facing the
@@ -1138,27 +1141,33 @@ it. It is purely presentational. It never changes *what* is decided or *when* (t
 and `xrDonDecision` are untouched), and it adds no time to the hydration except the glide itself,
 which is configurable down to 0.
 
-### 16.1 The asset
+### 16.1 The asset (user decision 2026-10-16)
 
-On this box (Omarchy 4.0.4), `~/.local/share/omarchy` is a symlink to `/usr/share/omarchy`, which
-holds:
+The glyph is **the distro's own logo, resolved the standard way**, so it is right on any distro and
+this repo ships no third-party branding (which also retires the trademark question the earlier draft
+raised about bundling Omarchy's mark). Resolution order, first hit wins:
 
-| file | what | use |
-|---|---|---|
-| `/usr/share/omarchy/icon.png` | 300 × 300 RGBA PNG, the square mark | **the right shape for a glyph** |
-| `/usr/share/omarchy/logo.svg` | 1215 × 285 SVG wordmark, single-colour (`fill="#000"`) | too wide for a glyph; usable as a tinted lower line |
-| `/usr/share/omarchy/icon.txt`, `logo.txt` | ASCII-art versions | n/a |
+1. **Explicit override**: `openxr:don_glyph = <path>` (PNG or SVG) — the user's choice beats
+   everything.
+2. **freedesktop os-release `LOGO=`**: read `/etc/os-release`, falling back to
+   `/usr/lib/os-release`. `LOGO` is an XDG *icon name*, resolved through the icon theme lookup:
+   prefer a scalable SVG, else the largest hicolor PNG, then `/usr/share/pixmaps/<name>.{svg,png}`.
+   On this box `LOGO=omarchy` resolves to `/usr/share/icons/hicolor/256x256/apps/omarchy.png`
+   (also `/usr/share/pixmaps/omarchy.png`).
+3. **os-release `ANSI_COLOR`** (here `38;2;158;206;106`, i.e. RGB 158/206/106) is an *optional*
+   brand tint for the glyph and its glow. It is parsed only for the `38;2;r;g;b` truecolor form
+   (and the basic 30–37/90–97 palette); anything else means no tint.
+4. **Generic built-in fallback** (`assets/openxr/don-glyph.svg`, our own drawing: a simple
+   ring-and-dot mark) when nothing above resolves.
 
-`logo.svg` is owned by the `omarchy-settings 4.0.4-1` package; the `omarchy` package metadata says
-`Licenses: MIT`, upstream `https://github.com/basecamp/omarchy`. **No LICENSE file is installed**,
-and MIT covers the code; whether it grants use of the logo as a brand mark in another project is
-unclear (logos are usually trademark, not copyright, questions). So:
+**Rejected as the primary source:** fastfetch's logo, which is what Omarchy's "About" shows. It is
+ASCII art, either from `~/.config/omarchy/branding/about.txt` (Omarchy-specific) or fastfetch's
+built-in database keyed on os-release `ID`. Text art is coarse as a 3D glyph and not a desktop
+standard; at most it becomes a later `ascii` style.
 
-* The repo ships a **generic default glyph** (`assets/openxr/don-glyph.svg`, our own drawing: a
-  simple ring-and-dot mark), so the feature works on any distro.
-* Omarchy's mark is a **user-configured asset**: `openxr:don_glyph = /usr/share/omarchy/icon.png`,
-  set by the Omarchy XR session package (`hypxrland-omarchy`) in its own config, not by Hyprland.
-  Nothing is copied into this repo until the licensing is confirmed with upstream.
+**Threading.** Resolution and all file I/O (os-release, icon lookup, decode/rasterize) happen on the
+**main thread only**, once at config load / session start (and again on a reload that changes
+`don_glyph`). The frame thread only ever adopts the finished pixel buffer (§16.2).
 
 ### 16.2 Render path
 
@@ -1166,7 +1175,7 @@ unclear (logos are usually trademark, not copyright, questions). So:
   timing is not tied to our frame loop, and the glyph has to hand over to the monitors' fade on the
   exact frame the hydration lands (§5.3). The glyph is 1–3 `XrCompositionLayerQuad`s submitted
   ahead of the monitor quads while `DONNING`.
-* **Texture.** The main thread rasterizes the configured asset at config load (PNG directly; SVG via
+* **Texture.** The main thread rasterizes the asset resolved by §16.1 at config load or session start (PNG directly; SVG via
   the hyprgraphics loader where it supports SVG, else refused with a config error) into a 1024 px
   premultiplied RGBA buffer, published under a mutex with a generation counter. The frame thread
   adopts a new generation by uploading it once into a dedicated static swapchain
@@ -1198,7 +1207,7 @@ capped at the settle timeout + 1 s, so it can never outlive the backstop.
 
 | option | default | meaning |
 |---|---|---|
-| `openxr:don_glyph` | `default` | `default` (the shipped generic mark), `none` (Phase 2's blank wait), or a path to a PNG/SVG |
+| `openxr:don_glyph` | `auto` | `auto` (the os-release `LOGO` via the icon theme, tinted by `ANSI_COLOR`, else the built-in generic mark — §16.1), `generic` (the built-in mark), `none` (Phase 2's blank wait), or a path to a PNG/SVG |
 | `openxr:don_glyph_glide_ms` | 450 | glide duration; 0 = no glide (cross-fade in place) |
 | `openxr:don_glyph_depth` | 0.008 | layer spacing in metres; 0 = one flat quad |
 
