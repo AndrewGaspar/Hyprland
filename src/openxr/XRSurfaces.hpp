@@ -129,7 +129,8 @@ namespace OpenXR {
     struct SXRSurfaceTuning {
         float snapDist     = 0.08F;   // enter: the window's bottom edge within this of the surface (m)
         float exitDist     = 0.12F;   // a previewed snap holds until it is this far (hysteresis, m)
-        float maxPenetrate = 0.25F;   // ...also counts while pushed this far THROUGH the surface (m)
+        float maxPenetrate = 0.25F;   // ...also counts while pushed this far THROUGH the surface, or
+                                      // deeper while the window's center is still above it (m)
         float standTiltRad = 0.209F;  // ~12 deg back-tilt of a standing window
         float lift         = 0.002F;  // gap kept between the window and the surface (m)
         float flatTiltCos  = 0.7071F; // a carried window whose normal is within 45 deg of the
@@ -152,6 +153,25 @@ namespace OpenXR {
         bool    flat = false; // modifier: lie flat instead of standing
     };
 
+    // Why a plane did not qualify (or XR_SURF_OK), for the carry trace (research/32 diagnosability).
+    enum eXRSurfaceVerdict : uint8_t {
+        XR_SURF_OK = 0,
+        XR_SURF_ORIENT,       // ceilings, slopes, and walls with openxr:surfaces_walls off
+        XR_SURF_TOO_HIGH,      // the window is farther above it than the entry distance
+        XR_SURF_TOO_DEEP,      // pushed through too far: its center is below the surface as well
+        XR_SURF_OUTSIDE,       // the bottom edge (or center, for a wall) is not over the plane
+        XR_SURF_NONFINITE,
+    };
+    const char* xrSurfaceVerdictName(eXRSurfaceVerdict v);
+
+    // What an evaluation saw: the numbers the carry trace logs.
+    struct SXRSurfaceDiag {
+        eXRSurfaceVerdict verdict   = XR_SURF_OK;
+        float             lowest    = 0.F; // lowest visible corner above the plane (a wall: the center's distance)
+        float             centerH   = 0.F; // the content center above the plane
+        bool              contained = false;
+    };
+
     struct SXRSurfaceCandidate {
         bool        ok      = false;
         size_t      index   = 0;
@@ -164,10 +184,16 @@ namespace OpenXR {
     };
 
     // One plane, against an explicit entry distance (snapDist, or exitDist for the sticky plane).
-    SXRSurfaceCandidate xrSurfaceEvaluate(const SXRPlane& p, const SXRSurfaceQuery& q, const SXRSurfaceTuning& t, float enterDist);
-    // Every plane; a horizontal surface beats a wall, the plane the ray points at beats one it does
-    // not, then the nearest. `stickyId` (0 = none) is the plane already previewed: it is judged
-    // against exitDist so a preview does not flicker at its threshold.
+    // An upward plane qualifies when the window's lowest corner is within `enterDist` above it and
+    // either no deeper than maxPenetrate below it or the window still straddles it (its content
+    // center is above the surface): a large window lowered THROUGH a table is on that table, however
+    // far its bottom edge went. `diag`, when given, says what was seen and why it did not qualify.
+    SXRSurfaceCandidate xrSurfaceEvaluate(const SXRPlane& p, const SXRSurfaceQuery& q, const SXRSurfaceTuning& t, float enterDist, SXRSurfaceDiag* diag = nullptr);
+    // Every plane; a horizontal surface beats a wall, a higher horizontal surface beats a lower one
+    // (both qualifying means the bottom edge is over both: the floor under a table is under the
+    // table), then the plane the ray points at beats one it does not (it breaks ties between
+    // surfaces at about the same height), then the nearest. `stickyId` (0 = none) is the plane already previewed: it is judged against
+    // exitDist so a preview does not flicker at its threshold.
     SXRSurfaceCandidate xrSurfacePick(const SXRPlane* planes, size_t n, const SXRSurfaceQuery& q, const SXRSurfaceTuning& t, uint64_t stickyId);
     // The snapped CONTENT pose for a kind, contact and plane.
     SXRPose xrSnapPose(eXRSnapKind kind, const SXRPlane& p, const Vec3& contact, const SXRSurfaceQuery& q, const SXRSurfaceTuning& t);

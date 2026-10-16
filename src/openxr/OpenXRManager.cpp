@@ -7757,6 +7757,9 @@ std::expected<void, std::string> COpenXRManager::cmdGazePush(const std::string& 
     std::scoped_lock lock(m_layersMu);
     if (!layer->m_anchor.applyDistance(delta, ctx))
         return std::unexpected<std::string>("gazepush: head tracking unavailable or no current pose");
+    // research/32: a nudge is a one-step carry — the frame pass settles the window onto a surface
+    // it was pushed into, as a release from a carry would (a no-op with openxr:surfaces off).
+    layer->m_anchor.requestSurfaceSettle();
     return {};
 }
 

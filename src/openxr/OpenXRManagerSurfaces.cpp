@@ -221,6 +221,29 @@ COpenXRManager::SXRSurfaceStatus COpenXRManager::surfaceStatus() {
 
 // ---- frame thread ----
 
+// The window as the snap sees it: `content` (the content pose before any preview), the visible
+// half-width and the distance from the content center down to the visible bottom edge (content
+// half-height + bottom chrome margin + move-bar). The ray is the gaze (view forward); a hand carry
+// replaces it with the aim ray.
+static OpenXR::SXRSurfaceQuery surfaceQueryFor(const CXRMonitorLayer& l, const OpenXR::SXRSolveResult& res, const OpenXR::SXRPose& content, const OpenXR::SXRPose& view,
+                                               bool viewValid) {
+    const OpenXR::SXRChromeGeometry& chrome = l.m_chrome;
+    const float                      quadW  = res.widthMeters / (chrome.contentFracW() > 0.F ? chrome.contentFracW() : 1.F);
+    const float                      quadH  = res.heightMeters / (chrome.contentFracH() > 0.F ? chrome.contentFracH() : 1.F);
+    OpenXR::SXRSurfaceQuery          q;
+    q.content   = content;
+    q.halfWidth = quadW * 0.5F;
+    q.bottomExt = res.heightMeters * 0.5F + quadH * std::max(0.F, 1.F - chrome.contentV1);
+    q.head      = view.pos;
+    q.headValid = viewValid;
+    if (viewValid) {
+        q.haveRay   = true;
+        q.rayOrigin = view.pos;
+        q.rayDir    = OpenXR::poseForward(view.rot);
+    }
+    return q;
+}
+
 void COpenXRManager::surfaceReexpress(const OpenXR::SXRPose& m) {
     // Called from applyReferenceSpaceChange, inside its m_layersMu scope for the attachments.
     OpenXR::xrPlanesReexpress(m_planesFrame, m);
@@ -262,6 +285,15 @@ void COpenXRManager::surfaceFramePass(const std::vector<PXRLAYER>& active, const
     for (size_t i = 0; i < active.size(); ++i) {
         CXRMonitorLayer&   l = *active[i];
         OpenXR::CXRAnchor& a = l.m_anchor;
+
+        // 1b. A keyboard nudge (gazepush on a monitor nobody carries) moved a world-placed window:
+        //     a one-step carry, so it settles onto a surface it now meets exactly as a release would.
+        if (a.takeSurfaceSettle() && on && solved[i] && !a.grabbed() && !a.gazeGrabbed() && a.state().mode == OpenXR::XR_ANCHOR_LOCAL &&
+            (!a.adaptiveEnabled() || a.adaptivePhase() == OpenXR::XRAD_DOCKED)) {
+            const OpenXR::SXRSurfaceQuery q = surfaceQueryFor(l, results[i], a.state().anchorPose, view, viewValid);
+            if (const auto c = OpenXR::xrSurfacePick(planes, nPlanes, q, tun, 0); c.ok)
+                a.surfaceSettleAt(c);
+        }
 
         // 2. A release this frame (or a gaze release on the main thread since the last one) snapped.
         OpenXR::SXRSurfaceCandidate snap;
@@ -341,32 +373,16 @@ void COpenXRManager::surfaceFramePass(const std::vector<PXRLAYER>& active, const
         if (l.m_surfaceAttach.valid)
             l.m_surfaceAttach = OpenXR::SXRSurfaceAttach{};
 
-        // The window as the snap sees it: content pose before any preview, the visible half-width and
-        // the distance from the content center down to the visible bottom edge (content half-height +
-        // bottom chrome margin + move-bar).
-        const auto&                      res    = results[i];
-        const OpenXR::SXRChromeGeometry& chrome = l.m_chrome;
-        const float                      quadW  = res.widthMeters / (chrome.contentFracW() > 0.F ? chrome.contentFracW() : 1.F);
-        const float                      quadH  = res.heightMeters / (chrome.contentFracH() > 0.F ? chrome.contentFracH() : 1.F);
-        OpenXR::SXRSurfaceQuery          q;
-        q.content   = a.carryWorld();
-        q.halfWidth = quadW * 0.5F;
-        q.bottomExt = res.heightMeters * 0.5F + quadH * std::max(0.F, 1.F - chrome.contentV1);
-        q.head      = view.pos;
-        q.headValid = viewValid;
+        OpenXR::SXRSurfaceQuery q = surfaceQueryFor(l, results[i], a.carryWorld(), view, viewValid);
         if (moveGrab && m_input) {
             const auto& hs = m_input->hand(a.grabHand());
+            q.haveRay      = hs.aim.has_value();
             if (hs.aim) {
-                q.haveRay   = true;
                 q.rayOrigin = hs.aim->pos + OpenXR::Vec3{0.F, floorShift, 0.F};
                 q.rayDir    = OpenXR::poseForward(hs.aim->rot);
             }
             // the controller trigger held at release lays the window flat (a hand's select is its pinch)
             q.flat = !m_input->handActive(a.grabHand()) && hs.select >= 0.5F;
-        } else if (viewValid) {
-            q.haveRay   = true;
-            q.rayOrigin = view.pos;
-            q.rayDir    = OpenXR::poseForward(view.rot);
         }
 
         const OpenXR::SXRSurfaceArm& prev   = a.surfaceArm();

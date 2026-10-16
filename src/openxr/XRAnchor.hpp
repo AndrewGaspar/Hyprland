@@ -780,6 +780,12 @@ namespace OpenXR {
         eXRHand grabHand() const;
         // The snap the last release made, once (the frame thread stores the attachment + reports it).
         bool takeSurfaceSnap(SXRSurfaceCandidate& out);
+        // A keyboard nudge (gazepush on a monitor that is NOT carried) is a one-step carry: it asks
+        // the frame thread to settle the window onto a surface it now meets (takeSurfaceSettle, once).
+        // surfaceSettleAt is that settle: the same placement and report a snapping release makes.
+        void requestSurfaceSettle();
+        bool takeSurfaceSettle();
+        void surfaceSettleAt(const SXRSurfaceCandidate& c);
 
         // ---- accessors (main thread reads for IPC/status) ----
         const SXRAnchorState& state() const {
@@ -891,7 +897,8 @@ namespace OpenXR {
         bool                surfaceSnapOnRelease(const SXRPose& releaseWorld);
         SXRSurfaceArm       m_surfaceArm;
         SXRPose             m_carryWorld;
-        bool                m_surfaceSnapPending = false;
+        bool                m_surfaceSnapPending   = false;
+        bool                m_surfaceSettlePending = false;
         SXRSurfaceCandidate m_surfaceSnap;
 
         // last composed world pose (LOCAL_FLOOR)

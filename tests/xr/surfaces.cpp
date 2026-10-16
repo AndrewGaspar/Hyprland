@@ -3,11 +3,13 @@
 #include <openxr/XRAnchor.hpp>
 
 #include <gtest/gtest.h>
+#include <hyprutils/memory/Casts.hpp>
 
 #include <cmath>
 #include <format>
 
 using namespace OpenXR;
+using Hyprutils::Memory::sc;
 
 // tests/xr/surfaces.cpp — research/32 C0-C2: the pure plane model and the snap math. No runtime.
 
@@ -206,7 +208,8 @@ TEST(Surfaces, HysteresisHoldsTheStickyPlane) {
 }
 
 TEST(Surfaces, PrefersTheTableOverAWallAndTheRayHitPlane) {
-    auto res = xrParseSyntheticPlanes("wall pos:0,1,-0.75 size:3,3; table pos:0,0.74,-0.7 size:1.2,0.7; table pos:0,0.70,-0.7 size:1.2,0.7");
+    // two patches of one table 2 cm apart (within the same-surface band, so the ray may choose)
+    auto res = xrParseSyntheticPlanes("wall pos:0,1,-0.75 size:3,3; table pos:0,0.74,-0.7 size:1.2,0.7; table pos:0,0.72,-0.7 size:1.2,0.7");
     ASSERT_TRUE(res.has_value());
     SXRSurfaceTuning tun;
     auto             q = carried((*res)[1], 0.03F);
@@ -531,4 +534,178 @@ TEST(Surfaces, GazeCarryReleaseSnapsFromTheCarriedPose) {
     SXRSurfaceCandidate snap;
     ASSERT_TRUE(a.takeSurfaceSnap(snap));
     EXPECT_EQ(snap.planeId, t.id);
+}
+
+// ---- the live repro (2026-10-16, XREAL Air 2 Ultra + Monado XR_EXT_plane_detection) ----
+// Status showed a PLATFORM plane 0x42 at [0.65, 1.13, -0.54], 1.68 x 1.23 m, floor patches at
+// y ~0.70, and XR-main (1.32 m wide, 2560x1600) anchored local at ~[0.3, 1.45, -1.4]. Its visible
+// bottom edge hung ~0.27 m BELOW the table top from the start, so once over the table the window
+// was always "in" it — and the old fixed 0.25 m penetration limit turned exactly that away.
+
+static const Vec3 LIVE_HEAD{0.25F, 1.55F, 0.05F};
+
+// Plane 0x42 as XRPlaneDetection builds it from a Monado location: a +Z-normal pose (Basalt's
+// z-up plane frame through xr_world), the outer contour counter-clockwise about +Z.
+static SXRPlane liveTable() {
+    const SXRPose raw{Vec3{0.65F, 1.13F, -0.54F}, qFromPitch(-90.F * DEG)};
+    const SXRVec2 contour[] = {{-0.84F, -0.615F}, {0.84F, -0.615F}, {0.84F, 0.615F}, {-0.84F, 0.615F}};
+    bool          swapped   = true;
+    SXRPlane      p         = xrCanonicalPlane(raw, XR_PLANE_UP, contour, 4, 1.68F, 1.23F, swapped);
+    EXPECT_FALSE(swapped);
+    p.id     = 0x42;
+    p.label  = XR_PLANE_LABEL_PLATFORM;
+    p.source = XR_PLANE_SRC_DETECTION;
+    return p;
+}
+
+static SXRPlane liveFloor() {
+    const SXRPose raw{Vec3{0.3F, 0.70F, -1.0F}, qFromPitch(-90.F * DEG)};
+    const SXRVec2 contour[] = {{-2.F, -2.F}, {2.F, -2.F}, {2.F, 2.F}, {-2.F, 2.F}};
+    bool          swapped   = true;
+    SXRPlane      p         = xrCanonicalPlane(raw, XR_PLANE_UP, contour, 4, 4.F, 4.F, swapped);
+    p.id                    = 0x7;
+    p.label                 = XR_PLANE_LABEL_FLOOR;
+    p.source                = XR_PLANE_SRC_DETECTION;
+    return p;
+}
+
+// XR-main as the frame pass queries it: 1.32 m x 0.825 m of content plus the default chrome
+// (0.10 m margin; the bottom margin also holds the 0.08 m bar), facing the head, gazed at.
+static constexpr float LIVE_BOTTOM_EXT = 0.825F * 0.5F + 0.18F;
+
+static SXRSurfaceQuery liveWindow(const Vec3& center) {
+    SXRSurfaceQuery q;
+    q.content   = SXRPose{center, lookAtNoRoll(center, LIVE_HEAD, Quat{})};
+    q.halfWidth = (1.32F + 0.2F) * 0.5F;
+    q.bottomExt = LIVE_BOTTOM_EXT;
+    q.head      = LIVE_HEAD;
+    q.headValid = true;
+    q.haveRay   = true;
+    q.rayOrigin = LIVE_HEAD;
+    q.rayDir    = (center - LIVE_HEAD).normalized();
+    return q;
+}
+
+TEST(Surfaces, LiveTableTakesTheBigWindowLoweredThroughIt) {
+    const auto       t = liveTable();
+    SXRSurfaceTuning tun;
+
+    // Carried over the table where the user had it: center 0.32 m above the top, bottom edge
+    // ~0.27 m under it. The old rule (lowest < -maxPenetrate) said no; the window straddles the table.
+    SXRSurfaceDiag d;
+    const auto     c = xrSurfaceEvaluate(t, liveWindow(Vec3{0.5F, 1.45F, -0.8F}), tun, tun.snapDist, &d);
+    EXPECT_LT(d.lowest, -tun.maxPenetrate);
+    EXPECT_GT(d.centerH, 0.F);
+    EXPECT_TRUE(d.contained);
+    ASSERT_TRUE(c.ok) << xrSurfaceVerdictName(d.verdict);
+    EXPECT_EQ(c.kind, XR_SNAP_STAND);
+    EXPECT_NEAR(c.contact.y, 1.13F, 1e-3F);
+
+    // Lowered through the table in 1 cm steps, as the frame pass sees it (sticky once previewed):
+    // the preview starts with the bottom edge 8 cm above the top and holds until the window's
+    // center goes under it — no gap in between.
+    uint64_t sticky = 0;
+    float    first = -1.F, last = -1.F;
+    bool     gap   = false;
+    for (int i = 0; i <= 100; ++i) {
+        const float y  = 1.95F - 0.01F * sc<float>(i);
+        const auto  pc = xrSurfacePick(&t, 1, liveWindow(Vec3{0.5F, y, -0.8F}), tun, sticky);
+        if (pc.ok) {
+            if (first < 0.F)
+                first = y;
+            else if (sticky == 0)
+                gap = true;
+            last = y;
+        }
+        sticky = pc.ok ? pc.planeId : 0;
+    }
+    EXPECT_FALSE(gap);
+    EXPECT_NEAR(first, 1.13F + 0.08F + LIVE_BOTTOM_EXT, 0.04F); // less the window's pitch toward the head
+    EXPECT_NEAR(last, 1.13F, 0.02F);
+
+    // ...and a release anywhere in there lands it on the table, bottom edge on the top.
+    SXRSurfaceArm arm;
+    arm.havePlane = true;
+    arm.plane     = t;
+    arm.query     = liveWindow(Vec3{0.5F, 1.30F, -0.8F});
+    const auto r  = xrSurfaceRelease(arm, arm.query.content, LIVE_HEAD, true);
+    ASSERT_TRUE(r.ok);
+    EXPECT_EQ(r.planeId, 0x42U);
+    const Vec3 up = qRotate(r.pose.rot, Vec3{0.F, 1.F, 0.F});
+    EXPECT_NEAR((r.pose.pos - up * LIVE_BOTTOM_EXT).y, 1.13F + tun.lift, 1e-3F);
+
+    // Under the table (center below its top, and deeper than maxPenetrate): not on it.
+    SXRSurfaceDiag under;
+    EXPECT_FALSE(xrSurfaceEvaluate(t, liveWindow(Vec3{0.5F, 1.05F, -0.8F}), tun, tun.snapDist, &under).ok);
+    EXPECT_EQ(under.verdict, XR_SURF_TOO_DEEP);
+}
+
+TEST(Surfaces, LiveTableBeatsTheFloorUnderIt) {
+    const SXRPlane   planes[] = {liveFloor(), liveTable()};
+    SXRSurfaceTuning tun;
+    // Bottom edge 2 cm over the floor patch, center well above the table top: both qualify and the
+    // floor is the nearer, but it is under the table.
+    const auto q = liveWindow(Vec3{0.5F, 0.72F + LIVE_BOTTOM_EXT, -0.8F});
+    ASSERT_TRUE(xrSurfaceEvaluate(planes[0], q, tun, tun.snapDist).ok);
+    const auto c = xrSurfacePick(planes, 2, q, tun, 0);
+    ASSERT_TRUE(c.ok);
+    EXPECT_EQ(c.planeId, 0x42U);
+    // Past the table's far edge only the floor is under it.
+    const auto off = xrSurfacePick(planes, 2, liveWindow(Vec3{0.5F, 0.72F + LIVE_BOTTOM_EXT, -1.6F}), tun, 0);
+    ASSERT_TRUE(off.ok);
+    EXPECT_EQ(off.planeId, 0x7U);
+}
+
+TEST(Surfaces, LiveKeyboardNudgeThroughTheTableSettlesOnIt) {
+    // The logged sequence: SUPER+ALT+minus x10 (`gazepush -0.1`) with NO carry active — a nudge of
+    // the gazed-at monitor along the head->monitor ray — pulling XR-main from beyond the table's far
+    // edge in over it, then SUPER+SHIFT+G. Each nudge is now a one-step carry the frame pass settles
+    // (requestSurfaceSettle -> takeSurfaceSettle -> pick -> surfaceSettleAt, as below).
+    const auto       t = liveTable();
+    SXRSurfaceTuning tun;
+    CXRAnchor        a;
+    SXRAnchorState   st;
+    st.mode        = XR_ANCHOR_LOCAL;
+    st.widthMeters = 1.32F;
+    st.anchorPose  = SXRPose{Vec3{0.3F, 1.45F, -1.4F}, lookAtNoRoll(Vec3{0.3F, 1.45F, -1.4F}, LIVE_HEAD, Quat{})};
+    a.initFromState(st);
+    SXRSolveInput in;
+    in.view = SXRPose{LIVE_HEAD, lookAtNoRoll(LIVE_HEAD, LIVE_HEAD + (LIVE_HEAD - st.anchorPose.pos), Quat{})};
+    in.dt   = 1.F / 90.F;
+    in.pxW  = 2560;
+    in.pxH  = 1600;
+    a.solve(in, {});
+    const SXRVerbContext ctx{in.view, true, std::nullopt, std::nullopt};
+
+    // Where it started it is not over the table (whose far edge is at z ~ -1.16).
+    SXRSurfaceDiag d0;
+    EXPECT_FALSE(xrSurfaceEvaluate(t, liveWindow(a.state().anchorPose.pos), tun, tun.snapDist, &d0).ok);
+    EXPECT_EQ(d0.verdict, XR_SURF_OUTSIDE);
+
+    int steps = 0;
+    for (; steps < 10; ++steps) {
+        ASSERT_TRUE(a.applyDistance(-0.1F, ctx));
+        a.requestSurfaceSettle();
+        a.solve(in, {});
+        // the frame pass: once per request, the anchor's own world pose against the planes
+        ASSERT_TRUE(a.takeSurfaceSettle());
+        EXPECT_FALSE(a.takeSurfaceSettle());
+        SXRSurfaceQuery q = liveWindow(a.state().anchorPose.pos);
+        q.content         = a.state().anchorPose;
+        if (const auto c = xrSurfacePick(&t, 1, q, tun, 0); c.ok) {
+            a.surfaceSettleAt(c);
+            break;
+        }
+    }
+    ASSERT_LT(steps, 10) << "ten nudges through the table never settled the window on it";
+    EXPECT_LE(steps, 4);
+    SXRSurfaceCandidate snap;
+    ASSERT_TRUE(a.takeSurfaceSnap(snap));
+    EXPECT_FALSE(a.takeSurfaceSnap(snap));
+    EXPECT_EQ(snap.planeId, 0x42U);
+    EXPECT_EQ(snap.kind, XR_SNAP_STAND);
+    EXPECT_EQ(a.state().mode, XR_ANCHOR_LOCAL);
+    expectVecNear(a.state().anchorPose.pos, snap.pose.pos);
+    const Vec3 up = qRotate(a.state().anchorPose.rot, Vec3{0.F, 1.F, 0.F});
+    EXPECT_NEAR((a.state().anchorPose.pos - up * LIVE_BOTTOM_EXT).y, 1.13F + tun.lift, 1e-3F);
 }

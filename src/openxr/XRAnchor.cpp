@@ -166,18 +166,19 @@ void CXRAnchor::initFromState(const SXRAnchorState& state) {
     m_grabPinch          = false;
     m_grabHandActive     = false;
     m_carryFilter.reset();
-    m_resizing           = false;
+    m_resizing = false;
     // adaptive runtime reset (the config in m_state.adaptive is preserved; the phase machine is not).
-    m_adPhase            = XRAD_DOCKED;
-    m_dockSeatCaptured   = false;
-    m_outDwell           = 0.F;
-    m_inDwell            = 0.F;
-    m_adT                = 0.F;
-    m_seedLeashAtTarget  = false;
-    m_adRoamRuntimeSet   = false;
-    m_adLeftSinceDock    = false;
-    m_surfaceArm         = SXRSurfaceArm{};
-    m_surfaceSnapPending = false;
+    m_adPhase              = XRAD_DOCKED;
+    m_dockSeatCaptured     = false;
+    m_outDwell             = 0.F;
+    m_inDwell              = 0.F;
+    m_adT                  = 0.F;
+    m_seedLeashAtTarget    = false;
+    m_adRoamRuntimeSet     = false;
+    m_adLeftSinceDock      = false;
+    m_surfaceArm           = SXRSurfaceArm{};
+    m_surfaceSnapPending   = false;
+    m_surfaceSettlePending = false;
     // m_lastWorld / m_hasLastWorld intentionally preserved: switching representation of an
     // existing on-screen quad should not lose where it currently is.
 }
@@ -1219,10 +1220,24 @@ bool CXRAnchor::surfaceSnapOnRelease(const SXRPose& releaseWorld) {
     m_surfaceArm     = SXRSurfaceArm{};
     if (!c.ok)
         return false;
+    surfaceSettleAt(c);
+    return true;
+}
+
+void CXRAnchor::requestSurfaceSettle() {
+    m_surfaceSettlePending = true;
+}
+
+bool CXRAnchor::takeSurfaceSettle() {
+    const bool pending     = m_surfaceSettlePending;
+    m_surfaceSettlePending = false;
+    return pending;
+}
+
+void CXRAnchor::surfaceSettleAt(const SXRSurfaceCandidate& c) {
     // A placement on a surface is a world placement: anchor:local, warped there, adaptive re-docked
     // at it — exactly the voice `place` verb's contract.
     placeLocalAt(c.pose);
     m_surfaceSnap        = c;
     m_surfaceSnapPending = true;
-    return true;
 }
