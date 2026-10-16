@@ -1,6 +1,8 @@
 # 30 — Don/doff intent: a state machine for hydrating and dehydrating the room
 
-**Status:** design only (2026-10-15). Nothing here is implemented. It replaces the cross-session
+**Status:** design (2026-10-15), with the user's answers to §15 folded in (§15 now records the
+decisions). Phases 0 and 1 are being implemented on branch `xr-donoff-design`; everything else is
+design only. It replaces the cross-session
 placement capture → staging → commit-gate → recenter-on-plug pipeline documented in
 [doc 03 §8.2–§8.3](../03-anchoring.md#82-recenter-on-plug) and built by
 [research/28](28-spatial-model.md) tranche 1 (H2). It keeps that work's invariants (I3, I4, I9, I11,
@@ -41,10 +43,13 @@ touches has a `file:line` reference against `hypxrland` at `21e863220`.
 6. **History is multi-resolution and stays in memory.** Full rate covers roughly the last 20 s. It
    is followed by 250 ms, 2 s, 15 s and 2 min tiers out to about 34 h, plus a semantic tier of dwell
    episodes. Each tier holds summaries that preserve dwell and stability statistics, not subsamples.
-   The total is about 0.6 MiB. The frame thread writes POD under its own mutex. No history is
-   persisted, because positions in a dead session frame are meaningless after a restart and keeping
-   a head trajectory on disk is a privacy cost with no benefit. Only committed head-relative memories
-   may be persisted later, as an opt-in.
+   Every record also carries the poses of up to 8 monitors, keyed by stable numeric ids (§8.4,
+   user decision Q8). The total is about 3.3 MiB. The frame thread writes POD under its own mutex.
+   No history is persisted. Persisting committed memories is a later, opt-in phase whose
+   serialization story is still open (§8.6, Q9).
+7. **Seat yaw is stillness-weighted** (user decision Q4). Each sample's yaw votes with a weight that
+   falls as its angular speed rises, so the seat faces where the user *rested* their gaze, not where
+   their head swept through (§6.2).
 
 ---
 
@@ -322,7 +327,8 @@ so it is **frame-thread-owned**: one `float m_hydrationAlpha` per manager, multi
 uniform monitor alpha at the blit. It sits next to `m_fxAlphaDrawn`, so the redraw diff
 (`XRMonitorLayer.hpp:348-350`) recomposes animation-only frames. While `DONNING` and hidden, the
 value is 0 and quads may simply be left out of the submitted layer list, which saves the
-composition too. After `HYDRATED` it eases 0 → 1 over **180 ms** (smoothstep). A late-discontinuity
+composition too. (Phase 2b shows a glyph during this wait instead of nothing, §16.) After
+`HYDRATED` it eases 0 → 1 over **180 ms** (smoothstep). A late-discontinuity
 re-hydrate cross-fades: 120 ms out, hydrate, 180 ms in.
 
 Only `anchor:local` monitors are hidden. `head`/`body`/`device` monitors ride the user and never
@@ -447,17 +453,43 @@ per T0 push):
   `dwellMin` = **8 s** of `WORN && trusted` samples, of which ≥ **70 %** are `level`. In 3DoF there
   is no position, so only the wear, trust and level conditions apply. Yaw is **not** constrained:
   working across a monitor wall is still one dwell.
-* **Accumulates** (all associative sums): sample count, time, Σpos over `level` samples, (Σcos yaw,
-  Σsin yaw) over `level && still` samples, position AABB, max ω, `gazeOnMonitorMs` (the existing
-  gaze pass's raw hit id ≠ −1, `XRMath.hpp:611-612`), and a per-monitor gaze histogram (top 4 ids by
-  dwell time, as `uint32` monitor ids, never strings).
+* **Accumulates** (all associative sums): sample count, time, Σpos over `level` samples, the
+  stillness-weighted yaw vector (Σw·cos yaw, Σw·sin yaw, Σw) over `upright && level` samples (below),
+  position AABB, max ω, `gazeOnMonitorMs` (the existing gaze pass's raw hit id ≠ −1,
+  `XRMath.hpp:611-612`), a per-monitor gaze histogram (top 4 ids by dwell time, as `uint32` monitor
+  ids, never strings), and at close a snapshot of the arrangement (up to 8 monitor poses, §8.4).
 * **Closes** when the head is outside `seatRadius` for more than 1.5 s (a walk), `WORN` falls (the
   episode is closed at `tOnset`, not at the edge, so the take-off is never inside it), `originGen`
   changes to an unbridgeable gen, or the session ends.
-* **Seat pose** = `{pos: Σpos / n, yaw: atan2(Σsin, Σcos)}`. The resultant length
-  `R̄ = |Σ(cos, sin)| / n` is stored. When `R̄ < 0.4` (the user looked everywhere evenly), the seat
+* **Seat pose** = `{pos: Σpos / n, yaw: atan2(Σw·sin, Σw·cos)}`. The weighted resultant length
+  `R̄ = |Σw·(cos, sin)| / Σw` is stored. When `R̄ < 0.4` (the user looked everywhere evenly), the seat
   yaw is taken from `xrGroupSeatFrame` of the arrangement instead (`XRAnchor.hpp`, the GROUP
   re-seat's implied viewer). With no stable gaze direction, the arrangement says where "forward" is.
+
+**Stillness weighting (user decision Q4).** "Forward" is the mean of where the user looked, but a
+sample taken mid-sweep says little about where they were looking, and a sample taken while the head
+rested says a lot. Each eligible sample *i* (`WORN && trusted && upright && level`) votes with
+
+```
+w_i = dt_i / (1 + ω_i / ω₀)        ω₀ = 6°/s,  dt_i = clamp(t_i − t_{i−1}, 0, 50 ms)
+```
+
+where `ω_i` is the §5.1 angular-speed EMA. Reading-level stillness (ω ≈ 2°/s) weighs 0.75 per
+second of dwell; a slow scan (15°/s) 0.29; a head turn to glance at a side monitor (60°/s) 0.09. The
+form is a rational falloff rather than a Gaussian on purpose: it is heavy-tailed, so a dwell spent
+in constant gentle motion (a 3DoF user who never rests) still produces a mean, while a hard cut-off
+would produce none. The `dt` factor makes it frame-rate independent, and the clamp stops a frame
+hitch from becoming a vote.
+
+Because `w_i` depends only on the sample itself, the three sums `(Σw·cos, Σw·sin, Σw)` merge by
+addition, so every tier (T1–T4) and every episode can compute the **same** weighted mean and
+concentration after decimation that brute force over T0 would (up to float rounding — tested,
+§13.1). No tier ever has to store the samples to re-weight them.
+
+The glance-at-a-side-monitor case (R7) is decided mostly by *duration* (60 s on the centre monitor
+against 2 s on XR-3) and the weighting removes the sweep between them. A user who genuinely parks
+their attention on a side monitor for most of a dwell gets a seat facing between the two, which is
+where they were sitting.
 
 ### 6.3 Seat selection and intrinsic acceptance
 
@@ -495,7 +527,9 @@ committed as one rigid set (one seat, every eligible monitor; offsets
 of `anchor:local` monitors, not a historical snapshot. Under one generation a `LOCAL` monitor's
 world pose changes only by user action (grab, verb, re-seat) or a bridged re-expression. A grab
 *after* the dwell is something the user wants kept, and committing it against the dwell's seat is
-exactly right. This is why history records hold **no per-monitor poses** (§8.4). Adaptive monitors
+exactly right. History records now *do* hold per-monitor poses (§8.4, Q8), but selection still
+commits the **live** arrangement for this reason; the recorded poses serve diagnostics, traces and
+future "put it back where it was" features. Adaptive monitors
 contribute their docked pose (the rule at `OpenXRManager.cpp:2346-2347` is kept).
 
 Intrinsic acceptance (D2) has one ranking rule, to stop a weak witness overwriting a strong one:
@@ -559,66 +593,89 @@ Commit sites:
 
 | tier | resolution | capacity (pow2) | span | record | size |
 |---|---|---|---|---|---|
-| **T0** raw | every frame | 2048 | ≈ 17 s @120 Hz, 23 s @90 Hz, 34 s @60 Hz | `SXRHistSample` 64 B | 128 KiB |
-| **T1** | 250 ms buckets | 1024 | ≈ 4.3 min | `SXRHistSummary` 112 B | 112 KiB |
-| **T2** | 2 s | 1024 | ≈ 34 min | 112 B | 112 KiB |
-| **T3** | 15 s | 1024 | ≈ 4.3 h | 112 B | 112 KiB |
-| **T4** | 2 min | 1024 | ≈ 34 h | 112 B | 112 KiB |
-| **E** dwell episodes | per episode | 256 | days, typically | `SXRDwellEpisode` 96 B | 24 KiB |
+| **T0** raw | every frame | 2048 | ≈ 17 s @120 Hz, 23 s @90 Hz, 34 s @60 Hz | `SXRHistSample` 352 B (64 B head + 8 × 36 B monitors) | 704 KiB |
+| **T1** | 250 ms buckets | 1024 | ≈ 4.3 min | `SXRHistSummary` 640 B (128 B head + 8 × 64 B monitors) | 640 KiB |
+| **T2** | 2 s | 1024 | ≈ 34 min | 640 B | 640 KiB |
+| **T3** | 15 s | 1024 | ≈ 4.3 h | 640 B | 640 KiB |
+| **T4** | 2 min | 1024 | ≈ 34 h | 640 B | 640 KiB |
+| **E** dwell episodes | per episode | 256 | days, typically | `SXRDwellEpisode` ≈ 420 B (incl. an 8-monitor arrangement snapshot) | ≈ 105 KiB |
 | **G** origin generations | per event | 64 | session-ish | 48 B | 3 KiB |
-| **J** edge journal (presence, visibility, session, don decisions, commits, authored edits) | per event | 256 | days | 24 B | 6 KiB |
+| **J** edge journal (presence, visibility, session, don decisions, commits, authored edits, monitor create/destroy) | per event | 256 | days | 32 B | 8 KiB |
 
-Total ≈ **610 KiB**, fixed, allocated once inside `COpenXRManager` as `std::array` members. For
-comparison, the existing voice/gaze ring is 8192 × `SXRPoseSample` ≈ 512 KiB
-(`OpenXRManager.hpp:987-999`). Its 91 s full-rate window serves a different consumer (deictic
-lookup), and this design leaves it alone (open question Q7).
+Total ≈ **3.3 MiB**, fixed, allocated once (one heap block owned by `COpenXRManager`, never
+reallocated). The per-monitor columns are ~80 % of it; the user's call (Q8) was that more
+information is better while it is this cheap. For comparison, the existing voice/gaze ring is
+8192 × `SXRPoseSample` ≈ 512 KiB (`OpenXRManager.hpp:987-999`). Its 91 s full-rate window serves a
+different consumer (deictic lookup), and the two stay separate (Q7, decided).
+
+Exact record sizes are `static_assert`ed in `XRPoseHistory.hpp`; the figures above are the design
+targets the asserts pin.
 
 ### 8.2 Records
 
 ```cpp
 // XRPoseHistory.hpp — everything here is POD, trivially copyable, static_assert'ed sizes.
-enum eXRHistFlag : uint16_t {
+constexpr size_t XR_HIST_MAX_MONITORS = 8;   // per record; see §8.4 for overflow
+enum eXRHistFlag : uint32_t {
     XR_HF_VALID = 1 << 0, XR_HF_TRACKED = 1 << 1, XR_HF_POS_TRACKED = 1 << 2, XR_HF_VISIBLE = 1 << 3,
     XR_HF_PRESENT = 1 << 4, XR_HF_PRESENCE_KNOWN = 1 << 5, XR_HF_WORN = 1 << 6, XR_HF_UPRIGHT = 1 << 7,
     XR_HF_LEVEL = 1 << 8, XR_HF_STILL = 1 << 9, XR_HF_DEAD_STILL = 1 << 10, XR_HF_IN_DWELL = 1 << 11,
     XR_HF_GRAB = 1 << 12, XR_HF_ROAMING = 1 << 13, XR_HF_GAZE_ON_MONITOR = 1 << 14, XR_HF_DONNING = 1 << 15,
+    XR_HF_TRUSTED = 1 << 16, XR_HF_GAZE_EVAL = 1 << 17, // the gaze pass ran (P5 only applies then)
 };
-struct SXRHistSample {            // 64 B
-    int64_t  tNs;                 // predictedDisplayTime (monotonic, same clock the frame loop uses)
-    Vec3     headPos;             // session ref space, gen `gen`
+struct SXRHistMonitorPose {        // 36 B
+    uint32_t id;                   // stable layer id (§8.4), 0 = empty slot
+    uint8_t  mode;                 // eXRAnchorMode
+    uint8_t  flags;                // STALE | GRABBED | ROAMING | ELIGIBLE | GAZED
+    uint16_t _pad;
+    Vec3     pos;                  // world (LOCAL_FLOOR, gen `gen`) for LOCAL; the anchor offset otherwise
+    Quat     rot;
+};
+struct SXRHistSample {             // 64 B + 8 × 36 B = 352 B
+    int64_t  tNs;                  // steady clock (CLOCK_MONOTONIC) — the clock main-thread edges use
+    Vec3     headPos;              // session ref space, gen `gen`
     Quat     headRot;
-    float    angSpeed, linSpeed;  // the §5.1 EMAs (so onset/dwell replay without re-deriving)
-    uint32_t arrangeEpoch;        // bumps on authored edits / re-seats (§7)
-    uint32_t gazeMonitorId;       // raw gaze hit id, 0 = none (layer ids are nonzero)
-    uint16_t gen;                 // origin generation
-    uint16_t flags;               // eXRHistFlag
-    uint8_t  _pad[4];
+    float    angSpeed, linSpeed;   // the §5.1 EMAs (so onset/dwell replay without re-deriving)
+    uint32_t arrangeEpoch;         // bumps on authored edits / re-seats (§7)
+    uint32_t gazeMonitorId;        // stable id of the raw gaze hit, 0 = none
+    uint16_t gen;                  // origin generation
+    uint8_t  nMonitors, monitorsDropped;
+    uint32_t flags;                // eXRHistFlag
+    SXRHistMonitorPose monitors[XR_HIST_MAX_MONITORS];
 };
-struct SXRHistSummary {           // 112 B — the merge of N samples or N lower-tier summaries
+struct SXRHistMonitorSummary {     // 64 B — merges exactly (sums / min / max / or / and)
+    uint32_t id, n;
+    Vec3     posSum, posMin, posMax;
+    Quat     rotSum;               // Σ of hemisphere-canonical (w ≥ 0) quats; mean = normalize(sum)
+    uint8_t  mode, flagsOr, flagsAnd, _pad;
+};
+struct SXRHistSummary {            // 128 B + 8 × 64 B = 640 B — the merge of N samples or N lower-tier summaries
     int64_t  t0Ns, t1Ns;
-    uint32_t n;                   // samples covered
-    uint32_t wornMs, trustedMs, levelMs, stillMs, dwellMs, gazeOnMonitorMs; // time-weighted, sums merge exactly
-    Vec3     posSum;              // Σ pos over LEVEL samples (mean = posSum / nLevel)
+    uint32_t n;                    // samples covered
+    uint32_t wornUs, trustedUs, levelUs, stillUs, dwellUs, gazeOnMonitorUs; // time-weighted, integer, merge exactly
+    Vec3     posSum;               // Σ pos over LEVEL samples (mean = posSum / nLevel)
     uint32_t nLevel;
-    Vec3     posMin, posMax;      // AABB — spread without storing samples
-    float    yawCos, yawSin;      // Σ over LEVEL&&STILL: circular mean + concentration, merge exactly
-    float    pitchSum;            // over LEVEL
+    Vec3     posMin, posMax;       // AABB — spread without storing samples
+    float    yawWCos, yawWSin, yawW; // stillness-weighted yaw sums (§6.2): mean + concentration, merge exactly
+    float    pitchSum;             // over LEVEL
     float    angSpeedMax, linSpeedMax;
     uint32_t arrangeEpochLast;
-    uint16_t gen;                 // a bucket NEVER spans two gens (closed early, see §8.3)
-    uint16_t flagsOr, flagsAnd;
-    uint8_t  closedEarly;         // 1 = gen change, 2 = session end
-    uint8_t  _pad[5];
+    uint32_t flagsOr, flagsAnd;
+    uint16_t gen;                  // a bucket NEVER spans two gens (closed early, see §8.3)
+    uint8_t  closedEarly;          // 1 = gen change, 2 = session end
+    uint8_t  nMonitors, monitorsDropped;
+    SXRHistMonitorSummary monitors[XR_HIST_MAX_MONITORS];
 };
-struct SXRDwellEpisode {          // 96 B
+struct SXRDwellEpisode {           // ≈ 420 B
     int64_t  tStartNs, tEndNs;
     Vec3     seatPos; float seatYaw, yawConcentration;
     Vec3     posMin, posMax;
     float    levelFrac, gazeFrac, angSpeedMax;
-    uint32_t primaryMonitor;      // most-gazed id
+    uint32_t gazeIds[4]; uint32_t gazeUs[4]; // top-4 gazed monitors; gazeIds[0] = primary
     uint32_t arrangeEpochStart, arrangeEpochEnd;
-    uint16_t gen; uint8_t dof; uint8_t endReason; // walk | doff | gen | session
-    uint8_t  _pad[8];
+    uint16_t gen; uint8_t dof; uint8_t endReason; // open | walk | doff | gen | session
+    uint8_t  nMonitors;
+    SXRHistMonitorPose arrangement[XR_HIST_MAX_MONITORS]; // the monitors as they stood when it closed
 };
 ```
 
@@ -628,28 +685,54 @@ Each tier above T0 has one **open accumulator**. A T0 push folds the sample into
 accumulator: O(1) adds plus min/max. When the accumulator's span reaches the tier resolution it is
 **closed**: pushed into T1's ring and folded into T2's accumulator, and so on upward. Folding is the
 same associative `xrHistMerge(SXRHistSummary&, const SXRHistSummary&)` at every level. Sums, counts
-and time-weighted milliseconds add, AABBs union, max takes max, `flagsOr |=`, `flagsAnd &=`, and
-the yaw vector adds. **Dwell and stability statistics are therefore exact at every tier.** A T4
-bucket knows precisely how many of its 120 s were spent dwelling, level and still, and what its mean
+and time-weighted microseconds add, AABBs union, max takes max, `flagsOr |=`, `flagsAnd &=`, and
+the stillness-weighted yaw vector adds. **Dwell and stability statistics are therefore exact at
+every tier** (integer time fields bit-exact, float sums up to rounding). A T4 bucket knows precisely
+how many of its 120 s were spent dwelling, level and still, and what its stillness-weighted mean
 seat yaw and concentration were. Naive subsampling would have kept one random frame out of 14,400.
 
+**Per-monitor summaries merge by id**, not by slot index: a monitor present in both operands sums
+into one entry; a monitor present in only one is carried over. When the union exceeds 8, the
+entries covering the fewest samples are dropped and `monitorsDropped` is raised (it ORs upward, so
+a tier says "some monitors are missing here" rather than silently averaging fewer). A monitor that
+was destroyed mid-bucket simply has a smaller `n` than the bucket; one created mid-bucket likewise.
+A rename changes nothing in the history, because nothing in it is a name.
+
 Buckets close **early** on a generation change and at session end, so no summary ever averages
-positions from two frames. Wear changes do *not* close buckets. `wornMs` records the fraction, and
+positions from two frames. Wear changes do *not* close buckets. `wornUs` records the fraction, and
 an episode boundary carries the precise edge.
 
-Per frame the cost is one 64 B copy, at most five accumulator folds (only on closes), and one
-episode step: well under a microsecond. The frame thread holds `m_historyMu` only for the push.
+Per frame the cost is one 352 B copy, the per-monitor folds into the open T1 accumulator (≤ 8
+id compares each), at most four further folds (only on closes), and one episode step: still around
+a microsecond. The frame thread holds `m_historyMu` only for the push.
 
-### 8.4 Why records hold no per-monitor poses
+### 8.4 Per-monitor poses in the history (user decision Q8)
 
-The brief suggested storing per-monitor offsets or world poses. The design rejects that on purpose.
-Within one generation a `LOCAL` monitor's world pose changes **only** through an authored edit or a
-bridged re-expression, so the live anchors plus `arrangeEpoch` reconstruct any historical
-arrangement that matters (§6.3). Storing them would cost 16 monitors × 28 B × 90 Hz, about 40 KiB/s
-at T0. Worse, it would invite committing a *historical* arrangement that the user has since
-deliberately changed. If a future feature needs "where was XR-3 an hour ago", the edge journal J
-can carry an authored-edit record with the monitor id and resulting pose. At a few per hour that is
-negligible. Q8 asks whether to do that now.
+The first draft rejected per-monitor poses on the grounds that the live anchors plus `arrangeEpoch`
+reconstruct any arrangement that matters. The user's answer was "more info is better since it should
+be cheap to retain", so every record now carries them. Selection still commits the *live*
+arrangement (§6.3); the recorded poses are for status, traces, replay assertions, and future verbs
+("put XR-3 back where it was an hour ago").
+
+* **Identity.** Every `CXRMonitorLayer` gets a `uint32_t m_histId` at construction from a
+  process-wide counter: never 0, never reused, unaffected by plug/unplug (unlike `MONITORID`, which is
+  −1 while unplugged and is recycled by the compositor) and by renames. The frame thread only ever
+  sees this number. The main thread resolves ids to names from the live layers, plus a small
+  main-thread `{id → name}` table (32 entries) that remembers recently destroyed monitors so status
+  and traces can still name them.
+* **Create / destroy / rename.** Creation and destruction are edge-journal records
+  (`J{MONITOR_CREATED|MONITOR_DESTROYED, id}`); in the sample stream a monitor simply starts or stops
+  appearing. A rename is a journal record `J{MONITOR_RENAMED, id}` with the new name kept main-side;
+  ids do not change. (Renames do not exist as a verb today; the record type is reserved.)
+* **Cap and choice.** At most 8 monitors per record. When more exist, `anchor:local` monitors win
+  over head/body/device ones, then lower ids (older monitors) win; `monitorsDropped` counts the rest.
+  The cap is a `constexpr`; 8 covers the largest rig in use (6) with room.
+* **What a pose means.** For `anchor:local` the world pose (LOCAL_FLOOR, the sample's `gen`); for the
+  other modes the anchor's own offset in its view/body/grip space (that is what is stable for them).
+  The `mode` byte says which.
+* **Cost.** ≈ 2.7 MiB of the 3.3 MiB total (§8.1). Within one generation an `anchor:local` monitor
+  only moves on authored edits, so T0 is highly redundant; that redundancy is accepted for simplicity
+  (fixed-size records, no delta coding, trivially copyable snapshots).
 
 ### 8.5 Threading
 
@@ -658,7 +741,8 @@ negligible. Q8 asks whether to do that now.
   `recordPoseSample` (`OpenXRManager.cpp:7526`) already does for the gaze ring.
 * **Lock:** `std::mutex m_historyMu`, a sibling of `m_poseRingMu`, never nested with `m_layersMu`.
   Readers copy what they need out under the lock. `xrSelectSeat` runs on a **snapshot** taken under
-  the lock (T0 + E + T1–T2 are ≈ 400 KiB, copied once per doff edge, about 50 µs), then releases it
+  the lock (the whole 3.3 MiB block, one memcpy per doff edge, a few hundred µs into a buffer
+  allocated once), then releases it
   before `commitSeat` takes `m_layersMu`.
 * **Session end:** the commit at `:1116` runs after the frame thread is joined, so the lock is
   uncontended.
@@ -671,7 +755,7 @@ negligible. Q8 asks whether to do that now.
 
 ### 8.6 Persistence and privacy: in-memory only
 
-**Recommendation: never persist the history.** Head positions are expressed in a session reference
+**Never persist the history.** (Decided.) Head positions are expressed in a session reference
 frame that is dead after any restart. A T3 bucket from yesterday's session describes coordinates in
 a space that no longer exists, so it carries no placement value across a compositor restart. The
 only thing that *is* meaningful across restarts is the committed head-relative memory, and that is
@@ -683,10 +767,32 @@ compositor socket. On disk it becomes a durable record of the user's day with no
 
 Two separate, explicit, opt-in exceptions:
 
-1. **Committed memories** (Phase 5, optional). Per monitor: `{offset pose, provenance source,
-   committedAt}`, no positions in any world frame and no trajectory. This goes in the
-   `$XDG_STATE_HOME/hypr/xr-spatial.json` file that research/28 §9.1 already proposes, behind a new
-   option. It answers research/28 S7 (layout survives a compositor restart).
+1. **Committed memories** (Phase 5, later, opt-in; user decision Q9). The user wants this but wants
+   to think hard about the serialization story first, so nothing is decided here beyond "opt-in,
+   memories not trajectories". The questions Phase 5 has to answer before any code:
+   * **Format.** JSON (diffable, hand-editable, matches research/28 §9.1's `xr-spatial.json`) or a
+     hyprlang-style config fragment the user could paste, or a binary blob? Is it one file or one per
+     HMD/runtime?
+   * **Versioning.** A top-level schema version and a migration rule for every field; what happens to
+     a file written by a newer build (ignore? refuse? read the known subset?).
+   * **What is stored.** Per monitor: head-relative offset pose, provenance (`dwell`/`reseat`/…),
+     commit time, seat duration and concentration? The arrangement as one rigid set or per monitor?
+     Declared rigs are already in the config, so are they excluded? What about the stable `m_histId`
+     (process-local today; persisting needs a name- or uuid-based key, and a rule for renames)?
+   * **Keying.** By monitor name (renames break it), by an `xrmonitor` declaration hash, or by a
+     persisted uuid? What about `create`d monitors that no longer exist at load time: recreate them,
+     or keep the memory dormant until a monitor with that key appears?
+   * **Privacy.** Even offsets reveal a little (desk geometry, how far the user sits). Where does the
+     file live (`$XDG_STATE_HOME`), what mode bits, is it excluded from dotfile sync by default, and
+     does `hyprctl openxr forget all` delete it too (it should)?
+   * **Frame/origin semantics across runtime restarts.** Head-relative offsets are frame-free by
+     construction, but anything else (a STAGE-anchored pose from Track W, a 6DoF "same room"
+     signature) only means something if the runtime's room frame is stable across restarts, which is
+     exactly what research/28 M0 has not shown. Does the file carry a runtime/HMD/room identity so a
+     memory from the Quest is not replayed on the XREAL? Does a restored memory carry reduced
+     provenance (`persisted`) so the §6.3 ranking rule treats it as weaker than a fresh dwell?
+   * **When it is written.** At every commit (I11 edge) or only at clean exit? Atomic rename,
+     debounce, and what a crash mid-write leaves behind.
 2. **Tuning traces** (§13.4). Off by default. Each trace file is written only while the user has
    turned recording on, and the doc and the log line say so.
 
@@ -832,9 +938,11 @@ It never prints raw T0 samples (use trace recording for that).
 
 **History** (`donoff_history.cpp`):
 * Tier spans after N pushes at 60/90/120 Hz. `static_assert` on record sizes and on total footprint
-  < 700 KiB.
-* Merge exactness: random sample streams, then check that the T4 `dwellMs/levelMs/n` equal brute-force
-  sums over the raw stream. The circular-mean yaw across the ±π wrap equals the brute-force mean.
+  < 3.5 MiB.
+* Merge exactness: random sample streams, then check that the T4 `dwellUs/levelUs/n` equal brute-force
+  sums over the raw stream. The **stillness-weighted** circular-mean yaw and its concentration, across
+  the ±π wrap, equal the brute-force weighted mean. Per-monitor summaries equal brute-force per-id
+  sums, including monitors created and destroyed mid-bucket and the >8 overflow.
 * A gen change mid-bucket closes it early, and no summary has samples from two gens.
 * No allocation: the history is a `std::is_trivially_copyable` aggregate.
 
@@ -910,7 +1018,7 @@ Safety, from memory: run in the container. Never run non-`--xr` hyprtester on th
 ### 13.3 What cannot be automated
 
 The real XREAL proximity timing, the Quest `LOCAL_FLOOR` re-derive ordering relative to presence
-(§5.6), and XREAL SLAM continuity across a doff (Q3). These need recorded traces.
+(§5.6), and XREAL SLAM continuity across a doff (Q3, test procedure in §15). These need recorded traces.
 
 ### 13.4 Recording real don/doff traces
 
@@ -948,7 +1056,7 @@ says that head-pose traces are being written and where. Recording turns itself o
 Devices: XREAL Air 2 Ultra 3DoF (plain driver), XREAL with `XREAL_AIR_SLAM=1`, and Quest 3 via
 WiVRn. Traces are labeled by hand (a sidecar `.expect.json`) and the useful ones are committed to
 `tests/xr/data/donoff/` after review. They are head poses in a session frame, not linked to identity,
-but the user should still look before committing them (Q6).
+but the user should still look before committing them (Q6: approved).
 
 ---
 
@@ -956,12 +1064,13 @@ but the user should still look before committing them (Q6).
 
 | phase | ships | default behavior change |
 |---|---|---|
-| **0 — instrument (shadow)** | `XRPoseHistory`, features, episode detector, edge journal, `donoff` status, `donoff record`, and **shadow selection**: at every legacy commit, also run `xrSelectSeat` and log `shadow: would remember … (vs legacy …)`. `placement_memory` exists, default `legacy`. | none |
+| **0 — instrument (shadow)** | `XRPoseHistory` (incl. per-monitor poses), features, the `upright` guard on every durable yaw read, episode detector, edge journal, `donoff` status, `donoff record`, and **shadow selection**: at every legacy commit, also run `xrSelectSeat` and log `shadow: would remember … (vs legacy …)`. `placement_memory` exists, default `legacy`. | none, except that a non-upright head no longer stages a memory (the R2 fix) |
 | **1 — commit** | `placement_memory = intent` path: `xrSelectSeat` + `commitSeat` at doff/session end, `RESEAT` immediate commit, provenance, `forget` verb. The staging block and drift gate stay only under `legacy`. | default remains `legacy` until about a week of fishfood shadow logs agree. Then `intent`. |
 | **2 — don** | FSM `DONNING`, settle detector, hide/fade, backstop, `don_settle_timeout_ms`, `don_fade_ms` | re-seat after settle instead of at +35 ms (timeout 0 = old timing) |
+| **2b — don glyph** | the head-locked settle glyph and its glide to the settle target (§16) | a glyph during the settle (`don_glyph = none` restores Phase 2's blank wait) |
 | **3 — resume** | §5.4 rows 5–7 with gen tracking; `don_resume_radius`; late-discontinuity cross-fade; STAGE bridge **behind M0** | row 6 (opt-out by radius 0) |
 | **4 — delete legacy** | remove `legacy`, the staging fields, `xrRestoreCommitGate` and its gtests; rewrite doc 03 §8.2–8.4 | none |
-| **5 — optional persistence** | committed memories to `xr-spatial.json`, opt-in | none |
+| **5 — optional persistence** | committed memories, opt-in, once the §8.6 serialization questions are answered | none |
 
 **The current bad memory.** Memories are in-memory, so the deployed session's flipped XR-main
 memory dies on the next compositor restart. Before that, one `xrmonitor reseat` fixes it once
@@ -973,37 +1082,128 @@ the Path A container loop before deploying to the daily driver.
 
 ---
 
-## 15. Open questions for the user
+## 15. Decisions (the user's answers, 2026-10-15)
 
-1. **Rehydrate when you moved (row 6).** With 6DoF, if you doff, walk to another room, and don,
-   should the monitors come with you (proposed), or stay at the desk as they do today? Proposed:
-   come with you, with `don_resume_radius = 0` to opt out.
-2. **What you see while settling.** Proposed: nothing (monitors hidden, up to 3 s worst case, about
-   0.5–1 s typically). Alternative: a small HUD "settling…" glyph via hypxrhud, or showing the
-   monitors dimmed at 30 % in their pre-decision place. Do you want any visual during the settle?
-3. **XREAL SLAM across a doff.** Does Basalt keep tracking (cameras streaming) while the display is
-   off and the glasses lie on the desk? If not, every XREAL re-don is a "no continuity" case and
-   falls to row 7 (resume, today's behavior). The traces will tell, but if you already know, it
-   decides whether row 5 matters on XREAL at all.
-4. **Seat yaw when you look around a lot.** Proposed: the circular mean of where you looked during
-   the dwell, falling back to the arrangement's own implied viewer frame when attention was spread
-   evenly. Alternative: *always* use the arrangement's implied viewer frame, so the head yaw never
-   enters the memory and the monitors are always restored facing you as a group. That is simpler and
-   immune to R7, but it ignores *where in the wall* you were working. Preference?
-5. **Staleness by time.** research/28 §7.3 argues time is a weak proxy. Should a very long doff (for
-   example overnight, in the same session) still resume in place under 3DoF, or rehydrate around the
-   head? Proposed: resume (today's behavior), no time rule.
-6. **Traces in-tree.** OK to commit a dozen of your recorded don/doff traces (head poses only, no
-   timestamps beyond relative time) into `tests/xr/data/donoff/` as replay fixtures?
-7. **Merge with the voice/gaze ring?** T0 duplicates part of the existing 8192-sample gaze ring (for
-   hypxrvoice deixis). Keep two rings (proposed, since they have different retention needs), or make
-   T0 serve both at 8192 × 64 B = 512 KiB?
-8. **Per-monitor pose journal.** Should authored edits record the resulting monitor pose in the edge
-   journal now (for a future "put XR-3 back where it was an hour ago" voice command), or wait for a
-   consumer?
-9. **Persistence (Phase 5).** Do you want committed memories (not history) to survive a compositor
-   restart, opt-in, in `xr-spatial.json`? This is research/28 S7.
-10. **The 22:43:56 case.** The log shows no presence-absent before `openxr disable`. Were the glasses
-    pushed up on your forehead, or still on your face but turned (for example looking back at the
-    laptop)? Either is handled by `upright` + dwell, but it changes how much the forehead-park case
-    (protocol item 2) should drive the thresholds.
+The draft's ten open questions, with the user's answers and what each changed.
+
+1. **Rehydrate when you moved (row 6): monitors come with you.** As proposed. 6DoF, doff, walk to
+   another room, don: the room rehydrates around the head. Opt-out: `openxr:don_resume_radius = 0`.
+   (§5.4 row 6, Phase 3.)
+2. **What you see while settling: a glyph, not nothing.** A head-locked Omarchy logo with subtle 3D
+   depth, which then glides to where the seat's main monitor will appear before the monitors fade in
+   around it. Designed in §16 as its own phase (**2b**); not implemented with Phases 0/1. Asset
+   facts recorded in §16.1.
+3. **XREAL SLAM across a doff: unknown, stays open.** Test procedure:
+   1. Run Monado with `XREAL_AIR_SLAM=1` (doc 07 §1.6). Turn `hyprctl openxr donoff record on`.
+   2. Wear 30 s at the desk. Doff and lay the glasses on the desk **lenses up, cameras facing the
+      room**, untouched, 60 s. Don at the same seat.
+   3. Repeat with the glasses **face down** (cameras blocked), and once with the glasses **moved
+      about 1 m along the desk** while off.
+   4. In each trace: is `POS_TRACKED` set on the samples while unworn? Does the head position at
+      the don edge agree with the pre-doff seat (within the 0.75 m resume radius in case 1/2, and
+      reflecting the 1 m move in case 3)? Grep the Monado log for Basalt resets around the doff.
+   5. Verdict: if position stays tracked and continuous in case 1, row 5 (resume without re-seat)
+      matters on XREAL; if Basalt drops or resets, every XREAL re-don is "no continuity" and falls to
+      row 7 (resume in place, today's behaviour), which is safe either way.
+4. **Seat yaw: the mean of where you looked, weighted by stillness.** Less motion during a sample
+   gives it more weight: `w = dt / (1 + ω/ω₀)`, ω₀ = 6°/s. The tiers carry `(Σw·cos, Σw·sin, Σw)`
+   so the weighted mean and concentration are exact after decimation. Specified in §6.2; summary
+   fields in §8.2. The `xrGroupSeatFrame` fallback for `R̄ < 0.4` stays.
+5. **Long doff in the same session: resume in place if back at the same spot.** No time rule. As
+   proposed (§5.4 rows 5 and 7).
+6. **Traces in-tree: yes**, about a dozen recorded don/doff traces may be committed under
+   `tests/xr/data/donoff/` as replay fixtures (§13.1 `donoff_replay.cpp`, §13.4).
+7. **Two histories.** The voice/gaze ring and T0 stay separate (§8.1).
+8. **Record per-monitor poses in the history.** "More info is better since it should be cheap to
+   retain." Every T0 sample, every tier summary and every episode now carries up to 8 monitors' poses
+   under stable numeric ids. Layout, memory budget (≈ 3.3 MiB), decimation (merge by id), the cap,
+   and create/destroy/rename representation are in §8.1–§8.4.
+9. **Persistence across compositor restarts: later, opt-in.** The user wants to think hard about
+   the serialization story first. Phase 5 stays a later phase; §8.6 lists the questions (format,
+   versioning, what is stored, keying, privacy, frame/origin semantics across runtime restarts,
+   write timing) instead of deciding them.
+10. **The 22:43:56 case: unknown** whether the glasses were on the forehead. The `upright` guard
+    (§5.1) covers both readings: a forehead-parked head is not upright, and a turned-but-worn head
+    facing backwards is still caught by P3 facing (§6.3).
+
+---
+
+## 16. Phase 2b — the don glyph (design only)
+
+**Goal.** Replace Phase 2's blank wait (`DONNING`, monitors hidden for 0.5–3 s) with something that
+says "the room is coming": the Omarchy logo, head-locked with a little depth, which on settle glides
+to where the seat's main monitor is about to appear, and dissolves as the monitors fade in around
+it. It is purely presentational. It never changes *what* is decided or *when* (the settle detector
+and `xrDonDecision` are untouched), and it adds no time to the hydration except the glide itself,
+which is configurable down to 0.
+
+### 16.1 The asset
+
+On this box (Omarchy 4.0.4), `~/.local/share/omarchy` is a symlink to `/usr/share/omarchy`, which
+holds:
+
+| file | what | use |
+|---|---|---|
+| `/usr/share/omarchy/icon.png` | 300 × 300 RGBA PNG, the square mark | **the right shape for a glyph** |
+| `/usr/share/omarchy/logo.svg` | 1215 × 285 SVG wordmark, single-colour (`fill="#000"`) | too wide for a glyph; usable as a tinted lower line |
+| `/usr/share/omarchy/icon.txt`, `logo.txt` | ASCII-art versions | n/a |
+
+`logo.svg` is owned by the `omarchy-settings 4.0.4-1` package; the `omarchy` package metadata says
+`Licenses: MIT`, upstream `https://github.com/basecamp/omarchy`. **No LICENSE file is installed**,
+and MIT covers the code; whether it grants use of the logo as a brand mark in another project is
+unclear (logos are usually trademark, not copyright, questions). So:
+
+* The repo ships a **generic default glyph** (`assets/openxr/don-glyph.svg`, our own drawing: a
+  simple ring-and-dot mark), so the feature works on any distro.
+* Omarchy's mark is a **user-configured asset**: `openxr:don_glyph = /usr/share/omarchy/icon.png`,
+  set by the Omarchy XR session package (`hypxrland-omarchy`) in its own config, not by Hyprland.
+  Nothing is copied into this repo until the licensing is confirmed with upstream.
+
+### 16.2 Render path
+
+* **Owned by HypXRland, in our own layer list.** Not hypxrhud: the HUD is a separate session, so its
+  timing is not tied to our frame loop, and the glyph has to hand over to the monitors' fade on the
+  exact frame the hydration lands (§5.3). The glyph is 1–3 `XrCompositionLayerQuad`s submitted
+  ahead of the monitor quads while `DONNING`.
+* **Texture.** The main thread rasterizes the configured asset at config load (PNG directly; SVG via
+  the hyprgraphics loader where it supports SVG, else refused with a config error) into a 1024 px
+  premultiplied RGBA buffer, published under a mutex with a generation counter. The frame thread
+  adopts a new generation by uploading it once into a dedicated static swapchain
+  (`XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT`), created lazily and destroyed with the session. No
+  refcounts and no strings cross to the frame thread.
+* **Depth.** Three quads from the same texture at 1.20 m, 1.208 m and 1.216 m: the front face at
+  full alpha, the two behind it darkened (×0.55, ×0.3) — a stacked-card extrusion that reads as a
+  slab in stereo. `openxr:don_glyph_depth` (default 0.008 m spacing, 0 = one flat quad).
+* **Head-locking with parallax.** Not hard VIEW-space locking (that has no parallax and feels
+  glued to the face). The glyph rides a critically damped spring on the head pose (τ ≈ 120 ms) in
+  LOCAL space, 1.2 m ahead, 2° below the eye line, 0.16 m wide. During the head motion of a don the
+  three layers lag by slightly different angles, which is where the subtle depth comes from; when the
+  head is still they line up.
+
+### 16.3 Timeline
+
+| t | glyph | monitors |
+|---|---|---|
+| `DONNING` entry (only when the decision hides; a `RESUME` at the edge shows no glyph) | fades in, 150 ms, smoothstep | hidden |
+| settling | lazy head-locked | hidden |
+| `HYDRATED` with a target | **glide**, `don_glyph_glide_ms` (default 450 ms), ease-in-out cubic: position lerp and rotation slerp from its head-locked pose to the **target centre** (the seat's main monitor's hydrated pose: the primary monitor of the memory, else the one nearest the seat's forward), width shrinking to `min(0.16 m, 0.25 × monitor width)`, layer spacing collapsing to 0 | hidden until glide end |
+| glide end | fades out over 220 ms | fade in over `don_fade_ms` (180 ms), centred on the glyph |
+
+**No settle target** (timeout rung 3, `HOLD_DEAD`, no `anchor:local` monitor, the backstop): the
+glyph skips the glide and fades out in place over 220 ms while the monitors fade in. Its lifetime is
+capped at the settle timeout + 1 s, so it can never outlive the backstop.
+
+### 16.4 Configuration (new; separate wiki PR)
+
+| option | default | meaning |
+|---|---|---|
+| `openxr:don_glyph` | `default` | `default` (the shipped generic mark), `none` (Phase 2's blank wait), or a path to a PNG/SVG |
+| `openxr:don_glyph_glide_ms` | 450 | glide duration; 0 = no glide (cross-fade in place) |
+| `openxr:don_glyph_depth` | 0.008 | layer spacing in metres; 0 = one flat quad |
+
+### 16.5 Tests
+
+The timeline is a pure function `xrDonGlyphFrame(tSinceDonNs, tHydratedNs, haveTarget, lazyHead,
+target, params) → {pose[3], alpha[3], monitorAlpha}` and is gtested frame by frame (fade-in, glide
+endpoints, the no-target path, the cap). A `--xr` case asserts the status `donoff.glyph` phase
+sequence `in → hold → glide → out` across a scripted don.
