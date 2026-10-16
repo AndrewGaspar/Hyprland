@@ -46,6 +46,10 @@ namespace OpenXR {
         return XR_SEATHEAD_OK;
     }
 
+    eXRSeatHead xrSeatHeadCheckDeliberate(const SXRPose& head) {
+        return xrSeatHeadCheck(head, std::numeric_limits<float>::infinity());
+    }
+
     const char* xrSeatHeadName(eXRSeatHead v) {
         switch (v) {
             case XR_SEATHEAD_OK: return "ok";

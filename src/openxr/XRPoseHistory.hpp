@@ -265,8 +265,9 @@ namespace OpenXR {
     // it plants it metres up or down — so the head itself is vetted first. Non-finite is a broken
     // locate; a head more than XR_SEAT_HEAD_MAX_HEIGHT from the floor of a floor-based space is not a
     // person (a diverged 6DoF tracker, a runtime that lost its floor); a head that is not upright
-    // (xrHeadUpright) has no trustworthy yaw and is mid-take-off or parked on a forehead. A refused
-    // GROUP re-seat is dropped with a WARN; a refused RESTORE stays armed for the next sane frame.
+    // (xrHeadUpright) has no trustworthy yaw and is mid-take-off or parked on a forehead. The full
+    // check gates everything AUTOMATIC: the don-time RESTORE (stays armed for the next sane frame) and
+    // the memory capture.
     enum eXRSeatHead : uint8_t {
         XR_SEATHEAD_OK = 0,
         XR_SEATHEAD_NONFINITE,
@@ -276,6 +277,11 @@ namespace OpenXR {
     constexpr float XR_SEAT_HEAD_MAX_HEIGHT = 3.F; // m, |y| in LOCAL_FLOOR
     eXRSeatHead     xrSeatHeadCheck(const SXRPose& head, float maxHeight = XR_SEAT_HEAD_MAX_HEIGHT);
     const char*     xrSeatHeadName(eXRSeatHead v);
+    // The DELIBERATE re-seat's check (`xrmonitor reseat`, SUPER+CTRL+Home): the user is asking, and
+    // a floor estimate that has drifted metres off is exactly what that keypress repairs (2026-10-15:
+    // eye at y = -3.16), so height is not a reason to refuse it — only a broken locate or a head that
+    // is not upright is. Callers WARN when the head is beyond XR_SEAT_HEAD_MAX_HEIGHT anyway.
+    eXRSeatHead xrSeatHeadCheckDeliberate(const SXRPose& head);
     // §6.2: a sample's yaw vote. dt is clamped to XR_HIST_MAX_DT_NS; weight = dt_s / (1 + ω/ω₀).
     constexpr float XR_STILL_OMEGA0 = 6.F * 3.14159265F / 180.F; // rad/s
     float           xrStillnessWeight(int64_t dtNs, float angSpeed);

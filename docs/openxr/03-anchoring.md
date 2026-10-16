@@ -881,13 +881,18 @@ remember the drift. `m_seatEye` is latched by every re-seat, cleared at every di
 reference-space change. Under `placement_memory = intent` the dwell seat's mean eye position plays this
 role (research/30 §6.2). A deliberate change of posture is what the re-seat key is for.
 
-**Nonsense heads are refused** (`xrSeatHeadCheck`, `XRPoseHistory.hpp`): non-finite, more than
-`XR_SEAT_HEAD_MAX_HEIGHT` (3 m) from the floor, or not upright (`xrHeadUpright`). The verb answers with
-the reason (`the head is implausibly far from the floor (eye [...]) — not re-seating to it`); the frame
-thread re-checks its own pose, drops a refused `GROUP` with a WARN, and keeps a refused `RESTORE`
-armed (one WARN per deferral) so it runs on the first plausible frame. Note this means the reported
-session itself (eye at −3.16 m) would be refused rather than repaired — planting the room relative to a
-tracker that has lost the floor by three metres only moves the problem to the moment it recovers.
+**Nonsense heads.** `xrSeatHeadCheck` (`XRPoseHistory.hpp`) rejects a head that is non-finite, more
+than `XR_SEAT_HEAD_MAX_HEIGHT` (3 m) from the floor, or not upright (`xrHeadUpright`). That full check
+gates everything **automatic**: a refused `RESTORE` stays armed (one WARN per deferral) and runs on the
+first plausible frame, and the §8.3 capture measures nothing against such a head.
+
+The **deliberate** re-seat uses `xrSeatHeadCheckDeliberate` — only non-finite or not-upright refuses
+it. The keypress is the user's own request, and a floor estimate metres off (the reported session's eye
+read −3.16 m) is exactly what it repairs: the group is planted around the eyes the runtime reports,
+with a WARN (`… re-seating anyway: deliberate`) and a warning in the verb's reply. `m_seatEye` is
+latched from that head like any re-seat, and the planted offsets are committed as the memory
+(`RESEAT_DONE`), so the memory stays consistent while the capture is gated off. A refusal answers with
+the reason (`the head is not upright (eye [...]) — not re-seating to it`).
 
 **LOCAL fallback** (no `XR_EXT_local_floor`): the head at the LOCAL origin reads `openxr:floor_offset`
 (default 1.5 m), so a declared rig now lands 0.1 m lower relative to the eyes than before unless
