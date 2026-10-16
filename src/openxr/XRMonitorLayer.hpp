@@ -21,6 +21,7 @@
 #include "XRMonitorConfig.hpp" // SXRMonitorParams / OpenXR::SXRAnchorSpec (unguarded)
 #include "XRRule.hpp"          // SXREffects / SXRResolvedEffects / SXRFxEnv (unguarded)
 #include "XRDonDoff.hpp"       // research/30: SXRRestoreProvenance (pure, unguarded)
+#include "XRSurfaces.hpp"      // research/32: SXRSurfaceAttach (pure, unguarded)
 #include "XRViewpointTransport.hpp"
 #include "XRViewpointEligibility.hpp"
 #include "../helpers/memory/Memory.hpp"
@@ -304,6 +305,16 @@ class CXRMonitorLayer {
     // since a gaze ray has no cursor of its own for pre-grab selection.
     std::atomic<bool>    m_gazeSelected{false};
     std::atomic<bool>    m_gazeCarried{false};
+
+    // ---- surfaces (research/32 C2) ----
+    // m_surfaceAttach: the plane this window was snapped onto, and its pose RELATIVE to that plane,
+    // so a refined plane carries it along and a vanished one leaves it where it is. POD, guarded by
+    // COpenXRManager::m_layersMu; written by the frame thread's surface pass (and re-expressed across
+    // a reference-space change), read by the main thread for status.
+    OpenXR::SXRSurfaceAttach m_surfaceAttach;
+    // frame -> main (status): this window is being shown snapped right now (a preview), on which plane
+    std::atomic<bool>     m_surfacePreview{false};
+    std::atomic<uint64_t> m_surfacePreviewPlane{0};
     // Gaze cursor: one packed word (OpenXR::xrPackCursor) for the gaze point on the CARRIED quad,
     // written by gazeSelectPass and drawn by drawCursor over content + chrome (distinct color). Same
     // one-frame-latency contract; m_gazeCursorDrawn is the redraw-diff of what was last drawn.

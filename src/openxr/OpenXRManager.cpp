@@ -123,6 +123,10 @@ COpenXRManager::~COpenXRManager() {
     if (m_l2dTimer && g_pEventLoopManager)
         g_pEventLoopManager->removeTimer(m_l2dTimer);
     m_l2dTimer.reset();
+    // ...and for the surfaces plane poll (research/32).
+    if (m_surfaceTimer && g_pEventLoopManager)
+        g_pEventLoopManager->removeTimer(m_surfaceTimer);
+    m_surfaceTimer.reset();
 }
 
 void COpenXRManager::init() {
@@ -396,6 +400,7 @@ void COpenXRManager::start() {
     publishCursorCrossingMode(); // task #139: seed openxr:cursor_crossing (raycast | layout)
     publishStereoPairTuning(); // WP X1: seed the stereo kill switch before any layer publishes a declaration
     publishDepthDesktopTuning(); // WP X3: seed the depth desktop (packs each XR monitor's mode)
+    publishSurfaceTuning();      // research/32: seed openxr:surfaces* (sources, tuning) before the frame thread
 
     // Concurrency guard for the off-main handshake below. A previously-in-flight OR abandoned handshake
     // worker may still be blocked in xrCreateInstance against a wedged runtime, or an abandoned bring-up
@@ -461,6 +466,10 @@ void COpenXRManager::start() {
         sess->m_overlayRequested = (*POVERLAY != 0);
         sess->m_overlayZ         = (uint32_t)std::max<int64_t>(0, (int64_t)*POVERLAYZ);
     }
+    // research/32 C1: XR_EXT_plane_detection is requested only for a user who opted into surfaces
+    // (read at session start like the overlay: toggling detection needs a session restart; the
+    // synthetic planes do not).
+    sess->m_planeDetectionRequested = m_surfacesEnabled && m_surfacesDetect;
 
     // Task #89 phase 2 blocker B: kick the runtime FIRST-CONTACT handshake (xrCreateInstance +
     // xrGetSystem) FULLY off the main thread and return immediately. beginHandshake() spawns a detached
@@ -912,6 +921,9 @@ void COpenXRManager::continueBringup(CXRSession* sess) {
 
     // Register the synthetic ray pointer (doc 04 §8), honoring openxr:pointer.
     ensurePointerDevice();
+
+    // research/32: the session's runtime plane source (XR_EXT_plane_detection, when it can run)
+    surfacesSessionUp();
 }
 
 void COpenXRManager::abortStart() {
@@ -1177,6 +1189,8 @@ void COpenXRManager::stop() {
     //    wedged runtime. xrDestroyInstance (in CXRSession::destroy) reaps all child handles.
     for (auto& l : m_layers)
         l->destroySwapchain(/*skipXrCall=*/lost);
+    // research/32: the plane detector is a session child — release it before the session
+    surfacesSessionDown(lost);
     if (m_input) {
         m_input->destroy(/*runtimeLost=*/lost); // action spaces are session children — destroy before the session
         m_input.reset();
@@ -1391,6 +1405,10 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
             // research/30 Phase 2: the don settle decided; the frame thread already acted on it
             onDonHydrated(sc<uint32_t>(e.a));
             break;
+        case eXRStateEventType::SURFACE_SNAP:
+            // research/32 C2: a release landed a window on a surface; the frame thread already placed it
+            onSurfaceSnapped(e);
+            break;
         case eXRStateEventType::RECENTERED: {
             // doc 03 §8.4: the runtime moved LOCAL_FLOOR and openxr:recenter = follow, so the user's
             // recenter button means "bring my monitors to me". Re-check the policy HERE (the frame
@@ -1543,6 +1561,8 @@ void COpenXRManager::applyReferenceSpaceChange(const OpenXR::SXRPose& m) {
         // the eyes the arrangement was placed for are a point in the same space (doc 03 §8.4)
         if (m_seatEyeValid)
             m_seatEye = OpenXR::poseCompose(OpenXR::poseInverse(m), OpenXR::SXRPose{m_seatEye, OpenXR::Quat{}}).pos;
+        // research/32: the planes and every plane-relative attachment's last placed pose, the same way
+        surfaceReexpress(m);
     }
     // research/30 §5.5: a KNOWN bridge — a seat measured before this can be re-expressed by M
     bumpOriginGen(OpenXR::XR_BRIDGE_KNOWN, OpenXR::XR_GENC_RECENTER_KNOWN, m);
@@ -1588,6 +1608,10 @@ void COpenXRManager::frameThread() {
     // token the previous session left published must not hide anything in this one
     m_donFrame           = SXRDonFrame{};
     m_donFrame.seenToken = m_donGateToken.load(std::memory_order_acquire);
+    // research/32: the frame copy of the planes starts empty with every session; the first poll of
+    // this one publishes afresh (and the tuning is re-read on the first frame)
+    m_planesFrame    = OpenXR::SXRPlaneSnapshot{};
+    m_planesFrameGen = 0;
     m_posTrackedSeen.store(false, std::memory_order_relaxed);
 
     while (m_running.load()) {
@@ -1766,6 +1790,8 @@ void COpenXRManager::frameThread() {
             continue;
         }
         frameFailStreak = 0; // a clean wait+begin clears the streak
+        // research/32: the main thread's plane poll locates against "now"
+        m_lastDisplayTime.store(fs.predictedDisplayTime, std::memory_order_release);
 
         // Sample controller/hand actions once per frame (doc 04 §2): xrSyncActions + per-hand
         // aim/grip pose + analog reads at the predicted display time, located in the reference
@@ -2915,6 +2941,12 @@ void COpenXRManager::frameThread() {
                 }
             }
         }
+
+        // research/32 C2: surfaces — collect this frame's snaps, (re-)arm carried windows against the
+        // planes, and move plane-relative windows with a refined plane. After processPointer/gaze so a
+        // release this frame is already decided, before the viewpoint publish so a snapped window's
+        // geometry is current. Takes m_layersMu itself.
+        surfaceFramePass(active, results, solved, viewPose, viewValid, m_session->m_usingLocalFloor ? 0.F : floorOffset);
 
         // Publish surface-relative eye geometry only after input/gaze processing. A grab or carry
         // can begin in that pass; checking afterward prevents one last stable-looking sample from
@@ -4751,6 +4783,8 @@ void COpenXRManager::handleFrameDiscontinuity(const std::string& why) {
     invalidateAnchorFrames(why.c_str());
     // research/30 §5.5: nothing bridges this one
     bumpOriginGen(OpenXR::XR_BRIDGE_UNKNOWN, OpenXR::XR_GENC_DISCONTINUITY, OpenXR::SXRPose{});
+    // research/32: and the planes describe nowhere now either
+    surfaceDiscontinuity();
 
     static auto PRECENTER = CConfigValue<Hyprlang::INT>("openxr:recenter_on_plug");
     const bool  follow    = m_recenterPolicy.load(std::memory_order_relaxed) == OpenXR::XR_RECENTER_FOLLOW;
@@ -4992,6 +5026,8 @@ void COpenXRManager::onConfigReload(bool forceProbe) {
     // WP X1: re-resolve each monitor's stereo declaration (a windowrule change moves it) and apply
     // openxr:stereo_quad_pair immediately rather than at the next repaint.
     publishStereoPairTuning();
+    // research/32: re-parse openxr:surfaces* — the synthetic planes and the snap tuning apply live
+    publishSurfaceTuning();
 
     // research/24 WP X3: openxr:depth_desktop decides whether each XR monitor scans out a per-eye
     // PAIR of panes. Unlike its neighbours this changes the output's MODE, so it re-registers the
@@ -6419,6 +6455,12 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
             default: info.grabKind = "none"; break;
         }
         info.hovered                     = l->m_hovered;          // WP7
+        // research/32: the surface it rests on (plane-relative), and a live snap preview
+        info.surfaceAttached             = l->m_surfaceAttach.valid;
+        info.surfacePlaneLost            = l->m_surfaceAttach.planeLost;
+        info.surfacePlane                = l->m_surfaceAttach.planeId;
+        info.surfaceKind                 = OpenXR::xrSnapKindName(l->m_surfaceAttach.valid ? l->m_surfaceAttach.kind : OpenXR::XR_SNAP_NONE);
+        info.surfacePreview              = l->m_surfacePreview.load(std::memory_order_relaxed);
         info.region                      = OpenXR::xrRegionName((OpenXR::eXRQuadRegion)l->m_hoverRegion.load(std::memory_order_relaxed)); // report 14
         info.contentPath                 = OpenXR::xrContentPathName(l->m_contentPath.load(std::memory_order_relaxed)); // WP-L2
         // Cross-session restore (doc 03 §8.3): answers "will this monitor come back where I left it".

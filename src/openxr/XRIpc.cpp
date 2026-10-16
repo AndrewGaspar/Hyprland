@@ -9,8 +9,45 @@
 #include "OpenXRManager.hpp"
 #include "../debug/HyprCtl.hpp"
 #include "../SharedDefs.hpp"
+#include "../helpers/MiscFunctions.hpp" // escapeJSONStrings
 
 using namespace Hyprutils::String;
+
+// research/32: the `surfaces` object of the JSON status — the sources, every plane (solver frame:
+// LOCAL_FLOOR metres, normal = the plane's +Z, vertices plane-local) and the last snap.
+static std::string surfacesJson(const COpenXRManager::SXRSurfaceStatus& s) {
+    std::string planes;
+    for (size_t i = 0; i < s.planes.size(); ++i) {
+        const auto& p = s.planes[i];
+        const auto  n = OpenXR::xrPlaneNormal(p);
+        std::string verts;
+        for (size_t v = 0; v < p.nPoly; ++v)
+            verts += std::format("{}[{:.3f}, {:.3f}]", v ? ", " : "", p.poly[v].x, p.poly[v].y);
+        planes += std::format(R"#({}
+            {{ "id": "{:#x}", "label": "{}", "orientation": "{}", "source": "{}", "generation": {}, "pos": [{:.3f}, {:.3f}, {:.3f}], "quat": [{:.4f}, {:.4f}, {:.4f}, {:.4f}],
+               "normal": [{:.3f}, {:.3f}, {:.3f}], "extents": [{:.3f}, {:.3f}], "polygon": [{}] }})#",
+                              i ? "," : "", p.id, OpenXR::xrPlaneLabelName(p.label), OpenXR::xrPlaneOrientName(p.orient), OpenXR::xrPlaneSourceName(p.source), p.generation,
+                              p.pose.pos.x, p.pose.pos.y, p.pose.pos.z, p.pose.rot.x, p.pose.rot.y, p.pose.rot.z, p.pose.rot.w, n.x, n.y, n.z, p.extentX, p.extentY, verts);
+    }
+    return std::format(R"#({{ "enabled": {}, "runtime": "{}", "synthetic": "{}",
+        "planes": [{}],
+        "lastSnap": {{ "valid": {}, "monitor": "{}", "planeId": "{:#x}", "label": "{}", "kind": "{}", "contact": [{:.3f}, {:.3f}, {:.3f}], "pos": [{:.3f}, {:.3f}, {:.3f}], "ageMs": {} }} }})#",
+                       s.enabled ? "true" : "false", escapeJSONStrings(s.runtime), escapeJSONStrings(s.synthetic), planes, s.haveSnap ? "true" : "false",
+                       escapeJSONStrings(s.snapMonitor), s.snapPlane, s.snapLabel, s.snapKind, s.snapContact.x, s.snapContact.y, s.snapContact.z, s.snapPos.x, s.snapPos.y,
+                       s.snapPos.z, s.snapAgeMs);
+}
+
+// research/32: the text form — one line for the feature, one per plane.
+static std::string surfacesText(const COpenXRManager::SXRSurfaceStatus& s) {
+    std::string out =
+        std::format("surfaces: on — runtime {}, synthetic {}, {} plane(s){}\n", s.runtime, s.synthetic, s.planes.size(),
+                    s.haveSnap ? std::format("; last snap: {} {} on {} {:#x} {}s ago", s.snapMonitor, s.snapKind, s.snapLabel, s.snapPlane, s.snapAgeMs / 1000) : std::string{});
+    for (const auto& p : s.planes)
+        out += std::format("  plane {:#x}: {} ({}, {}) at [{:.2f}, {:.2f}, {:.2f}] {:.2f}x{:.2f}m{}\n", p.id, OpenXR::xrPlaneLabelName(p.label),
+                           OpenXR::xrPlaneOrientName(p.orient), OpenXR::xrPlaneSourceName(p.source), p.pose.pos.x, p.pose.pos.y, p.pose.pos.z, p.extentX, p.extentY,
+                           p.nPoly ? std::format(", {}-gon", p.nPoly) : std::string{});
+    return out;
+}
 
 // hyprctl openxr status  (default when no subcommand). The bar-pollable surface (doc 05 §4.3).
 // research/30 §12.2: the `donoff` object of the JSON status.
@@ -114,6 +151,8 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
     const auto        WORLD = g_pOpenXRManager->worldFrameStatus();
     // research/30 §12.2: the don/doff FSM, the last doff's seat verdict (or its shadow), the dwell.
     const auto        DONOFF    = g_pOpenXRManager->donoffStatus();
+    // research/32: the surfaces feature — sources, planes, the last snap.
+    const auto        SURF      = g_pOpenXRManager->surfaceStatus();
     auto              handLabel = [](const COpenXRManager::SXRHandInputInfo& hi) -> std::string {
         if (!hi.hands)
             return "controllers";
@@ -124,8 +163,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
         std::string mons;
         for (size_t i = 0; i < MONS.size(); ++i) {
             const auto& m = MONS[i];
-            mons +=
-                std::format(R"#(        {{
+            mons += std::format(R"#(        {{
             "name": "{}",
             "id": {},
             "size_m": {:.2f},
@@ -174,6 +212,13 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
                 "azDeg": {:.2f},
                 "elDeg": {:.2f}
             }},
+            "surface": {{
+                "attached": {},
+                "planeId": "{:#x}",
+                "kind": "{}",
+                "planeLost": {},
+                "preview": {}
+            }},
             "transparency": {{
                 "alpha": {:.3f},
                 "alphaTarget": {:.3f},
@@ -186,12 +231,14 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
                 "transitioning": {}
             }}
         }})#",
-                            m.name, m.id, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.quatX, m.quatY, m.quatZ, m.quatW, m.grabbed ? "true" : "false", m.grabKind,
-                            m.hovered ? "true" : "false", m.region, m.plugged ? "true" : "false", m.contentPath, m.linear ? "true" : "false", m.stereo, m.producer,
-                            m.chrome ? "true" : "false", m.quads, m.adaptiveEnabled ? "true" : "false", m.adaptivePhase, m.adaptiveRoamMode, m.adaptiveSeatDist, m.adaptiveT,
-                            m.anchorState, m.restorable ? "true" : "false", m.restoreX, m.restoreY, m.restoreZ, m.staged ? "true" : "false", m.stagedX, m.stagedY, m.stagedZ,
-                            m.commit, m.provenance, m.provenanceAgeS, m.provenanceSeatS, m.l2dSource, m.l2dCol, m.l2dRow, m.l2dX, m.l2dY, m.l2dAzDeg, m.l2dElDeg, m.fxAlpha,
-                            m.fxAlphaTarget, m.fxAlphaSrc, m.fxBlackAlpha, m.fxBlackAlphaTarget, m.fxBlackAlphaSrc, m.fxKnee, m.fxKneeSrc, m.fxTransitioning ? "true" : "false");
+                                m.name, m.id, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.quatX, m.quatY, m.quatZ, m.quatW, m.grabbed ? "true" : "false", m.grabKind,
+                                m.hovered ? "true" : "false", m.region, m.plugged ? "true" : "false", m.contentPath, m.linear ? "true" : "false", m.stereo, m.producer,
+                                m.chrome ? "true" : "false", m.quads, m.adaptiveEnabled ? "true" : "false", m.adaptivePhase, m.adaptiveRoamMode, m.adaptiveSeatDist, m.adaptiveT,
+                                m.anchorState, m.restorable ? "true" : "false", m.restoreX, m.restoreY, m.restoreZ, m.staged ? "true" : "false", m.stagedX, m.stagedY, m.stagedZ,
+                                m.commit, m.provenance, m.provenanceAgeS, m.provenanceSeatS, m.l2dSource, m.l2dCol, m.l2dRow, m.l2dX, m.l2dY, m.l2dAzDeg, m.l2dElDeg,
+                                m.surfaceAttached ? "true" : "false", m.surfacePlane, m.surfaceKind, m.surfacePlaneLost ? "true" : "false", m.surfacePreview ? "true" : "false",
+                                m.fxAlpha, m.fxAlphaTarget, m.fxAlphaSrc, m.fxBlackAlpha, m.fxBlackAlphaTarget, m.fxBlackAlphaSrc, m.fxKnee, m.fxKneeSrc,
+                                m.fxTransitioning ? "true" : "false");
             if (i + 1 < MONS.size())
                 mons += ",\n";
             else
@@ -235,6 +282,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
         "placed": {}, "rows": {}, "blockWidth": {}, "blockHeight": {},
         "vertical": "{}", "attach": "{}", "pxPerDegree": {:.1f}
     }},
+    "surfaces": {},
     "monitors": [{}{}]
 }}
 )#",
@@ -246,7 +294,8 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
                            HANDIN.state, GAZE.source, GAZE.hoveredMonitor, GAZE.hoveredName, GAZE.carrying ? "true" : "false", GAZE.carryMonitor, GAZE.dist,
                            HANDS[0].hands ? "hands" : "controllers", HANDS[0].gesture, HANDS[0].filtered ? "true" : "false", HANDS[1].hands ? "hands" : "controllers",
                            HANDS[1].gesture, HANDS[1].filtered ? "true" : "false", L2D.enabled ? "true" : "false", L2D.frozen ? "true" : "false", L2D.refValid ? "true" : "false",
-                           L2D.refYawDeg, L2D.placed, L2D.rows, L2D.width, L2D.height, L2D.vertical, L2D.attach, L2D.pxPerDegree, MONS.empty() ? "" : "\n", mons);
+                           L2D.refYawDeg, L2D.placed, L2D.rows, L2D.width, L2D.height, L2D.vertical, L2D.attach, L2D.pxPerDegree, surfacesJson(SURF), MONS.empty() ? "" : "\n",
+                           mons);
     }
 
     const std::string FOLLOWLINE = UNPLUG_PEND >= 0 ? std::format("{} (unplug in {}ms)", FOLLOW, UNPLUG_PEND) : FOLLOW;
@@ -316,12 +365,20 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
                                             std::string{});
     // doc 05 §3.3: the HMD every `when` is matched against (sticky across session end).
     out += std::format("hmd context: {}\n", OpenXR::describeXRSystemContext(g_pOpenXRManager->xrSystemContext()));
+    // research/32: only when the feature is on, so an opted-out session's status is unchanged.
+    if (SURF.enabled)
+        out += surfacesText(SURF);
     for (const auto& m : MONS) {
         out += std::format("monitor {} (ID {}): {}x{}@{:.2f} size {:.2f}m anchor {} pos [{:.2f}, {:.2f}, {:.2f}] grabbed: {} ({}) hovered: {} ({}) plugged: {} content: {}{}", m.name,
                            m.id, m.w, m.h, m.refresh, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.grabbed ? "yes" : "no", m.grabKind, m.hovered ? "yes" : "no", m.region,
                            m.plugged ? "yes" : "no", m.contentPath, m.linear ? " (linear)" : "");
         if (m.adaptiveEnabled)
             out += std::format(" adaptive: {} (roam {}, seat {:.2f}m)", m.adaptivePhase, m.adaptiveRoamMode, m.adaptiveSeatDist);
+        // research/32: only mentioned when it rests on a surface or is being shown snapped
+        if (m.surfaceAttached)
+            out += std::format(" surface: {} on {:#x}{}", m.surfaceKind, m.surfacePlane, m.surfacePlaneLost ? " (plane lost, holding)" : "");
+        else if (m.surfacePreview)
+            out += " surface: previewing";
         // WP X1: only mentioned when a monitor is actually in stereo, so a mono session's status is
         // byte-identical to before. `quads` alongside it is the tell for a pair the budget refused.
         if (m.stereo != "off")

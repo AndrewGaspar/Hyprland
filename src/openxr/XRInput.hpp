@@ -71,6 +71,8 @@ enum class eXRStateEventType : uint8_t {
                      // the planted offsets (CXRMonitorLayer::m_reseatPlanted) as the new memory
     DON_HYDRATED,    // research/30 Phase 2: the don settle decided (a = the gate token); the details
                      // are in COpenXRManager::m_donHyd (POD under m_donHydMu)
+    SURFACE_SNAP,    // research/32 C2: a released window was snapped onto a surface (str = monitor name,
+                     // a = OpenXR::eXRSnapKind); details in COpenXRManager::m_surfaceSnapRec
 };
 
 struct SXRStateEvent {
