@@ -7686,8 +7686,10 @@ std::expected<void, std::string> COpenXRManager::cmdGazeGrab(const std::string& 
             in.gripLeft  = ctx.gripLeft;
             in.gripRight = ctx.gripRight;
             std::scoped_lock lock(m_layersMu);
-            if (layer->m_anchor.gazeGrabbed())
+            if (layer->m_anchor.gazeGrabbed()) {
+                surfaceLogGazeRelease(*layer);
                 layer->m_anchor.endGazeGrab(in, tune);
+            }
         }
         return {};
     }
@@ -7714,8 +7716,10 @@ std::expected<void, std::string> COpenXRManager::cmdGazeRelease() {
         in.gripLeft  = ctx.gripLeft;
         in.gripRight = ctx.gripRight;
         std::scoped_lock lock(m_layersMu);
-        if (layer->m_anchor.gazeGrabbed())
+        if (layer->m_anchor.gazeGrabbed()) {
+            surfaceLogGazeRelease(*layer);
             layer->m_anchor.endGazeGrab(in, tune);
+        }
     }
     return {};
 }

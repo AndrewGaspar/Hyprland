@@ -209,6 +209,16 @@ binds never landed it. The log shows why, in two parts:
   + margin + bar) is ~0.59 m under its centre, so it hung 0.27 m under the table top at rest. When the
   carry did start, it previewed at once (bottom edge 0.134 m under the top) and dropped the preview
   half a second later — most likely as the bottom edge passed −0.25 m (the log had no numbers to
-  say), with the window still visibly standing in the table. Fix: deeper
-  penetration counts while the content centre is above the surface, and when the window is over two
-  qualifying horizontal surfaces the higher wins even over the plane the gaze ray hits (the ray runs through the window centre and on past the table edge to the floor behind it; the floor under a table is under the table).
+  say), with the window still visibly standing in the table. Fix: deeper penetration counts while
+  the content centre is above the surface, and when the window is over two qualifying horizontal
+  surfaces the higher wins, even over the plane the gaze ray hits (the ray runs through the window
+  centre and on past the table's edge to the floor behind it; the floor under a table is under the
+  table).
+
+So the next live failure is readable from `hyprland.log`, a **carry trace** (Log::DEBUG, `surfaces
+trace:`) records, every 500 ms while a window is carried, on every preview edge and on every nudge,
+the window (content pose, half-width, bottom extent, head) and the six planes nearest its bottom
+edge: label, orientation, height, lowest-corner and centre height above it, over it or not, and the
+verdict (`too far above`, `too deep through`, `not over it`, …). The frame thread writes POD records
+into a 4-slot ring; the main thread formats them from the poll timer and before a gaze release,
+which logs what it re-decides against.

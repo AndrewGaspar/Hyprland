@@ -118,6 +118,7 @@ void COpenXRManager::publishPlanes(const OpenXR::SXRPlaneSnapshot& s, uint32_t e
 }
 
 void COpenXRManager::onSurfacePoll() {
+    surfaceTraceDrain();
     if (!m_surfacesEnabled || !m_running.load() || !m_session || !m_surfaceSources) {
         cancelSurfaceTimer();
         return;
@@ -219,7 +220,99 @@ COpenXRManager::SXRSurfaceStatus COpenXRManager::surfaceStatus() {
     return st;
 }
 
+void COpenXRManager::surfaceTraceDrain() {
+    std::array<SXRSurfaceTraceRec, 4> recs;
+    size_t                            n    = 0;
+    uint32_t                          lost = 0;
+    {
+        std::scoped_lock lock(m_surfaceTraceMu);
+        n                  = m_surfaceTraceCount;
+        const size_t first = (m_surfaceTraceHead + m_surfaceTrace.size() - n) % m_surfaceTrace.size();
+        for (size_t i = 0; i < n; ++i)
+            recs[i] = m_surfaceTrace[(first + i) % m_surfaceTrace.size()];
+        lost                = m_surfaceTraceLost;
+        m_surfaceTraceCount = 0;
+        m_surfaceTraceLost  = 0;
+    }
+    if (lost)
+        Log::logger->log(Log::DEBUG, "[OPENXR] surfaces trace: {} record(s) dropped before this drain", lost);
+
+    for (size_t r = 0; r < n; ++r) {
+        const auto& rec = recs[r];
+        const auto& q   = rec.query;
+        // The planes nearest the window's bottom first: those are the ones that matter. Clutter and
+        // planes far from it are counted, not listed.
+        std::array<const SXRSurfaceTraceRec::SPlane*, OpenXR::XR_PLANE_MAX> order{};
+        const size_t                                                        np = std::min<size_t>(rec.nPlanes, order.size());
+        for (size_t i = 0; i < np; ++i)
+            order[i] = &rec.planes[i];
+        std::sort(order.begin(), order.begin() + np, [](const auto* a, const auto* b) { return std::fabs(a->diag.lowest) < std::fabs(b->diag.lowest); });
+
+        std::string planes;
+        size_t      listed = 0;
+        for (size_t i = 0; i < np; ++i) {
+            const auto& p = *order[i];
+            if (listed >= 6)
+                break;
+            planes += std::format(" | {:#x} {} {} h{:.2f}: lowest {:+.3f} center {:+.3f} {} -> {}", p.id, OpenXR::xrPlaneLabelName(p.label), OpenXR::xrPlaneOrientName(p.orient),
+                                  p.height, p.diag.lowest, p.diag.centerH, p.diag.contained ? "over" : "not over", OpenXR::xrSurfaceVerdictName(p.verdict));
+            ++listed;
+        }
+        if (np > listed)
+            planes += std::format(" | +{} more", np - listed);
+        const std::string name = rec.monitor.data(); // NUL-terminated: copied with room for it
+        Log::logger->log(Log::DEBUG, "[OPENXR] surfaces trace: {} {} at [{:.2f}, {:.2f}, {:.2f}] halfW {:.2f} bottom {:.2f} head {}[{:.2f}, {:.2f}, {:.2f}]: {} plane(s), {}{}",
+                         name, rec.settle ? "nudged" : "carried", q.content.pos.x, q.content.pos.y, q.content.pos.z, q.halfWidth, q.bottomExt, q.headValid ? "" : "(invalid) ",
+                         q.head.x, q.head.y, q.head.z, rec.nPlanes,
+                         rec.picked ? std::format("snap {:#x}", rec.picked) : (rec.armed ? std::format("armed {:#x}", rec.armed) : std::string("nothing qualifies")), planes);
+    }
+}
+
+void COpenXRManager::surfaceLogGazeRelease(const CXRMonitorLayer& l) {
+    // MAIN, under m_layersMu, just before endGazeGrab: what the release will re-decide against.
+    if (!m_surfacesEnabled)
+        return;
+    surfaceTraceDrain(); // the carry's last records first, so the log reads in order
+    const OpenXR::SXRSurfaceArm& arm = l.m_anchor.surfaceArm();
+    if (!arm.havePlane)
+        Log::logger->log(Log::DEBUG, "[OPENXR] surfaces: gaze release of {} with nothing armed — it stays where it is", l.m_monitorName);
+    else
+        Log::logger->log(Log::DEBUG, "[OPENXR] surfaces: gaze release of {} with {} plane {:#x} {}", l.m_monitorName, OpenXR::xrPlaneLabelName(arm.plane.label), arm.plane.id,
+                         arm.preview ? "previewed" : "armed (not previewed: it must be back within the entry distance)");
+}
+
 // ---- frame thread ----
+
+void COpenXRManager::surfaceTraceRecord(const CXRMonitorLayer& l, const OpenXR::SXRSurfaceQuery& q, bool settle, uint64_t picked, uint64_t armed, uint64_t sticky) {
+    // POD only: the record is filled on the stack and copied into the ring.
+    SXRSurfaceTraceRec rec;
+    std::copy_n(l.m_monitorName.data(), std::min(l.m_monitorName.size(), rec.monitor.size() - 1), rec.monitor.data());
+    rec.settle                          = settle;
+    rec.query                           = q;
+    rec.picked                          = picked;
+    rec.armed                           = armed;
+    const OpenXR::SXRSurfaceTuning& tun = m_surfaceTuningFrame;
+    const size_t                    np  = std::min<size_t>(m_planesFrame.n, m_planesFrame.planes.size());
+    rec.nPlanes                         = sc<uint8_t>(np);
+    for (size_t i = 0; i < np; ++i) {
+        const OpenXR::SXRPlane& p     = m_planesFrame.planes[i];
+        const bool              stick = sticky != 0 && p.id == sticky;
+        auto&                   out   = rec.planes[i];
+        OpenXR::xrSurfaceEvaluate(p, q, tun, stick ? std::max(tun.exitDist, tun.snapDist) : tun.snapDist, &out.diag);
+        out.id      = p.id;
+        out.label   = p.label;
+        out.orient  = p.orient;
+        out.verdict = out.diag.verdict;
+        out.height  = p.pose.pos.y;
+    }
+    std::scoped_lock lock(m_surfaceTraceMu);
+    m_surfaceTrace[m_surfaceTraceHead] = rec;
+    m_surfaceTraceHead                 = (m_surfaceTraceHead + 1) % m_surfaceTrace.size();
+    if (m_surfaceTraceCount < m_surfaceTrace.size())
+        ++m_surfaceTraceCount;
+    else
+        ++m_surfaceTraceLost;
+}
 
 // The window as the snap sees it: `content` (the content pose before any preview), the visible
 // half-width and the distance from the content center down to the visible bottom edge (content
@@ -281,7 +374,12 @@ void COpenXRManager::surfaceFramePass(const std::vector<PXRLAYER>& active, const
     const OpenXR::SXRPlane*         planes  = m_planesFrame.planes.data();
     const size_t                    nPlanes = std::min<size_t>(m_planesFrame.n, m_planesFrame.planes.size());
 
-    std::scoped_lock                lock(m_layersMu);
+    // the carry trace's rate limit: one record per carried window per XR_SURFACE_TRACE_MS
+    const int64_t    nowMs    = Time::millis(Time::steadyNow());
+    const bool       traceDue = nowMs - m_surfaceTraceLastMs >= XR_SURFACE_TRACE_MS;
+    bool             traced   = false;
+
+    std::scoped_lock lock(m_layersMu);
     for (size_t i = 0; i < active.size(); ++i) {
         CXRMonitorLayer&   l = *active[i];
         OpenXR::CXRAnchor& a = l.m_anchor;
@@ -291,7 +389,9 @@ void COpenXRManager::surfaceFramePass(const std::vector<PXRLAYER>& active, const
         if (a.takeSurfaceSettle() && on && solved[i] && !a.grabbed() && !a.gazeGrabbed() && a.state().mode == OpenXR::XR_ANCHOR_LOCAL &&
             (!a.adaptiveEnabled() || a.adaptivePhase() == OpenXR::XRAD_DOCKED)) {
             const OpenXR::SXRSurfaceQuery q = surfaceQueryFor(l, results[i], a.state().anchorPose, view, viewValid);
-            if (const auto c = OpenXR::xrSurfacePick(planes, nPlanes, q, tun, 0); c.ok)
+            const auto                    c = OpenXR::xrSurfacePick(planes, nPlanes, q, tun, 0);
+            surfaceTraceRecord(l, q, true, c.ok ? c.planeId : 0, 0, 0); // every nudge: they are discrete
+            if (c.ok)
                 a.surfaceSettleAt(c);
         }
 
@@ -409,6 +509,10 @@ void COpenXRManager::surfaceFramePass(const std::vector<PXRLAYER>& active, const
             }
         }
         a.setSurfaceArm(arm);
+        if (traceDue || arm.preview != wasPrev) { // ...and always on a preview edge: the why of an exit
+            surfaceTraceRecord(l, q, false, c.ok ? arm.plane.id : 0, !c.ok && arm.havePlane ? arm.plane.id : 0, sticky);
+            traced = true;
+        }
 
         if (arm.preview != wasPrev || (arm.preview && l.m_surfacePreviewPlane.load(std::memory_order_relaxed) != arm.plane.id)) {
             if (arm.preview)
@@ -420,6 +524,8 @@ void COpenXRManager::surfaceFramePass(const std::vector<PXRLAYER>& active, const
         l.m_surfacePreview.store(arm.preview, std::memory_order_relaxed);
         l.m_surfacePreviewPlane.store(arm.preview ? arm.plane.id : 0, std::memory_order_relaxed);
     }
+    if (traced)
+        m_surfaceTraceLastMs = nowMs;
 }
 
 #endif // HAVE_OPENXR
