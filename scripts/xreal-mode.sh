@@ -115,6 +115,14 @@
 #
 # Exit codes: 0 ok/started · 2 usage · 69 glasses asleep · 75 already in flight
 
+# REPO MIRROR. The canonical copy is bin/xreal-mode in the user's Hyprland
+# dotfiles (github.com/AndrewGaspar/omarchy-hyprland-config, installed as
+# ~/.config/hypr/bin/xreal-mode); this file is that script verbatim (as of
+# dotfiles 530b4f9) plus this note, with scripts/lib/hypr-config.sh mirrored
+# beside it. Change the canonical copy first, then re-sync this one. It
+# replaces the old WP-XR1 toggle (window-mode SBS default, --mono, classic
+# `hyprctl dispatch dpms`, which is a Lua syntax error under the Lua config).
+
 set -uo pipefail
 
 self_dir="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)"
