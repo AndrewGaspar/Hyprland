@@ -115,14 +115,6 @@
 #
 # Exit codes: 0 ok/started · 2 usage · 69 glasses asleep · 75 already in flight
 
-# REPO MIRROR. The canonical copy is bin/xreal-mode in the user's Hyprland
-# dotfiles (github.com/AndrewGaspar/omarchy-hyprland-config, installed as
-# ~/.config/hypr/bin/xreal-mode); this file is that script verbatim (as of
-# dotfiles ed90a50) plus this note, with scripts/lib/hypr-config.sh mirrored
-# beside it. Change the canonical copy first, then re-sync this one. It
-# replaces the old WP-XR1 toggle (window-mode SBS default, --mono, classic
-# `hyprctl dispatch dpms`, which is a Lua syntax error under the Lua config).
-
 set -uo pipefail
 
 self_dir="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)"
@@ -173,8 +165,33 @@ for _r in "${HYPXRLAND_REPO:-}" "$HOME/code/Hyprland" "$HOME/code/hypxrland"; do
     [[ -n $_r && -d $_r/subprojects/monado ]] && { REPO="$_r"; break; }
 done
 REPO="${REPO:-$HOME/code/Hyprland}"
+_explicit_build="${MONADO_XREAL_BUILD:-}"
 MONADO_XREAL_BUILD="${MONADO_XREAL_BUILD:-$REPO/subprojects/monado/build-xreal}"
-RUNTIME_JSON="${XREAL_RUNTIME_JSON:-$MONADO_XREAL_BUILD/openxr_monado-dev.json}"
+
+# Which xreal Monado runtime the clients load. The manifest has to match the
+# monado-service the unit actually runs, so:
+#   XREAL_RUNTIME_JSON / MONADO_XREAL_BUILD set  -> exactly that
+#   the unit is the packaged one (/usr/lib/...)  -> the monado-xreal package's manifest
+#   a source build in the checkout               -> that build
+#   otherwise                                    -> the package's manifest, if installed
+# The package is Omedora's COPR monado-xreal; its unit runs
+# /usr/libexec/monado-xreal/monado-service, so pairing it with a checkout build's
+# manifest would mix two Monado versions over IPC.
+PKG_RUNTIME_JSON="${XREAL_PKG_RUNTIME_JSON:-/usr/share/openxr/1/openxr_monado-xreal.json}"
+BUILD_RUNTIME_JSON="$MONADO_XREAL_BUILD/openxr_monado-dev.json"
+_unit_path="$(systemctl --user show -P FragmentPath "$XR_UNIT" 2>/dev/null || true)"
+if [[ -n ${XREAL_RUNTIME_JSON:-} ]]; then
+    RUNTIME_JSON="$XREAL_RUNTIME_JSON"
+elif [[ -n $_explicit_build ]]; then
+    RUNTIME_JSON="$BUILD_RUNTIME_JSON"
+elif [[ $_unit_path == /usr/* && -f $PKG_RUNTIME_JSON ]]; then
+    RUNTIME_JSON="$PKG_RUNTIME_JSON"
+elif [[ -f $BUILD_RUNTIME_JSON || ! -f $PKG_RUNTIME_JSON ]]; then
+    RUNTIME_JSON="$BUILD_RUNTIME_JSON"
+else
+    RUNTIME_JSON="$PKG_RUNTIME_JSON"
+fi
+unset _explicit_build _unit_path
 
 # xreal-ctl: PATH first (it may be installed to /usr/local/bin), then the repo.
 XREAL_CTL="${XREAL_CTL:-}"
@@ -1241,7 +1258,7 @@ cmd_xr() {
     fi
     if [[ ! -f $RUNTIME_JSON ]]; then
         err "the xreal Monado runtime manifest is missing: $RUNTIME_JSON"
-        err "build it with: $REPO/scripts/build-monado.sh --xreal"
+        err "install the monado-xreal package, or build it from source with: $REPO/scripts/build-monado.sh --xreal"
         return 1
     fi
     if [[ -n $XREAL_CTL && $DRY_RUN -eq 0 ]] && ! "$XREAL_CTL" detect >/dev/null 2>&1; then
