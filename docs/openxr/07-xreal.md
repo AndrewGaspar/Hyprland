@@ -385,6 +385,33 @@ Replay trouble injection (`<start_s>,<len_s>` from the first frame, combinable):
 IMU at gravity + noise and the view: glasses on a desk), `_DOFF` (display off/on edges). `STILL`+`BLACK`
 reproduces the 2026-10-15 runaway.
 
+**Plane detection (opt-in, `XREAL_AIR_PLANES=1`, needs `XREAL_AIR_SLAM=1`).** `XR_EXT_plane_detection`
+for horizontal surfaces (tables, the floor), consumed by Hyprland's `openxr:surfaces` (research/32). A
+low-priority worker (`auxiliary/tracking/t_plane_detector.h`) puts a half-resolution SGBM depth of the
+same stereo pairs (rectified through the factory fisheye624 model; optionally also Basalt's landmarks)
+into a gravity-aligned 5 cm column height map in the SLAM world, with the SLAM pose of each frame. Only
+data from while the output follows SLAM is used; a new SLAM world (fresh tracker, re-initialisation)
+drops the map. Planes are reported in the head pose's space (+Y up, plane +Z normal) once stable for a
+few seconds. The build needs `XRT_FEATURE_OPENXR_PLANE_DETECTION=ON` (the default when the XREAL driver
+and SLAM are built; an old `build-xreal` cache may hold `OFF` — reconfigure with
+`-DXRT_FEATURE_OPENXR_PLANE_DETECTION=ON`). Unset, the driver does not advertise planes and nothing runs.
+Add `Environment=XREAL_AIR_PLANES=1` to the 6DoF drop-in; the journal says
+`Plane detection on (XREAL_AIR_PLANES=1): ...` at start.
+
+| `XREAL_AIR_PLANES_*` | Default | Meaning |
+|---|---|---|
+| (`XREAL_AIR_PLANES`) | 0 | enable (needs `XREAL_AIR_SLAM=1`) |
+| `HZ` | 4 | dense stereo pairs per second, 0 for landmarks only |
+| `LANDMARKS` | 0 | also use Basalt's landmarks (VIT pose features); measured to add nothing over the dense stereo |
+| `STABLE_MS` | 5000 | a plane is reported once it has held this long |
+| `MAX_SIGMA_CM` | 3 | points with a larger height uncertainty are not used |
+| `UPPER_MODE` | 0 | per column, prefer the highest height mode over a bigger one below it (glossy tops mirror the room) |
+| `NEAR_CM` | 60 | points nearer to the head than this are not used (hands) |
+| `DUMP` | — | debugging: dump the map's input points to this path (`monado-cli plane-map-replay`) |
+
+Offline: `monado-cli xreal-slam-replay` also writes `planes.csv` / `planes_final.csv`; without hardware,
+the simulated HMD serves static planes from `SIMULATED_PLANES="table:0,-0.55,-0.8,1.2,0.6;floor:0,-1.1,-1.5,3,3"`.
+
 ---
 
 ## 2. The toggle

@@ -228,3 +228,45 @@ narrow sofa-arm platforms. Detected planes (declared ones are taken as declared)
 snap candidates when smaller than 0.08 m² or narrower than 0.20 m on their short side, and upward
 ones when less than 0.10 m below the eyes (`xrPlaneClutter`; constants, no options). The trace lists
 them as `clutter: …` and counts rather than lists them.
+
+## 9. Method bake-off and the Monado implementation (2026-10-16)
+
+**Bake-off** (offline, `~/xreal-datasets/plane-eval/BAKEOFF.md`; scripts, plots and per-run results in
+`bakeoff/`). Seven approaches on the same LR02 inputs (every 5th frame, fisheye624 rectification, same
+point filters), scored by table/floor height, area, time to first/converged table, snapshot jitter,
+unwanted planes and cost. No ground truth: heights are cross-checked between methods and back-projected.
+
+| method | table h / area | first / conv | snapshot std | unwanted | cost per frame |
+|---|---|---|---|---|---|
+| **column map, SGBM half-res (chosen)** | −0.574 / 0.43 m² | 4 / 82 s | 9.4 mm | 15, 2.5 m² | 3.7 ms SGBM + 2.6 ms map |
+| RANSAC + world merge | −0.566 / 1.12 (bleeds onto sofa) | 18 / 84 | 4.9 | 16, **11.5 m²** | ~37 ms py |
+| CAPE on SGBM | none (planarity test needs ~3× less noise) | — | — | 0 | 0.1 ms |
+| CAPE on CREStereo (1 Hz) | −0.563 / 0.86 | 42 / 71 | 6.2 | **0** | 4.5 s CREStereo |
+| TSDF on SGBM | **none** (the glossy top's reflections carve it away) | — | — | 17, 2.3 | 34 ms + extract |
+| Basalt landmarks only | −0.578 / 0.47 | **90 / 94** | 5.3 | 8, 1.4 | ~0 |
+| column map on CREStereo (1 Hz) | −0.570 / 1.14 | **2 / 75** | **2.9** | 12, 2.7 | 4.5 s CREStereo |
+| DAv2 hybrid (2 Hz) | −0.572 / 0.31 (floor 1.2–3.3 m²) | 10 / 78 | 11.5 | 12, 1.9 | +290 ms |
+
+- **Verdict: keep the column map** — best of the real-time CPU methods and the smallest to build.
+  Learned stereo (CREStereo) into the *same* map beat SGBM on every quality metric (floor σ 3–5 cm vs
+  9–14 cm beyond 2 m, table from 2 s, 2.9 mm jitter) but costs 4.5 s per frame on 4 CPU threads: a later
+  upgrade on the iGPU/NPU at ≤ 1 Hz (`t_plane_depth.h` is the seam for it). Drop TSDF, per-frame RANSAC,
+  CAPE-on-SGBM, landmarks-only and the DAv2 hybrid.
+- **Plan change (§3/§6):** A0 (landmarks alone) is skipped — real Basalt landmarks agree on heights but
+  see the table only after the user leans in (74–90 s), and adding them to the dense map changed nothing.
+  Straight to A1, half-res SGBM + column map.
+- Table above floor is 0.442–0.462 m across all methods and both living-room recordings; the methods agree
+  on the table height within ±1 cm. A tape-measured height is still needed to rank absolute accuracy.
+
+**Monado implementation** (monado `hypxrland`, commits 8550e285c..613d8eeb1; opt-in `XREAL_AIR_PLANES=1`,
+tunables in doc 07 §1.6): `t_plane_map` (5 cm columns with 1 cm height histograms weighted by height σ,
+~1 Hz extraction, region growing, same-height merging, stable ids, a stability time before reporting,
+geometric FLOOR / PLATFORM labels; pure, no OpenCV), `t_plane_stereo` (rectification through the camera's
+own model, half-res SGBM), `t_plane_detector` (nice +10 worker, SLAM pose at mid-exposure, resets on a new
+SLAM world), `t_plane_detections` (one shared plane list answers every `XR_EXT_plane_detection` request),
+the xreal_air vtable (head-pose space, +Z normal up) and static `SIMULATED_PLANES` on the simulated HMD.
+Unit tests: `tests_t_plane` (10 cases).
+
+**Replay of the C++ implementation** (`monado-cli xreal-slam-replay` on LR02): table −0.578 m (offline
+reference −0.574), floor −1.010…−1.028 (−1.019), table id stable from 8 s, 2.4 mm height std. The worker
+does not hurt the SLAM: start-to-end error 0.59 / 0.78 cm with planes against 1.00 / 1.00 cm without.
