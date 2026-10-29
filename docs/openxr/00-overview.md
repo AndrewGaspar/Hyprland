@@ -57,10 +57,11 @@ Runtimes exercised: **Monado** (including its null compositor for headless testi
 | `09-meta-horizon-compatibility.md` | tested status and known deficiencies for Windows Meta Horizon PC VR titles through Heroic, Proton, WineOpenXR, DXVK, Monado, and WiVRn |
 | `10-view-dependent-surfaces.md` | experimental implementation and staged contract for head-tracked “portal” Wayland surfaces: the landed protocol/compositor/native demo, surface-relative eye points, timing/sample association, pair-latched SBS, Wine integration, security, nesting, and acceptance tests |
 | `11-handoff-2026-08.md` | exact cross-repository source/deployment state after the August 2026 portal, Meta compatibility, recorder-control, and HUD-key work; pending attended checks and restart commands |
+| `12-porting-to-0.57.md` | rules learned forward-porting onto upstream 0.57: Lua-only config surface, `hyprctl keyword` → `eval`, the context-explicit renderer (and the `bindFB` pitfall), the `CWindow` split, logging/IPC moves, dependency + container refresh, and the tests to run after every port |
 
-A ready-to-copy config with every variable, several `xrmonitor` declarations, and example
-binds lives at `example/openxr.conf`. For the XREAL Air 2 Ultra as a 3DoF display, see
-`docs/openxr/07-xreal.md` and the profile at `example/xreal.conf`.
+A ready-to-copy Lua config with every variable, several `hl.xr_monitor` declarations, and example
+binds lives at `example/openxr.lua`. For the XREAL Air 2 Ultra as a 3DoF display, see
+`docs/openxr/07-xreal.md` and the profile at `example/xreal.lua`.
 
 ## Architecture
 

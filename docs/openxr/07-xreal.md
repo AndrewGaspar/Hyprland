@@ -24,7 +24,7 @@ The pieces:
 | `xreal-ctl` | standalone HID helper (mode 2d/3d, brightness) for the flat side | `contrib/xreal/` |
 | systemd unit | user unit for the xreal Monado runtime (à la wivrn) | `contrib/xreal/monado-xreal.service` |
 | the toggle | `xreal-mode.sh {xr\|2d\|3d\|off\|status}` | `scripts/xreal-mode.sh` (mirror of dotfiles `bin/xreal-mode`) |
-| 3DoF profile | curved-arc layout + keyboard/gaze binds + window rules | `example/xreal.conf` |
+| 3DoF profile | curved-arc layout + keyboard/gaze binds + window rules | `example/xreal.lua` |
 
 ---
 
@@ -311,14 +311,20 @@ genuinely-unplugged / USB-wedged case (which needs a physical replug) — it wou
 
 ### 1.5 The 3DoF profile
 
-Source `example/xreal.conf` from your `hyprland.conf` and bind the toggle to a key:
+`example/xreal.lua` is a Lua module (0.57+ has no classic `.conf`). Load it from your
+`hyprland.lua` (or `hyprland-xr.lua`) by explicit path — the file is tracked by the config watcher,
+so editing it reloads like any required module:
 
-```
-source = ~/code/Hyprland/example/xreal.conf
+```lua
+require("~/code/Hyprland/example/xreal.lua")
 ```
 
-Edit the `monitor DP-5` window rules in that file to your glasses' connector name if it isn't `DP-5`
-(the AMD box is DP-5; find yours with `hyprctl monitors`).
+or copy the parts you want into your `hyprland-xr.lua`. If you also load `example/openxr.lua`, load
+`xreal.lua` after it: `hl.config` merges per key, so its `openxr` values override only the keys it
+names. The toggle binds (`SUPER+F12` / `SUPER+SHIFT+F12`) are at the bottom of the file.
+
+Edit the `monitor = "DP-5"` field of the `xreal-openxr` window rule in that file to your glasses'
+connector name if it isn't `DP-5` (the AMD box is DP-5; find yours with `hyprctl monitors`).
 
 ### 1.6 Opt-in 6DoF (stereo cameras + Basalt VIO, live-validated 2026-10-15)
 

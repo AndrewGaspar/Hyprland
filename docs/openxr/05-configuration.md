@@ -1,9 +1,21 @@
 # 05 — Configuration & Control Reference
 
+> **Hyprland 0.57+ is Lua-only.** Upstream removed the classic hyprlang front end and
+> `hyprctl keyword`, so every classic snippet in this document (`openxr { … }`, `xrmonitor =`,
+> `xrrule =`, `monitor = …, stereo:sbs`, `windowrule = …`, `bind = …, xrmonitor, …`) is now written
+> in its Lua form — the right-hand column of the §0 table: `hl.config({ openxr = { … } })`,
+> `hl.xr_monitor("…")` / `hl.xr_rule("…")` (the classic value string is accepted verbatim),
+> `hl.monitor{…}`, `hl.window_rule{…}`, `hl.bind("MODS + KEY", hl.dsp.xrmonitor("verb"))`. Runtime
+> changes use `hyprctl eval 'hl.config({ openxr = { key = value } })'` instead of
+> `hyprctl keyword openxr:key value`; string-typed options must be quoted. Working references:
+> `contrib/hyprland-xr.lua` (the daily-driver session config) and `example/openxr.lua`; porting
+> notes in [`12-porting-to-0.57.md`](12-porting-to-0.57.md). The grammar, semantics and defaults
+> below are unchanged — read the classic examples as the Lua lines in §0.
+
 The complete user-facing control surface of HypXRland: the `openxr:*` config section, the
 `xrmonitor` and `xrrule` keywords, the `xrmonitor` dispatcher, the `hyprctl openxr` command, the
 socket2 events, idle integration, and consumer recipes (waybar, hypridle, shell). A ready-to-copy
-config with every variable and example binds lives at `example/openxr.conf`; run
+config (Lua) with every variable and example binds lives at `example/openxr.lua`; run
 `hyprctl descriptions | grep openxr` for the live descriptions including min/max clamps.
 
 Every keyword here has a Lua form too — `hl.config`, `hl.xr_monitor`, `hl.xr_rule` — sharing one
@@ -1063,7 +1075,7 @@ your face while you walk through a room you cannot fully see. That is the one ge
 configuration this feature exists to fix: at `alpha 0.55` the desktop stays readable *and* you can
 see the doorway, the coffee table and the cat. It is **not** hardcoded (a default that silently
 changes what your monitors look like would be worse), so it lives here and in
-`example/openxr.conf` — copy it.
+`example/openxr.lua` — copy it.
 
 Tune to taste: lower (`0.4`) sees the room better, higher (`0.7`) keeps text crisper. Report 09
 §3.4 cites Meta's MR guidance that UI over passthrough needs contrast; do not drive it so low that
@@ -1872,7 +1884,7 @@ differ, which for a packed mono desktop they do not.
 
 ### Example — the XREAL flat path
 
-`example/xreal.conf` carries the ready-to-copy version. The glasses re-present a native
+`example/xreal.lua` carries the ready-to-copy version. The glasses re-present a native
 **3840×1080@60** EDID after the HID `mode 3d` switch and hardware-split every scanline, so:
 
 ```ini

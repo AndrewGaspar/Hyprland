@@ -129,12 +129,12 @@ requests:
     disable          → Stop the OpenXR session
 
     create <name> <WxH[@Hz]> <anchor-spec...> [size:M]
-                     → Create an XR monitor (same grammar as the xrmonitor
-                       config keyword, space-separated; see example/openxr.conf)
+                     → Create an XR monitor (same grammar as an hl.xr_monitor
+                       string, space-separated; see example/openxr.lua)
     destroy <name>   → Destroy an XR monitor
     select <name>    → Select the monitor subsequent verbs act on
-    layout           → Dump paste-ready xrmonitor config lines with the LIVE
-                       poses (persist an in-headset arrangement)
+    layout           → Dump paste-ready hl.xr_monitor("…") config lines with the
+                       LIVE poses (persist an in-headset arrangement)
 
     anchor <spec>    → Re-anchor the selected monitor (local/head/body/device)
     move <dx dy dz>  → Nudge the selected monitor (metres)
