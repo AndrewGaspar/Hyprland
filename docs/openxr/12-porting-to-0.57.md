@@ -33,6 +33,10 @@ surface.
   `COpenXRManager::onConfigReload()` one idle tick later, and for *every* `openxr` key (the old keyword
   hook special-cased a few). Tests must wait for the effect in `j/openxr`; product code must not assume
   a synchronous apply. `hl.config` does not emit `config.reloaded` — only a full reload does.
+- **Option names and descriptions must be JSON-safe.** `hyprctl descriptions` is
+  `Config::Values::getAsJson()`, which splices them into JSON strings unescaped; one `"` (the
+  0.57 port's `openxr:surfaces_synthetic` quoted its example) makes the whole array invalid for every
+  consumer. Write examples in backticks; `tests/config/ValueDescriptions.cpp` guards it.
 - **Reload re-runs the whole script** (fresh Lua state; `package.loaded` is cleared for user modules,
   so `require()`d files re-execute). A runtime error in a required module aborts the rest of the
   script — every `hl.xr_monitor` after it is missing on that reload (audit P3, still open).
@@ -129,6 +133,14 @@ surface.
   regression. The 0.57 run's `xr_don_settle_hides_until_still` failure was exactly that: it committed
   its doff seat from the previous case's backwards-facing dwell, because it never sat facing its own
   monitor before the disable.
+- The non-XR suite is not green upstream in this image either. With 0.57 and the image's
+  kitty 0.49, vanilla v0.57.0's own suite fails ~16 cases (group/master/monocle fullscreen and
+  geometry, `hyprctlGetprop`, `posPreserve`, rule-confinement, …) and hyprtester aborts outright in
+  `centerMasterColumnResize` (`std::stod` on a window attribute it could not read), so every case
+  after it never runs. Compare against vanilla in the SAME image before calling a failure a fork
+  regression — export `v0.57.0` into the worktree, build it into `/build/vanilla` inside a
+  suffixed container, and run `containers/test/run-full-tests.sh` with `BUILD_DIR`/`SRC_DIR`
+  pointed at it — then run the cases after the abort point by name.
 - The first "Hyprland has crashed" in every container run is expected: the stock headless launch
   throws `CBackend::create() failed!` in seatless rootless podman, and `runXrSuite` then nests into
   labwc.
