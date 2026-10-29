@@ -1160,7 +1160,7 @@ std::vector<SP<IValue>> Values::getConfigValues() {
         MS<String>("openxr:surfaces_synthetic",
                    "declared planes for openxr:surfaces, in LOCAL_FLOOR metres, separated by ';': `<table|platform|floor|ceiling|wall|plane> pos:x,y,z size:w,d [yaw:deg]` "
                    "(pos = the plane's center; size = width and depth, or width and height for a wall; a wall faces +Z at yaw 0). For testing and for headsets without plane "
-                   "detection, e.g. \"table pos:0,0.74,-0.7 size:1.2,0.7\"",
+                   "detection, e.g. `table pos:0,0.74,-0.7 size:1.2,0.7`",
                    ""),
         MS<Bool>("openxr:surfaces_detect", "with openxr:surfaces on, use the runtime's XR_EXT_plane_detection when it advertises the extension (read at session start)", true),
         MS<Float>("openxr:surfaces_snap_distance",
