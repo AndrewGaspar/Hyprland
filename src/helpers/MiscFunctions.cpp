@@ -484,7 +484,7 @@ bool killPid(pid_t pid, int sig) {
     // The whole point of this wrapper: a non-positive pid is a broadcast, not a process. See the
     // declaration for where the -1s and 0s come from.
     if (pid <= 0) {
-        Log::logger->log(Log::ERR, "killPid: refusing to send signal {} to pid {}: that is a broadcast, not a process", sig, (int64_t)pid);
+        LOG(Log::ERR, "killPid: refusing to send signal {} to pid {}: that is a broadcast, not a process", sig, (int64_t)pid);
         return false;
     }
 

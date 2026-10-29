@@ -1035,7 +1035,7 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
     // (§3.8) — warn, but honor the config.
     const Vector2D SCALEBASE = paneSize();
     if (isStereo() && !RULE->m_stereoVirtualMode && m_scale != 1.F && !autoScale)
-        Log::logger->log(Log::WARN, "Monitor {}: stereo output with scale {:.2f} != 1.0 — the physical per-eye split maps 1:1 only at scale 1.0", m_name, m_scale);
+        LOG(Log::WARN, "Monitor {}: stereo output with scale {:.2f} != 1.0 — the physical per-eye split maps 1:1 only at scale 1.0", m_name, m_scale);
 
     Vector2D logicalSize = Monitor::Stereo::scaleValidationSize(m_pixelSize, m_stereoMode, m_scale);
     if (!*PDISABLESCALECHECKS && (logicalSize.x != std::round(logicalSize.x) || logicalSize.y != std::round(logicalSize.y))) {
@@ -1868,7 +1868,7 @@ void CMonitor::sanitizeStereoMode(const Vector2D& requestedMode) {
     // loudly: a silently halved desktop is the failure mode that reads as "the compositor broke".
     if (m_stereoVirtualMode && (requestedMode.x <= 0 || requestedMode.y <= 0)) {
         const auto ERRSTR = std::format("Monitor {}: a per-eye pack needs an explicit per-eye resolution, but the rule asks for a mode by preference — disabling stereo", m_name);
-        Log::logger->log(Log::ERR, ERRSTR);
+        LOG(Log::ERR, "{}", ERRSTR);
         ErrorOverlay::overlay()->queueError(ERRSTR);
         m_stereoMode        = Config::STEREO_OFF;
         m_stereoVirtualMode = false;
@@ -1885,7 +1885,7 @@ void CMonitor::sanitizeStereoMode(const Vector2D& requestedMode) {
         const auto ERRSTR = requestedMode.x > 0 && requestedMode.y > 0 ?
             std::format("Monitor {}: mode {:X0} is not the stereo mode requested ({:X0}), disabling stereo", m_name, m_pixelSize, requestedMode) :
             std::format("Monitor {}: fell back to mode {:X0}, which is not the mode the stereo rule asked for, disabling stereo", m_name, m_pixelSize);
-        Log::logger->log(Log::ERR, ERRSTR);
+        LOG(Log::ERR, "{}", ERRSTR);
         ErrorOverlay::overlay()->queueError(ERRSTR);
         m_stereoMode = Config::STEREO_OFF;
         return;
@@ -1893,7 +1893,7 @@ void CMonitor::sanitizeStereoMode(const Vector2D& requestedMode) {
 
     const auto DIV = stereoPackDivisor();
     if (!Monitor::Stereo::modeDivides(m_pixelSize, m_stereoMode)) {
-        Log::logger->log(Log::ERR, "Monitor {}: mode {:X0} is not divisible into a {}x{} stereo pack, disabling stereo", m_name, m_pixelSize, sc<int>(DIV.x), sc<int>(DIV.y));
+        LOG(Log::ERR, "Monitor {}: mode {:X0} is not divisible into a {}x{} stereo pack, disabling stereo", m_name, m_pixelSize, sc<int>(DIV.x), sc<int>(DIV.y));
         ErrorOverlay::overlay()->queueError(std::format("Monitor {}: mode not divisible for stereo packing, stereo disabled", m_name));
         m_stereoMode = Config::STEREO_OFF;
     }

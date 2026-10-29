@@ -379,14 +379,14 @@ void COpenXRManager::start() {
             // Loud ONCE per block, then quiet: the re-probe retries this every few seconds and an
             // ERR per retry would bury the rest of the log. A disable/enable cycle clears the latch
             // (see stop()), so asking again explicitly always gets a fresh, loud answer.
-            Log::logger->log(m_taintBlockLogged ? Log::DEBUG : Log::ERR, "[OPENXR] refusing XR bring-up: {}. The desktop session is unaffected.", verdict.reason);
+            LOG(m_taintBlockLogged ? Log::DEBUG : Log::ERR, "[OPENXR] refusing XR bring-up: {}. The desktop session is unaffected.", verdict.reason);
             m_taintBlockLogged = true;
             setState(XR_STATE_UNAVAILABLE);
             return;
         }
 
         if (verdict.oopsed)
-            Log::logger->log(Log::WARN, "[OPENXR] {}", verdict.reason);
+            LOG(Log::WARN, "[OPENXR] {}", verdict.reason);
         m_taintBlockLogged = false;
     }
 
@@ -408,7 +408,7 @@ void COpenXRManager::start() {
     // the OpenXR loader's process-global init. Skip this attempt — the reprobe retries once the in-flight
     // worker resolves and clears its flag.
     if (m_handshakeInFlight.load(std::memory_order_acquire) || m_bringupInFlight.load(std::memory_order_acquire)) {
-        Log::logger->log(Log::DEBUG, "[OPENXR] a prior runtime handshake/bring-up is still in flight — deferring this probe");
+        LOG(Log::DEBUG, "[OPENXR] a prior runtime handshake/bring-up is still in flight — deferring this probe");
         abortStart();
         return;
     }
@@ -440,11 +440,11 @@ void COpenXRManager::start() {
         switch (action.kind) {
             case OpenXR::XR_RTJSON_SET:
                 setenv("XR_RUNTIME_JSON", action.value.c_str(), 1);
-                Log::logger->log(Log::DEBUG, "[OPENXR] openxr:runtime_json -> XR_RUNTIME_JSON = {}", action.value);
+                LOG(Log::DEBUG, "[OPENXR] openxr:runtime_json -> XR_RUNTIME_JSON = {}", action.value);
                 break;
             case OpenXR::XR_RTJSON_UNSET:
                 unsetenv("XR_RUNTIME_JSON");
-                Log::logger->log(Log::DEBUG, "[OPENXR] openxr:runtime_json cleared -> restored login XR_RUNTIME_JSON (unset)");
+                LOG(Log::DEBUG, "[OPENXR] openxr:runtime_json cleared -> restored login XR_RUNTIME_JSON (unset)");
                 break;
             case OpenXR::XR_RTJSON_NOOP: break;
         }
@@ -485,7 +485,7 @@ void COpenXRManager::start() {
         // The completion channel could not be created (essentially impossible past init()). Refuse to go
         // async — an unsignalled worker would wedge STARTING forever. Drop to UNAVAILABLE so the reprobe
         // keeps retrying; the desktop is unaffected.
-        Log::logger->log(Log::ERR, "[OPENXR] handshake-completion channel unavailable; deferring probe, state -> unavailable");
+        LOG(Log::ERR, "[OPENXR] handshake-completion channel unavailable; deferring probe, state -> unavailable");
         delete sess;
         setState(XR_STATE_UNAVAILABLE);
         return;
@@ -501,7 +501,7 @@ bool COpenXRManager::setupHandshakeChannel() {
         return true;
     m_handshakeFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (m_handshakeFd < 0) {
-        Log::logger->log(Log::ERR, "[OPENXR] eventfd() failed for the handshake-completion channel");
+        LOG(Log::ERR, "[OPENXR] eventfd() failed for the handshake-completion channel");
         return false;
     }
     m_handshakeSource = wl_event_loop_add_fd(
@@ -512,7 +512,7 @@ bool COpenXRManager::setupHandshakeChannel() {
         },
         this);
     if (!m_handshakeSource) {
-        Log::logger->log(Log::ERR, "[OPENXR] wl_event_loop_add_fd failed for the handshake-completion channel");
+        LOG(Log::ERR, "[OPENXR] wl_event_loop_add_fd failed for the handshake-completion channel");
         close(m_handshakeFd);
         m_handshakeFd = -1;
         return false;
@@ -622,7 +622,7 @@ void COpenXRManager::onHandshakeComplete(std::shared_ptr<SHandshakeClaim> claim)
 
     const auto elapsedMs = (int)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - claim->started).count();
     if (elapsedMs >= OpenXR::XR_HANDSHAKE_TIMEOUT_MS)
-        Log::logger->log(Log::WARN, "[OPENXR] runtime handshake took {}ms (runtime slow to answer); the desktop stayed responsive throughout", elapsedMs);
+        LOG(Log::WARN, "[OPENXR] runtime handshake took {}ms (runtime slow to answer); the desktop stayed responsive throughout", elapsedMs);
 
     // 1. Instance (extension checks; missing runtime / required extensions -> UNAVAILABLE). Adopt `sess`
     //    into m_session so abortStart() tears it down on the failure paths (no helper is in flight here).
@@ -638,8 +638,8 @@ void COpenXRManager::onHandshakeComplete(std::shared_ptr<SHandshakeClaim> claim)
         // degraded list even when NO server is running (verified in an isolated $XDG_RUNTIME_DIR),
         // so without the socket stat a stopped service would poll at base forever too.
         m_probeWait = m_session->m_runtimeReachable && runtimeSocketPresent() ? XR_WAIT_HEADSET : XR_WAIT_RUNTIME;
-        Log::logger->log(Log::WARN, "[OPENXR] {}, state -> unavailable",
-                         m_probeWait == XR_WAIT_HEADSET ? "runtime reachable but degraded (headset likely not connected)" : "no runtime / required extensions unavailable");
+        LOG(Log::WARN, "[OPENXR] {}, state -> unavailable",
+            m_probeWait == XR_WAIT_HEADSET ? "runtime reachable but degraded (headset likely not connected)" : "no runtime / required extensions unavailable");
         abortStart();
         return;
     }
@@ -651,7 +651,7 @@ void COpenXRManager::onHandshakeComplete(std::shared_ptr<SHandshakeClaim> claim)
         // spec-intended "poll me later" result. The re-probe then waits gently for the headset rather
         // than growing the backoff as it would for an absent runtime.
         m_probeWait = m_session->m_formFactorUnavailable ? XR_WAIT_HEADSET : XR_WAIT_RUNTIME;
-        Log::logger->log(Log::WARN, "[OPENXR] system lookup failed ({}), state -> unavailable", m_probeWait == XR_WAIT_HEADSET ? "headset not connected" : "runtime error");
+        LOG(Log::WARN, "[OPENXR] system lookup failed ({}), state -> unavailable", m_probeWait == XR_WAIT_HEADSET ? "headset not connected" : "runtime error");
         abortStart();
         return;
     }
@@ -687,10 +687,9 @@ void COpenXRManager::continueBringup(CXRSession* sess) {
         const auto       pick   = OpenXR::pickBlendMode(sess->m_blendModes, *PBLEND);
         sess->m_blendMode       = xrBlendModeToXr(pick.mode);
         if (pick.requestedUnsupported)
-            Log::logger->log(Log::WARN, "[OPENXR] openxr:blend_mode '{}' is not supported by this runtime; falling back to '{}'", *PBLEND,
-                             OpenXR::blendModeToString(pick.mode));
+            LOG(Log::WARN, "[OPENXR] openxr:blend_mode '{}' is not supported by this runtime; falling back to '{}'", *PBLEND, OpenXR::blendModeToString(pick.mode));
         else
-            Log::logger->log(Log::DEBUG, "[OPENXR] environment blend mode: {} (openxr:blend_mode = {})", OpenXR::blendModeToString(pick.mode), *PBLEND);
+            LOG(Log::DEBUG, "[OPENXR] environment blend mode: {} (openxr:blend_mode = {})", OpenXR::blendModeToString(pick.mode), *PBLEND);
     }
 
     // The luma key (openxr:black_alpha) is gated on the blend mode we just picked — re-publish now
@@ -706,7 +705,7 @@ void COpenXRManager::continueBringup(CXRSession* sess) {
     static auto       PGPU = CConfigValue<std::string>("openxr:gpu");
     const std::string gpu  = *PGPU;
     if (!gfx->initEGL(gpu)) {
-        Log::logger->log(Log::ERR, "[OPENXR] EGL/GBM init failed, state -> unavailable");
+        LOG(Log::ERR, "[OPENXR] EGL/GBM init failed, state -> unavailable");
         m_session  = UP<CXRSession>(sess); // adopt so abortStart() tears both down (synchronous failure)
         m_graphics = UP<CXRGraphics>(gfx);
         abortStart();
@@ -752,13 +751,13 @@ void COpenXRManager::continueBringup(CXRSession* sess) {
             // The bound abandons the WORKER; it does not stop this thread parking. Say so when the
             // park was long enough for the user to feel it (reload-storm investigation 2026-08-21).
             if (eglBlockedMs >= OpenXR::XR_MAIN_THREAD_STALL_WARN_MS)
-                Log::logger->log(Log::WARN, "[OPENXR] the runtime's EGL device query blocked the compositor main thread for {}ms", eglBlockedMs);
+                LOG(Log::WARN, "[OPENXR] the runtime's EGL device query blocked the compositor main thread for {}ms", eglBlockedMs);
             if (eglProbe.has_value())
                 rt = *eglProbe;
             else {
                 rt.probe = "EGL device query (XR_MND_query_egl_device)";
                 rt.note  = "EGL device query timed out";
-                Log::logger->log(Log::WARN, "[OPENXR] the runtime's EGL device query did not respond within {}ms; falling back", OpenXR::XR_PROBE_TIMEOUT_MS);
+                LOG(Log::WARN, "[OPENXR] the runtime's EGL device query did not respond within {}ms; falling back", OpenXR::XR_PROBE_TIMEOUT_MS);
             }
         } else
             rt.note = "runtime does not advertise XR_MND_query_egl_device";
@@ -778,21 +777,22 @@ void COpenXRManager::continueBringup(CXRSession* sess) {
             const auto       vkProbe     = OpenXR::runBoundedProbe([inst, sys](const std::atomic<bool>& abandon) { return OpenXR::probeRuntimeRenderNode(inst, sys, &abandon); },
                                                                    OpenXR::XR_PROBE_TIMEOUT_MS, &vkBlockedMs);
             if (vkBlockedMs >= OpenXR::XR_MAIN_THREAD_STALL_WARN_MS)
-                Log::logger->log(Log::WARN, "[OPENXR] the runtime GPU (Vulkan) probe blocked the compositor main thread for {}ms", vkBlockedMs);
+                LOG(Log::WARN, "[OPENXR] the runtime GPU (Vulkan) probe blocked the compositor main thread for {}ms", vkBlockedMs);
 
             if (vkProbe.has_value())
                 rt = *vkProbe;
             else {
                 rt.probe = "Vulkan device query (XR_KHR_vulkan_enable2)";
                 rt.note  = "GPU probe timed out";
-                Log::logger->log(Log::WARN, "[OPENXR] runtime GPU probe did not respond within {}ms; proceeding without GPU verification", OpenXR::XR_PROBE_TIMEOUT_MS);
+                LOG(Log::WARN, "[OPENXR] runtime GPU probe did not respond within {}ms; proceeding without GPU verification", OpenXR::XR_PROBE_TIMEOUT_MS);
             }
 
             // Both questions went unanswered — carry both reasons into the "could not verify" WARN.
             if (!rt.determined)
                 rt.note = std::format("{}; {}", eglNote, rt.note);
             else
-                Log::logger->log(Log::DEBUG, "[OPENXR] EGL device query unavailable ({}), fell back to the Vulkan device query — correct unless this runtime renders clients on a separate GPU", eglNote);
+                LOG(Log::DEBUG, "[OPENXR] EGL device query unavailable ({}), fell back to the Vulkan device query — correct unless this runtime renders clients on a separate GPU",
+                    eglNote);
         } else if (!rt.determined)
             rt.note = std::format("{}; no XR_KHR_vulkan_enable2 to fall back on", rt.note);
 
@@ -800,12 +800,11 @@ void COpenXRManager::continueBringup(CXRSession* sess) {
         m_runtimeGpu = rt.determined ? std::format("{} (drm {}:{}, via {})", rt.deviceName.empty() ? "GPU" : rt.deviceName, rt.drmMajor, rt.drmMinor, rt.probe) : "";
 
         if (rt.determined && node.valid && (rt.drmMajor != node.major || rt.drmMinor != node.minor)) {
-            Log::logger->log(Log::ERR,
-                             "[OPENXR] openxr:gpu selects {} (drm {}:{}) but the runtime '{}' composites on {} (drm {}:{}), per its {}. Cross-GPU buffer "
-                             "import crashes the graphics driver and would take the whole session down, so XR is refusing to start. Point openxr:gpu at "
-                             "the runtime's GPU (or unset it). Desktop session unaffected.",
-                             node.path, node.major, node.minor, m_runtimeName, rt.deviceName.empty() ? "another GPU" : rt.deviceName, rt.drmMajor, rt.drmMinor,
-                             rt.probe);
+            LOG(Log::ERR,
+                "[OPENXR] openxr:gpu selects {} (drm {}:{}) but the runtime '{}' composites on {} (drm {}:{}), per its {}. Cross-GPU buffer "
+                "import crashes the graphics driver and would take the whole session down, so XR is refusing to start. Point openxr:gpu at "
+                "the runtime's GPU (or unset it). Desktop session unaffected.",
+                node.path, node.major, node.minor, m_runtimeName, rt.deviceName.empty() ? "another GPU" : rt.deviceName, rt.drmMajor, rt.drmMinor, rt.probe);
             m_session  = UP<CXRSession>(sess); // adopt so abortStart() tears both down (synchronous refusal)
             m_graphics = UP<CXRGraphics>(gfx);
             abortStart();
@@ -813,13 +812,13 @@ void COpenXRManager::continueBringup(CXRSession* sess) {
         }
 
         if (rt.determined && node.valid)
-            Log::logger->log(Log::DEBUG, "[OPENXR] XR GPU verified against runtime: {} (drm {}:{}), per its {}", rt.deviceName.empty() ? node.path : rt.deviceName, node.major,
-                             node.minor, rt.probe);
+            LOG(Log::DEBUG, "[OPENXR] XR GPU verified against runtime: {} (drm {}:{}), per its {}", rt.deviceName.empty() ? node.path : rt.deviceName, node.major, node.minor,
+                rt.probe);
         else
-            Log::logger->log(Log::WARN,
-                             "[OPENXR] could not verify the XR GPU matches the runtime ({}); proceeding. If the session crashes at swapchain creation, "
-                             "openxr:gpu is pointing at the wrong GPU (it must be the GPU the runtime renders on).",
-                             !node.valid ? "XR render node unknown (shared-display fallback)" : rt.note);
+            LOG(Log::WARN,
+                "[OPENXR] could not verify the XR GPU matches the runtime ({}); proceeding. If the session crashes at swapchain creation, "
+                "openxr:gpu is pointing at the wrong GPU (it must be the GPU the runtime renders on).",
+                !node.valid ? "XR render node unknown (shared-display fallback)" : rt.note);
     }
 
     // --- Direct-mode session BRING-UP (steps 4-8), task #89 phase 2 blocker A -------------------
@@ -838,7 +837,7 @@ void COpenXRManager::continueBringup(CXRSession* sess) {
     if (br == BRINGUP_TIMEOUT) {
         // Ownership of sess + gfx (and any partially-created input) was transferred to the still-running
         // helper — do NOT touch them. m_bringupInFlight is latched; the helper clears it on late return.
-        Log::logger->log(Log::WARN, "[OPENXR] session bring-up did not complete within {}ms — finishing it off-thread; state -> unavailable", OpenXR::XR_BRINGUP_TIMEOUT_MS);
+        LOG(Log::WARN, "[OPENXR] session bring-up did not complete within {}ms — finishing it off-thread; state -> unavailable", OpenXR::XR_BRINGUP_TIMEOUT_MS);
         m_probeWait = XR_WAIT_RUNTIME; // the runtime is present-but-unresponsive; poll it again shortly
         markWatchActivity();           // treat as "runtime materializing": next probes at base cadence
         m_runtimeName.clear();
@@ -900,7 +899,7 @@ void COpenXRManager::continueBringup(CXRSession* sess) {
     m_frameThread = std::thread([this] { frameThread(); });
 
     setState(XR_STATE_RUNNING_IDLE);
-    Log::logger->log(Log::DEBUG, "[OPENXR] session up (runtime: {}, system: {}), frame thread started", m_runtimeName, m_systemName);
+    LOG(Log::DEBUG, "[OPENXR] session up (runtime: {}, system: {}), frame thread started", m_runtimeName, m_systemName);
 
     // Re-assert the plugged state now that a session EXISTS (research/18 WP-M2). Under the
     // `session` mode this plugs the XR monitors immediately; under the default `visible` mode the
@@ -1017,7 +1016,7 @@ COpenXRManager::eBringupResult COpenXRManager::runBoundedBringup(CXRSession* ses
             crumb(5, "input->init");
             in = new CXRInput();
             if (!in->init(*s, s->m_hasHandInteraction)) {
-                Log::logger->log(Log::WARN, "[OPENXR] input action system unavailable; continuing without XR input");
+                LOG(Log::WARN, "[OPENXR] input action system unavailable; continuing without XR input");
                 in->destroy();
                 delete in;
                 in = nullptr;
@@ -1147,7 +1146,7 @@ void COpenXRManager::stop() {
         donoffTraceEdge("session-end");
         writeDonoffTrace();
         m_donoffRecording = false;
-        Log::logger->log(Log::DEBUG, "[OPENXR] don/doff trace recording turned itself off (session ended)");
+        LOG(Log::DEBUG, "[OPENXR] don/doff trace recording turned itself off (session ended)");
     }
 
     // ...and then: every anchor:local pose in the process is now named against a LOCAL_FLOOR origin
@@ -1247,7 +1246,7 @@ bool COpenXRManager::setupFrameChannel() {
 
     m_eventFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (m_eventFd < 0) {
-        Log::logger->log(Log::ERR, "[OPENXR] eventfd() failed for the frame->main channel");
+        LOG(Log::ERR, "[OPENXR] eventfd() failed for the frame->main channel");
         return false;
     }
 
@@ -1260,7 +1259,7 @@ bool COpenXRManager::setupFrameChannel() {
         this);
 
     if (!m_eventSource) {
-        Log::logger->log(Log::ERR, "[OPENXR] wl_event_loop_add_fd failed for the frame->main channel");
+        LOG(Log::ERR, "[OPENXR] wl_event_loop_add_fd failed for the frame->main channel");
         close(m_eventFd);
         m_eventFd = -1;
         return false;
@@ -1299,7 +1298,7 @@ void COpenXRManager::enqueue(XRQueueItem item) {
 
     if (!m_queue.push(std::move(item))) {
         if (!droppable && !m_queueOverflowed.exchange(true))
-            Log::logger->log(Log::ERR, "[OPENXR] frame->main event queue overflow; a non-droppable event was lost");
+            LOG(Log::ERR, "[OPENXR] frame->main event queue overflow; a non-droppable event was lost");
         return;
     }
     wakeMain();
@@ -1332,7 +1331,7 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
             m_presenceKnown = true;
             m_userPresent   = e.a != 0;
             journal(OpenXR::XR_J_PRESENCE, m_userPresent ? 1 : 0);
-            Log::logger->log(Log::DEBUG, "[OPENXR] user {} — re-evaluating monitor plug state", m_userPresent ? "present (donned)" : "absent (doffed)");
+            LOG(Log::DEBUG, "[OPENXR] user {} — re-evaluating monitor plug state", m_userPresent ? "present (donned)" : "absent (doffed)");
             updateMonitorsPlugged(/*allowGrace=*/true);
             // research/20 phase 2: presence is now an INPUT to shouldInhibitIdle() under
             // openxr:inhibit_idle = present, so the don/doff edge must re-fold the Wayland
@@ -1399,7 +1398,7 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
                 requestEffectEval();
             break;
         }
-        case eXRStateEventType::TRACKING: Log::logger->log(Log::DEBUG, "[OPENXR] device-lock tracking {} (monitor {})", e.a ? "gained" : "lost", e.str); break;
+        case eXRStateEventType::TRACKING: LOG(Log::DEBUG, "[OPENXR] device-lock tracking {} (monitor {})", e.a ? "gained" : "lost", e.str); break;
         case eXRStateEventType::RESEAT_DONE:
             // research/30 §7: one SUPER+CTRL+Home must be able to repair a bad memory (D4).
             commitReseatDone();
@@ -1423,7 +1422,7 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
             // A recenter that cannot be followed is not an error the user asked a question about —
             // typically there is simply nothing anchor:local to move. Log it and move on.
             if (!r)
-                Log::logger->log(Log::DEBUG, "[OPENXR] recenter: follow policy did not re-seat — {}", r.error());
+                LOG(Log::DEBUG, "[OPENXR] recenter: follow policy did not re-seat — {}", r.error());
             break;
         }
         case eXRStateEventType::SCHEDULE_FRAMES: {
@@ -1510,7 +1509,7 @@ void COpenXRManager::ensurePointerDevice() {
         return;
     m_pointerDevice = CXRPointerDevice::create();
     g_pInputManager->newMouse(m_pointerDevice); // -> setupMouse -> attachPointer + destroy listener
-    Log::logger->log(Log::DEBUG, "[OPENXR] ray pointer device registered");
+    LOG(Log::DEBUG, "[OPENXR] ray pointer device registered");
 }
 
 void COpenXRManager::removePointerDevice() {
@@ -1519,7 +1518,7 @@ void COpenXRManager::removePointerDevice() {
     m_pointerDevice->destroy(); // fires m_events.destroy -> InputManager + PointerManager detach
     m_pointerDevice.reset();
     m_curHoveredMonitor.clear();
-    Log::logger->log(Log::DEBUG, "[OPENXR] ray pointer device removed");
+    LOG(Log::DEBUG, "[OPENXR] ray pointer device removed");
 }
 
 void COpenXRManager::onFrameChannelReadable() {
@@ -1654,7 +1653,7 @@ void COpenXRManager::frameThread() {
             m_worldChanges.fetch_add(1, std::memory_order_relaxed);
             stageProbeAt = 0;
             if (valid)
-                Log::logger->log(Log::DEBUG, "[OPENXR] room frame (STAGE) redefined with a usable delta — the runtime compensated, monitors keep their place");
+                LOG(Log::DEBUG, "[OPENXR] room frame (STAGE) redefined with a usable delta — the runtime compensated, monitors keep their place");
             else {
                 m_worldChangesUnresolvable.fetch_add(1, std::memory_order_relaxed);
                 handleFrameDiscontinuity("the headset's room frame moved by an unknown amount (STAGE redefined with no usable delta)");
@@ -1686,7 +1685,7 @@ void COpenXRManager::frameThread() {
                 recenterHeadOld      = headLast;
                 recenterHeadOldValid = headLastValid;
                 recenterHeadOldTime  = headLastTime;
-                Log::logger->log(Log::DEBUG, "[OPENXR] recenter carried no pose — reconstructing the frame change from the head across it");
+                LOG(Log::DEBUG, "[OPENXR] recenter carried no pose — reconstructing the frame change from the head across it");
             }
         }
 
@@ -2022,8 +2021,7 @@ void COpenXRManager::frameThread() {
                 if (buf) {
                     m_graphics->blitBuffer(buf, *l, dst, blackAlpha, blackKnee);
                     if (!l->m_hasContent)
-                        Log::logger->log(Log::DEBUG, "[OPENXR] first blit landed for XR monitor '{}' ({}x{})", l->m_monitorName, (int)l->m_swapchainSize.x,
-                                         (int)l->m_swapchainSize.y);
+                        LOG(Log::DEBUG, "[OPENXR] first blit landed for XR monitor '{}' ({}x{})", l->m_monitorName, (int)l->m_swapchainSize.x, (int)l->m_swapchainSize.y);
                     l->m_hasContent = true;
                     // Snapshot the fresh content (WITHOUT chrome/cursor) so an animation-only frame
                     // can restore it into a different acquired image (WP-G2 / report 14). Only when
@@ -2155,7 +2153,7 @@ void COpenXRManager::frameThread() {
             headTrackedEverSeen = true;
         else if (viewValid && !viewTracked && !headTrackedEverSeen && !headTrackedWarned) {
             headTrackedWarned = true;
-            Log::logger->log(Log::DEBUG, "[OPENXR] this runtime reports head poses VALID but never TRACKED — durable placement capture will run on VALID alone");
+            LOG(Log::DEBUG, "[OPENXR] this runtime reports head poses VALID but never TRACKED — durable placement capture will run on VALID alone");
         }
         const bool headTrustworthy = viewValid && (viewTracked || !headTrackedEverSeen);
 
@@ -2186,9 +2184,9 @@ void COpenXRManager::frameThread() {
                 m_stageZ.store(p.pos.z, std::memory_order_relaxed);
                 m_stageYawDeg.store(yawDeg, std::memory_order_relaxed);
                 m_stageProbes.fetch_add(1, std::memory_order_relaxed);
-                Log::logger->log(Log::DEBUG, "[OPENXR] M0 stage probe: T_{}<-stage = [{:.3f}, {:.3f}, {:.3f}] yaw {:.1f} deg, flags 0x{:x}{}",
-                                 m_session->m_usingLocalFloor ? "localfloor" : "local", p.pos.x, p.pos.y, p.pos.z, yawDeg, (unsigned long long)sl.locationFlags,
-                                 located ? "" : " (NOT LOCATABLE — disconnected fragments of the tracked volume)");
+                LOG(Log::DEBUG, "[OPENXR] M0 stage probe: T_{}<-stage = [{:.3f}, {:.3f}, {:.3f}] yaw {:.1f} deg, flags 0x{:x}{}",
+                    m_session->m_usingLocalFloor ? "localfloor" : "local", p.pos.x, p.pos.y, p.pos.z, yawDeg, (unsigned long long)sl.locationFlags,
+                    located ? "" : " (NOT LOCATABLE — disconnected fragments of the tracked volume)");
             }
             // Play-area extents, once per session: a room DISAMBIGUATOR, not a localiser (§7.1), and
             // WiVRn implements no get_reference_bounds_rect at all — so "unavailable" is the expected
@@ -2197,7 +2195,8 @@ void COpenXRManager::frameThread() {
                 stageBoundsLogged = true;
                 XrExtent2Df ext{};
                 const XrResult br = xrGetReferenceSpaceBoundsRect(m_session->m_session, XR_REFERENCE_SPACE_TYPE_STAGE, &ext);
-                Log::logger->log(Log::DEBUG, "[OPENXR] M0 stage bounds: {}", br == XR_SUCCESS ? std::format("{:.2f} x {:.2f} m", ext.width, ext.height) : std::format("unavailable ({})", (int)br));
+                LOG(Log::DEBUG, "[OPENXR] M0 stage bounds: {}",
+                    br == XR_SUCCESS ? std::format("{:.2f} x {:.2f} m", ext.width, ext.height) : std::format("unavailable ({})", (int)br));
             }
         }
 
@@ -2221,11 +2220,11 @@ void COpenXRManager::frameThread() {
                 case OpenXR::eXRRecenterFix::XR_RECENTER_SOLVE_FROM_HEAD: {
                     const auto M = OpenXR::solveReferenceSpaceChangeFromHead(recenterHeadOld, viewPose);
                     if (OpenXR::xrRecenterIsNoOp(M))
-                        Log::logger->log(Log::DEBUG, "[OPENXR] recenter: the reconstructed frame change is the identity — nothing to re-express");
+                        LOG(Log::DEBUG, "[OPENXR] recenter: the reconstructed frame change is the identity — nothing to re-express");
                     else {
                         applyReferenceSpaceChange(M);
-                        Log::logger->log(Log::DEBUG, "[OPENXR] recenter: reconstructed a {:.2f}m / {:.1f} deg frame change from the head — monitors held where they are in the room",
-                                         M.pos.length(), OpenXR::qYawOf(M.rot, 0.F) * 180.F / 3.14159265F);
+                        LOG(Log::DEBUG, "[OPENXR] recenter: reconstructed a {:.2f}m / {:.1f} deg frame change from the head — monitors held where they are in the room",
+                            M.pos.length(), OpenXR::qYawOf(M.rot, 0.F) * 180.F / 3.14159265F);
                     }
                     break;
                 }
@@ -2671,26 +2670,24 @@ void COpenXRManager::frameThread() {
         // (or the fallback for a monitor that has never been placed under tracking). Outside the
         // layer lock, POD counters only.
         if (reseatHeadVetoLog)
-            Log::logger->log(Log::WARN, "[OPENXR] re-seat {}: {} (eye [{:.2f}, {:.2f}, {:.2f}]) — {}", reseatHeadVetoKind ? "refused" : "deferred",
-                             OpenXR::xrSeatHeadName(reseatHeadVeto), viewPose.pos.x, viewPose.pos.y, viewPose.pos.z,
-                             reseatHeadVetoKind ? "monitors left where they are; try again once tracking has settled" :
-                                                  "the restore stays armed and runs on the first frame with a plausible head");
+            LOG(Log::WARN, "[OPENXR] re-seat {}: {} (eye [{:.2f}, {:.2f}, {:.2f}]) — {}", reseatHeadVetoKind ? "refused" : "deferred", OpenXR::xrSeatHeadName(reseatHeadVeto),
+                viewPose.pos.x, viewPose.pos.y, viewPose.pos.z,
+                reseatHeadVetoKind ? "monitors left where they are; try again once tracking has settled" :
+                                     "the restore stays armed and runs on the first frame with a plausible head");
         if (reseatFarHead && reseatGrouped)
-            Log::logger->log(Log::WARN,
-                             "[OPENXR] re-seat: the head is {:.2f}m from the floor (beyond {:.0f}m — the runtime's floor estimate is off); re-seating anyway: deliberate",
-                             viewPose.pos.y, OpenXR::XR_SEAT_HEAD_MAX_HEIGHT);
+            LOG(Log::WARN, "[OPENXR] re-seat: the head is {:.2f}m from the floor (beyond {:.0f}m — the runtime's floor estimate is off); re-seating anyway: deliberate",
+                viewPose.pos.y, OpenXR::XR_SEAT_HEAD_MAX_HEIGHT);
         if (reseatUnseatable)
-            Log::logger->log(Log::WARN,
-                             "[OPENXR] re-seat: the monitor group has no common facing (their normals cancel) — there is no 'in front of' to bring it around to, so nothing moved");
+            LOG(Log::WARN, "[OPENXR] re-seat: the monitor group has no common facing (their normals cancel) — there is no 'in front of' to bring it around to, so nothing moved");
         else if (reseatGrouped) {
-            Log::logger->log(Log::DEBUG,
-                             "[OPENXR] re-seated the arrangement of {} anchor:local monitor(s) onto the current head at its authored {:.2f}m, moving it {:+.2f}m vertically with the head "
-                             "(rigid; relative layout preserved)",
-                             reseatGrouped, reseatDist, reseatRise);
+            LOG(Log::DEBUG,
+                "[OPENXR] re-seated the arrangement of {} anchor:local monitor(s) onto the current head at its authored {:.2f}m, moving it {:+.2f}m vertically with the head "
+                "(rigid; relative layout preserved)",
+                reseatGrouped, reseatDist, reseatRise);
             enqueue(SXRStateEvent{.type = eXRStateEventType::RESEAT_DONE, .a = reseatGrouped});
         } else if (reseatRan)
-            Log::logger->log(Log::DEBUG, "[OPENXR] re-seated {} anchor:local monitor(s) to the head: {} restored from the last wearing, {} from their declared rig", reseatRestored + reseatDeclared,
-                             reseatRestored, reseatDeclared);
+            LOG(Log::DEBUG, "[OPENXR] re-seated {} anchor:local monitor(s) to the head: {} restored from the last wearing, {} from their declared rig",
+                reseatRestored + reseatDeclared, reseatRestored, reseatDeclared);
 
         std::vector<XrCompositionLayerQuad>              quads;
         std::vector<const XrCompositionLayerBaseHeader*> layerPtrs;
@@ -3120,7 +3117,7 @@ bool COpenXRManager::createLayerSwapchain(CXRMonitorLayer& layer, const Vector2D
 
     XrResult r = xrCreateSwapchain(m_session->m_session, &info, &layer.m_swapchain);
     if (XR_FAILED(r)) {
-        Log::logger->log(Log::ERR, "[OPENXR] xrCreateSwapchain for '{}' ({}x{}) failed: {}", layer.m_monitorName, (int)fullSize.x, (int)fullSize.y, (int)r);
+        LOG(Log::ERR, "[OPENXR] xrCreateSwapchain for '{}' ({}x{}) failed: {}", layer.m_monitorName, (int)fullSize.x, (int)fullSize.y, (int)r);
         layer.m_swapchain = XR_NULL_HANDLE;
         return false;
     }
@@ -3160,9 +3157,8 @@ bool COpenXRManager::createLayerSwapchain(CXRMonitorLayer& layer, const Vector2D
     layer.m_chromeUpdateNs    = 0;
     layer.m_chromeActiveNs    = 0;
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] swapchain created for XR monitor '{}': {}x{} (content {}x{} @ +{},+{}), {} images, format 0x{:x}", layer.m_monitorName,
-                     (int)fullSize.x, (int)fullSize.y, (int)size.x, (int)size.y, (int)contentOffset.x, (int)contentOffset.y, imgCount,
-                     (unsigned long long)m_session->m_swapchainFormat);
+    LOG(Log::DEBUG, "[OPENXR] swapchain created for XR monitor '{}': {}x{} (content {}x{} @ +{},+{}), {} images, format 0x{:x}", layer.m_monitorName, (int)fullSize.x,
+        (int)fullSize.y, (int)size.x, (int)size.y, (int)contentOffset.x, (int)contentOffset.y, imgCount, (unsigned long long)m_session->m_swapchainFormat);
     return true;
 }
 
@@ -3308,9 +3304,9 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
         layer->m_l2dUserPinned    = USERRULE.m_offset != Vector2D{-INT32_MAX, -INT32_MAX} && !USERRULE.m_offsetOwnedByXR;
         layer->m_userProvidedMode = USERRULE.m_resolution != Vector2D{} && !USERRULE.m_resolutionOwnedByXR;
         if (layer->m_l2dUserPinned)
-            Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}' is pinned by an explicit monitor= offset — excluded from 2D-plane sync", params.m_name);
+            LOG(Log::DEBUG, "[OPENXR] XR monitor '{}' is pinned by an explicit monitor= offset — excluded from 2D-plane sync", params.m_name);
         if (params.m_resolution && layer->m_userProvidedMode)
-            Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}' keeps its explicit monitor= resolution", params.m_name);
+            LOG(Log::DEBUG, "[OPENXR] XR monitor '{}' keeps its explicit monitor= resolution", params.m_name);
     }
 
     // 4. Bind: cache the monitor + wire listeners. The onGone callback runs the removal
@@ -3371,7 +3367,7 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
     //     (updateMonitorsPlugged()). Consults the same instantaneous predicate as that funnel.
     {
         if (!monitorsShouldBePluggedNow() && mon->m_enabled) {
-            Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}' created unplugged (headset not worn / session not usable)", params.m_name);
+            LOG(Log::DEBUG, "[OPENXR] XR monitor '{}' created unplugged (headset not worn / session not usable)", params.m_name);
             mon->onDisconnect();
         }
     }
@@ -3397,7 +3393,7 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
     //     exist, which is what makes the projection see the whole arrangement instead of a prefix.
     requestLayout2DSync();
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] created XR monitor '{}' (seq {}, size {}m)", params.m_name, layer->m_seq, sizeMeters);
+    LOG(Log::DEBUG, "[OPENXR] created XR monitor '{}' (seq {}, size {}m)", params.m_name, layer->m_seq, sizeMeters);
     journal(OpenXR::XR_J_MONITOR_CREATED, layer->m_histId); // research/30 §8.4
     return layer;
 }
@@ -3486,7 +3482,7 @@ void COpenXRManager::finalizeLayerRemoval(const std::string& name) {
     // when the departed monitor still occupied a column, leaving a hole in the middle of the plane.
     requestLayout2DSync();
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] destroyed XR monitor '{}'", name);
+    LOG(Log::DEBUG, "[OPENXR] destroyed XR monitor '{}'", name);
 }
 
 void COpenXRManager::destroyOutputDeferred(SP<Aquamarine::IOutput> output) {
@@ -3741,7 +3737,7 @@ void COpenXRManager::refreshMonitorRuleOwnership() {
         std::scoped_lock lock(m_layersMu);
         for (const auto& o : ownership) {
             if (o.layer->m_l2dUserPinned != o.userPosition) {
-                Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}' {} explicit monitor= position ownership", o.layer->m_monitorName, o.userPosition ? "gained" : "released");
+                LOG(Log::DEBUG, "[OPENXR] XR monitor '{}' {} explicit monitor= position ownership", o.layer->m_monitorName, o.userPosition ? "gained" : "released");
                 layoutOwnershipChanged = true;
             }
             o.layer->m_l2dUserPinned    = o.userPosition;
@@ -3887,10 +3883,9 @@ void COpenXRManager::applyCrossGpuLinear(const PHLMONITOR& mon) {
         }
     }
 
-    Log::logger->log(Log::DEBUG,
-                     "[OPENXR] XR monitor '{}' buffers: {} — negotiated modifier 0x{:x} ({}) (force_linear={}, XR drm {}:{}, allocator drm {}:{}, gpus {}, {})", mon->m_name,
-                     force ? "LINEAR (cross-GPU import)" : "native tiling", negModifier, NFormatUtils::drmModifierName(negModifier), *PFORCE, xrNode.major, xrNode.minor, allocMajor,
-                     allocMinor, gpusKnown ? "known" : "unresolved", gpusKnown ? (sameGpu ? "same GPU" : "cross-GPU") : "assumed same");
+    LOG(Log::DEBUG, "[OPENXR] XR monitor '{}' buffers: {} — negotiated modifier 0x{:x} ({}) (force_linear={}, XR drm {}:{}, allocator drm {}:{}, gpus {}, {})", mon->m_name,
+        force ? "LINEAR (cross-GPU import)" : "native tiling", negModifier, NFormatUtils::drmModifierName(negModifier), *PFORCE, xrNode.major, xrNode.minor, allocMajor, allocMinor,
+        gpusKnown ? "known" : "unresolved", gpusKnown ? (sameGpu ? "same GPU" : "cross-GPU") : "assumed same");
 
     // Force a fresh composite so the newly-allocated buffer is presented promptly (and the XR import
     // flips content: black → dmabuf without waiting for incidental desktop damage).
@@ -3974,7 +3969,7 @@ void COpenXRManager::publishRecenterPolicy() {
     const auto       policy    = OpenXR::parseRecenterPolicy(*PRECENTER);
     const auto       prev      = (OpenXR::eXRRecenterPolicy)m_recenterPolicy.exchange((uint8_t)policy, std::memory_order_relaxed);
     if (prev != policy)
-        Log::logger->log(Log::DEBUG, "[OPENXR] recenter policy: {} -> {}", OpenXR::recenterPolicyName(prev), OpenXR::recenterPolicyName(policy));
+        LOG(Log::DEBUG, "[OPENXR] recenter policy: {} -> {}", OpenXR::recenterPolicyName(prev), OpenXR::recenterPolicyName(policy));
 }
 
 int COpenXRManager::monitorUnplugPendingMs() const {
@@ -4006,7 +4001,7 @@ void COpenXRManager::onUnplugGraceExpired() {
     // cancelled us and re-plugged, but re-check defensively so a stale fire can never unplug a
     // still-worn session.
     if (!monitorsShouldBePluggedNow() && m_monitorsPlugged) {
-        Log::logger->log(Log::DEBUG, "[OPENXR] monitor unplug grace elapsed (headset doffed/standby) — unplugging XR monitors");
+        LOG(Log::DEBUG, "[OPENXR] monitor unplug grace elapsed (headset doffed/standby) — unplugging XR monitors");
         setMonitorsPlugged(false);
     }
 }
@@ -4114,7 +4109,7 @@ bool COpenXRManager::probeInputsChanged() {
     const bool first  = m_lastProbeInputs.empty();
     m_lastProbeInputs = sig;
     if (!first)
-        Log::logger->log(Log::DEBUG, "[OPENXR] probe-relevant config changed — this reload may start a fresh attempt");
+        LOG(Log::DEBUG, "[OPENXR] probe-relevant config changed — this reload may start a fresh attempt");
     return true;
 }
 
@@ -4125,7 +4120,7 @@ void COpenXRManager::userDisable() {
     // user could not turn the thing off at all. The latch outranks openxr:enabled until an explicit
     // `enable` (or a change to openxr:enabled itself) clears it.
     m_manualDisable = true;
-    Log::logger->log(Log::DEBUG, "[OPENXR] user disable — sticky across reloads until `hyprctl openxr enable`");
+    LOG(Log::DEBUG, "[OPENXR] user disable — sticky across reloads until `hyprctl openxr enable`");
     stop();
 }
 
@@ -4169,7 +4164,7 @@ void COpenXRManager::maybeArmReprobe() {
     if (!OpenXR::xrShouldArmReprobeTimer(watchArmed, activity)) {
         if (m_reprobeTimer)
             m_reprobeTimer->updateTimeout(std::nullopt); // no timer in the quiet steady state
-        Log::logger->log(Log::DEBUG, "[OPENXR] dormant — waiting for the runtime watch (waiting for {}, no timer)", m_probeWait == XR_WAIT_HEADSET ? "headset" : "runtime");
+        LOG(Log::DEBUG, "[OPENXR] dormant — waiting for the runtime watch (waiting for {}, no timer)", m_probeWait == XR_WAIT_HEADSET ? "headset" : "runtime");
         return;
     }
 
@@ -4181,8 +4176,8 @@ void COpenXRManager::maybeArmReprobe() {
     // activity in the watched dirs also caps the delay at base: the runtime is materializing, and
     // that is precisely when polling hard is right. Only a truly absent, quiet runtime backs off.
     const int64_t ms = OpenXR::xrReprobeDelayMs(m_probeWait == XR_WAIT_HEADSET, activity, m_reprobeAttempt, base, 30000);
-    Log::logger->log(Log::DEBUG, "[OPENXR] dormant — re-probing in {}ms (waiting for {}, attempt {}{}{})", ms, m_probeWait == XR_WAIT_HEADSET ? "headset" : "runtime",
-                     m_reprobeAttempt, activity ? ", fs activity recent" : "", watchArmed ? "" : ", no watch — timer is the only mechanism");
+    LOG(Log::DEBUG, "[OPENXR] dormant — re-probing in {}ms (waiting for {}, attempt {}{}{})", ms, m_probeWait == XR_WAIT_HEADSET ? "headset" : "runtime", m_reprobeAttempt,
+        activity ? ", fs activity recent" : "", watchArmed ? "" : ", no watch — timer is the only mechanism");
     armReprobeTimer((int)ms);
 }
 
@@ -4195,7 +4190,7 @@ void COpenXRManager::armReprobeTimer(int ms) {
         const float   leftUs = m_reprobeTimer->leftUs();
         const int64_t leftMs = leftUs <= 0.f ? 0 : (int64_t)(leftUs / 1000.f);
         if (!OpenXR::xrShouldRearmReprobe(true, leftMs, (int64_t)std::max(0, ms))) {
-            Log::logger->log(Log::DEBUG, "[OPENXR] re-probe already pending in {}ms — not pushing it out to {}ms", leftMs, ms);
+            LOG(Log::DEBUG, "[OPENXR] re-probe already pending in {}ms — not pushing it out to {}ms", leftMs, ms);
             return;
         }
     }
@@ -4278,13 +4273,13 @@ void COpenXRManager::setupReprobeWatch() {
     const char* xdg = getenv("XDG_RUNTIME_DIR");
     m_watchSpecs    = OpenXR::xrReprobeWatchDirs(xdg ? std::string(xdg) : std::string());
     if (m_watchSpecs.empty()) {
-        Log::logger->log(Log::DEBUG, "[OPENXR] reprobe-watch: no $XDG_RUNTIME_DIR — timer fallback only");
+        LOG(Log::DEBUG, "[OPENXR] reprobe-watch: no $XDG_RUNTIME_DIR — timer fallback only");
         return;
     }
 
     m_watchInotifyFd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     if (m_watchInotifyFd < 0) {
-        Log::logger->log(Log::WARN, "[OPENXR] reprobe-watch: inotify_init1 failed — timer fallback only");
+        LOG(Log::WARN, "[OPENXR] reprobe-watch: inotify_init1 failed — timer fallback only");
         return;
     }
 
@@ -4298,7 +4293,7 @@ void COpenXRManager::setupReprobeWatch() {
             this);
     }
     if (!m_watchSource) {
-        Log::logger->log(Log::WARN, "[OPENXR] reprobe-watch: wl_event_loop_add_fd failed — timer fallback only");
+        LOG(Log::WARN, "[OPENXR] reprobe-watch: wl_event_loop_add_fd failed — timer fallback only");
         close(m_watchInotifyFd);
         m_watchInotifyFd = -1;
         return;
@@ -4312,7 +4307,7 @@ void COpenXRManager::setupReprobeWatch() {
     for (const auto& spec : m_watchSpecs)
         addReprobeWatchDir(spec, /*checkTriggerNow=*/false);
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] reprobe-watch armed on {} ({} dir watch(es))", m_watchSpecs.front().dir, m_watchByWd.size());
+    LOG(Log::DEBUG, "[OPENXR] reprobe-watch armed on {} ({} dir watch(es))", m_watchSpecs.front().dir, m_watchByWd.size());
 }
 
 void COpenXRManager::addReprobeWatchDir(const OpenXR::SXRReprobeWatch& spec, bool checkTriggerNow) {
@@ -4336,7 +4331,7 @@ void COpenXRManager::addReprobeWatchDir(const OpenXR::SXRReprobeWatch& spec, boo
     // by path instead of following the dead inode.
     const int wd = inotify_add_watch(m_watchInotifyFd, spec.dir.c_str(), IN_CREATE | IN_MOVED_TO | IN_MODIFY | IN_CLOSE_WRITE | IN_DELETE_SELF);
     if (wd < 0) {
-        Log::logger->log(Log::DEBUG, "[OPENXR] reprobe-watch: inotify_add_watch({}) failed", spec.dir);
+        LOG(Log::DEBUG, "[OPENXR] reprobe-watch: inotify_add_watch({}) failed", spec.dir);
         return;
     }
     m_watchByWd[wd] = spec;
@@ -4348,7 +4343,7 @@ void COpenXRManager::addReprobeWatchDir(const OpenXR::SXRReprobeWatch& spec, boo
         for (const auto& trig : spec.triggerNames) {
             const std::string path = spec.dir + "/" + trig;
             if (stat(path.c_str(), &st) == 0) {
-                Log::logger->log(Log::DEBUG, "[OPENXR] reprobe-watch: trigger {} already present on add — probing", path);
+                LOG(Log::DEBUG, "[OPENXR] reprobe-watch: trigger {} already present on add — probing", path);
                 triggerWatchedProbe();
                 break;
             }
@@ -4382,7 +4377,7 @@ void COpenXRManager::onReprobeWatchReadable() {
                 m_watchByWd.erase(it);
                 if (ev->mask & (IN_DELETE_SELF | IN_UNMOUNT)) // IN_IGNORED accompanies these; skip doubles
                     continue;
-                Log::logger->log(Log::DEBUG, "[OPENXR] reprobe-watch: watch on {} invalidated — re-adding by path", spec.dir);
+                LOG(Log::DEBUG, "[OPENXR] reprobe-watch: watch on {} invalidated — re-adding by path", spec.dir);
                 addReprobeWatchDir(spec, /*checkTriggerNow=*/true);
                 continue;
             }
@@ -4398,7 +4393,7 @@ void COpenXRManager::onReprobeWatchReadable() {
                 markWatchActivity(); // runtime dir materializing — poll at the fast cadence for a while
                 for (const auto& sub : m_watchSpecs)
                     if (sub.dir == spec.dir + "/" + name) {
-                        Log::logger->log(Log::DEBUG, "[OPENXR] reprobe-watch: nested dir {} appeared — watching it", sub.dir);
+                        LOG(Log::DEBUG, "[OPENXR] reprobe-watch: nested dir {} appeared — watching it", sub.dir);
                         addReprobeWatchDir(sub, /*checkTriggerNow=*/true);
                         break;
                     }
@@ -4415,7 +4410,7 @@ void COpenXRManager::onReprobeWatchReadable() {
             // compositor server at headset-connect) -> probe (debounced).
             if (OpenXR::xrReprobeTriggerMatch(spec, name)) {
                 markWatchActivity();
-                Log::logger->log(Log::DEBUG, "[OPENXR] reprobe-watch: trigger {}/{} (mask 0x{:x}) — probing soon", spec.dir, name, ev->mask);
+                LOG(Log::DEBUG, "[OPENXR] reprobe-watch: trigger {}/{} (mask 0x{:x}) — probing soon", spec.dir, name, ev->mask);
                 triggerWatchedProbe();
             }
         }
@@ -4449,7 +4444,7 @@ void COpenXRManager::onWatchDebounceExpired() {
     if (m_handshakeInFlight.load(std::memory_order_acquire)) {
         static auto PBASE = CConfigValue<Hyprlang::INT>("openxr:reprobe_interval_ms");
         m_reprobeAttempt  = 0;
-        Log::logger->log(Log::DEBUG, "[OPENXR] reprobe-watch: trigger fired but a handshake is in flight — retrying at base cadence");
+        LOG(Log::DEBUG, "[OPENXR] reprobe-watch: trigger fired but a handshake is in flight — retrying at base cadence");
         armReprobeTimer((int)std::max<int64_t>(250, (int64_t)*PBASE));
         return;
     }
@@ -4458,7 +4453,7 @@ void COpenXRManager::onWatchDebounceExpired() {
     // attempt 0 (base ms) — and the recent-activity window in maybeArmReprobe keeps subsequent delays
     // capped at base while the runtime keeps materializing. No 30s dead-air either way.
     m_reprobeAttempt = 0;
-    Log::logger->log(Log::DEBUG, "[OPENXR] reprobe-watch: trigger fired — probing now (backoff reset)");
+    LOG(Log::DEBUG, "[OPENXR] reprobe-watch: trigger fired — probing now (backoff reset)");
     start();
 }
 
@@ -4563,7 +4558,7 @@ void COpenXRManager::updateMonitorsPlugged(bool allowGrace) {
                 // head pose AFTER the frame thread has actually applied the re-seat.
                 m_l2dRef = OpenXR::SXRLayout2DRef{};
                 m_l2dPrev.clear();
-                Log::logger->log(Log::DEBUG, "[OPENXR] first plug of session — arming recenter-on-plug (anchor:local monitors re-seat to the current head)");
+                LOG(Log::DEBUG, "[OPENXR] first plug of session — arming recenter-on-plug (anchor:local monitors re-seat to the current head)");
             }
         }
         setMonitorsPlugged(true);
@@ -4583,7 +4578,7 @@ void COpenXRManager::updateMonitorsPlugged(bool allowGrace) {
         if (mode == OpenXR::XR_FOLLOW_VISIBLE && firstPlug && !m_monitorsPlugged && signalsAgree &&
             OpenXR::xrDeferFirstPlug(m_everPlugged, visibleSustainedMs(), plugSettleMs())) {
             const int64_t remaining = std::max<int64_t>(0, (int64_t)plugSettleMs() - visibleSustainedMs());
-            Log::logger->log(Log::DEBUG, "[OPENXR] plug signals agree — deferring first plug {}ms (session-start visibility blip guard)", remaining);
+            LOG(Log::DEBUG, "[OPENXR] plug signals agree — deferring first plug {}ms (session-start visibility blip guard)", remaining);
             armPlugSettleTimer((int)remaining);
             return;
         }
@@ -4600,7 +4595,7 @@ void COpenXRManager::updateMonitorsPlugged(bool allowGrace) {
     if (allowGrace && up) {
         static auto PGRACE = CConfigValue<Hyprlang::INT>("openxr:monitor_unplug_grace_ms");
         const int   ms     = (int)std::max<int64_t>(0, (int64_t)*PGRACE);
-        Log::logger->log(Log::DEBUG, "[OPENXR] headset doffed / no longer present — arming {}ms monitor unplug grace", ms);
+        LOG(Log::DEBUG, "[OPENXR] headset doffed / no longer present — arming {}ms monitor unplug grace", ms);
         armUnplugTimer(ms);
         return;
     }
@@ -4645,7 +4640,7 @@ void COpenXRManager::setMonitorsPlugged(bool plugged) {
         if (mon->m_enabled == want)
             continue;
 
-        Log::logger->log(Log::DEBUG, "[OPENXR] {} XR monitor '{}'", want ? "plugging" : "unplugging", l->m_monitorName);
+        LOG(Log::DEBUG, "[OPENXR] {} XR monitor '{}'", want ? "plugging" : "unplugging", l->m_monitorName);
 
         // The same two functions the rule manager dispatches for a runtime `monitor=...,disable`
         // flip (MonitorRuleManager::ensureMonitorStatus): onDisconnect() evacuates workspaces to a
@@ -4696,8 +4691,8 @@ void COpenXRManager::publishRestoreCapture() {
     // Worth a line: this gate is the difference between "your layout will come back" and "it will be
     // re-seated from the config", and `hyprctl openxr status` only shows the resulting per-monitor
     // state. Say which of the two inputs closed it.
-    Log::logger->log(Log::DEBUG, "[OPENXR] cross-session placement capture {} (session {}, user {})", want ? "ON" : "OFF", sessionVisible() ? "visible" : "not visible",
-                     !m_userPresenceSupported ? "presence unsupported" : (!m_presenceKnown ? "presence unknown" : (m_userPresent ? "present" : "absent")));
+    LOG(Log::DEBUG, "[OPENXR] cross-session placement capture {} (session {}, user {})", want ? "ON" : "OFF", sessionVisible() ? "visible" : "not visible",
+        !m_userPresenceSupported ? "presence unsupported" : (!m_presenceKnown ? "presence unknown" : (m_userPresent ? "present" : "absent")));
 
     // research/28 H2 — THE edge. Doc 03 §8.3 already said what the old design meant: while the
     // headset is worn the stored offset "is not a memory of where they PUT it, it is a live
@@ -4737,9 +4732,9 @@ void COpenXRManager::commitRestorePlacements(const char* why) {
                 // SAFE outcome, so it has to be an audible one. A refusal the user cannot see is
                 // indistinguishable from a capture that was never running.
                 ++refused;
-                Log::logger->log(Log::WARN, "[OPENXR] refusing to remember '{}' where it is now — {} (staged [{:.2f}, {:.2f}, {:.2f}] vs remembered [{:.2f}, {:.2f}, {:.2f}])",
-                                 l->m_monitorName, OpenXR::xrRestoreCommitName(verdict), l->m_restoreStaged.pos.x, l->m_restoreStaged.pos.y, l->m_restoreStaged.pos.z,
-                                 l->m_restoreOffset.pos.x, l->m_restoreOffset.pos.y, l->m_restoreOffset.pos.z);
+                LOG(Log::WARN, "[OPENXR] refusing to remember '{}' where it is now — {} (staged [{:.2f}, {:.2f}, {:.2f}] vs remembered [{:.2f}, {:.2f}, {:.2f}])", l->m_monitorName,
+                    OpenXR::xrRestoreCommitName(verdict), l->m_restoreStaged.pos.x, l->m_restoreStaged.pos.y, l->m_restoreStaged.pos.z, l->m_restoreOffset.pos.x,
+                    l->m_restoreOffset.pos.y, l->m_restoreOffset.pos.z);
             }
             // Either way the staging value has been consumed: a stale one must not be re-committed at
             // the next edge, when it would describe a head that has not existed for minutes.
@@ -4747,7 +4742,7 @@ void COpenXRManager::commitRestorePlacements(const char* why) {
         }
     }
     if (committed || refused)
-        Log::logger->log(Log::DEBUG, "[OPENXR] placement commit ({}): {} remembered, {} refused", why, committed, refused);
+        LOG(Log::DEBUG, "[OPENXR] placement commit ({}): {} remembered, {} refused", why, committed, refused);
 }
 
 void COpenXRManager::invalidateAnchorFrames(const char* why) {
@@ -4766,8 +4761,8 @@ void COpenXRManager::invalidateAnchorFrames(const char* why) {
         m_seatEyeValid = false; // a height in the frame that just died (doc 03 §8.4)
     }
     if (n)
-        Log::logger->log(Log::DEBUG, "[OPENXR] {} anchor pose(s) marked as expressed in a dead reference frame ({}) — no placement is remembered from them until something re-places them", n,
-                         why);
+        LOG(Log::DEBUG, "[OPENXR] {} anchor pose(s) marked as expressed in a dead reference frame ({}) — no placement is remembered from them until something re-places them", n,
+            why);
 }
 
 void COpenXRManager::handleFrameDiscontinuity(const std::string& why) {
@@ -4800,9 +4795,9 @@ void COpenXRManager::handleFrameDiscontinuity(const std::string& why) {
         armReseat(OpenXR::XR_RESEAT_ARM_RESTORE);
         m_l2dRefStale.store(true, std::memory_order_release);
         wakeMain();
-        Log::logger->log(Log::WARN, "[OPENXR] {} — re-seating the monitor group to the current head", why);
+        LOG(Log::WARN, "[OPENXR] {} — re-seating the monitor group to the current head", why);
     } else
-        Log::logger->log(Log::WARN, "[OPENXR] {} and recenter_on_plug is off — monitors keep coordinates from a reference frame that no longer exists", why);
+        LOG(Log::WARN, "[OPENXR] {} and recenter_on_plug is off — monitors keep coordinates from a reference frame that no longer exists", why);
 }
 
 COpenXRManager::SXRWorldFrameStatus COpenXRManager::worldFrameStatus() const {
@@ -4927,8 +4922,8 @@ std::expected<std::string, std::string> COpenXRManager::requestReseatToHead(cons
     // to the eyes — from the same inputs the frame thread uses, against the newest published head.
     const float rise = head.headPos.y - OpenXR::xrGroupImpliedEyeHeight(worlds.data(), worlds.size(), rigLive.data(), rigs.data(), rigs.size(), placedEye);
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] re-seat requested ({}) — {} anchor:local monitor(s) will be replanted around the current head at {:.2f}m, {:+.2f}m vertically", why,
-                     eligible, authored, rise);
+    LOG(Log::DEBUG, "[OPENXR] re-seat requested ({}) — {} anchor:local monitor(s) will be replanted around the current head at {:.2f}m, {:+.2f}m vertically", why, eligible,
+        authored, rise);
     return std::format("re-seated {} monitor{} to the current head (authored distance {:.2f}m, moved {:+.2f}m vertically){}", eligible, eligible == 1 ? "" : "s", authored, rise,
                        FARHEAD ? std::format(" — warning: the head reads {:.2f}m from the floor, the runtime's floor estimate is off; re-seated anyway", head.headPos.y) :
                                  std::string{});
@@ -4995,7 +4990,7 @@ void COpenXRManager::onPropsRefreshed() {
         // Cheap enough to count unconditionally; logged sparsely so a genuine storm still shows up in
         // the log without the filter itself becoming the noise it was added to remove.
         if ((++m_refreshesFiltered % 64) == 1)
-            Log::logger->log(Log::DEBUG, "[OPENXR] ignoring config prop refresh (classes {:#x}, nothing XR reads) — {} filtered so far", classes, m_refreshesFiltered);
+            LOG(Log::DEBUG, "[OPENXR] ignoring config prop refresh (classes {:#x}, nothing XR reads) — {} filtered so far", classes, m_refreshesFiltered);
         return;
     }
 
@@ -5064,7 +5059,7 @@ void COpenXRManager::onConfigReload(bool forceProbe) {
     // broken. A reload that merely RE-APPLIES an unchanged `= 1` (what every reload does) must not.
     const int enabledNow = enabled ? 1 : 0;
     if (m_lastEnabledSeen >= 0 && m_lastEnabledSeen != enabledNow && enabledNow == 1 && m_manualDisable) {
-        Log::logger->log(Log::DEBUG, "[OPENXR] openxr:enabled flipped back to 1 — clearing the sticky manual disable");
+        LOG(Log::DEBUG, "[OPENXR] openxr:enabled flipped back to 1 — clearing the sticky manual disable");
         m_manualDisable = false;
     }
     m_lastEnabledSeen = enabledNow;
@@ -5203,10 +5198,10 @@ void COpenXRManager::publishBlackAlphaTuning(std::optional<OpenXR::eXRBlendMode>
     if (OpenXR::xrBlackKeyActive(want) && mode && !showsThrough) {
         if (m_blackAlphaWarnedFor != want) {
             m_blackAlphaWarnedFor = want;
-            Log::logger->log(Log::WARN,
-                             "[OPENXR] openxr:black_alpha = {:.2f} has no effect under blend mode '{}': luma-keyed transparency needs a see-through composite. Set "
-                             "openxr:blend_mode = alpha (passthrough) or additive and restart the session (hyprctl openxr disable && hyprctl openxr enable)",
-                             want, OpenXR::blendModeToString(*mode));
+            LOG(Log::WARN,
+                "[OPENXR] openxr:black_alpha = {:.2f} has no effect under blend mode '{}': luma-keyed transparency needs a see-through composite. Set "
+                "openxr:blend_mode = alpha (passthrough) or additive and restart the session (hyprctl openxr disable && hyprctl openxr enable)",
+                want, OpenXR::blendModeToString(*mode));
         }
     } else
         m_blackAlphaWarnedFor = -1.F; // re-arm
@@ -5296,7 +5291,7 @@ void COpenXRManager::publishDepthDesktopTuning() {
     if (!changed)
         return;
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] depth desktop {} — re-deriving XR monitor modes", want ? "ON (per-eye composite, packed mode)" : "OFF (single composite)");
+    LOG(Log::DEBUG, "[OPENXR] depth desktop {} — re-deriving XR monitor modes", want ? "ON (per-eye composite, packed mode)" : "OFF (single composite)");
     reassertMonitorModeRules();
 
     // The declaration the frame thread reads is derived from the monitor's live packing state, and
@@ -5330,7 +5325,7 @@ void COpenXRManager::reloadXRRules() {
     m_rulesUseTitle = std::ranges::any_of(m_xrRules, [](const OpenXR::SXRRule& r) { return (bool)r.conds.focusTitleRe; });
 
     if (!m_xrRules.empty())
-        Log::logger->log(Log::DEBUG, "[OPENXR] {} xrrule(s) loaded (title trigger: {})", m_xrRules.size(), m_rulesUseTitle ? "on" : "off");
+        LOG(Log::DEBUG, "[OPENXR] {} xrrule(s) loaded (title trigger: {})", m_xrRules.size(), m_rulesUseTitle ? "on" : "off");
 
     requestEffectEval();
 }
@@ -5712,10 +5707,10 @@ void COpenXRManager::evaluateMonitorEffects() {
     // and the rules are (correctly) resolved with keying off until one is picked.
     else if (gatedAnyKey && m_session && !m_fxKeyGateWarned) {
         m_fxKeyGateWarned = true;
-        Log::logger->log(Log::WARN,
-                         "[OPENXR] an xrrule (or manual override) asks for luma-keyed transparency, but the session blend mode is '{}': keying needs a see-through composite and "
-                         "is ignored. Set openxr:blend_mode = alpha (passthrough) or additive and restart the session. Uniform `alpha` still applies (as a dim)",
-                         blendModeName());
+        LOG(Log::WARN,
+            "[OPENXR] an xrrule (or manual override) asks for luma-keyed transparency, but the session blend mode is '{}': keying needs a see-through composite and "
+            "is ignored. Set openxr:blend_mode = alpha (passthrough) or additive and restart the session. Uniform `alpha` still applies (as a dim)",
+            blendModeName());
     }
 
     if (g_pHyprRenderer)
@@ -6068,8 +6063,7 @@ void COpenXRManager::reconcileDeclaredMonitors() {
     std::vector<std::string> ambiguous;
     const auto               declared = OpenXR::effectiveXRMonitorDeclarations(Config::xrDeclarationMgr()->monitors(), m_xrContext, &ambiguous);
     for (const auto& name : ambiguous)
-        Log::logger->log(Log::WARN, "[OPENXR] xrmonitor '{}': several `when`-qualified declarations match {}; the last one wins", name,
-                         OpenXR::describeXRSystemContext(m_xrContext));
+        LOG(Log::WARN, "[OPENXR] xrmonitor '{}': several `when`-qualified declarations match {}; the last one wins", name, OpenXR::describeXRSystemContext(m_xrContext));
 
     // Snapshot current declared layer names.
     std::vector<std::string> liveDeclared;
@@ -6130,13 +6124,13 @@ void COpenXRManager::reconcileDeclaredMonitors() {
         }
         if (existing && !existing->m_declaredByConfig) {
             // Name collision with a runtime-created monitor: leave the runtime one alone.
-            Log::logger->log(Log::WARN, "[OPENXR] xrmonitor '{}' declared in config but a runtime monitor already owns the name; ignoring the declaration", d.m_name);
+            LOG(Log::WARN, "[OPENXR] xrmonitor '{}' declared in config but a runtime monitor already owns the name; ignoring the declaration", d.m_name);
             continue;
         }
         // D \ L: create.
         auto res = createXRMonitor(d);
         if (!res) {
-            Log::logger->log(Log::WARN, "[OPENXR] failed to create declared xrmonitor '{}': {}", d.m_name, res.error());
+            LOG(Log::WARN, "[OPENXR] failed to create declared xrmonitor '{}': {}", d.m_name, res.error());
             continue;
         }
         res.value()->m_declaredByConfig = true;
@@ -6178,7 +6172,7 @@ OpenXR::SXRResolvedDefaults COpenXRManager::resolveLayerDefaults(const CXRMonito
 
     // The only failure is an unknown profile: its blocks were deleted by a reload after this monitor
     // was created with `profile:`. The monitor keeps existing; it just falls back to the base layers.
-    Log::logger->log(Log::WARN, "[OPENXR] XR monitor '{}': xr_defaults profile '{}' no longer exists; using the base defaults", layer.m_monitorName, layer.m_profile);
+    LOG(Log::WARN, "[OPENXR] XR monitor '{}': xr_defaults profile '{}' no longer exists; using the base defaults", layer.m_monitorName, layer.m_profile);
     return OpenXR::resolveXRDefaults(blocks, "", m_xrContext, globals, layer.m_explicit).value_or(OpenXR::SXRResolvedDefaults{});
 }
 
@@ -6214,7 +6208,7 @@ void COpenXRManager::reapplyXRDefaults() {
             if (resolved.size.source != OpenXR::XR_DEFSRC_EXPLICIT && !layer->m_sizeUserOwned && layer->m_defaultSizeApplied > 0.F &&
                 std::abs(live - layer->m_defaultSizeApplied) > 1e-4F) {
                 layer->m_sizeUserOwned = true;
-                Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}': quad width was resized at runtime; xr_defaults no longer own it", layer->m_monitorName);
+                LOG(Log::DEBUG, "[OPENXR] XR monitor '{}': quad width was resized at runtime; xr_defaults no longer own it", layer->m_monitorName);
             }
 
             if (resolved.size.source != OpenXR::XR_DEFSRC_EXPLICIT && !layer->m_sizeUserOwned && std::abs(live - resolved.size.value) > 1e-4F) {
@@ -6232,9 +6226,9 @@ void COpenXRManager::reapplyXRDefaults() {
         layer->m_resolved = resolved;
 
         if (modeChanged || sizeChanged)
-            Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}': xr_defaults re-resolved (mode {} via {}, scale {} via {}, size {}m via {})", layer->m_monitorName,
-                             res ? std::format("{}x{}@{}", res->x, res->y, hz.value_or(60.F)) : std::string("unrequested"), OpenXR::xrDefaultSourceName(resolved.resolution.source),
-                             resolved.scale.value, OpenXR::xrDefaultSourceName(resolved.scale.source), resolved.size.value, OpenXR::xrDefaultSourceName(resolved.size.source));
+            LOG(Log::DEBUG, "[OPENXR] XR monitor '{}': xr_defaults re-resolved (mode {} via {}, scale {} via {}, size {}m via {})", layer->m_monitorName,
+                res ? std::format("{}x{}@{}", res->x, res->y, hz.value_or(60.F)) : std::string("unrequested"), OpenXR::xrDefaultSourceName(resolved.resolution.source),
+                resolved.scale.value, OpenXR::xrDefaultSourceName(resolved.scale.source), resolved.size.value, OpenXR::xrDefaultSourceName(resolved.size.source));
 
         if (!mon || !Config::monitorRuleMgr())
             continue;
@@ -6278,7 +6272,7 @@ void COpenXRManager::refreshXRSystemContext() {
     if (ctx == m_xrContext)
         return;
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] bound HMD context: {}", OpenXR::describeXRSystemContext(ctx));
+    LOG(Log::DEBUG, "[OPENXR] bound HMD context: {}", OpenXR::describeXRSystemContext(ctx));
     m_xrContext = std::move(ctx);
 
     // `when` may now select different declarations and different xr_defaults blocks.
@@ -6314,7 +6308,7 @@ void COpenXRManager::recomputeQuadActive() {
 
     for (auto& [name, nowActive] : flips) {
         if (!nowActive)
-            Log::logger->log(Log::WARN, "[OPENXR] XR monitor '{}' quad suspended: over the runtime layer cap ({})", name, maxCount);
+            LOG(Log::WARN, "[OPENXR] XR monitor '{}' quad suspended: over the runtime layer cap ({})", name, maxCount);
         if (g_pEventManager)
             g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitorquad", name + (nowActive ? ",1" : ",0")});
     }
@@ -6692,7 +6686,7 @@ void COpenXRManager::releaseLayout2DPlacements() {
         releaseLayout2DRuleOffset(name);
     if (!changed)
         return;
-    Log::logger->log(Log::DEBUG, "[OPENXR] 2D-plane sync off — XR monitors handed back to auto placement");
+    LOG(Log::DEBUG, "[OPENXR] 2D-plane sync off — XR monitors handed back to auto placement");
     State::monitorLayoutController()->scheduleRecheck();
 }
 
@@ -6712,8 +6706,8 @@ void COpenXRManager::latchLayout2DReference() {
     m_l2dRef.eye   = ctx.view.pos;
     m_l2dRef.yaw   = horiz < 1e-4F ? m_l2dRef.yaw : std::atan2(fwd.x, -fwd.z); // looking straight up/down: keep the last yaw
     m_l2dRef.valid = true;
-    Log::logger->log(Log::DEBUG, "[OPENXR] 2D-plane sync: reference frame latched (eye [{:.2f}, {:.2f}, {:.2f}], yaw {:.1f} deg)", m_l2dRef.eye.x, m_l2dRef.eye.y, m_l2dRef.eye.z,
-                     m_l2dRef.yaw * 57.29578F);
+    LOG(Log::DEBUG, "[OPENXR] 2D-plane sync: reference frame latched (eye [{:.2f}, {:.2f}, {:.2f}], yaw {:.1f} deg)", m_l2dRef.eye.x, m_l2dRef.eye.y, m_l2dRef.eye.z,
+        m_l2dRef.yaw * 57.29578F);
 }
 
 void COpenXRManager::requestLayout2DSync() {
@@ -6957,8 +6951,8 @@ void COpenXRManager::syncLayout2D(bool force) {
     if (!changed)
         return; // the common case: a trigger fired but nothing actually moved (hysteresis held)
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] 2D-plane sync: placed {} monitor(s) in {} row(s), block {}x{} at [{}, {}]{}", chosen.size(), res.rows, res.width, res.height, origin.x,
-                     origin.y, pinned > 0 ? std::format(" ({} pinned by monitor= rules)", pinned) : "");
+    LOG(Log::DEBUG, "[OPENXR] 2D-plane sync: placed {} monitor(s) in {} row(s), block {}x{} at [{}, {}]{}", chosen.size(), res.rows, res.width, res.height, origin.x, origin.y,
+        pinned > 0 ? std::format(" ({} pinned by monitor= rules)", pinned) : "");
 
     State::monitorLayoutController()->scheduleRecheck();
     if (g_pEventManager)
@@ -7172,8 +7166,7 @@ std::optional<Vector2D> COpenXRManager::redirectCursorCrossing(const Vector2D& o
         return std::nullopt;
     }
     const Vector2D land = OpenXR::xrCrossEntryPoint(tgt->logicalBox(), pick.u, pick.v, OpenXR::XR_CROSS_ENTRY_INSET_PX);
-    Log::logger->log(Log::TRACE, "[OPENXR] cursor ray-crossing {} -> {} at uv {:.3f},{:.3f} ({:.2f}m{})", src->m_name, tgt->m_name, pick.u, pick.v, pick.t,
-                     pick.tolerated ? ", tolerated" : "");
+    LOG(Log::TRACE, "[OPENXR] cursor ray-crossing {} -> {} at uv {:.3f},{:.3f} ({:.2f}m{})", src->m_name, tgt->m_name, pick.u, pick.v, pick.t, pick.tolerated ? ", tolerated" : "");
     m_crossPush.reset();
     return land;
 }
@@ -7846,10 +7839,10 @@ std::expected<void, std::string> COpenXRManager::cmdView(const std::string& args
             }
         }
         for (const auto& name : aborted)
-            Log::logger->log(Log::DEBUG, "[OPENXR] monitor view hidden mid-grab: released '{}' where it was last displayed", name);
+            LOG(Log::DEBUG, "[OPENXR] monitor view hidden mid-grab: released '{}' where it was last displayed", name);
     }
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] monitor view {}", visible ? "shown" : "hidden");
+    LOG(Log::DEBUG, "[OPENXR] monitor view {}", visible ? "shown" : "hidden");
     return {};
 }
 

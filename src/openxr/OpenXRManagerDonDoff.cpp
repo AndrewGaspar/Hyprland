@@ -236,7 +236,7 @@ void COpenXRManager::donDoffInput(OpenXR::eXRDonInput in, const char* why) {
     auto       setState = [&](OpenXR::eXRDonState next) {
         if (next == m_donState)
             return;
-        Log::logger->log(Log::DEBUG, "[OPENXR] don/doff: {} -> {} ({})", OpenXR::xrDonStateName(m_donState), OpenXR::xrDonStateName(next), why);
+        LOG(Log::DEBUG, "[OPENXR] don/doff: {} -> {} ({})", OpenXR::xrDonStateName(m_donState), OpenXR::xrDonStateName(next), why);
         m_donState      = next;
         m_donStateSince = Time::steadyNow();
     };
@@ -251,7 +251,7 @@ void COpenXRManager::donDoffInput(OpenXR::eXRDonInput in, const char* why) {
         // legacy way (first valid frame) rather than lose it
         m_donRestore = XR_DONR_DONE;
         armReseat(OpenXR::XR_RESEAT_ARM_RESTORE);
-        Log::logger->log(Log::DEBUG, "[OPENXR] don/doff: the deferred recenter-on-plug re-seat runs now (the don gate is off)");
+        LOG(Log::DEBUG, "[OPENXR] don/doff: the deferred recenter-on-plug re-seat runs now (the don gate is off)");
     }
     if (prev == OpenXR::XR_DON_DONNING && (step.next == OpenXR::XR_DON_UNWORN || step.next == OpenXR::XR_DON_NO_SESSION)) {
         // taken off (or the session ended) before the head settled: show the monitors where they are
@@ -261,7 +261,7 @@ void COpenXRManager::donDoffInput(OpenXR::eXRDonInput in, const char* why) {
             m_donRestore = step.next == OpenXR::XR_DON_UNWORN ? XR_DONR_PENDING : XR_DONR_NONE;
         m_lastDon.haveLastDon   = true;
         m_lastDon.lastDonSettle = "cancelled";
-        Log::logger->log(Log::DEBUG, "[OPENXR] don settle abandoned ({}) — nothing was placed", why);
+        LOG(Log::DEBUG, "[OPENXR] don settle abandoned ({}) — nothing was placed", why);
     }
     if (step.actions & OpenXR::XR_DA_SHOW_IN_PLACE) {
         // the backstop (§5.2): no hydration arrived, so no valid view did either. Show in place; an
@@ -274,8 +274,8 @@ void COpenXRManager::donDoffInput(OpenXR::eXRDonInput in, const char* why) {
         m_lastDon.haveLastDon     = true;
         m_lastDon.lastDonSettle   = "backstop";
         m_lastDon.lastDonSettleMs = (steadyNs() - m_donGateEdgeNs.load(std::memory_order_relaxed)) / 1'000'000;
-        Log::logger->log(Log::WARN, "[OPENXR] don settle produced nothing in {} ms (no valid head pose) — showing the monitors where they are{}", m_lastDon.lastDonSettleMs,
-                         m_donKind == XR_DONG_RESTORE ? "; the re-seat runs on the first plausible head" : "");
+        LOG(Log::WARN, "[OPENXR] don settle produced nothing in {} ms (no valid head pose) — showing the monitors where they are{}", m_lastDon.lastDonSettleMs,
+            m_donKind == XR_DONG_RESTORE ? "; the re-seat runs on the first plausible head" : "");
     }
     if (in == OpenXR::XR_DIN_SESSION_DOWN && m_posTrackedSeen.load(std::memory_order_relaxed))
         expectSixDof(); // remembers this system as a 6DoF one for the next session
@@ -384,8 +384,8 @@ void COpenXRManager::enterDonning(bool restore, bool needPos, const char* why, c
     } else
         m_donBackstopTimer->updateTimeout(dur);
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] don/doff: hiding {} anchor:local monitor(s) until the head settles ({}; {}{}; at most {} ms)", hidden, why, reason,
-                     needPos ? ", 6DoF expected" : "", timeout);
+    LOG(Log::DEBUG, "[OPENXR] don/doff: hiding {} anchor:local monitor(s) until the head settles ({}; {}{}; at most {} ms)", hidden, why, reason, needPos ? ", 6DoF expected" : "",
+        timeout);
 }
 
 void COpenXRManager::releaseDonGate() {
@@ -417,7 +417,7 @@ bool COpenXRManager::donClaimFirstPlugRestore() {
         return false;
     }
     m_donRestore = XR_DONR_PENDING; // not worn yet (monitors_follow_session = off | session): the next don runs it
-    Log::logger->log(Log::DEBUG, "[OPENXR] first plug of session — the recenter-on-plug re-seat is deferred to the don settle");
+    LOG(Log::DEBUG, "[OPENXR] first plug of session — the recenter-on-plug re-seat is deferred to the don settle");
     return true;
 }
 
@@ -464,13 +464,13 @@ void COpenXRManager::onDonHydrated(uint32_t token) {
 
     const char* what = restore ? (r.havePose ? "re-seated from the settled head" : "re-seat armed for the first upright head") : "shown in place";
     if (r.state == OpenXR::XR_SETTLE_SETTLED)
-        Log::logger->log(Log::DEBUG, "[OPENXR] don settled after {} ms (ω max {:.0f}°/s mean {:.0f}°/s, pitch {:.0f}°, roll {:.0f}°) — {}", m_lastDon.lastDonSettleMs,
-                         m_lastDon.lastDonAngMaxDeg, m_lastDon.lastDonAngMeanDeg, m_lastDon.lastDonPitchDeg, m_lastDon.lastDonRollDeg, what);
+        LOG(Log::DEBUG, "[OPENXR] don settled after {} ms (ω max {:.0f}°/s mean {:.0f}°/s, pitch {:.0f}°, roll {:.0f}°) — {}", m_lastDon.lastDonSettleMs,
+            m_lastDon.lastDonAngMaxDeg, m_lastDon.lastDonAngMeanDeg, m_lastDon.lastDonPitchDeg, m_lastDon.lastDonRollDeg, what);
     else
-        Log::logger->log(Log::WARN, "[OPENXR] don settle timed out after {} ms ({}) — rung {}: {}", m_lastDon.lastDonSettleMs, settleBlockName(r.block), sc<int>(r.rung),
-                         r.rung == OpenXR::XR_RUNG_BEST_WINDOW      ? std::format("{}, from the calmest moment it looked ahead", what) :
-                             r.rung == OpenXR::XR_RUNG_LAST_UPRIGHT ? std::format("{}, from the last upright head (reclined?)", what) :
-                                                                      std::format("{}; nothing moved on our own account", what));
+        LOG(Log::WARN, "[OPENXR] don settle timed out after {} ms ({}) — rung {}: {}", m_lastDon.lastDonSettleMs, settleBlockName(r.block), sc<int>(r.rung),
+            r.rung == OpenXR::XR_RUNG_BEST_WINDOW      ? std::format("{}, from the calmest moment it looked ahead", what) :
+                r.rung == OpenXR::XR_RUNG_LAST_UPRIGHT ? std::format("{}, from the last upright head (reclined?)", what) :
+                                                         std::format("{}; nothing moved on our own account", what));
     journal(OpenXR::XR_J_DON_SETTLED, token, r.rung, sc<float>(m_lastDon.lastDonSettleMs) * 1e-3F);
     donDoffInput(OpenXR::XR_DIN_HYDRATED, "the head settled");
 }
@@ -666,8 +666,8 @@ void COpenXRManager::doffCommit(const char* why) {
             r.reason == OpenXR::XR_SEATREF_SHORT                                                             ? std::format(" ({})", fmtDur(r.detail)) :
                                                                                                                std::string{};
         d.refusals.push_back(std::format("{}: {}{}", OpenXR::xrSeatSourceName(r.src), OpenXR::xrSeatRefusalName(r.reason), detail));
-        Log::logger->log(logLvl, "[OPENXR] {}doff seat candidate refused: {} ending {:.1f}s before the edge — {}{}; trying the next", prefix, OpenXR::xrSeatSourceName(r.src),
-                         sc<double>(tEdge - r.tEndNs) * 1e-9, OpenXR::xrSeatRefusalName(r.reason), detail);
+        LOG(logLvl, "[OPENXR] {}doff seat candidate refused: {} ending {:.1f}s before the edge — {}{}; trying the next", prefix, OpenXR::xrSeatSourceName(r.src),
+            sc<double>(tEdge - r.tEndNs) * 1e-9, OpenXR::xrSeatRefusalName(r.reason), detail);
     }
 
     const std::string onsetStr =
@@ -682,9 +682,9 @@ void COpenXRManager::doffCommit(const char* why) {
         if (v.ok) {
             d.committed           = commitSeat(v, arr);
             m_authoredSinceCommit = 0;
-            Log::logger->log(Log::DEBUG, "[OPENXR] doff seat ({}; {}): {} — remembered {} monitor(s)", why, onsetStr, seatStr, d.committed);
+            LOG(Log::DEBUG, "[OPENXR] doff seat ({}; {}): {} — remembered {} monitor(s)", why, onsetStr, seatStr, d.committed);
         } else
-            Log::logger->log(Log::WARN, "[OPENXR] doff ({}): no trustworthy seat in 30 min of history — keeping the previous memory", why);
+            LOG(Log::WARN, "[OPENXR] doff ({}): no trustworthy seat in 30 min of history — keeping the previous memory", why);
         journal(OpenXR::XR_J_DOFF_COMMIT, v.ok ? v.chosen.src : 0, sc<uint32_t>(d.committed), d.onsetBeforeEdgeMs * 1e-3F);
         return;
     }
@@ -692,7 +692,7 @@ void COpenXRManager::doffCommit(const char* why) {
     // ---- shadow: compare what the selection WOULD remember with what the legacy gate DID ----
     if (!v.ok) {
         d.shadowSummary = "no trustworthy seat; legacy memory stands";
-        Log::logger->log(Log::DEBUG, "[OPENXR] shadow: doff ({}): no trustworthy seat in 30 min of history ({}) — the intent path would keep the previous memory", why, onsetStr);
+        LOG(Log::DEBUG, "[OPENXR] shadow: doff ({}): no trustworthy seat in 30 min of history ({}) — the intent path would keep the previous memory", why, onsetStr);
         journal(OpenXR::XR_J_SHADOW, 0, 0, 0.F);
         return;
     }
@@ -740,16 +740,15 @@ void COpenXRManager::doffCommit(const char* why) {
             worstName = c.name;
         }
         if (!ok)
-            Log::logger->log(c.legacyValid ? Log::WARN : Log::DEBUG,
-                             "[OPENXR] shadow:   {}: would remember [{:.2f}, {:.2f}, {:.2f}] vs memory ({}) [{:.2f}, {:.2f}, {:.2f}] (Δ {:.2f} m, bearing Δ {:.0f}°)", c.name,
-                             c.would.pos.x, c.would.pos.y, c.would.pos.z, c.legacyValid ? OpenXR::xrSeatSourceName(c.legacySrc) : "none", c.legacy.pos.x, c.legacy.pos.y,
-                             c.legacy.pos.z, dm, db);
+            LOG(c.legacyValid ? Log::WARN : Log::DEBUG,
+                "[OPENXR] shadow:   {}: would remember [{:.2f}, {:.2f}, {:.2f}] vs memory ({}) [{:.2f}, {:.2f}, {:.2f}] (Δ {:.2f} m, bearing Δ {:.0f}°)", c.name, c.would.pos.x,
+                c.would.pos.y, c.would.pos.z, c.legacyValid ? OpenXR::xrSeatSourceName(c.legacySrc) : "none", c.legacy.pos.x, c.legacy.pos.y, c.legacy.pos.z, dm, db);
     }
     d.committed = sc<int>(cmps.size());
     d.shadowSummary =
         std::format("would remember {} monitor(s); legacy agrees for {}/{} (worst {}: {:.2f} m, {:.0f}°)", cmps.size(), agree, cmps.size(), worstName, worstM, worstDeg);
-    Log::logger->log(Log::DEBUG, "[OPENXR] shadow: doff seat ({}; {}): {} — would remember {} monitor(s); legacy memory agrees for {}/{} (worst {}: {:.2f} m, {:.0f}°)", why,
-                     onsetStr, seatStr, cmps.size(), agree, cmps.size(), worstName, worstM, worstDeg);
+    LOG(Log::DEBUG, "[OPENXR] shadow: doff seat ({}; {}): {} — would remember {} monitor(s); legacy memory agrees for {}/{} (worst {}: {:.2f} m, {:.0f}°)", why, onsetStr, seatStr,
+        cmps.size(), agree, cmps.size(), worstName, worstM, worstDeg);
     journal(OpenXR::XR_J_SHADOW, v.chosen.src, sc<uint32_t>(agree), worstDeg);
 }
 
@@ -782,7 +781,7 @@ void COpenXRManager::commitReseatDone() {
     m_authoredSinceCommit = 0;
     journal(OpenXR::XR_J_RESEAT_COMMIT, 0, sc<uint32_t>(n));
     donDoffInput(OpenXR::XR_DIN_RESEAT_DONE, "re-seat");
-    Log::logger->log(Log::DEBUG, "[OPENXR] re-seat committed as the new memory for {} monitor(s) (provenance reseat)", n);
+    LOG(Log::DEBUG, "[OPENXR] re-seat committed as the new memory for {} monitor(s) (provenance reseat)", n);
 }
 
 void COpenXRManager::noteAuthored(uint32_t histId, const char* why) {
@@ -836,7 +835,7 @@ std::expected<std::string, std::string> COpenXRManager::cmdForget(const std::str
     if (!all && id == 0)
         return std::unexpected<std::string>("forget: no XR monitor named '" + target + "'");
     journal(OpenXR::XR_J_FORGET, id, sc<uint32_t>(n));
-    Log::logger->log(Log::DEBUG, "[OPENXR] forgot {} remembered placement(s) ({}) — the next session re-seats them from their declared rig", n, all ? "all" : target);
+    LOG(Log::DEBUG, "[OPENXR] forgot {} remembered placement(s) ({}) — the next session re-seats them from their declared rig", n, all ? "all" : target);
     return std::format("forgot {} remembered placement{} — the next session re-seats {} from the declared rig", n, n == 1 ? "" : "s", all ? "them" : "it");
 }
 
@@ -971,16 +970,15 @@ std::expected<std::string, std::string> COpenXRManager::cmdDonoffRecord(const st
         a.pop_back();
     if (a == "on") {
         m_donoffRecording = true;
-        Log::logger->log(Log::WARN,
-                         "[OPENXR] don/doff trace recording ON — head-pose traces (±15 s around each wear edge) are being written to {} until `donoff record off` or session end",
-                         traceDir().string());
+        LOG(Log::WARN, "[OPENXR] don/doff trace recording ON — head-pose traces (±15 s around each wear edge) are being written to {} until `donoff record off` or session end",
+            traceDir().string());
         return std::format("recording don/doff traces to {} (head poses around each wear edge; off at session end)", traceDir().string());
     }
     if (a == "off") {
         if (m_donoffRecording && m_donoffTraceEdgeNs)
             writeDonoffTrace();
         m_donoffRecording = false;
-        Log::logger->log(Log::DEBUG, "[OPENXR] don/doff trace recording off");
+        LOG(Log::DEBUG, "[OPENXR] don/doff trace recording off");
         return std::string{"don/doff trace recording off"};
     }
     return std::unexpected<std::string>("donoff record: expected on|off");
@@ -1029,7 +1027,7 @@ void COpenXRManager::writeDonoffTrace() {
     const std::string file = (dir / std::format("donoff-{:%Y%m%dT%H%M%S}-{}.jsonl", std::chrono::floor<std::chrono::seconds>(wall), sys)).string();
     std::ofstream     o(file);
     if (!o) {
-        Log::logger->log(Log::WARN, "[OPENXR] don/doff trace: cannot write {}", file);
+        LOG(Log::WARN, "[OPENXR] don/doff trace: cannot write {}", file);
         return;
     }
     const auto& h   = *m_historySnap;
@@ -1061,7 +1059,7 @@ void COpenXRManager::writeDonoffTrace() {
             continue;
         o << std::format(R"({{"t":{:.3f},"ev":"{}","a":{},"b":{},"x":{:.3f}}})", sc<double>(e.tNs - edge) * 1e-6, journalKindName(e.kind), e.a, e.b, e.x) << "\n";
     }
-    Log::logger->log(Log::DEBUG, "[OPENXR] don/doff trace written: {}", file);
+    LOG(Log::DEBUG, "[OPENXR] don/doff trace written: {}", file);
 }
 
 #endif

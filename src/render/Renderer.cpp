@@ -2966,8 +2966,8 @@ void IHyprRenderer::renderMonitor(PHLMONITOR pMonitor, bool commit) {
         static auto PLOGDAMAGE = CConfigValue<Config::INTEGER>("debug:log_damage");
         if (*PLOGDAMAGE) {
             const auto& EXT = frameDamage.pixman()->extents;
-            Log::logger->log(Log::DEBUG, "Damage: Stereo fold on {} ({} panes): extents xy: {}, {} wh: {}, {}", pMonitor->m_name, pMonitor->stereoPaneCount(), EXT.x1, EXT.y1,
-                             EXT.x2 - EXT.x1, EXT.y2 - EXT.y1);
+            LOG(Log::DEBUG, "Damage: Stereo fold on {} ({} panes): extents xy: {}, {} wh: {}, {}", pMonitor->m_name, pMonitor->stereoPaneCount(), EXT.x1, EXT.y1, EXT.x2 - EXT.x1,
+                EXT.y2 - EXT.y1);
         }
     }
 

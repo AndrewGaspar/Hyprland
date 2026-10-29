@@ -75,8 +75,7 @@ const char* CXRPlaneDetectionSource::name() const {
 void CXRPlaneDetectionSource::fail(eDetState state, const std::string& why) {
     m_state = state;
     m_why   = why;
-    Log::logger->log(state == DET_UNSUPPORTED ? Log::DEBUG : Log::WARN, "[OPENXR] surfaces: XR_EXT_plane_detection {} — {}", state == DET_UNSUPPORTED ? "unsupported" : "disabled",
-                     why);
+    LOG(state == DET_UNSUPPORTED ? Log::DEBUG : Log::WARN, "[OPENXR] surfaces: XR_EXT_plane_detection {} — {}", state == DET_UNSUPPORTED ? "unsupported" : "disabled", why);
 }
 
 std::string CXRPlaneDetectionSource::status() const {
@@ -135,7 +134,7 @@ bool CXRPlaneDetectionSource::ensureDetector() {
         fail(DET_FAILED, std::format("xrCreatePlaneDetectorEXT failed ({})", sc<int>(r)));
         return false;
     }
-    Log::logger->log(Log::DEBUG, "[OPENXR] surfaces: plane detector created ({})", m_contour ? "with contours" : "extents only");
+    LOG(Log::DEBUG, "[OPENXR] surfaces: plane detector created ({})", m_contour ? "with contours" : "extents only");
     return true;
 }
 
@@ -225,7 +224,7 @@ bool CXRPlaneDetectionSource::fetch(const OpenXR::SXRPlanePollContext& ctx, std:
         OpenXR::SXRPlane p = OpenXR::xrCanonicalPlane(pose, orientFromXr(l.orientation), poly.data(), poly.size(), l.extents.width, l.extents.height, swapped);
         if (swapped && !m_swapLogged) {
             m_swapLogged = true;
-            Log::logger->log(Log::DEBUG, "[OPENXR] surfaces: the runtime's plane poses use a +Y normal; re-expressing them as +Z (logged once)");
+            LOG(Log::DEBUG, "[OPENXR] surfaces: the runtime's plane poses use a +Y normal; re-expressing them as +Z (logged once)");
         }
         p.id         = l.planeId;
         p.label      = labelFromXr(l.semanticType);

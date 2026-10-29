@@ -395,7 +395,7 @@ void CDRMLeaseProtocol::reclaim(PHLMONITOR monitor) {
         std::erase_if(m->m_connectorsSent, [](const auto& e) { return e.expired() || e->m_dead; });
     }
 
-    LOGM(Log::DEBUG, "Reclaimed lease offer for {}", monitor->m_name);
+    LOG(Log::DEBUG, "Reclaimed lease offer for {}", monitor->m_name);
 }
 
 std::string CDRMLeaseProtocol::getDeviceName() {

@@ -157,7 +157,7 @@ uint64_t CXRViewpointResource::activate(uint64_t token, uint64_t geometryId, uin
     m_resource->sendActive(EPOCH.hi, EPOCH.lo, GEOMETRY.hi, GEOMETRY.lo, widthUM, heightUM, HYPXR_VIEWPOINT_V1_LAYOUT_SBS, HYPXR_VIEWPOINT_V1_CAPABILITY_PAIR_LATCHED);
     // The other half of the inactive-reason trail: without this, "it went active at some point" was
     // only ever observable in the client's own stdout.
-    Log::logger->log(Log::DEBUG, "[OPENXR] viewpoint for surface {} active (epoch {}, {}x{} um)", m_surfaceIdForLog, m_epoch, widthUM, heightUM);
+    LOG(Log::DEBUG, "[OPENXR] viewpoint for surface {} active (epoch {}, {}x{} um)", m_surfaceIdForLog, m_epoch, widthUM, heightUM);
     return m_epoch;
 }
 
@@ -185,7 +185,7 @@ void CXRViewpointResource::invalidate(hypxrViewpointV1InactiveReason reason) {
     // forever looks identical from the compositor side whether the cause is a missing window rule, a
     // doffed headset, or a geometry mismatch — and telling those apart by guesswork cost a live
     // session most of an afternoon.
-    Log::logger->log(Log::DEBUG, "[OPENXR] viewpoint for surface {} inactive: {}", m_surfaceIdForLog, inactiveReasonName(reason));
+    LOG(Log::DEBUG, "[OPENXR] viewpoint for surface {} inactive: {}", m_surfaceIdForLog, inactiveReasonName(reason));
 
     const auto EPOCH = OpenXR::splitViewpointU64(m_epoch);
     m_resource->sendInactive(EPOCH.hi, EPOCH.lo, reason);

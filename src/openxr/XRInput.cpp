@@ -46,7 +46,7 @@ namespace {
     bool suggestProfile(XrInstance instance, const char* profilePath, const std::vector<XrActionSuggestedBinding>& bindings) {
         XrPath profile = toPath(instance, profilePath);
         if (profile == XR_NULL_PATH) {
-            Log::logger->log(Log::WARN, "[OPENXR] could not intern interaction profile path '{}'", profilePath);
+            LOG(Log::WARN, "[OPENXR] could not intern interaction profile path '{}'", profilePath);
             return false;
         }
 
@@ -57,14 +57,14 @@ namespace {
 
         XrResult r = xrSuggestInteractionProfileBindings(instance, &sb);
         if (XR_SUCCEEDED(r)) {
-            Log::logger->log(Log::DEBUG, "[OPENXR] suggested bindings for {}", profilePath);
+            LOG(Log::DEBUG, "[OPENXR] suggested bindings for {}", profilePath);
             return true;
         }
         // Unknown/unsupported profile: informational only.
         if (r == XR_ERROR_PATH_UNSUPPORTED)
-            Log::logger->log(Log::DEBUG, "[OPENXR] interaction profile {} unsupported by the runtime; skipped", profilePath);
+            LOG(Log::DEBUG, "[OPENXR] interaction profile {} unsupported by the runtime; skipped", profilePath);
         else
-            Log::logger->log(Log::WARN, "[OPENXR] xrSuggestInteractionProfileBindings({}) failed: {}", profilePath, (int)r);
+            LOG(Log::WARN, "[OPENXR] xrSuggestInteractionProfileBindings({}) failed: {}", profilePath, (int)r);
         return false;
     }
 }
@@ -79,7 +79,7 @@ bool CXRInput::init(CXRSession& session, bool hasHandInteraction) {
     m_hasHandInteraction = hasHandInteraction;
 
     if (m_instance == XR_NULL_HANDLE || m_session == XR_NULL_HANDLE) {
-        Log::logger->log(Log::ERR, "[OPENXR] CXRInput::init called without a live instance/session");
+        LOG(Log::ERR, "[OPENXR] CXRInput::init called without a live instance/session");
         return false;
     }
 
@@ -92,7 +92,7 @@ bool CXRInput::init(CXRSession& session, bool hasHandInteraction) {
     strncpy(asInfo.localizedActionSetName, "Hyprland", XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE - 1);
     asInfo.priority = 0;
     if (XR_FAILED(xrCreateActionSet(m_instance, &asInfo, &m_actionSet))) {
-        Log::logger->log(Log::ERR, "[OPENXR] xrCreateActionSet failed");
+        LOG(Log::ERR, "[OPENXR] xrCreateActionSet failed");
         return false;
     }
 
@@ -105,7 +105,7 @@ bool CXRInput::init(CXRSession& session, bool hasHandInteraction) {
         ai.countSubactionPaths = 2;
         ai.subactionPaths      = m_handPath.data();
         if (XR_FAILED(xrCreateAction(m_actionSet, &ai, &out))) {
-            Log::logger->log(Log::ERR, "[OPENXR] xrCreateAction('{}') failed", name);
+            LOG(Log::ERR, "[OPENXR] xrCreateAction('{}') failed", name);
             return false;
         }
         return true;
@@ -127,7 +127,7 @@ bool CXRInput::init(CXRSession& session, bool hasHandInteraction) {
 
     // 3. Suggested bindings for every supported profile.
     if (!suggestBindings())
-        Log::logger->log(Log::WARN, "[OPENXR] no interaction profile bindings were accepted by the runtime");
+        LOG(Log::WARN, "[OPENXR] no interaction profile bindings were accepted by the runtime");
 
     // 4. Per-hand aim + grip action spaces (poseInActionSpace = identity).
     if (!createActionSpaces())
@@ -139,11 +139,11 @@ bool CXRInput::init(CXRSession& session, bool hasHandInteraction) {
     attach.actionSets                    = &m_actionSet;
     XrResult r                           = xrAttachSessionActionSets(m_session, &attach);
     if (XR_FAILED(r)) {
-        Log::logger->log(Log::ERR, "[OPENXR] xrAttachSessionActionSets failed: {}", (int)r);
+        LOG(Log::ERR, "[OPENXR] xrAttachSessionActionSets failed: {}", (int)r);
         return false;
     }
     m_attached = true;
-    Log::logger->log(Log::DEBUG, "[OPENXR] action set 'hyprland' attached to session");
+    LOG(Log::DEBUG, "[OPENXR] action set 'hyprland' attached to session");
     return true;
 }
 
@@ -222,7 +222,7 @@ bool CXRInput::createActionSpaces() {
         si.poseInActionSpace       = {{0, 0, 0, 1}, {0, 0, 0}}; // identity
         XrResult r                 = xrCreateActionSpace(m_session, &si, &out);
         if (XR_FAILED(r)) {
-            Log::logger->log(Log::ERR, "[OPENXR] xrCreateActionSpace failed: {}", (int)r);
+            LOG(Log::ERR, "[OPENXR] xrCreateActionSpace failed: {}", (int)r);
             out = XR_NULL_HANDLE;
             return false;
         }
@@ -238,7 +238,7 @@ bool CXRInput::createActionSpaces() {
     // spaces above are what the core pointer/anchor paths need.
     if (m_hasHandInteraction) {
         if (!makeSpace(m_pinchPoseAction, XR_HAND_LEFT, m_pinchSpace[XR_HAND_LEFT]) || !makeSpace(m_pinchPoseAction, XR_HAND_RIGHT, m_pinchSpace[XR_HAND_RIGHT]))
-            Log::logger->log(Log::WARN, "[OPENXR] pinch pose action spaces unavailable; hand grabs will anchor to the grip pose");
+            LOG(Log::WARN, "[OPENXR] pinch pose action spaces unavailable; hand grabs will anchor to the grip pose");
     }
 
     return true;
@@ -286,7 +286,7 @@ void CXRInput::logInteractionProfileOnce() {
     for (auto hand : {XR_HAND_LEFT, XR_HAND_RIGHT}) {
         XrInteractionProfileState st = {XR_TYPE_INTERACTION_PROFILE_STATE};
         if (XR_SUCCEEDED(xrGetCurrentInteractionProfile(m_session, m_handPath[hand], &st)))
-            Log::logger->log(Log::DEBUG, "[OPENXR] current interaction profile ({}): {}", hand == XR_HAND_LEFT ? "left" : "right", fromPath(m_instance, st.interactionProfile));
+            LOG(Log::DEBUG, "[OPENXR] current interaction profile ({}): {}", hand == XR_HAND_LEFT ? "left" : "right", fromPath(m_instance, st.interactionProfile));
     }
 }
 
@@ -322,7 +322,7 @@ void CXRInput::sample(XrTime predictedDisplayTime, XrSpace refSpace) {
         static bool warned = false;
         if (!warned) {
             warned = true;
-            Log::logger->log(Log::WARN, "[OPENXR] xrSyncActions failed: {} (logged once)", (int)r);
+            LOG(Log::WARN, "[OPENXR] xrSyncActions failed: {} (logged once)", (int)r);
         }
         for (auto& h : m_hands)
             h = SXRHandState{};
@@ -634,16 +634,16 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
         // Body hover (pointer). Ownership transfers on a body-hover change, exactly as before.
         if (newBodyMon != m_hoverMon[hand]) {
             m_owner = hand; // hover change owns the pointer (§3)
-            Log::logger->log(Log::DEBUG, "[OPENXR] hand {} body-hover {} -> {} (content uv {:.3f},{:.3f})", hand == XR_HAND_LEFT ? "L" : "R", (long long)m_hoverMon[hand],
-                             (long long)newBodyMon, newBodyUV.x, newBodyUV.y);
+            LOG(Log::DEBUG, "[OPENXR] hand {} body-hover {} -> {} (content uv {:.3f},{:.3f})", hand == XR_HAND_LEFT ? "L" : "R", (long long)m_hoverMon[hand], (long long)newBodyMon,
+                newBodyUV.x, newBodyUV.y);
         }
         m_hoverMon[hand] = newBodyMon;
         m_hoverUV[hand]  = newBodyUV;
 
         // Chrome region transition (hover-only; aids chrome visuals / grab gating).
         if (stickMon != m_hoverChromeMon[hand] || stickRegion != m_hoverRegion[hand]) {
-            Log::logger->log(Log::DEBUG, "[OPENXR] hand {} region {}@{} -> {}@{}", hand == XR_HAND_LEFT ? "L" : "R", OpenXR::xrRegionName(m_hoverRegion[hand]),
-                             (long long)m_hoverChromeMon[hand], OpenXR::xrRegionName(stickRegion), (long long)stickMon);
+            LOG(Log::DEBUG, "[OPENXR] hand {} region {}@{} -> {}@{}", hand == XR_HAND_LEFT ? "L" : "R", OpenXR::xrRegionName(m_hoverRegion[hand]),
+                (long long)m_hoverChromeMon[hand], OpenXR::xrRegionName(stickRegion), (long long)stickMon);
         }
         m_hoverChromeMon[hand] = stickMon;
         m_hoverRegion[hand]    = stickRegion;

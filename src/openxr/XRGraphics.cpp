@@ -192,9 +192,9 @@ bool CXRGraphics::selectDisplay(const std::string& gpuOverride) {
     }
 
     if (targetNode.empty())
-        Log::logger->log(Log::WARN, "[OPENXR] could not resolve Hyprland's render node; will scan EGL devices without a target");
+        LOG(Log::WARN, "[OPENXR] could not resolve Hyprland's render node; will scan EGL devices without a target");
     else
-        Log::logger->log(Log::DEBUG, "[OPENXR] target XR render node: {}{}", targetNode, overridden ? " (openxr:gpu override)" : " (Hyprland primary)");
+        LOG(Log::DEBUG, "[OPENXR] target XR render node: {}{}", targetNode, overridden ? " (openxr:gpu override)" : " (Hyprland primary)");
 
     // BOUNDED. Enumeration enters every installed GPU vendor driver (see scanEglDevices), and a
     // wedged one blocks forever — on the main thread that is a frozen desktop, not a failed XR
@@ -209,19 +209,18 @@ bool CXRGraphics::selectDisplay(const std::string& gpuOverride) {
     // The bound abandons the WORKER; the caller still parks for the full duration. On the main
     // thread that IS the desktop hitch, so name it rather than leaving it invisible.
     if (blockedMs >= OpenXR::XR_MAIN_THREAD_STALL_WARN_MS)
-        Log::logger->log(Log::WARN, "[OPENXR] EGL device enumeration blocked the compositor main thread for {}ms (a GPU driver was slow to answer)", blockedMs);
+        LOG(Log::WARN, "[OPENXR] EGL device enumeration blocked the compositor main thread for {}ms (a GPU driver was slow to answer)", blockedMs);
     if (!scanned.has_value()) {
-        Log::logger->log(Log::ERR,
-                         "[OPENXR] EGL device enumeration did not complete within {}ms — a GPU driver is not responding. Refusing to start XR (the desktop is unaffected; "
-                         "the enumeration thread is abandoned). If the kernel has oopsed this boot, reboot.",
-                         OpenXR::XR_PROBE_TIMEOUT_MS);
+        LOG(Log::ERR,
+            "[OPENXR] EGL device enumeration did not complete within {}ms — a GPU driver is not responding. Refusing to start XR (the desktop is unaffected; "
+            "the enumeration thread is abandoned). If the kernel has oopsed this boot, reboot.",
+            OpenXR::XR_PROBE_TIMEOUT_MS);
         return false;
     }
     const auto& scan = *scanned;
 
     if (scan.entryPoints && scan.deviceCount > 0) {
-        Log::logger->log(Log::DEBUG, "[OPENXR] found {} EGL devices; queried {}{}", scan.deviceCount, scan.nodePaths.size(),
-                         scan.pinShortCircuit ? " (stopped at the pinned node)" : "");
+        LOG(Log::DEBUG, "[OPENXR] found {} EGL devices; queried {}{}", scan.deviceCount, scan.nodePaths.size(), scan.pinShortCircuit ? " (stopped at the pinned node)" : "");
 
         auto eglGetPlatformDisplayEXT_fn = (PFNEGLGETPLATFORMDISPLAYEXTPROC_t)scan.getPlatformDisplay;
 
@@ -251,7 +250,7 @@ bool CXRGraphics::selectDisplay(const std::string& gpuOverride) {
                 close(fd);
                 continue;
             }
-            Log::logger->log(Log::DEBUG, "[OPENXR] using GBM EGL display from {} for the XR context", path);
+            LOG(Log::DEBUG, "[OPENXR] using GBM EGL display from {} for the XR context", path);
             m_eglDisplay  = tryDpy;
             m_gbmOwned    = gbm;
             m_gbmFd       = fd;
@@ -272,7 +271,7 @@ bool CXRGraphics::selectDisplay(const std::string& gpuOverride) {
     // A configured openxr:gpu that matched no EGL device is a misconfiguration: fail loudly
     // rather than silently rendering XR on the wrong GPU (doc 01).
     if (overridden) {
-        Log::logger->log(Log::ERR, "[OPENXR] openxr:gpu '{}' did not match any EGL device — refusing to start", gpuOverride);
+        LOG(Log::ERR, "[OPENXR] openxr:gpu '{}' did not match any EGL device — refusing to start", gpuOverride);
         return false;
     }
 
@@ -280,13 +279,13 @@ bool CXRGraphics::selectDisplay(const std::string& gpuOverride) {
     // DMA-BUF import, but worth trying (eglInitialize is refcounted, so re-initializing an
     // already-initialized display is fine).
     if (Render::GL::g_pHyprOpenGL) {
-        Log::logger->log(Log::WARN, "[OPENXR] no matching EGL device found, falling back to Hyprland's display (cross-GPU import may fail)");
+        LOG(Log::WARN, "[OPENXR] no matching EGL device found, falling back to Hyprland's display (cross-GPU import may fail)");
         m_eglDisplay  = Render::GL::g_pHyprOpenGL->m_eglDisplay;
         m_ownsDisplay = false;
         return true;
     }
 
-    Log::logger->log(Log::ERR, "[OPENXR] no EGL display available");
+    LOG(Log::ERR, "[OPENXR] no EGL display available");
     return false;
 }
 
@@ -295,16 +294,16 @@ bool CXRGraphics::initEGL(const std::string& gpuOverride) {
         return false;
 
     if (m_eglDisplay == EGL_NO_DISPLAY) {
-        Log::logger->log(Log::ERR, "[OPENXR] failed to get an EGL display (0x{:x})", (unsigned)eglGetError());
+        LOG(Log::ERR, "[OPENXR] failed to get an EGL display (0x{:x})", (unsigned)eglGetError());
         return false;
     }
 
     EGLint major = 0, minor = 0;
     if (!eglInitialize(m_eglDisplay, &major, &minor)) {
-        Log::logger->log(Log::ERR, "[OPENXR] eglInitialize failed (0x{:x})", (unsigned)eglGetError());
+        LOG(Log::ERR, "[OPENXR] eglInitialize failed (0x{:x})", (unsigned)eglGetError());
         return false;
     }
-    Log::logger->log(Log::DEBUG, "[OPENXR] EGL {}.{} initialized", major, minor);
+    LOG(Log::DEBUG, "[OPENXR] EGL {}.{} initialized", major, minor);
 
     eglBindAPI(EGL_OPENGL_ES_API);
 
@@ -340,22 +339,22 @@ bool CXRGraphics::initEGL(const std::string& gpuOverride) {
             eglGetConfigAttrib(m_eglDisplay, c, EGL_RENDERABLE_TYPE, &rt);
             if (rt & EGL_OPENGL_ES3_BIT) {
                 cfg = c;
-                Log::logger->log(Log::DEBUG, "[OPENXR] manually selected a GLES3 config (eglChooseConfig workaround)");
+                LOG(Log::DEBUG, "[OPENXR] manually selected a GLES3 config (eglChooseConfig workaround)");
                 break;
             }
         }
     }
     if (!cfg) {
-        Log::logger->log(Log::ERR, "[OPENXR] no suitable EGL config found (0x{:x})", (unsigned)eglGetError());
+        LOG(Log::ERR, "[OPENXR] no suitable EGL config found (0x{:x})", (unsigned)eglGetError());
         return false;
     }
     m_config = cfg;
-    Log::logger->log(Log::DEBUG, "[OPENXR] EGL config selected");
+    LOG(Log::DEBUG, "[OPENXR] EGL config selected");
 
     const EGLint ctxAttrs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
     m_xrContext             = eglCreateContext(m_eglDisplay, m_config, EGL_NO_CONTEXT, ctxAttrs);
     if (m_xrContext == EGL_NO_CONTEXT) {
-        Log::logger->log(Log::ERR, "[OPENXR] eglCreateContext failed (0x{:x})", (unsigned)eglGetError());
+        LOG(Log::ERR, "[OPENXR] eglCreateContext failed (0x{:x})", (unsigned)eglGetError());
         return false;
     }
 
@@ -370,7 +369,7 @@ bool CXRGraphics::initEGL(const std::string& gpuOverride) {
     // WP-L2). blitBuffer appends the per-plane MODIFIER_LO/HI attribs when this is set.
     if (const char* exts = eglQueryString(m_eglDisplay, EGL_EXTENSIONS))
         m_hasModifiers = std::strstr(exts, "EGL_EXT_image_dma_buf_import_modifiers") != nullptr;
-    Log::logger->log(Log::DEBUG, "[OPENXR] EGL context created (dmabuf import modifiers: {})", m_hasModifiers ? "yes" : "no");
+    LOG(Log::DEBUG, "[OPENXR] EGL context created (dmabuf import modifiers: {})", m_hasModifiers ? "yes" : "no");
     return true;
 }
 
@@ -455,7 +454,7 @@ bool CXRGraphics::initBlitGL() {
         if (!ok) {
             char log[512] = {};
             glGetShaderInfoLog(s, sizeof(log), nullptr, log);
-            Log::logger->log(Log::ERR, "[OPENXR] shader compile error: {}", log);
+            LOG(Log::ERR, "[OPENXR] shader compile error: {}", log);
             glDeleteShader(s);
             return 0;
         }
@@ -482,7 +481,7 @@ bool CXRGraphics::initBlitGL() {
         if (!linked) {
             char log[512] = {};
             glGetProgramInfoLog(prog, sizeof(log), nullptr, log);
-            Log::logger->log(Log::ERR, "[OPENXR] shader link error: {}", log);
+            LOG(Log::ERR, "[OPENXR] shader link error: {}", log);
             glDeleteProgram(prog);
             return 0;
         }
@@ -497,7 +496,7 @@ bool CXRGraphics::initBlitGL() {
     // is not fatal — that path then keeps its plain glBlitFramebuffer (opaque) behavior.
     m_blitProg2D = linkProgram(fs2DSrc.c_str());
     if (!m_blitProg2D)
-        Log::logger->log(Log::WARN, "[OPENXR] sampler2D blit program failed to build — the CPU fallback path will ignore openxr:black_alpha");
+        LOG(Log::WARN, "[OPENXR] sampler2D blit program failed to build — the CPU fallback path will ignore openxr:black_alpha");
 
     // Uniform per-monitor alpha (doc 05 §xrrule): a flat-color program used ONLY as a multiply pass
     // over the finished swapchain image (see fadeTex). Textureless — the fade is pure blend state.
@@ -510,7 +509,7 @@ bool CXRGraphics::initBlitGL() {
     )";
     m_fadeProg            = linkProgram(fsFadeSrc);
     if (!m_fadeProg)
-        Log::logger->log(Log::WARN, "[OPENXR] fade program failed to build — per-monitor `alpha` effects will be ignored (monitors stay opaque)");
+        LOG(Log::WARN, "[OPENXR] fade program failed to build — per-monitor `alpha` effects will be ignored (monitors stay opaque)");
 
     glGenVertexArrays(1, &m_blitVAO);
 
@@ -518,11 +517,11 @@ bool CXRGraphics::initBlitGL() {
     // desktop bytes into GL_SRGB8_ALPHA8 swapchains; GLES would encode them a second time on write
     // (washed-out XR monitors). Turn that off once for this context — see XRSrgb.hpp.
     if (OpenXR::disableSrgbWriteEncoding())
-        Log::logger->log(Log::DEBUG, "[OPENXR] sRGB write encoding disabled (GL_EXT_sRGB_write_control) — swapchain writes are raw");
+        LOG(Log::DEBUG, "[OPENXR] sRGB write encoding disabled (GL_EXT_sRGB_write_control) — swapchain writes are raw");
     else
-        Log::logger->log(Log::WARN, "[OPENXR] GL_EXT_sRGB_write_control unavailable — sRGB swapchain writes are re-encoded, XR monitors will look washed out");
+        LOG(Log::WARN, "[OPENXR] GL_EXT_sRGB_write_control unavailable — sRGB swapchain writes are re-encoded, XR monitors will look washed out");
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] blit GL resources initialized");
+    LOG(Log::DEBUG, "[OPENXR] blit GL resources initialized");
     return true;
 }
 
@@ -649,7 +648,9 @@ void CXRGraphics::blitBuffer(const SP<Aquamarine::IBuffer>& buf, CXRMonitorLayer
             layer.m_importFailFourcc = dmab.format;
             layer.m_importFailMod    = dmab.modifier;
             layer.m_importFailEgl    = eglErr;
-            Log::logger->log(Log::WARN, "[OPENXR] dmabuf import failed for XR monitor {}: fourcc 0x{:x} modifier 0x{:x} planes {} (modifiers {}) EGL 0x{:x} — falling back (cross-GPU? see openxr:gpu)", layer.m_monitorName, dmab.format, dmab.modifier, dmab.planes, m_hasModifiers ? "passed" : "unavailable", eglErr);
+            LOG(Log::WARN,
+                "[OPENXR] dmabuf import failed for XR monitor {}: fourcc 0x{:x} modifier 0x{:x} planes {} (modifiers {}) EGL 0x{:x} — falling back (cross-GPU? see openxr:gpu)",
+                layer.m_monitorName, dmab.format, dmab.modifier, dmab.planes, m_hasModifiers ? "passed" : "unavailable", eglErr);
         }
     }
 

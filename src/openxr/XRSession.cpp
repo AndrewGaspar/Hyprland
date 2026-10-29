@@ -41,7 +41,7 @@ typedef struct XrSessionCreateInfoOverlayEXTX {
     do {                                                                                                                                                                           \
         XrResult _r = (expr);                                                                                                                                                      \
         if (XR_FAILED(_r)) {                                                                                                                                                       \
-            Log::logger->log(Log::ERR, "[OPENXR] " #expr " failed: {}", (int)_r);                                                                                                  \
+            LOG(Log::ERR, "[OPENXR] " #expr " failed: {}", (int)_r);                                                                                                               \
             return false;                                                                                                                                                          \
         }                                                                                                                                                                          \
     } while (0)
@@ -73,9 +73,8 @@ bool CXRSession::createInstance() {
     };
 
     if (!hasExt("XR_MNDX_egl_enable") || !hasExt("XR_KHR_opengl_es_enable")) {
-        Log::logger->log(m_runtimeReachable ? Log::WARN : Log::ERR,
-                         "[OPENXR] required extensions XR_MNDX_egl_enable / XR_KHR_opengl_es_enable not available{}",
-                         m_runtimeReachable ? " (runtime reachable but degraded — likely headset not connected)" : "");
+        LOG(m_runtimeReachable ? Log::WARN : Log::ERR, "[OPENXR] required extensions XR_MNDX_egl_enable / XR_KHR_opengl_es_enable not available{}",
+            m_runtimeReachable ? " (runtime reachable but degraded — likely headset not connected)" : "");
         return false;
     }
 
@@ -133,7 +132,7 @@ bool CXRSession::createInstance() {
     if (m_isOverlay)
         exts.push_back(XR_EXTX_OVERLAY_EXTENSION_NAME);
     else if (m_overlayRequested && !m_hasOverlay)
-        Log::logger->log(Log::WARN, "[OPENXR] openxr:overlay requested but this runtime does not advertise XR_EXTX_overlay; creating a normal (exclusive) session");
+        LOG(Log::WARN, "[OPENXR] openxr:overlay requested but this runtime does not advertise XR_EXTX_overlay; creating a normal (exclusive) session");
 
     // research/32 C1: XR_EXT_plane_detection, unless openxr:surfaces_detect is off, and only when
     // the runtime lists it. Whether the HEADSET can detect planes is a separate question the system
@@ -162,10 +161,9 @@ bool CXRSession::createInstance() {
     if (XR_SUCCEEDED(xrGetInstanceProperties(m_instance, &props)))
         m_runtimeName = props.runtimeName;
 
-    Log::logger->log(Log::DEBUG,
-                     "[OPENXR] instance created (runtime: {}, local_floor: {}, hand_interaction: {}, hand_tracking: {}, overlay: {}, user_presence: {}, plane_detection: {})",
-                     m_runtimeName.empty() ? "?" : m_runtimeName, m_hasLocalFloor, m_hasHandInteraction, m_hasHandTracking, m_isOverlay, m_hasUserPresence,
-                     m_hasPlaneDetection ? "enabled" : (m_planeDetectionAdvertised ? "advertised" : "no"));
+    LOG(Log::DEBUG, "[OPENXR] instance created (runtime: {}, local_floor: {}, hand_interaction: {}, hand_tracking: {}, overlay: {}, user_presence: {}, plane_detection: {})",
+        m_runtimeName.empty() ? "?" : m_runtimeName, m_hasLocalFloor, m_hasHandInteraction, m_hasHandTracking, m_isOverlay, m_hasUserPresence,
+        m_hasPlaneDetection ? "enabled" : (m_planeDetectionAdvertised ? "advertised" : "no"));
     return true;
 }
 
@@ -179,8 +177,8 @@ bool CXRSession::getSystem() {
         const XrResult _sr    = xrGetSystem(m_instance, &sysInfo, &m_systemId);
         m_formFactorUnavailable = (_sr == XR_ERROR_FORM_FACTOR_UNAVAILABLE);
         if (XR_FAILED(_sr)) {
-            Log::logger->log(m_formFactorUnavailable ? Log::DEBUG : Log::ERR, "[OPENXR] xrGetSystem failed: {}{}", (int)_sr,
-                             m_formFactorUnavailable ? " (headset not connected / not donned)" : "");
+            LOG(m_formFactorUnavailable ? Log::DEBUG : Log::ERR, "[OPENXR] xrGetSystem failed: {}{}", (int)_sr,
+                m_formFactorUnavailable ? " (headset not connected / not donned)" : "");
             return false;
         }
     }
@@ -224,8 +222,8 @@ bool CXRSession::getSystem() {
             m_supportsHandTracking = handProps.supportsHandTracking;
     }
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] system id {} ({}), maxLayerCount {}, user_presence {}", (unsigned long long)m_systemId, m_systemName.empty() ? "?" : m_systemName,
-                     m_maxLayerCount, !m_hasUserPresence ? "ext-absent" : (m_supportsUserPresence ? "supported" : "unsupported"));
+    LOG(Log::DEBUG, "[OPENXR] system id {} ({}), maxLayerCount {}, user_presence {}", (unsigned long long)m_systemId, m_systemName.empty() ? "?" : m_systemName, m_maxLayerCount,
+        !m_hasUserPresence ? "ext-absent" : (m_supportsUserPresence ? "supported" : "unsupported"));
 
     // Enumerate the supported environment blend modes for the primary-stereo view configuration
     // (doc 01). This needs only instance + system (not a session), so it runs here. The list is
@@ -243,10 +241,10 @@ bool CXRSession::getSystem() {
             }
             if (m_blendModes.empty()) // all values were unknown enums — keep a safe default
                 m_blendModes = {OpenXR::XR_BLEND_OPAQUE};
-            Log::logger->log(Log::DEBUG, "[OPENXR] environment blend modes (preferred first): {}", list);
+            LOG(Log::DEBUG, "[OPENXR] environment blend modes (preferred first): {}", list);
         }
     } else
-        Log::logger->log(Log::WARN, "[OPENXR] xrEnumerateEnvironmentBlendModes failed/empty ({}); assuming OPAQUE only", (int)br);
+        LOG(Log::WARN, "[OPENXR] xrEnumerateEnvironmentBlendModes failed/empty ({}); assuming OPAQUE only", (int)br);
 
     return true;
 }
@@ -278,7 +276,7 @@ bool CXRSession::createSession(CXRGraphics& gfx) {
         overlayInfo.sessionLayersPlacement = m_overlayZ;
         overlayInfo.next                   = &binding;
         sessionInfo.next                   = &overlayInfo;
-        Log::logger->log(Log::DEBUG, "[OPENXR] creating overlay session (sessionLayersPlacement = {})", m_overlayZ);
+        LOG(Log::DEBUG, "[OPENXR] creating overlay session (sessionLayersPlacement = {})", m_overlayZ);
     }
 
     // The WIP binds m_xrContext current around xrCreateSession and unbinds after — keep it.
@@ -287,11 +285,11 @@ bool CXRSession::createSession(CXRGraphics& gfx) {
     eglMakeCurrent(gfx.m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 
     if (XR_FAILED(r)) {
-        Log::logger->log(Log::ERR, "[OPENXR] xrCreateSession failed: {}", (int)r);
+        LOG(Log::ERR, "[OPENXR] xrCreateSession failed: {}", (int)r);
         return false;
     }
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] session created ({})", m_isOverlay ? "overlay" : "exclusive");
+    LOG(Log::DEBUG, "[OPENXR] session created ({})", m_isOverlay ? "overlay" : "exclusive");
     return true;
 }
 
@@ -313,11 +311,11 @@ bool CXRSession::createSpaces(CXRGraphics& gfx) {
     eglMakeCurrent(gfx.m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 
     if (XR_FAILED(r1)) {
-        Log::logger->log(Log::ERR, "[OPENXR] xrCreateReferenceSpace (reference) failed: {}", (int)r1);
+        LOG(Log::ERR, "[OPENXR] xrCreateReferenceSpace (reference) failed: {}", (int)r1);
         return false;
     }
     if (XR_FAILED(r2)) {
-        Log::logger->log(Log::ERR, "[OPENXR] xrCreateReferenceSpace (view) failed: {}", (int)r2);
+        LOG(Log::ERR, "[OPENXR] xrCreateReferenceSpace (view) failed: {}", (int)r2);
         return false;
     }
 
@@ -327,14 +325,14 @@ bool CXRSession::createSpaces(CXRGraphics& gfx) {
     // other path is untouched (nothing is anchored in STAGE by this tranche).
     createStageSpace(gfx);
 
-    Log::logger->log(Log::DEBUG, "[OPENXR] reference spaces created ({} + VIEW{})", m_usingLocalFloor ? "LOCAL_FLOOR" : "LOCAL", m_stageSpace != XR_NULL_HANDLE ? " + STAGE" : "");
+    LOG(Log::DEBUG, "[OPENXR] reference spaces created ({} + VIEW{})", m_usingLocalFloor ? "LOCAL_FLOOR" : "LOCAL", m_stageSpace != XR_NULL_HANDLE ? " + STAGE" : "");
     return true;
 }
 
 void CXRSession::createStageSpace(CXRGraphics& gfx) {
     uint32_t spaceCount = 0;
     if (XR_FAILED(xrEnumerateReferenceSpaces(m_session, 0, &spaceCount, nullptr)) || spaceCount == 0) {
-        Log::logger->log(Log::DEBUG, "[OPENXR] xrEnumerateReferenceSpaces returned nothing — no STAGE probe (research/28 M0)");
+        LOG(Log::DEBUG, "[OPENXR] xrEnumerateReferenceSpaces returned nothing — no STAGE probe (research/28 M0)");
         return;
     }
     std::vector<XrReferenceSpaceType> types(spaceCount);
@@ -345,7 +343,7 @@ void CXRSession::createStageSpace(CXRGraphics& gfx) {
             m_stageEnumerated = true;
 
     if (!m_stageEnumerated) {
-        Log::logger->log(Log::DEBUG, "[OPENXR] runtime does not enumerate XR_REFERENCE_SPACE_TYPE_STAGE — the room-frame probe self-skips (research/28 M0)");
+        LOG(Log::DEBUG, "[OPENXR] runtime does not enumerate XR_REFERENCE_SPACE_TYPE_STAGE — the room-frame probe self-skips (research/28 M0)");
         return;
     }
 
@@ -359,7 +357,7 @@ void CXRSession::createStageSpace(CXRGraphics& gfx) {
 
     if (XR_FAILED(r)) {
         m_stageSpace = XR_NULL_HANDLE;
-        Log::logger->log(Log::WARN, "[OPENXR] STAGE is enumerated but xrCreateReferenceSpace failed: {} — the room-frame probe self-skips", (int)r);
+        LOG(Log::WARN, "[OPENXR] STAGE is enumerated but xrCreateReferenceSpace failed: {} — the room-frame probe self-skips", (int)r);
     }
 }
 
@@ -378,7 +376,7 @@ bool CXRSession::chooseSwapchainFormat() {
 
     if (formats.empty()) {
         m_swapchainFormat = kRGBA8;
-        Log::logger->log(Log::WARN, "[OPENXR] runtime enumerated no swapchain formats; defaulting to GL_RGBA8");
+        LOG(Log::WARN, "[OPENXR] runtime enumerated no swapchain formats; defaulting to GL_RGBA8");
         return true;
     }
 
@@ -406,7 +404,7 @@ bool CXRSession::chooseSwapchainFormat() {
             }
 
     m_swapchainFormat = chosen;
-    Log::logger->log(Log::DEBUG, "[OPENXR] chosen swapchain format 0x{:x}", (unsigned long long)chosen);
+    LOG(Log::DEBUG, "[OPENXR] chosen swapchain format 0x{:x}", (unsigned long long)chosen);
     return true;
 }
 
@@ -418,7 +416,7 @@ void CXRSession::pollEvents() {
             case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
                 auto* ev  = reinterpret_cast<XrEventDataSessionStateChanged*>(&event);
                 m_xrState = ev->state;
-                Log::logger->log(Log::DEBUG, "[OPENXR] session state -> {}", (int)m_xrState);
+                LOG(Log::DEBUG, "[OPENXR] session state -> {}", (int)m_xrState);
 
                 switch (m_xrState) {
                     case XR_SESSION_STATE_READY: {
@@ -429,9 +427,9 @@ void CXRSession::pollEvents() {
                         XrResult r                             = xrBeginSession(m_session, &beginInfo);
                         if (XR_SUCCEEDED(r)) {
                             m_sessionBegan = true;
-                            Log::logger->log(Log::DEBUG, "[OPENXR] session begun");
+                            LOG(Log::DEBUG, "[OPENXR] session begun");
                         } else
-                            Log::logger->log(Log::ERR, "[OPENXR] xrBeginSession failed: {}", (int)r);
+                            LOG(Log::ERR, "[OPENXR] xrBeginSession failed: {}", (int)r);
                         break;
                     }
                     case XR_SESSION_STATE_STOPPING: {
@@ -457,7 +455,7 @@ void CXRSession::pollEvents() {
                 break;
             }
             case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING: {
-                Log::logger->log(Log::WARN, "[OPENXR] instance loss pending -> teardown to unavailable");
+                LOG(Log::WARN, "[OPENXR] instance loss pending -> teardown to unavailable");
                 m_exitRequested = true;
                 m_instanceLost  = true;
                 break;
@@ -468,7 +466,7 @@ void CXRSession::pollEvents() {
                 // (active-device detection). The event carries only the session; per-hand queries
                 // happen in CXRInput::refreshHandProfiles.
                 m_interactionProfileChanged = true;
-                Log::logger->log(Log::DEBUG, "[OPENXR] interaction profile changed");
+                LOG(Log::DEBUG, "[OPENXR] interaction profile changed");
                 break;
             }
             case XR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT: {
@@ -478,7 +476,7 @@ void CXRSession::pollEvents() {
                 auto* ev              = reinterpret_cast<XrEventDataUserPresenceChangedEXT*>(&event);
                 m_userPresent         = ev->isUserPresent;
                 m_userPresenceChanged = true;
-                Log::logger->log(Log::DEBUG, "[OPENXR] user presence changed -> {}", (bool)m_userPresent ? "present" : "absent");
+                LOG(Log::DEBUG, "[OPENXR] user presence changed -> {}", (bool)m_userPresent ? "present" : "absent");
                 break;
             }
             case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING: {
@@ -505,23 +503,23 @@ void CXRSession::pollEvents() {
                         m_recenterPending   = true;
                         m_recenterPoseValid = ev->poseValid;
                         m_recenterPose      = xrToPose(ev->poseInPreviousSpace);
-                        Log::logger->log(Log::DEBUG, "[OPENXR] reference space change pending (recenter, poseValid={})", (bool)ev->poseValid);
+                        LOG(Log::DEBUG, "[OPENXR] reference space change pending (recenter, poseValid={})", (bool)ev->poseValid);
                         break;
                     case OpenXR::XR_SPACECHANGE_WORLD_OK:
                         m_worldChangePending   = true;
                         m_worldChangePoseValid = true;
-                        Log::logger->log(Log::DEBUG, "[OPENXR] the headset's STAGE (room) frame was redefined with a usable delta — the runtime compensated; world content is unmoved");
+                        LOG(Log::DEBUG, "[OPENXR] the headset's STAGE (room) frame was redefined with a usable delta — the runtime compensated; world content is unmoved");
                         break;
                     case OpenXR::XR_SPACECHANGE_WORLD_LOST:
                         m_worldChangePending   = true;
                         m_worldChangePoseValid = false;
-                        Log::logger->log(Log::WARN,
-                                         "[OPENXR] the headset's STAGE (room) frame was redefined with NO usable delta — the streamed world has shifted by an unknown amount and "
-                                         "cannot be corrected");
+                        LOG(Log::WARN,
+                            "[OPENXR] the headset's STAGE (room) frame was redefined with NO usable delta — the streamed world has shifted by an unknown amount and "
+                            "cannot be corrected");
                         break;
                     case OpenXR::XR_SPACECHANGE_IGNORE:
-                        Log::logger->log(Log::DEBUG, "[OPENXR] ignoring a reference space change for type {} (we hold {} + VIEW{})", (int)ev->referenceSpaceType, (int)ourType,
-                                         m_stageSpace != XR_NULL_HANDLE ? " + STAGE" : "");
+                        LOG(Log::DEBUG, "[OPENXR] ignoring a reference space change for type {} (we hold {} + VIEW{})", (int)ev->referenceSpaceType, (int)ourType,
+                            m_stageSpace != XR_NULL_HANDLE ? " + STAGE" : "");
                         break;
                 }
                 break;
@@ -543,7 +541,7 @@ void CXRSession::pollEvents() {
 void CXRSession::markRuntimeLost(const char* why, int xrResult) {
     // Once-per-session WARN so a dead runtime + a spinning frame loop cannot flood the log.
     if (!m_lostLogged) {
-        Log::logger->log(Log::WARN, "[OPENXR] runtime lost ({} -> {}) -> teardown to unavailable", why, xrResult);
+        LOG(Log::WARN, "[OPENXR] runtime lost ({} -> {}) -> teardown to unavailable", why, xrResult);
         m_lostLogged = true;
     }
     m_exitRequested = true;

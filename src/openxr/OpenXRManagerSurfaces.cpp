@@ -55,7 +55,7 @@ void COpenXRManager::publishSurfaceTuning() {
 
     const std::string spec = *PSYNTH;
     if (!m_surfaceSources->setSyntheticSpec(spec))
-        Log::logger->log(Log::ERR, "[OPENXR] surfaces: {}", m_surfaceSources->syntheticStatus());
+        LOG(Log::ERR, "[OPENXR] surfaces: {}", m_surfaceSources->syntheticStatus());
 
     OpenXR::SXRSurfaceTuning t;
     t.snapDist     = std::clamp(sc<float>(*PSNAP), 0.01F, 0.5F);
@@ -69,7 +69,7 @@ void COpenXRManager::publishSurfaceTuning() {
     }
 
     if (enabled != m_surfacesEnabled)
-        Log::logger->log(Log::DEBUG, "[OPENXR] surfaces {}", enabled ? "enabled" : "disabled");
+        LOG(Log::DEBUG, "[OPENXR] surfaces {}", enabled ? "enabled" : "disabled");
     m_surfacesEnabled = enabled;
     m_surfacesOn.store(enabled, std::memory_order_release);
 
@@ -149,12 +149,12 @@ void COpenXRManager::onSurfacePoll() {
     const bool               changed = m_surfaceSources->poll(ctx, snap);
     const auto               ms      = std::chrono::duration_cast<std::chrono::milliseconds>(Time::steadyNow() - t0).count();
     if (ms > 100)
-        Log::logger->log(Log::WARN, "[OPENXR] surfaces: a plane poll held the main thread {}ms ({})", ms, m_surfaceSources->runtimeStatus());
+        LOG(Log::WARN, "[OPENXR] surfaces: a plane poll held the main thread {}ms ({})", ms, m_surfaceSources->runtimeStatus());
 
     if (changed) {
         publishPlanes(snap, epoch);
-        Log::logger->log(Log::DEBUG, "[OPENXR] surfaces: published {} plane(s), generation {} ({}; synthetic: {})", snap.n, snap.generation, m_surfaceSources->runtimeStatus(),
-                         m_surfaceSources->syntheticStatus());
+        LOG(Log::DEBUG, "[OPENXR] surfaces: published {} plane(s), generation {} ({}; synthetic: {})", snap.n, snap.generation, m_surfaceSources->runtimeStatus(),
+            m_surfaceSources->syntheticStatus());
     }
     armSurfaceTimer(m_surfacePollMs);
 }
@@ -165,7 +165,7 @@ void COpenXRManager::surfacesSessionUp() {
     if (m_session)
         m_surfaceSources->setRuntimeSource(makeUnique<CXRPlaneDetectionSource>(m_session->m_instance, m_session->m_session, m_session->m_refSpace, m_session->m_hasPlaneDetection,
                                                                                m_session->m_planeDetectionAdvertised, m_session->m_planeDetectionFeatures));
-    Log::logger->log(Log::DEBUG, "[OPENXR] surfaces: runtime plane source {}", m_surfaceSources->runtimeStatus());
+    LOG(Log::DEBUG, "[OPENXR] surfaces: runtime plane source {}", m_surfaceSources->runtimeStatus());
     if (m_surfacesEnabled)
         armSurfaceTimer(0);
 }
@@ -187,8 +187,8 @@ void COpenXRManager::onSurfaceSnapped(const SXRStateEvent& e) {
         std::scoped_lock lock(m_surfaceStatusMu);
         rec = m_surfaceSnapRec;
     }
-    Log::logger->log(Log::DEBUG, "[OPENXR] surfaces: {} snapped onto {} plane {:#x} ({}) at [{:.2f}, {:.2f}, {:.2f}]", e.str, OpenXR::xrPlaneLabelName(rec.label), rec.planeId,
-                     OpenXR::xrSnapKindName(rec.kind), rec.contact.x, rec.contact.y, rec.contact.z);
+    LOG(Log::DEBUG, "[OPENXR] surfaces: {} snapped onto {} plane {:#x} ({}) at [{:.2f}, {:.2f}, {:.2f}]", e.str, OpenXR::xrPlaneLabelName(rec.label), rec.planeId,
+        OpenXR::xrSnapKindName(rec.kind), rec.contact.x, rec.contact.y, rec.contact.z);
     if (!e.str.empty() && g_pEventManager)
         g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitorsurface", std::format("{},{},{}", e.str, OpenXR::xrSnapKindName(rec.kind), OpenXR::xrPlaneLabelName(rec.label))});
 }
@@ -235,7 +235,7 @@ void COpenXRManager::surfaceTraceDrain() {
         m_surfaceTraceLost  = 0;
     }
     if (lost)
-        Log::logger->log(Log::DEBUG, "[OPENXR] surfaces trace: {} record(s) dropped before this drain", lost);
+        LOG(Log::DEBUG, "[OPENXR] surfaces trace: {} record(s) dropped before this drain", lost);
 
     for (size_t r = 0; r < n; ++r) {
         const auto& rec = recs[r];
@@ -267,10 +267,10 @@ void COpenXRManager::surfaceTraceDrain() {
         if (np > listed)
             planes += std::format(" | +{} more ({} clutter)", np - listed, clutter);
         const std::string name = rec.monitor.data(); // NUL-terminated: copied with room for it
-        Log::logger->log(Log::DEBUG, "[OPENXR] surfaces trace: {} {} at [{:.2f}, {:.2f}, {:.2f}] halfW {:.2f} bottom {:.2f} head {}[{:.2f}, {:.2f}, {:.2f}]: {} plane(s), {}{}",
-                         name, rec.settle ? "nudged" : "carried", q.content.pos.x, q.content.pos.y, q.content.pos.z, q.halfWidth, q.bottomExt, q.headValid ? "" : "(invalid) ",
-                         q.head.x, q.head.y, q.head.z, rec.nPlanes,
-                         rec.picked ? std::format("snap {:#x}", rec.picked) : (rec.armed ? std::format("armed {:#x}", rec.armed) : std::string("nothing qualifies")), planes);
+        LOG(Log::DEBUG, "[OPENXR] surfaces trace: {} {} at [{:.2f}, {:.2f}, {:.2f}] halfW {:.2f} bottom {:.2f} head {}[{:.2f}, {:.2f}, {:.2f}]: {} plane(s), {}{}", name,
+            rec.settle ? "nudged" : "carried", q.content.pos.x, q.content.pos.y, q.content.pos.z, q.halfWidth, q.bottomExt, q.headValid ? "" : "(invalid) ", q.head.x, q.head.y,
+            q.head.z, rec.nPlanes, rec.picked ? std::format("snap {:#x}", rec.picked) : (rec.armed ? std::format("armed {:#x}", rec.armed) : std::string("nothing qualifies")),
+            planes);
     }
 }
 
@@ -281,10 +281,10 @@ void COpenXRManager::surfaceLogGazeRelease(const CXRMonitorLayer& l) {
     surfaceTraceDrain(); // the carry's last records first, so the log reads in order
     const OpenXR::SXRSurfaceArm& arm = l.m_anchor.surfaceArm();
     if (!arm.havePlane)
-        Log::logger->log(Log::DEBUG, "[OPENXR] surfaces: gaze release of {} with nothing armed — it stays where it is", l.m_monitorName);
+        LOG(Log::DEBUG, "[OPENXR] surfaces: gaze release of {} with nothing armed — it stays where it is", l.m_monitorName);
     else
-        Log::logger->log(Log::DEBUG, "[OPENXR] surfaces: gaze release of {} with {} plane {:#x} {}", l.m_monitorName, OpenXR::xrPlaneLabelName(arm.plane.label), arm.plane.id,
-                         arm.preview ? "previewed" : "armed (not previewed: it must be back within the entry distance)");
+        LOG(Log::DEBUG, "[OPENXR] surfaces: gaze release of {} with {} plane {:#x} {}", l.m_monitorName, OpenXR::xrPlaneLabelName(arm.plane.label), arm.plane.id,
+            arm.preview ? "previewed" : "armed (not previewed: it must be back within the entry distance)");
 }
 
 // ---- frame thread ----
@@ -449,7 +449,7 @@ void COpenXRManager::surfaceFramePass(const std::vector<PXRLAYER>& active, const
             //    is over; otherwise follow a refined plane, hold when the plane is gone, detach on a jump.
             auto& att = l.m_surfaceAttach;
             if (a.state().mode != OpenXR::XR_ANCHOR_LOCAL || !OpenXR::xrPoseIdentical(a.state().anchorPose, att.placed)) {
-                Log::logger->log(Log::DEBUG, "[OPENXR] surfaces: {} moved off its surface — no longer plane-relative", l.m_monitorName);
+                LOG(Log::DEBUG, "[OPENXR] surfaces: {} moved off its surface — no longer plane-relative", l.m_monitorName);
                 att = OpenXR::SXRSurfaceAttach{};
                 continue;
             }
@@ -458,7 +458,7 @@ void COpenXRManager::surfaceFramePass(const std::vector<PXRLAYER>& active, const
             const OpenXR::SXRPlane* p    = OpenXR::xrFindPlane(m_planesFrame, att.planeId);
             const bool              lost = p == nullptr;
             if (lost != att.planeLost)
-                Log::logger->log(Log::DEBUG, "[OPENXR] surfaces: {}'s plane {:#x} {}", l.m_monitorName, att.planeId, lost ? "vanished — holding its world pose" : "is back");
+                LOG(Log::DEBUG, "[OPENXR] surfaces: {}'s plane {:#x} {}", l.m_monitorName, att.planeId, lost ? "vanished — holding its world pose" : "is back");
             att.planeLost = lost;
             OpenXR::SXRPose W;
             switch (OpenXR::xrAttachStep(att, p, W)) {
@@ -469,7 +469,7 @@ void COpenXRManager::surfaceFramePass(const std::vector<PXRLAYER>& active, const
                     att.placed = W;
                     break;
                 case OpenXR::XR_ATTACH_DETACH:
-                    Log::logger->log(Log::DEBUG, "[OPENXR] surfaces: {}'s plane {:#x} jumped — detaching, the window stays put", l.m_monitorName, att.planeId);
+                    LOG(Log::DEBUG, "[OPENXR] surfaces: {}'s plane {:#x} jumped — detaching, the window stays put", l.m_monitorName, att.planeId);
                     att = OpenXR::SXRSurfaceAttach{};
                     break;
                 case OpenXR::XR_ATTACH_HOLD: break;
@@ -524,10 +524,10 @@ void COpenXRManager::surfaceFramePass(const std::vector<PXRLAYER>& active, const
 
         if (arm.preview != wasPrev || (arm.preview && l.m_surfacePreviewPlane.load(std::memory_order_relaxed) != arm.plane.id)) {
             if (arm.preview)
-                Log::logger->log(Log::DEBUG, "[OPENXR] surfaces: {} previewing a {} on {} plane {:#x} ({:.3f}m away)", l.m_monitorName, OpenXR::xrSnapKindName(c.kind),
-                                 OpenXR::xrPlaneLabelName(arm.plane.label), arm.plane.id, c.dist);
+                LOG(Log::DEBUG, "[OPENXR] surfaces: {} previewing a {} on {} plane {:#x} ({:.3f}m away)", l.m_monitorName, OpenXR::xrSnapKindName(c.kind),
+                    OpenXR::xrPlaneLabelName(arm.plane.label), arm.plane.id, c.dist);
             else
-                Log::logger->log(Log::DEBUG, "[OPENXR] surfaces: {} left the surface", l.m_monitorName);
+                LOG(Log::DEBUG, "[OPENXR] surfaces: {} left the surface", l.m_monitorName);
         }
         l.m_surfacePreview.store(arm.preview, std::memory_order_relaxed);
         l.m_surfacePreviewPlane.store(arm.preview ? arm.plane.id : 0, std::memory_order_relaxed);
