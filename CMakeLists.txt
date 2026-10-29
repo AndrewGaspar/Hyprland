@@ -145,7 +145,14 @@ endif()
 set(AQUAMARINE_MINIMUM_VERSION 0.15.0)
 set(HYPRLANG_MINIMUM_VERSION 0.6.7)
 set(HYPRCURSOR_MINIMUM_VERSION 0.1.7)
-set(HYPRUTILS_MINIMUM_VERSION 0.14.3)
+# HypXRland: upstream 9ba363e05 ("window: utf8 truncate received window metadata")
+# raised this to 0.14.3, but v0.57.0 uses nothing that 0.14.3 added: the only new
+# header (hyprutils/string/UTF8.hpp) is unreferenced (truncUTF8InPlace lives in
+# Hyprland's own StringUtils.hpp), the soname is unchanged (.so.13), and every
+# hyprutils symbol a v0.57.0 binary imports is exported by 0.14.2. Omarchy's frozen
+# mirror ships 0.14.2, so accept it; raise this back when the mirror moves or when
+# we start using a 0.14.3 API.
+set(HYPRUTILS_MINIMUM_VERSION 0.14.2)
 set(HYPRGRAPHICS_MINIMUM_VERSION 0.5.1)
 
 pkg_check_modules(aquamarine_dep REQUIRED IMPORTED_TARGET aquamarine>=${AQUAMARINE_MINIMUM_VERSION})
