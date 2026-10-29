@@ -69,7 +69,20 @@ command -v labwc >/dev/null || { log "FATAL: labwc not installed"; FINAL_RC=2; e
 command -v kitty >/dev/null || log "WARNING: kitty not installed — 108 of the 178 cases will fail"
 [[ -x "$BUILD/hyprtester/hyprtester" ]] || { log "FATAL: hyprtester missing at $BUILD/hyprtester/hyprtester (build first)"; FINAL_RC=3; exit 3; }
 [[ -x "$BUILD/Hyprland" ]]              || { log "FATAL: Hyprland missing at $BUILD/Hyprland (build first)"; FINAL_RC=3; exit 3; }
-[[ -f "$SRC/hyprtester/plugin/hyprtestplugin.so" ]] || { log "FATAL: hyprtestplugin.so missing (build first)"; FINAL_RC=3; exit 3; }
+
+# hyprtestplugin.so is dlopen'd into the compositor under test, so it must be built against THIS
+# container's headers and libraries and THIS tree. It lives in the /src overlay, which is fresh per
+# container: what is there is whatever the HOST last built (hyprtester's POST_BUILD writes it in-source),
+# or nothing — and build-in-ctr.sh only refreshes it when hyprtester actually relinks. Rebuild it here
+# (build.sh = make clean all; a few seconds), with the same Lua include dir and hyprutils header-shadow
+# decision hyprtester/CMakeLists.txt makes.
+LUA_INC="$(sed -n 's/^LUA_INCLUDE_DIRS:INTERNAL=//p' "$BUILD/CMakeCache.txt" 2>/dev/null)"
+HU_SHADOW=""
+grep -q dataPointer /usr/include/hyprutils/memory/ImplBase.hpp 2>/dev/null || HU_SHADOW="$SRC/subprojects/hyprutils/include"
+log "building hyprtestplugin.so in-container (lua include: ${LUA_INC:-/usr/include}${HU_SHADOW:+, hyprutils shadow: $HU_SHADOW})"
+( cd "$SRC/hyprtester/plugin" && bash ./build.sh "${LUA_INC:-/usr/include}" "$HU_SHADOW" ) >>"$RUN_LOG" 2>&1 \
+    || { log "FATAL: hyprtestplugin.so build failed (see $RUN_LOG)"; FINAL_RC=3; exit 3; }
+[[ -f "$SRC/hyprtester/plugin/hyprtestplugin.so" ]] || { log "FATAL: hyprtestplugin.so missing after build"; FINAL_RC=3; exit 3; }
 [[ -e "$XR_GPU_NODE" ]] || log "WARNING: GPU node $XR_GPU_NODE does not exist inside the container"
 
 # --- 1. bring up labwc (headless nesting host, GPU-pinned) ---------------------
