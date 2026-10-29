@@ -20,6 +20,11 @@ hl.config({
         --   - HYPRTESTER_XR_GPU=/dev/dri/renderDXXX in the environment.
         -- The harness merges both through the generated wrapper config (main.cpp runXrSuite).
     },
+    -- The compositor log in the preserved run dir is the only account of a failed (or crashed)
+    -- case; log to it, like test.lua does.
+    debug = {
+        disable_logs = false,
+    },
 })
 
 -- Declared-set fixtures for xr_config_declared (WP11, docs/openxr/06-testing.md §2.1). Unique
