@@ -180,7 +180,7 @@ if [[ $_had_sys_nice -eq 1 ]]; then
 fi
 if [[ $FLAVOR == xreal ]]; then
     echo "   runtime manifest: $MONADO_BUILD/openxr_monado-dev.json"
-    echo "   point the toggle at it:  hyprctl keyword openxr:runtime_json $MONADO_BUILD/openxr_monado-dev.json"
+    echo "   point the toggle at it:  hyprctl eval 'hl.config({ openxr = { runtime_json = \"$MONADO_BUILD/openxr_monado-dev.json\" } })'"
     echo "   (scripts/xreal-mode.sh reads MONADO_XREAL_BUILD / defaults to this path.)"
 else
     echo "   hyprtester --xr and scripts/preview-xr.sh will now find this build automatically."

@@ -245,7 +245,7 @@ VA_DIR="${HYPXR_VA_DIR:-$CODE/hypxrva}"
 PAPER_DIR="${HYPXR_PAPER_DIR:-$CODE/hypxrpaper}"
 DOTFILES="${HYPXR_DOTFILES:-${XDG_CONFIG_HOME:-$HOME/.config}/hypr}"
 DOTFILES_URL="${HYPXR_DOTFILES_URL:-https://github.com/AndrewGaspar/omarchy-hyprland-config}"
-XRCONF="${HYPXRLAND_FISHFOOD_CONF:-$DOTFILES/hyprland-xr.conf}"
+XRCONF="${HYPXRLAND_FISHFOOD_CONF:-$DOTFILES/hyprland-xr.lua}"
 JOBS="${HYPXRLAND_FISHFOOD_JOBS:-8}"    # this box has frozen twice under heavier parallelism
 LOCK=/tmp/hypxrland-build.lock
 
@@ -790,21 +790,24 @@ comp_dotfiles() {
         ok "device branch: $branch"
     fi
 
-    file_present "$XRCONF" "hyprland-xr.conf (the XR session front-end config)"
+    file_present "$XRCONF" "hyprland-xr.lua (the XR session front-end config)"
 
-    # The per-machine bits inside hyprland-xr.conf. These are the lines that are
+    # The per-machine bits inside hyprland-xr.lua. These are the lines that are
     # WRONG by construction when a device branch is copied between machines.
+    # Lua forms (0.57+ reads Lua only): the `gpu = "/dev/dri/renderD…",` field of the
+    # openxr table, and hl.env("AQ_DRM_DEVICES", "…"). Commented-out lines start with
+    # `--` and never match.
     if [[ -r $XRCONF ]]; then
         local gpu aq
-        gpu=$(sed -n 's/^[[:space:]]*gpu[[:space:]]*=[[:space:]]*//p' "$XRCONF" | tail -1)
-        aq=$(sed -n 's/^[[:space:]]*env[[:space:]]*=[[:space:]]*AQ_DRM_DEVICES,//p' "$XRCONF" | tail -1)
+        gpu=$(sed -nE "s/^[[:space:]]*gpu[[:space:]]*=[[:space:]]*[\"']([^\"']*)[\"'].*/\\1/p" "$XRCONF" | tail -1)
+        aq=$(sed -nE "s/^[[:space:]]*hl\\.env\\([[:space:]]*[\"']AQ_DRM_DEVICES[\"'][[:space:]]*,[[:space:]]*[\"']([^\"']*)[\"'].*/\\1/p" "$XRCONF" | tail -1)
         if [[ -z $gpu ]]; then
-            warn "openxr:gpu is not set in hyprland-xr.conf"
+            warn "openxr.gpu is not set in hyprland-xr.lua"
             note "set it to the node the XR runtime renders on: ${HYPXR_GPU_NODE:-?}"
         elif [[ $gpu == "${HYPXR_GPU_NODE:-}" ]]; then
-            ok "openxr:gpu = $gpu (matches this machine's XR GPU)"
+            ok "openxr.gpu = $gpu (matches this machine's XR GPU)"
         else
-            warn "openxr:gpu = $gpu but this machine's XR GPU looks like ${HYPXR_GPU_NODE:-?}"
+            warn "openxr.gpu = $gpu but this machine's XR GPU looks like ${HYPXR_GPU_NODE:-?}"
             note "a cross-GPU EGL context crashes the runtime at swapchain time — fix before donning"
         fi
         if ((HYBRID_GPU)); then
@@ -1226,7 +1229,7 @@ Environment=LIBVA_DRIVERS_PATH=$HYPXR_LIBVA_DRIVERS_PATH"
     fi
 
     check_unit wivrn.service
-    note "wivrn.service is started by the session (exec-once in hyprland-xr.conf), not enabled"
+    note "wivrn.service is started by the session (hl.on(\"hyprland.start\") in hyprland-xr.lua), not enabled"
 }
 
 # ===========================================================================
@@ -1483,10 +1486,10 @@ comp_va() {
 
     # The watcher is autostarted by the compositor config, not by systemd.
     if [[ -r $XRCONF ]] && grep -q 'hypxrva-watcher' "$XRCONF"; then
-        ok "hypxrva-watcher autostarted from hyprland-xr.conf"
+        ok "hypxrva-watcher autostarted from hyprland-xr.lua"
     else
-        warn "hyprland-xr.conf has no hypxrva-watcher exec-once"
-        note "add:  exec-once = ~/.local/bin/hypxrva-watcher"
+        warn "hyprland-xr.lua does not autostart hypxrva-watcher"
+        note "add inside its hl.on(\"hyprland.start\", function() … end):  hl.exec_cmd(\"~/.local/bin/hypxrva-watcher\")"
     fi
     if have hypxrva-vaprobe; then
         note "verify end to end with: hypxrva-vaprobe | tail -1"

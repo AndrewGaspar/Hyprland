@@ -4,8 +4,8 @@
 # The fishfood checkout is a git worktree (branch `fishfood`) SIBLING to the
 # main repo, built RelWithDebInfo, and launched by a wayland-session desktop
 # entry that points straight at the built binary with the user's XR front-end
-# config (~/.config/hypr/hyprland-xr.conf by default — sources the normal
-# config and layers the openxr bits).
+# config (~/.config/hypr/hyprland-xr.lua by default — requires the normal
+# config and layers the openxr bits; 0.57+ reads Lua configs only).
 #
 #   fishfood.sh setup        one-time: create worktree + build + emit session file
 #   fishfood.sh update       fast-forward fishfood -> hypxrland tip and rebuild

@@ -62,10 +62,14 @@
 #         --wivrn                talk to the host WiVRn runtime for a REAL headset
 #                                (host must run wivrn-server with the headset up;
 #                                this container never starts wivrn-server).
-#         --conf FILE            source FILE (bind-mounted ro) as the base config
-#                                instead of the image's ~/.config/hypr/hyprland.conf.
+#         --conf FILE            require FILE (a Lua config, bind-mounted ro) as the
+#                                base config instead of the image's
+#                                ~/.config/hypr/hyprland.lua. Hyprland 0.57+ reads Lua
+#                                only; an image seeded with a classic-only Omarchy
+#                                (v3.8.2) has no Lua base, and the session then comes
+#                                up without one (merge-conf.sh says so).
 #         --passthrough / --no-passthrough
-#                                Force passthrough (openxr:blend_mode = alpha plus the
+#                                Force passthrough (openxr.blend_mode = "alpha" plus the
 #                                black_alpha luma key) on / off. DEFAULT: ON with a real
 #                                headset (--wivrn) — an in-headset session comes up
 #                                composited over the room, not in an opaque void — and
@@ -89,14 +93,14 @@
 #                                OpenXR session (gradient sky / bundled 'forest-clearing'
 #                                3D scene / a panorama or scene <path> reachable inside
 #                                the container) and run HypXRland as an XR_EXTX_overlay on
-#                                top (forces openxr:overlay = 1). Mirrors preview-xr.sh
+#                                top (forces openxr.overlay = true). Mirrors preview-xr.sh
 #                                --env. Needs hypxrpaper built into /build (build-in-ctr.sh).
 #         --gpu SPEC             GPU selection (default: split with --wivrn, else amd).
 #                                SPEC = split | amd|nvidia|intel | /dev/dri/renderD*.
 #             split              expose BOTH GPUs and assign roles separately: the
 #                                nested compositor renders on the host-compositor GPU
 #                                (AQ_DRM_DEVICES) and XR encodes on a different GPU
-#                                (openxr:gpu). This is the ONLY reliable --wivrn mode
+#                                (openxr.gpu). This is the ONLY reliable --wivrn mode
 #                                on a dual-GPU box; degrades to single-GPU when the
 #                                machine has only one GPU. A single-GPU --gpu pin with
 #                                --wivrn is kept for experiments (warns; known-broken).
@@ -831,13 +835,14 @@ cmd_session() {
     )
     # --env: hypxrpaper draws an ambient background as the PRIMARY session and
     # HypXRland composites its monitors on top as an XR_EXTX_overlay (session-launch.sh
-    # forces openxr:overlay=1 when XR_ENV is set). 'pano'/'forest' need no host files;
+    # forces openxr.overlay when XR_ENV is set). 'pano'/'forest' need no host files;
     # a custom <path> must be reachable INSIDE the container (e.g. under /src, or add a
     # bind mount) — the bundled scenes come from the /src submodule checkout.
     [[ -n $env_spec ]] && launch_env+=("XR_ENV=$env_spec")
     [[ -n $user_conf ]] && {
         [[ -f $user_conf ]] || die "--conf file not found: $user_conf"
-        local ctr_conf="$HOST_MNT/user.conf"
+        [[ $user_conf == *.lua ]] || die "--conf must be a Lua config (Hyprland 0.57+ has no classic .conf front end): $user_conf"
+        local ctr_conf="$HOST_MNT/user.lua"
         mounts+=(-v "$(cd "$(dirname "$user_conf")" && pwd)/$(basename "$user_conf"):$ctr_conf:ro")
         launch_env+=("XR_BASE_CONF=$ctr_conf")
     }
@@ -945,7 +950,7 @@ cmd_session() {
     if [[ $gpu == split ]]; then
         nested_node=$(gpu_node_in_ctr "$ctr" "$SPLIT_NESTED_SPEC")
         xr_node=$(gpu_node_in_ctr "$ctr" "$SPLIT_XR_SPEC")
-        log "In-container split GPU nodes: nested(AQ)=$nested_node  XR(openxr:gpu)=$xr_node"
+        log "In-container split GPU nodes: nested(AQ)=$nested_node  XR(openxr.gpu)=$xr_node"
         launch_env+=("NESTED_GPU_NODE=$nested_node" "XR_GPU_NODE=$xr_node")
     else
         gpu_node=$(gpu_node_in_ctr "$ctr" "$gpu")
@@ -980,7 +985,7 @@ EOF
     if [[ $gpu == split ]]; then
         cat <<EOF
   GPU: split — nested compositor (AQ_DRM_DEVICES) on $nested_node,
-                XR encode (openxr:gpu) on $xr_node.
+                XR encode (openxr.gpu) on $xr_node.
 EOF
     fi
     if [[ $use_wivrn -eq 1 ]]; then
@@ -1014,14 +1019,14 @@ EOF
     if [[ $passthrough -eq 1 ]]; then
         cat <<EOF
 
-  Passthrough: ON (openxr:blend_mode = alpha + black_alpha 0.2) — monitors
+  Passthrough: ON (openxr.blend_mode = "alpha" + black_alpha 0.2) — monitors
     composite over the room. --no-passthrough for the opaque VR void.
 EOF
     else
         cat <<EOF
 
   Passthrough: off ($([[ $use_wivrn -eq 1 ]] && echo "--no-passthrough / --env" || echo "windowed Monado has no cameras")).
-    Pass --passthrough to force openxr:blend_mode = alpha.
+    Pass --passthrough to force openxr.blend_mode = "alpha".
 EOF
     fi
     if [[ $xr_binds -eq 1 ]]; then
@@ -1032,7 +1037,7 @@ EOF
     SUPER+ALT+= / -      push / pull the gazed monitor  SUPER+ALT+H     hand input
     SUPER+Home           recenter selected monitor      SUPER+SHIFT+Home  2D re-sync
     SUPER+ALT+N          create XR-extra                SUPER+ALT+SHIFT+N  destroy it
-    SUPER+ALT+R          restart the XR session (applies start-scoped openxr:*)
+    SUPER+ALT+R          restart the XR session (applies start-scoped openxr.*)
 EOF
     fi
     cat <<EOF
@@ -1040,7 +1045,7 @@ EOF
   Talk to the nested session from the host:
     $0 exec hyprctl openxr status
     $0 exec hyprctl monitors
-    $0 exec hyprctl dispatch exec alacritty     # a terminal in the nested session
+    $0 exec hyprctl dispatch 'hl.dsp.exec_cmd("alacritty")'   # a terminal in the nested session
   Private-bus / isolation proof (all run INSIDE the container):
     $0 exec busctl --user list        # org.freedesktop.Notifications owner = container
     $0 exec ls /dev/input             # empty: no physical input devices

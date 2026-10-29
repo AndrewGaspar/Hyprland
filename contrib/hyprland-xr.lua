@@ -1,8 +1,8 @@
 -- HypXRland session config, in Lua.
 --
--- This is the line-for-line Lua translation of the classic `hyprland-xr.conf` XR session config:
--- the normal Omarchy setup with the OpenXR extension layered on top. Both front ends are supported
--- and produce identical state; pick one per session, because you cannot mix them (see COMPOSITION).
+-- The normal Omarchy setup with the OpenXR extension layered on top. Hyprland 0.57 removed the
+-- classic hyprlang (.conf) front end and `hyprctl keyword`, so this Lua file is THE XR session
+-- config (it began as the line-for-line translation of the old `hyprland-xr.conf`).
 --
 --   ~/code/hypxrland/build/Hyprland --config ~/.config/hypr/hyprland-xr.lua
 --
@@ -11,23 +11,14 @@
 --
 -- ---- COMPOSITION: how this file relates to the main config ------------------------------------
 --
--- A session has exactly ONE config manager, chosen by the extension of the MAIN config file:
--- `.lua` gets the Lua manager, anything else gets the classic hyprlang one. There is no bridge in
--- either direction — `source =` only ever parses hyprlang, and Lua's `require` only ever resolves
--- `.lua` / `init.lua`. So a `.lua` file cannot source a `.conf`, and a `.conf` cannot source a
--- `.lua`.
---
--- The classic file said:
---
---     source = ~/.config/hypr/hyprland.conf
---
--- The Lua equivalent, which requires the main Omarchy config to ALSO be Lua
--- (~/.config/hypr/hyprland.lua):
+-- The classic file said `source = ~/.config/hypr/hyprland.conf`. The Lua equivalent pulls the
+-- main Omarchy config (~/.config/hypr/hyprland.lua) in as a module:
 --
 --     require("hyprland")
 --
 -- `require` resolves against the main config's own directory, and the required file is tracked by
--- the config watcher exactly as a sourced file is — so editing either one still triggers a reload.
+-- the config watcher exactly as a sourced file was — so editing either one still triggers a
+-- reload, and a reload re-executes both (package.loaded is cleared for user modules).
 --
 -- Two ways to arrange it, both fine:
 --
@@ -37,9 +28,9 @@
 --   B. ~/.config/hypr/hyprland.lua is the main config and ends with `require("hyprland-xr")`. Then
 --      the XR session needs no `--config` at all — but every non-XR login gets the XR config too.
 --
--- Note that if both ~/.config/hypr/hyprland.lua and hyprland.conf exist, the .lua one wins for a
--- default launch. During a migration, keep the .conf as the fallback and launch the Lua session
--- explicitly with --config.
+-- Runtime changes go through `hyprctl eval 'hl…'` (settings, rules) and `hyprctl dispatch
+-- 'hl.dsp…'` (actions) or `hyprctl openxr <verb>`; anything set that way is wiped by the next
+-- reload, exactly like the old keyword path — keep what should persist in this file.
 
 -- Everything from the regular session: theme, bindings, monitors, autostart.
 require("hyprland")
@@ -121,10 +112,9 @@ for _, layout in ipairs({ "sbs", "hsbs", "tab", "htab" }) do
 end
 
 -- Viewpoint portal authorization (doc 10 §13.1): head-pose-relative feedback is privacy-gated per
--- app; this belongs HERE, in the config file — a `hyprctl keyword windowrule` copy is wiped by
--- every config reload (2026-08-15: that wipe cost a demo 3 silent hours of "inactive:
--- not_authorized"). Under Lua the runtime equivalent is `hyprctl eval 'hl.window_rule{…}'`, and it
--- is wiped by a reload for exactly the same reason. Keep it in the file.
+-- app; this belongs HERE, in the config file — a runtime `hyprctl eval 'hl.window_rule{…}'` copy
+-- is wiped by every config reload (2026-08-15: that wipe, then via the old `hyprctl keyword
+-- windowrule`, cost a demo 3 silent hours of "inactive: not_authorized"). Keep it in the file.
 hl.window_rule({
     name      = "viewpoint-demo",
     viewpoint = true,
@@ -297,12 +287,10 @@ hl.bind("SUPER + ALT + SHIFT + N", hl.dsp.exec_cmd("~/.config/hypr/scripts/hypxr
 
 hl.bind("SUPER + ALT + V", hl.dsp.exec_cmd("/home/ajg/code/hypxrvoice/build/hypxrvoicectl ptt toggle"),
         { description = "Voice push-to-talk" })
--- NOTE, migrating: hypxr-stereo-toggle.sh flips the XReal between its 2D and 3D personalities with
--- `hyprctl keyword monitor "desc:…, stereo:sbs"`, and `hyprctl keyword` does not exist under a Lua
--- config. Port those three lines in the script to the eval form before using this file:
---   hyprctl eval 'hl.monitor({ output = "desc:"..DESC, mode = "3840x1080@60", position = "auto", scale = "1", stereo = "sbs" })'
--- The XR scripts bound below otherwise use `hyprctl openxr …` and `hyprctl -j monitors`, which are
--- front-end independent and need no changes.
+-- NOTE: the XReal 2D/3D toggle must push its monitor rule with `hyprctl eval 'hl.monitor({ …,
+-- stereo = "sbs" })'` (scripts/xreal-mode.sh does, via scripts/lib/hypr-config.sh); `hyprctl
+-- keyword` does not exist in 0.57. The XR scripts bound below otherwise use `hyprctl openxr …` and
+-- `hyprctl -j monitors`, which need no changes.
 hl.bind("SUPER + ALT + S", hl.dsp.exec_cmd("~/.config/hypr/scripts/hypxr-stereo-toggle.sh"),
         { description = "Toggle XReal 2D/3D stereo desktop" })
 

@@ -10,21 +10,22 @@
 #               socket.
 #
 # The Omarchy autostart chain (waybar/mako/walker/portals via uwsm-app, from the
-# base config's `source`) comes up on THIS container's private system/session
+# base config's require()) comes up on THIS container's private system/session
 # buses — the whole point of the container. Nothing is shimmed.
 #
 # Env inputs (set inline by the wrapper's `machinectl shell … bash -lc` command):
 #   XR_MODE            windowed | wivrn                                (required)
-#   XR_GPU_NODE        render node -> openxr:gpu (XR encode side)      (required)
+#   XR_GPU_NODE        render node -> openxr.gpu (XR encode side)      (required)
 #   NESTED_GPU_NODE    render node -> AQ_DRM_DEVICES (nested compositor
 #                      / host-compositor side); default = XR_GPU_NODE
 #                      (single-GPU). Split-GPU --wivrn sets this to the
 #                      host GPU while XR_GPU_NODE is the encode GPU.
 #   XR_RUNTIME_JSON    OpenXR runtime manifest                        (required)
 #   HL_WAYLAND_DISPLAY absolute path of the bind-mounted host socket  (required)
-#   XR_BASE_CONF       base config to source (default ~/.config/hypr/hyprland.conf)
-#   XR_OVERLAY         1 -> openxr:overlay = 1 (auto-forced to 1 when XR_ENV is set)
-#   XR_PASSTHROUGH     1 -> openxr:blend_mode = alpha + the black_alpha luma-key
+#   XR_BASE_CONF       Lua base config to require (default ~/.config/hypr/hyprland.lua;
+#                      see merge-conf.sh for what happens when it is absent)
+#   XR_OVERLAY         1 -> openxr.overlay = true (auto-forced when XR_ENV is set)
+#   XR_PASSTHROUGH     1 -> openxr.blend_mode = "alpha" + the black_alpha luma-key
 #                      default (the wrapper defaults this ON for --wivrn)
 #   XR_BINDS           1 (default) -> merge in the container-session XR keybinds;
 #                      0 -> none (xr-container.sh --no-binds)
@@ -107,7 +108,7 @@ fi
 export AQ_BACKENDS=wayland
 export WAYLAND_DISPLAY="$HL_WAYLAND_DISPLAY"
 # Nested compositor renders on the host-compositor GPU (NESTED_GPU_NODE); the XR
-# encode side (openxr:gpu, set in the merged config) uses XR_GPU_NODE. On a
+# encode side (openxr.gpu, set in the merged config) uses XR_GPU_NODE. On a
 # single-GPU run NESTED_GPU_NODE is unset and both collapse to XR_GPU_NODE.
 NESTED_GPU_NODE="${NESTED_GPU_NODE:-$XR_GPU_NODE}"
 export AQ_DRM_DEVICES="$NESTED_GPU_NODE"
@@ -122,17 +123,17 @@ echo "   XR_RUNTIME_JSON=$XR_RUNTIME_JSON"
 
 # --- merged launch config ----------------------------------------------------
 # An ambient background (XR_ENV) means HypXRland composites its monitors ON TOP of
-# the hypxrpaper primary session, so it MUST be an overlay — force openxr:overlay=1.
+# the hypxrpaper primary session, so it MUST be an overlay — force openxr.overlay.
 XR_ENV="${XR_ENV:-}"
 XR_OVERLAY="${XR_OVERLAY:-0}"
 [[ -n $XR_ENV ]] && XR_OVERLAY=1
-MERGED="$XDG_RUNTIME_DIR/hyprland-xr-merged.conf"
+MERGED="$XDG_RUNTIME_DIR/hyprland-xr-merged.lua"
 XR_GPU_NODE="$XR_GPU_NODE" \
 XR_OVERLAY="$XR_OVERLAY" \
 XR_PASSTHROUGH="${XR_PASSTHROUGH:-0}" \
 XR_BINDS="${XR_BINDS:-1}" \
-XR_BASE_CONF="${XR_BASE_CONF:-$HOME/.config/hypr/hyprland.conf}" \
-    bash /src/containers/session/merge-conf.sh "$MERGED" >/dev/null
+XR_BASE_CONF="${XR_BASE_CONF:-$HOME/.config/hypr/hyprland.lua}" \
+    bash /src/containers/session/merge-conf.sh "$MERGED" >/dev/null || { echo "!! merge-conf.sh failed (see above)" >&2; exit 10; }
 echo "   merged config -> $MERGED  (passthrough=${XR_PASSTHROUGH:-0} xr-binds=${XR_BINDS:-1})"
 
 # --- runtime-specific bring-up ----------------------------------------------

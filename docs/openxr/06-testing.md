@@ -594,16 +594,16 @@ Beyond the automated suite, several scripts stand the extension up interactively
   **windowed** mode with the remote driver (a "Monado" window shows the rendered XR space) and a
   nested dev Hyprland (`build-debug`) with the XR extension enabled, then lets you drive the fake
   head/controllers with `monado-gui remote`. `--wivrn` uses the system WiVRn runtime and a real
-  headset instead; `--passthrough` sets `openxr:blend_mode = alpha`; `--env pano|forest|<path>`
+  headset instead; `--passthrough` sets `openxr.blend_mode = "alpha"`; `--env pano|forest|<path>`
   launches `hypxrpaper` as an ambient background (Hyprland then composites as an overlay);
-  `--conf <file>` swaps the base nested config (e.g. the Omarchy-mirror config from the next
+  `--conf <file.lua>` swaps the base nested config (e.g. the Omarchy-mirror config from the next
   script). The nested Hyprland runs under its own private DBus session bus, and the script kills
   only the PIDs/process group it spawned.
-- **`scripts/gen-omarchy-xr-conf.sh`** — generates a nested-safe config under
-  `~/.config/hypr/xr-nested/` that mirrors the user's Omarchy desktop (keybinds, look-and-feel,
-  theme) but skips anything that mutates global session state or launches daemons, plus a
-  `uwsm-app` shim so keybind-launched apps land in the nested session. Feed the generated
-  `nested.conf` to `preview-xr.sh --conf`.
+- **`scripts/gen-omarchy-xr-conf.sh`** — generates a nested-safe Lua config under
+  `~/.config/hypr/xr-nested/` that mirrors the user's (Lua, Omarchy 4.x) desktop (keybinds,
+  look-and-feel, theme) but skips anything that mutates global session state or launches daemons,
+  plus a `uwsm-app` shim so keybind-launched apps land in the nested session. Feed the generated
+  `nested.lua` to `preview-xr.sh --conf`.
 - **`scripts/fishfood.sh`** — installs the extension as a real desktop session alongside the
   distro Hyprland: a sibling git worktree built RelWithDebInfo, launched by a generated
   wayland-session `.desktop` entry pointing at the built binary with the user's XR front-end
