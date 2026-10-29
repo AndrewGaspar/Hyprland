@@ -595,14 +595,20 @@ namespace OpenXR {
     std::string anchorModeToString(const SXRAnchorState& state);
 
     // Inverse of parseXRMonitorLine (doc 05 §2.2 grammar / doc 03 §7 pose->text serialization
-    // rules): produces one paste-ready `xrmonitor = ...` config line. Pure and unconditional so
-    // it is shared by COpenXRManager::layoutDump() (the live `hyprctl openxr layout` path, which
-    // resolves `pose` per doc 03 §7 — the anchor's live solved world pose for LOCAL, the
-    // persistent stored offset for head/body/device) and by the round-trip unit test
-    // (tests/xr/parser.cpp) that this line, reparsed through parseXRMonitorLine, reproduces an
-    // equivalent SXRMonitorParams. `anchor.anchorPose` is ignored — `pose` is what gets printed.
-    std::string serializeXRMonitorLine(const std::string& name, Vector2D resolution, std::optional<float> refreshHz, const SXRAnchorState& anchor, const SXRPose& pose,
+    // rules): produces the declaration VALUE, `NAME, MODE, SPEC, size:X` — the grammar
+    // hl.xr_monitor's string form takes. Pure and unconditional so it is shared by
+    // COpenXRManager::layoutDump() (the live `hyprctl openxr layout` path, which resolves `pose`
+    // per doc 03 §7 — the anchor's live solved world pose for LOCAL, the persistent stored offset
+    // for head/body/device) and by the round-trip unit test (tests/xr/parser.cpp) that this value,
+    // reparsed through parseXRMonitorLine, reproduces an equivalent SXRMonitorParams.
+    // `anchor.anchorPose` is ignored — `pose` is what gets printed.
+    std::string serializeXRMonitorValue(const std::string& name, Vector2D resolution, std::optional<float> refreshHz, const SXRAnchorState& anchor, const SXRPose& pose,
                                         float sizeMeters);
+
+    // ...wrapped as one paste-ready Lua config line: `hl.xr_monitor("<value>")`. v0.57 removed
+    // the classic `xrmonitor =` keyword, so this is what `hyprctl openxr layout` prints.
+    std::string serializeXRMonitorLine(const std::string& name, Vector2D resolution, std::optional<float> refreshHz, const SXRAnchorState& anchor, const SXRPose& pose,
+                                       float sizeMeters);
 }
 
 // Parameters describing one XR monitor. Every create path (config keyword, dispatcher,

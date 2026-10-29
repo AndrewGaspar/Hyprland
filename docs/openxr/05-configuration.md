@@ -668,8 +668,8 @@ hl.xr_monitor({ name = "XR-palette", mode = "800x800",  anchor = "device:left", 
 ```
 
 It also accepts the **classic value string** verbatim, which matters because `hyprctl openxr
-layout` (§5) prints paste-ready `xrmonitor =` lines so you can arrange the desktop in-headset and
-persist the arrangement:
+layout` (§5) prints exactly this form — one paste-ready `hl.xr_monitor("…")` line per monitor — so
+you can arrange the desktop in-headset and persist the arrangement:
 
 ```lua
 hl.xr_monitor("XR-main, 2560x1440@90, anchor:local pos:0.017,1.457,-1.408 yaw:5.3, size:2.23")
@@ -1238,7 +1238,7 @@ hyprctl openxr reseat          # bring the whole anchor:local group to your curr
                                #   prints what it did ("re-seated 3 monitors to the current
                                #   head") or why it did not
 hyprctl openxr gaze [at <ms>]  # read-only head ray + timestamped gaze history (see below)
-hyprctl openxr layout          # dump the CURRENT live 3D layout as paste-ready xrmonitor= lines
+hyprctl openxr layout          # dump the CURRENT live 3D layout as paste-ready hl.xr_monitor(...) lines
 hyprctl openxr sync-layout [freeze|thaw]
                                # re-derive the 2D monitor plane from the 3D arrangement
 ```
@@ -1248,8 +1248,16 @@ hyprctl openxr sync-layout [freeze|thaw]
 `sync-layout` drives the **2D** projection (see [§2 layout2d](#2d-plane-sync-layout2d)).
 
 `hyprctl openxr layout` walks every live XR monitor (declared and runtime-created) and prints
-lines you can paste straight into your config to reproduce the arrangement — including a
-monitor that was moved at runtime with the dispatcher or a controller grab. `anchor:local`
+lines you can paste straight into your Lua config to reproduce the arrangement — including a
+monitor that was moved at runtime with the dispatcher or a controller grab. Each line is an
+`hl.xr_monitor` call in its string form, one per monitor:
+
+```lua
+hl.xr_monitor("XR-main, 2560x1440@90, anchor:local pos:0.017,1.457,-1.408 yaw:5.3 pitch:3.0 adaptive:on, size:2.23")
+```
+
+The string is the same `NAME, MODE, ANCHOR-SPEC, size:X` declaration grammar the table form
+spells field by field (§3), so you can paste it as-is or transcribe it into a table. `anchor:local`
 lines reflect the live world pose; `head`/`body`/`device` lines reflect the configured offset
 for that mode (their live position tracks you by design, so freezing it into a config line
 wouldn't mean what you'd expect). Roll is not representable in the serialization (yaw + pitch

@@ -582,7 +582,7 @@ class COpenXRManager {
     SXRGazeSample gazeSampleNow();
     SXRGazeSample gazeSampleAt(int64_t requestedTimestampMs);
 
-    // `hyprctl openxr layout`: paste-ready `xrmonitor = ...` lines for every live XR monitor.
+    // `hyprctl openxr layout`: paste-ready `hl.xr_monitor("...")` lines for every live XR monitor.
     std::string layoutDump();
 
     // Reconcile the declared (`xrmonitor` keyword) set against live layers (doc 05 §2.5). Runs

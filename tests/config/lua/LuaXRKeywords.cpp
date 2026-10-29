@@ -227,6 +227,27 @@ TEST(ConfigLuaXRMonitor, stringFormIsTheClassicKeywordLine) {
     expectSameMonitor(declaredMonitors()[0], classicMonitor(LINE));
 }
 
+// What `hyprctl openxr layout` prints must paste straight into a Lua config and declare the monitor
+// it was printed from — the serializer's line, run as-is, lands on the same state as its value
+// parsed by the shared grammar.
+TEST(ConfigLuaXRMonitor, layoutDumpLineIsPasteReadyLua) {
+    CXRLuaFixture          fx;
+    OpenXR::SXRAnchorState anchor;
+    anchor.mode             = OpenXR::XR_ANCHOR_LOCAL;
+    anchor.adaptive.enabled = true;
+    OpenXR::SXRPose pose;
+    pose.pos = OpenXR::Vec3{0.017f, 1.457f, -1.408f};
+
+    const auto VALUE = OpenXR::serializeXRMonitorValue("XR-main", Vector2D(2560, 1440), 90.f, anchor, pose, 2.23f);
+    const auto LINE  = OpenXR::serializeXRMonitorLine("XR-main", Vector2D(2560, 1440), 90.f, anchor, pose, 2.23f);
+
+    fx.run(LINE.c_str());
+
+    EXPECT_EQ(fx.errors(), "");
+    ASSERT_EQ(declaredMonitors().size(), 1u);
+    expectSameMonitor(declaredMonitors()[0], classicMonitor(VALUE));
+}
+
 // A pose written as a string and as a table must not be two different poses.
 TEST(ConfigLuaXRMonitor, vec3StringAndTableFormsAgree) {
     CXRLuaFixture fx;

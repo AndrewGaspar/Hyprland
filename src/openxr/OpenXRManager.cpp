@@ -6540,7 +6540,7 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
 }
 
 std::string COpenXRManager::layoutDump() {
-    // Paste-ready `xrmonitor = ...` lines (doc 05 §4.2 / doc 03 §7). Reflects the CURRENT live
+    // Paste-ready `hl.xr_monitor("...")` lines (doc 05 §5 / doc 03 §9). Reflects the CURRENT live
     // layout, not just the parsed/declared spec:
     //  - anchor:local serializes the anchor's *live solved world pose* (CXRAnchor::lastWorld()),
     //    not the persistent m_state.anchorPose. The two are identical for LOCAL whenever the

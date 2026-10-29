@@ -925,9 +925,10 @@ default `hold` it does not, so that path is byte-identical to what shipped. Unde
 
 ## 9. Layout persistence — `hyprctl openxr layout`
 
-`hyprctl openxr layout` walks the live XR monitors and prints paste-ready `xrmonitor = …` lines the
-user can drop into their config. The keyword grammar is owned by the configuration/IPC document; this
-page owns the pose→text rules (`serializeXRMonitorLine`):
+`hyprctl openxr layout` walks the live XR monitors and prints paste-ready `hl.xr_monitor("…")` lines
+the user can drop into their Lua config (the string form of `hl.xr_monitor`, which takes the
+declaration grammar verbatim). The grammar is owned by the configuration/IPC document; this page owns
+the pose→text rules (`serializeXRMonitorValue`; `serializeXRMonitorLine` wraps it in the Lua call):
 
 - `pos:` / `offset:` is `anchorPose.pos` in meters at 3 decimals, meaning per mode as stored (§3.1):
   world for `local`, view offset for `head`, body offset for `body`, grip offset for `device`. For an

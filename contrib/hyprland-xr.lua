@@ -225,8 +225,8 @@ hl.xr_defaults({ when = { hmd = "Quest 3" }, mode = "2560x1440@90", scale = 1.25
 hl.xr_defaults({ profile = "tall", mode = "1080x1920@90", size = 0.8 })
 
 -- XR monitor to bring up at launch. Arrange it in-headset by grabbing, then run
--- `hyprctl openxr layout` and persist the arrangement. That command still prints a paste-ready
--- CLASSIC `xrmonitor = …` line, which is why hl.xr_monitor also takes one as a string:
+-- `hyprctl openxr layout` and persist the arrangement. That command prints one paste-ready
+-- hl.xr_monitor call per monitor, in the string form (the declaration grammar verbatim):
 --
 --   hl.xr_monitor("XR-main, 2560x1440@90, anchor:local pos:0.017,1.457,-1.408 yaw:5.3 …")
 --

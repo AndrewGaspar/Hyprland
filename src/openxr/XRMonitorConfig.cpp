@@ -747,7 +747,7 @@ namespace {
     }
 }
 
-std::string OpenXR::serializeXRMonitorLine(const std::string& name, Vector2D resolution, std::optional<float> refreshHz, const SXRAnchorState& anchor, const SXRPose& pose,
+std::string OpenXR::serializeXRMonitorValue(const std::string& name, Vector2D resolution, std::optional<float> refreshHz, const SXRAnchorState& anchor, const SXRPose& pose,
                                             float sizeMeters) {
     std::string mode = std::format("{}x{}", (int)resolution.x, (int)resolution.y);
     if (refreshHz.has_value() && *refreshHz > 0.f)
@@ -799,7 +799,23 @@ std::string OpenXR::serializeXRMonitorLine(const std::string& name, Vector2D res
             spec += std::format(" carry:{}", anchor.adaptive.carryOffset ? "on" : "off");
     }
 
-    return std::format("xrmonitor = {}, {}, {}, size:{:.2f}", name, mode, spec, sizeMeters);
+    return std::format("{}, {}, {}, size:{:.2f}", name, mode, spec, sizeMeters);
+}
+
+std::string OpenXR::serializeXRMonitorLine(const std::string& name, Vector2D resolution, std::optional<float> refreshHz, const SXRAnchorState& anchor, const SXRPose& pose,
+                                           float sizeMeters) {
+    // A Lua double-quoted literal. Only the name is free text (the grammar forbids nothing but a
+    // comma in it), so escape what would end or bend the literal.
+    std::string literal;
+    for (const char c : serializeXRMonitorValue(name, resolution, refreshHz, anchor, pose, sizeMeters)) {
+        switch (c) {
+            case '"': literal += "\\\""; break;
+            case '\\': literal += "\\\\"; break;
+            case '\n': literal += "\\n"; break;
+            default: literal += c; break;
+        }
+    }
+    return std::format("hl.xr_monitor(\"{}\")", literal);
 }
 
 std::expected<void, std::string> OpenXR::parseXRMonitorMode(const std::string& mode, SXRMonitorParams& out) {
