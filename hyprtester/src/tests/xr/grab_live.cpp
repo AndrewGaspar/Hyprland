@@ -32,7 +32,7 @@ namespace {
     };
 
     // Test-only, no-JSON-library substring extraction: the `"pos": [...]` array belonging to
-    // `monitorName`'s block in a status blob. Scoped by name (WP11 note: xr-test.conf now
+    // `monitorName`'s block in a status blob. Scoped by name (WP11 note: xr-test.lua now
     // declares XR-conf-a/b fixtures alongside whatever this test creates, so `j/openxr` always
     // has >= 3 monitor blocks — a name-unscoped "first pos in the blob" search would silently
     // pick up a *different*, static monitor and never see this test's own movement). Good
@@ -53,7 +53,7 @@ namespace {
 
     // Same name-scoping for bool fields ("hovered"/"grabbed") as extractPos above, built on
     // WP11's XR::findAfter/XR::fieldAfter primitives. Without it, "hovered": true / "grabbed":
-    // true|false anywhere in the blob would match the XR-conf-a/b static fixtures xr-test.conf
+    // true|false anywhere in the blob would match the XR-conf-a/b static fixtures xr-test.lua
     // always declares, not necessarily this test's own monitor.
     bool scopedBoolField(const std::string& json, const std::string& monitorName, const std::string& field, bool expect) {
         const auto p = XR::findAfter(json, "\"name\": \"" + monitorName + "\"");

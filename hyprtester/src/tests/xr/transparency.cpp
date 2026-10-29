@@ -13,10 +13,10 @@
 // xr_transparency_rules — situational per-monitor transparency end to end (doc 05 §3.5).
 //
 // The rule engine's decisions are pinned by pure gtests (tests/xr/xrrule.cpp); what CANNOT be
-// covered there is the wiring: does an `xrrule` keyword reach the manager, does it get evaluated
+// covered there is the wiring: does an `hl.xr_rule` reach the manager, does it get evaluated
 // against a REAL monitor's context, does the eased value land in `hyprctl openxr status`, and does
 // the manual override actually outrank the rule and hand control back on `auto`. That whole chain
-// (config keyword -> declared list -> snapshot -> evaluation -> envelope -> atomics -> IPC) is what
+// (hl.xr_rule -> declared list -> snapshot -> evaluation -> envelope -> atomics -> IPC) is what
 // this exercises against a live session. It needs no headset and no passthrough: `alpha` is not
 // blend-mode gated, so it behaves identically under the null compositor's opaque mode.
 
@@ -32,10 +32,10 @@ namespace {
         std::string testName;
         std::string monitorName;
         ~SArtifactGuard() {
-            // A dynamic `hyprctl keyword xrrule` APPENDS (there is no name to replace), so the only
+            // A runtime `hl.xr_rule` APPENDS (there is no name to replace), so the only
             // way to drop the rule again is a reload — leaving it would leak into later tests.
             getFromSocket("/reload");
-            getFromSocket("/keyword openxr:transparency_blend_ms 600");
+            getFromSocket("/eval hl.config({ openxr = { transparency_blend_ms = 600 } })");
             if (!monitorName.empty())
                 getFromSocket("/openxr destroy " + monitorName);
             if (failed)
@@ -57,7 +57,7 @@ TEST_CASE(xr_transparency_rules) {
 
     // Snap transitions so the LIVE value equals the target immediately — the envelope shape itself
     // is gtest-covered; here we only care that the resolved number reaches the frame loop.
-    getFromSocket("/keyword openxr:transparency_blend_ms 0");
+    getFromSocket("/eval hl.config({ openxr = { transparency_blend_ms = 0 } })");
 
     ASSERT(getFromSocket("/openxr create " + mon + " 1280x720 anchor:local pos:0,1.4,-1.5"), std::string("ok"));
     guard.monitorName = mon;
@@ -84,8 +84,8 @@ TEST_CASE(xr_transparency_rules) {
     EXPECT(field("alphaSource"), std::string("default"));
     EXPECT(field("alphaTarget"), std::string("1.000"));
 
-    // 2. A rule that names this monitor applies (config keyword -> evaluation -> status).
-    ASSERT(getFromSocket("/keyword xrrule alpha 0.500, monitor:^" + mon + "$"), std::string("ok"));
+    // 2. A rule that names this monitor applies (hl.xr_rule -> evaluation -> status).
+    ASSERT(getFromSocket("/eval hl.xr_rule({ alpha = 0.5, match = { monitor = '^" + mon + "$' } })"), std::string("ok"));
     if (!awaitField("alphaSource", "rule", 4000))
         MARK_TEST_FAILED("xrrule never took effect: alphaSource never became 'rule'");
     else {

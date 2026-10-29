@@ -49,7 +49,7 @@ namespace {
     // Bracket-search technique proven by ray_live.cpp/grab_live.cpp on this environment: try a
     // few plausible controller heights (compensating for LOCAL vs LOCAL_FLOOR uncertainty across
     // runtimes) at a fixed x, identity orientation (aim = straight -Z), until the ray registers a
-    // hover on `monName` specifically (scoped by name — xr-test.conf's XR-conf-a/b fixtures are
+    // hover on `monName` specifically (scoped by name — xr-test.lua's XR-conf-a/b fixtures are
     // always present alongside whatever a test creates, doc 06 WP11 note).
     struct SPoseAttempt {
         MonadoWire::xrt_vec3 pos;
@@ -163,7 +163,7 @@ namespace {
         // should wrap construction in try/catch and SKIP the test on failure, matching the
         // env-instability posture used throughout this suite.
         explicit CXRClient(const std::string& monitorName) {
-            if (getFromSocket("/dispatch focusmonitor " + monitorName) != "ok")
+            if (getFromSocket("/dispatch hl.dsp.focus({ monitor = '" + monitorName + "' })") != "ok")
                 throw std::runtime_error("focusmonitor failed");
 
             m_proc = makeShared<CProcess>(binaryDir + "/pointer-scroll", std::vector<std::string>{});
@@ -528,7 +528,7 @@ TEST_CASE(xr_scroll) {
         bool changed = false;
         ~SSpeedGuard() {
             if (changed)
-                getFromSocket("/keyword openxr:scroll_speed 1.0");
+                getFromSocket("/eval hl.config({ openxr = { scroll_speed = 1.0 } })");
         }
     } speedGuard;
 
@@ -584,7 +584,7 @@ TEST_CASE(xr_scroll) {
     NLog::green("xr_scroll: baseline scroll magnitude {:.2f} reached the client", sum1);
 
     // --- doubling openxr:scroll_speed roughly doubles the magnitude -------------------------
-    ASSERT(getFromSocket("/keyword openxr:scroll_speed 2.0"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { scroll_speed = 2.0 } })"), std::string("ok"));
     speedGuard.changed = true;
     client->queryScrollSum(); // drain
 
@@ -607,7 +607,7 @@ TEST_CASE(xr_scroll) {
         NLog::green("xr_scroll: doubled scroll_speed magnitude {:.2f} vs baseline {:.2f} (proportional increase confirmed)", sum2, sum1);
     }
 
-    ASSERT(getFromSocket("/keyword openxr:scroll_speed 1.0"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { scroll_speed = 1.0 } })"), std::string("ok"));
     speedGuard.changed = false;
     client->queryScrollSum(); // drain
 

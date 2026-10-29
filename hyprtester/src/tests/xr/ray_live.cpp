@@ -29,7 +29,7 @@ namespace {
     };
 
     // Test-only, name-scoped bool-field check, built on WP11's XR::findAfter/XR::fieldAfter
-    // scraping primitives (same pattern as tests/xr/input.cpp's local scopedBoolField). xr-test.conf
+    // scraping primitives (same pattern as tests/xr/input.cpp's local scopedBoolField). xr-test.lua
     // declares XR-conf-a/b fixtures alongside whatever this test creates, so `j/openxr` always has
     // >= 2 monitor blocks — an unscoped "does '\"hovered\": true' appear anywhere in the blob"
     // search would false-positive the instant either static fixture is (or becomes) hovered for

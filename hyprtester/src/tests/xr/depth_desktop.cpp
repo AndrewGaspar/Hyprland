@@ -137,9 +137,9 @@ namespace {
                 return true;
             // stereoComposites and stereoContent are written BY a frame, so a monitor that has
             // stopped repainting reports the last one. Nudge it once the natural path has had its
-            // chance (the tests/main/stereo.cpp idiom, in the dispatcher the legacy config has).
+            // chance (the tests/main/stereo.cpp idiom).
             if (i == 8)
-                getFromSocket("/dispatch forcerendererreload");
+                getFromSocket("/dispatch hl.dsp.force_renderer_reload()");
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         return monitorField(mon, key) == want;
@@ -161,12 +161,12 @@ TEST_CASE(xr_depth_desktop_pair) {
     const std::string NAMEMARKER = "\"name\": \"" + MON + "\"";
 
     CScopeGuard       cfgGuard = {[&]() {
-        getFromSocket("/keyword openxr:depth_desktop 1");
-        getFromSocket("/keyword openxr:stereo_quad_pair 1");
+        getFromSocket("/eval hl.config({ openxr = { depth_desktop = true } })");
+        getFromSocket("/eval hl.config({ openxr = { stereo_quad_pair = true } })");
         Tests::killAllWindows();
     }};
 
-    ASSERT(getFromSocket("/keyword openxr:depth_desktop 1"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { depth_desktop = true } })"), std::string("ok"));
     ASSERT(getFromSocket("/openxr create " + MON + " 1280x720"), std::string("ok"));
     guard.monitorNames.push_back(MON);
     ASSERT(XR::waitForJson(
@@ -206,7 +206,7 @@ TEST_CASE(xr_depth_desktop_pair) {
     // ...and now something with depth. A focused window sits at decoration:depth_focused, so the
     // producer engages and the monitor genuinely composites twice — the panes stop being identical,
     // which is the whole feature.
-    ASSERT(getFromSocket("/dispatch focusmonitor " + MON), std::string("ok"));
+    ASSERT(getFromSocket("/dispatch hl.dsp.focus({ monitor = '" + MON + "' })"), std::string("ok"));
     auto kitty = Tests::spawnKitty("xr_depth_desktop");
     if (!kitty) {
         XR::logSkip(name(), "kitty did not spawn (env limitation)");
@@ -215,7 +215,7 @@ TEST_CASE(xr_depth_desktop_pair) {
     ASSERT(XR::waitForJson(
                "j/clients", [&](const std::string& r) { return r.contains("\"xr_depth_desktop\""); }, std::chrono::milliseconds(10000)),
            true);
-    ASSERT(getFromSocket("/dispatch focuswindow class:xr_depth_desktop"), std::string("ok"));
+    ASSERT(getFromSocket("/dispatch hl.dsp.focus({ window = 'class:xr_depth_desktop' })"), std::string("ok"));
     ASSERT(waitForMonitorField(MON, "stereoComposites", "2"), true);
     // Still exactly two quads — the second composite changed the PIXELS, not the submission.
     ASSERT(waitForDecl(MON, "sbs", "depth", 2), true);
@@ -224,16 +224,16 @@ TEST_CASE(xr_depth_desktop_pair) {
     // stays packed (`stereo` is still sbs) and ONE quad is submitted showing pane 0 — a mono desktop
     // at the right shape. Reporting `off` here would mean the pack had been dropped, which is a
     // different and much more expensive thing to do.
-    ASSERT(getFromSocket("/keyword openxr:stereo_quad_pair 0"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { stereo_quad_pair = false } })"), std::string("ok"));
     ASSERT(waitForDecl(MON, "sbs", "depth", 1), true);
     EXPECT(monitorField(MON, "scanoutWidth"), std::string("2560"));
-    ASSERT(getFromSocket("/keyword openxr:stereo_quad_pair 1"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { stereo_quad_pair = true } })"), std::string("ok"));
     ASSERT(waitForDecl(MON, "sbs", "depth", 2), true);
 
     // THE MASTER SWITCH. This one DOES drop the pack: the mode goes back to the declared size, the
     // swapchain is rebuilt at one pane, and the monitor is an ordinary quad again. The declared size
     // is unchanged across the whole round trip, which is the property that makes it safe to bind.
-    ASSERT(getFromSocket("/keyword openxr:depth_desktop 0"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { depth_desktop = false } })"), std::string("ok"));
     ASSERT(waitForDecl(MON, "off", "off", 1), true);
     ASSERT(waitForMonitorField(MON, "width", "1280"), true);
     EXPECT(monitorField(MON, "height"), std::string("720"));
@@ -245,7 +245,7 @@ TEST_CASE(xr_depth_desktop_pair) {
     ASSERT(waitForChrome(MON, true), true); // an ordinary quad has chrome too
 
     // ...and back, so it is a toggle rather than a one-way door.
-    ASSERT(getFromSocket("/keyword openxr:depth_desktop 1"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { depth_desktop = true } })"), std::string("ok"));
     ASSERT(waitForDecl(MON, "sbs", "depth", 2), true);
     ASSERT(waitForMonitorField(MON, "width", "1280"), true);
     EXPECT(monitorField(MON, "scanoutWidth"), std::string("2560"));
@@ -272,14 +272,14 @@ TEST_CASE(xr_depth_desktop_with_stereo_content) {
     const std::string MON        = XR::monitorName(32);
     const std::string NAMEMARKER = "\"name\": \"" + MON + "\"";
 
-    ASSERT(getFromSocket("/keyword windowrule stereo sbs always, match:class ^(xr_depth_content)$"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.window_rule({ stereo = 'sbs always', match = { class = '^(xr_depth_content)$' } })"), std::string("ok"));
     CScopeGuard ruleGuard = {[&]() {
-        getFromSocket("/keyword windowrule stereo off, match:class ^(xr_depth_content)$");
-        getFromSocket("/keyword openxr:depth_desktop 1");
+        getFromSocket("/eval hl.window_rule({ stereo = 'off', match = { class = '^(xr_depth_content)$' } })");
+        getFromSocket("/eval hl.config({ openxr = { depth_desktop = true } })");
         Tests::killAllWindows();
     }};
 
-    ASSERT(getFromSocket("/keyword openxr:depth_desktop 1"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { depth_desktop = true } })"), std::string("ok"));
     ASSERT(getFromSocket("/openxr create " + MON + " 1280x720"), std::string("ok"));
     guard.monitorNames.push_back(MON);
     ASSERT(XR::waitForJson(
@@ -287,7 +287,7 @@ TEST_CASE(xr_depth_desktop_with_stereo_content) {
            true);
     ASSERT(waitForDecl(MON, "sbs", "depth", 2), true);
 
-    ASSERT(getFromSocket("/dispatch focusmonitor " + MON), std::string("ok"));
+    ASSERT(getFromSocket("/dispatch hl.dsp.focus({ monitor = '" + MON + "' })"), std::string("ok"));
     auto kitty = Tests::spawnKitty("xr_depth_content");
     if (!kitty) {
         XR::logSkip(name(), "kitty did not spawn (env limitation)");
@@ -298,8 +298,8 @@ TEST_CASE(xr_depth_desktop_with_stereo_content) {
            true);
     EXPECT_CONTAINS(getFromSocket("/clients"), "stereo: sbs");
 
-    ASSERT(getFromSocket("/dispatch focuswindow class:xr_depth_content"), std::string("ok"));
-    ASSERT(getFromSocket("/dispatch fullscreen 0"), std::string("ok"));
+    ASSERT(getFromSocket("/dispatch hl.dsp.focus({ window = 'class:xr_depth_content' })"), std::string("ok"));
+    ASSERT(getFromSocket("/dispatch hl.dsp.window.fullscreen()"), std::string("ok"));
 
     // The crop reached a drawn surface: the window's packed frame is being un-packed per pane.
     ASSERT(waitForMonitorField(MON, "stereoContent", "true"), true);
@@ -311,9 +311,9 @@ TEST_CASE(xr_depth_desktop_with_stereo_content) {
     // cannot do: X1's coverage gate exists precisely because splitting the whole content rect for a
     // floating window would send half the desktop to each eye. Inside a depth desktop the crop is
     // per surface, so the window can be any size and the rest of the screen stays 2D.
-    ASSERT(getFromSocket("/dispatch fullscreen 0"), std::string("ok"));
-    ASSERT(getFromSocket("/dispatch setfloating class:xr_depth_content"), std::string("ok"));
-    ASSERT(getFromSocket("/dispatch resizewindowpixel exact 400 300, class:xr_depth_content"), std::string("ok"));
+    ASSERT(getFromSocket("/dispatch hl.dsp.window.fullscreen()"), std::string("ok"));
+    ASSERT(getFromSocket("/dispatch hl.dsp.window.float({ action = 'set', window = 'class:xr_depth_content' })"), std::string("ok"));
+    ASSERT(getFromSocket("/dispatch hl.dsp.window.resize({ x = 400, y = 300, window = 'class:xr_depth_content' })"), std::string("ok"));
     Tests::sync();
     ASSERT(waitForMonitorField(MON, "stereoContent", "true"), true);
     ASSERT(waitForDecl(MON, "sbs", "depth", 2), true);

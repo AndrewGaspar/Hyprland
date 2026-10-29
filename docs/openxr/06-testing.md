@@ -112,7 +112,7 @@ the wire ABI has drifted (§4).
 Hyprland starts its session — so the XR suite is a separate `hyprtester` invocation, selected by
 the `--xr` flag. Under `--xr`, `main.cpp`'s `runXrSuite()`:
 
-1. Defaults the config to `hyprtester/xr-test.conf` (instead of `test.lua`) and runs only
+1. Defaults the config to `hyprtester/xr-test.lua` (instead of `test.lua`) and runs only
    `xrTestCases`.
 2. Constructs a single `CMonadoOrchestrator` and starts it (§3). If Monado is unavailable, the
    suite still launches Hyprland — **without** `XR_RUNTIME_JSON` — so `xr_runtime_absent` can
@@ -126,14 +126,30 @@ handles this: it tries the headless launch first, and on failure symlinks the ho
 socket into the isolated run directory and relaunches **nested** inside the host's Wayland
 session (a few retries) — both halves explicit, since the isolation clears `WAYLAND_DISPLAY` out
 of the environment and the fallback hands it back to the child by name (§3.1). Under the nested fallback Aquamarine names the base output `WAYLAND-1`
-rather than the `HEADLESS-1` from `xr-test.conf`'s `monitor =` line, so tests never hard-code the
+rather than the `HEADLESS-1` from `xr-test.lua`'s `hl.monitor` line, so tests never hard-code the
 base monitor's name; every XR monitor a test creates is backend-independent.
 
-`xr-test.conf` is a **classic hyprlang** config (the `xrmonitor` keyword is registered in the
-legacy config manager — see the configuration reference). It enables OpenXR, sets a headless base
-monitor, and declares two static XR monitors (`XR-conf-a`, `XR-conf-b`) used as reconciliation
-fixtures. It intentionally carries no machine-specific GPU pin; per-box settings are merged in at
-runtime (§3).
+`xr-test.lua` is a **Lua** config — Hyprland 0.57 removed the classic hyprlang front end and the
+`hyprctl keyword` command, so the suite configures itself the same way the ordinary suite does.
+It enables OpenXR, sets a headless base monitor, and declares two static XR monitors (`XR-conf-a`,
+`XR-conf-b`, via the string form of `hl.xr_monitor`) used as reconciliation fixtures. It
+intentionally carries no machine-specific GPU pin; per-box settings are merged in at runtime (§3).
+
+Tests change settings at runtime over the socket with `/eval` and dispatch with Lua dispatchers:
+
+| Instead of (≤ 0.56) | Write (0.57+) |
+|---|---|
+| `/keyword openxr:depth_desktop 1` | `/eval hl.config({ openxr = { depth_desktop = true } })` — literal by declared type: bool, int, float, or a **quoted** string (`inhibit_idle = '1'`, `monitors_follow_session = 'visible'`) |
+| `/keyword monitor X, preferred, auto, 1` | `/eval hl.monitor({ output = 'X', mode = 'preferred', position = 'auto', scale = '1' })` — **merges** onto X's existing rule, so a revert must clear a field explicitly (`mirror = ''`, `stereo = 'off'`, `lease = false`) |
+| `/keyword windowrule stereo sbs always, match:class ^(X)$` | `/eval hl.window_rule({ stereo = 'sbs always', match = { class = '^(X)$' } })` |
+| `/keyword xrrule alpha 0.5, monitor:^X$` | `/eval hl.xr_rule({ alpha = 0.5, match = { monitor = '^X$' } })` |
+| `/dispatch focusmonitor X` / `focuswindow class:X` / `fullscreen 0` | `/dispatch hl.dsp.focus({ monitor = 'X' })` / `hl.dsp.focus({ window = 'class:X' })` / `hl.dsp.window.fullscreen()` |
+
+`/eval` replies `ok` or an `error: …` string, so `== "ok"` assertions stay meaningful. One timing
+difference from the old keyword path: a runtime `hl.config` fires `config.props_refreshed`, which
+runs `COpenXRManager::onConfigReload()` one idle tick later and for **every** `openxr` key (the
+keyword handler special-cased only some). A test that depends on that pass must wait for its
+effect in `j/openxr`, not assume it ran synchronously.
 
 ---
 
@@ -178,8 +194,10 @@ to the built binary, or the installed `share/openxr/1/openxr_monado.json` for an
 binary).
 
 **Per-box GPU pin.** Machine-specific launch knobs stay out of the tracked config: the harness
-generates a wrapper config that sources `xr-test.conf`, then an optional untracked
-`hyprtester/xr-test-local.conf`, then `openxr:gpu = $HYPRTESTER_XR_GPU` when that env var is set.
+generates `<run-dir>/xr-wrapper.lua`, which `require()`s `xr-test.lua` by absolute path, then an
+optional untracked `hyprtester/xr-test-local.lua`, then `hl.config({ openxr = { gpu = … } })` from
+`$HYPRTESTER_XR_GPU` when that env var is set. (A reload clears `package.loaded` for user modules,
+so the tests that rewrite `xr-test.lua` and `/reload` see their edit re-executed.)
 This matters on dual-GPU boxes — see §8.
 
 **Teardown**: `SIGTERM` → wait up to 3 s → `SIGKILL` + reap. The run directory is removed unless a
@@ -484,7 +502,13 @@ scripts/xr-container.sh test --gpu amd                  # full hyprtester --xr s
 scripts/xr-container.sh test --gpu amd xr_session_up    # a subset (name filter)
 scripts/xr-container.sh test --gpu nvidia               # …on NVIDIA via CDI
 scripts/xr-container.sh test --gpu amd --keep           # leave the container up to debug
+HYPXR_CTR_SUFFIX=-057a scripts/xr-container.sh test --build --gpu amd   # a separate image/volume set
 ```
+
+`HYPXR_CTR_SUFFIX` suffixes every image tag, volume and container name, so a second tree (e.g. a
+rebase onto a new upstream with different build deps) is validated with its own images, `/build`
+and ccache instead of clobbering the shared set — see
+[`containers/README.md`](../../containers/README.md#side-by-side-resource-sets-hypxr_ctr_suffix).
 
 `test` boots `:session` with **no host wayland/X11/wivrn mounts** — only the `/src` overlay, the
 build/ccache volumes, and one GPU device. It uses its **own network namespace** and the vendored

@@ -868,6 +868,10 @@ TEST_CASE(stereoWindowRules) {
     Tests::killAllWindows();
     ASSERT(Tests::windowCount(), 0);
 
+    // the xdg-tag opt-in shipped in the examples (`stereo:<layout>` toplevel tags, read by `auto`)
+    // parses: the match key and the effect both resolve by name in the Lua tables
+    OK(getFromSocket("/eval hl.window_rule({ match = { xdg_tag = '^stereo:.*' }, stereo = 'auto' })"));
+
     // a layout the grammar does not have must be refused, not silently ignored
     EXPECT_CONTAINS(getFromSocket("/eval hl.window_rule({ match = { class = 'kitty_stereo_bad' }, stereo = 'lr' })"), "unknown layout");
 }

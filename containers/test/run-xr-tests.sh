@@ -126,9 +126,9 @@ else
 fi
 
 # --- 3. run the suite, nested into labwc ---------------------------------------
-# hyprtester resolves its config (xr-test.conf) relative to CWD, so run from the
+# hyprtester resolves its config (xr-test.lua) relative to CWD, so run from the
 # hyprtester source dir (overlay-mounted, writable — xr_config_declared rewrites
-# and restores xr-test.conf in place).
+# and restores xr-test.lua in place).
 export WAYLAND_DISPLAY="$WL"
 export HYPRTESTER_MONADO_SERVICE="$MONADO_SERVICE"
 export HYPRTESTER_XR_GPU="$XR_GPU_NODE"

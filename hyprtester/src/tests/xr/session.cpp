@@ -141,7 +141,7 @@ TEST_CASE(xr_gpu_mismatch_fails_closed) {
 
     // Force the wrong GPU and restart the session. Pre-fix, this crashed the whole compositor;
     // the assertion is that we now survive and fail closed.
-    getFromSocket("/keyword openxr:gpu " + wrongGpu);
+    getFromSocket("/eval hl.config({ openxr = { gpu = '" + wrongGpu + "' } })");
     getFromSocket("/openxr disable");
     XR::waitForXrState("disabled", std::chrono::milliseconds(5000));
 
@@ -155,7 +155,7 @@ TEST_CASE(xr_gpu_mismatch_fails_closed) {
     EXPECT_CONTAINS(getFromSocket("j/openxr"), "\"state\": \"unavailable\"");
 
     // Restore the good GPU and bring XR back up so the rest of the group is unaffected.
-    getFromSocket("/keyword openxr:gpu " + currentGpu);
+    getFromSocket("/eval hl.config({ openxr = { gpu = '" + currentGpu + "' } })");
     getFromSocket("/openxr disable");
     XR::waitForXrState("disabled", std::chrono::milliseconds(5000));
     getFromSocket("/openxr enable");

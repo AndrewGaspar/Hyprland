@@ -377,15 +377,15 @@ TEST_CASE(xr_layout2d_rule_provenance) {
     // must claim the field again. Without the clearScale branch the first transition stays at 1.25.
     guard.reloadConfig = true;
     ASSERT(scaleIs(reused, 1.25F), true);
-    ASSERT(getFromSocket("/keyword openxr:default_monitor_scale 0"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { default_monitor_scale = 0 } })"), std::string("ok"));
     ASSERT(scaleIs(reused, 2.F), true);
-    ASSERT(getFromSocket("/keyword openxr:default_monitor_scale 1.25"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { default_monitor_scale = 1.25 } })"), std::string("ok"));
     ASSERT(scaleIs(reused, 1.25F), true);
 
     // A real user offset follows the opposite branch. Use a different name so the assertion also
     // proves provenance, rather than accidentally passing because the numeric values differ from
     // the old projection.
-    ASSERT(getFromSocket("/keyword monitor " + pinned + ", preferred, 320x240, 1"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.monitor({ output = '" + pinned + "', mode = 'preferred', position = '320x240', scale = '1' })"), std::string("ok"));
     ASSERT(getFromSocket("/openxr create " + pinned + " 1280x720 anchor:local pos:0,1.4,-1.5 yaw:0"), std::string("ok"));
     guard.monitorNames.push_back(pinned);
     ASSERT(sourceIs(pinned, "pinned"), true);
@@ -400,10 +400,10 @@ TEST_CASE(xr_layout2d_rule_provenance) {
 
     // Ownership is re-evaluated on runtime rule updates too: removing the explicit position lets
     // the existing monitor rejoin projection, and restoring it excludes the monitor again.
-    ASSERT(getFromSocket("/keyword monitor " + pinned + ", preferred, auto, 1"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.monitor({ output = '" + pinned + "', mode = 'preferred', position = 'auto', scale = '1' })"), std::string("ok"));
     ASSERT(syncNow(), true);
     ASSERT(sourceIs(pinned, "auto"), true);
-    ASSERT(getFromSocket("/keyword monitor " + pinned + ", preferred, 320x240, 1"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.monitor({ output = '" + pinned + "', mode = 'preferred', position = '320x240', scale = '1' })"), std::string("ok"));
     ASSERT(sourceIs(pinned, "pinned"), true);
 
     NLog::green("xr_layout2d_rule_provenance: same-name recreation stayed auto; scale handback and explicit offset precedence held");

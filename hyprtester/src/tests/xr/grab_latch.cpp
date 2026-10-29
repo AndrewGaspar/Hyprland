@@ -21,7 +21,7 @@ namespace {
         bool        restoreGrabFilter = false;
         ~SArtifactGuard() {
             if (restoreGrabFilter)
-                getFromSocket("/keyword openxr:grab_filter 1"); // back to the shipped default
+                getFromSocket("/eval hl.config({ openxr = { grab_filter = true } })"); // back to the shipped default
             if (!monitorName.empty())
                 getFromSocket("/openxr destroy " + monitorName);
             if (XR::g_ctx.remote) {
@@ -35,7 +35,7 @@ namespace {
     };
 
     // The world pos [x,y,z] of monitorName's block in the openxr status JSON, name-scoped
-    // (xr-test.conf always carries other static monitor blocks — see grab_live.cpp).
+    // (xr-test.lua always carries other static monitor blocks — see grab_live.cpp).
     std::optional<std::array<float, 3>> monitorPos(const std::string& json, const std::string& monitorName) {
         const auto namePos = XR::findAfter(json, "\"name\": \"" + monitorName + "\"");
         if (namePos == std::string::npos)
@@ -76,7 +76,7 @@ namespace {
         // filter — now applied to controllers too (grab_filter_scope=all) — would smooth the scripted
         // jerk out of the recorded carry ring, so the latch's outlier detection wouldn't be what's
         // under test. Disable it for these tests; the guard restores the default.
-        getFromSocket("/keyword openxr:grab_filter 0");
+        getFromSocket("/eval hl.config({ openxr = { grab_filter = false } })");
         guard.restoreGrabFilter = true;
         if (getFromSocket("/openxr create " + mon + " 1280x720 anchor:local pos:0,0,-1.5 size:1.5") != "ok") {
             logSkip("monitor create failed");

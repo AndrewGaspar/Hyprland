@@ -16,7 +16,7 @@
 // The payoff of keeping the geofence pure + dt-driven: the whole trigger is scriptable from the
 // Monado remote driver's head POSITION with no headset. Walk the scripted head out past the leave
 // radius, assert the monitor undocks (status phase -> roaming); walk it back inside the return
-// radius, assert it re-docks (phase -> docked). Thresholds are shrunk + sped up via hot keywords so
+// radius, assert it re-docks (phase -> docked). Thresholds are shrunk + sped up via hot hl.config options so
 // the whole thing runs in a few seconds. The FEEL (radii/dwell/easing taste) still needs a live
 // Quest — this only proves the machine fires end-to-end through the real frame loop + IPC.
 
@@ -38,11 +38,11 @@ namespace {
                 XR::g_ctx.remote->pulse();
             }
             // Restore adaptive thresholds to their defaults so later tests are unaffected.
-            getFromSocket("/keyword openxr:adaptive_leave_radius 1.5");
-            getFromSocket("/keyword openxr:adaptive_return_radius 1.0");
-            getFromSocket("/keyword openxr:adaptive_leave_dwell_ms 400");
-            getFromSocket("/keyword openxr:adaptive_return_dwell_ms 800");
-            getFromSocket("/keyword openxr:adaptive_transition_ms 700");
+            getFromSocket("/eval hl.config({ openxr = { adaptive_leave_radius = 1.5 } })");
+            getFromSocket("/eval hl.config({ openxr = { adaptive_return_radius = 1.0 } })");
+            getFromSocket("/eval hl.config({ openxr = { adaptive_leave_dwell_ms = 400 } })");
+            getFromSocket("/eval hl.config({ openxr = { adaptive_return_dwell_ms = 800 } })");
+            getFromSocket("/eval hl.config({ openxr = { adaptive_transition_ms = 700 } })");
             if (!monitorName.empty())
                 getFromSocket("/openxr destroy " + monitorName);
             if (failed)
@@ -70,11 +70,11 @@ TEST_CASE(xr_adaptive_geofence) {
     }
 
     // Fast, tight geofence so the walk-out/walk-in cycle completes in seconds.
-    getFromSocket("/keyword openxr:adaptive_leave_radius 1.0");
-    getFromSocket("/keyword openxr:adaptive_return_radius 0.5");
-    getFromSocket("/keyword openxr:adaptive_leave_dwell_ms 150");
-    getFromSocket("/keyword openxr:adaptive_return_dwell_ms 150");
-    getFromSocket("/keyword openxr:adaptive_transition_ms 200");
+    getFromSocket("/eval hl.config({ openxr = { adaptive_leave_radius = 1.0 } })");
+    getFromSocket("/eval hl.config({ openxr = { adaptive_return_radius = 0.5 } })");
+    getFromSocket("/eval hl.config({ openxr = { adaptive_leave_dwell_ms = 150 } })");
+    getFromSocket("/eval hl.config({ openxr = { adaptive_return_dwell_ms = 150 } })");
+    getFromSocket("/eval hl.config({ openxr = { adaptive_transition_ms = 200 } })");
 
     // Baseline: head at the origin (the desk seat).
     remote->setHeadPose(xrt_vec3{0.f, 0.f, 0.f}, xrt_quat{0.f, 0.f, 0.f, 1.f});

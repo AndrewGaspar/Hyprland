@@ -60,7 +60,7 @@ meta/hl.meta.lua
 
 hyprtester/pointer-scroll.txt
 /keyboard-modifiers.txt
-hyprtester/xr-test-local.conf
+hyprtester/xr-test-local.lua
 
 # HypXRland container artifacts (podman build/test scratch, preserved test dirs)
 containers/artifacts/

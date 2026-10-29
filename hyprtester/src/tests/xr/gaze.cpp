@@ -92,7 +92,7 @@ TEST_CASE(xr_gaze_grab) {
            true);
 
     // Make sure the gaze dwell is snappy for the test window.
-    getFromSocket("/keyword openxr:gaze_dwell_ms 120");
+    getFromSocket("/eval hl.config({ openxr = { gaze_dwell_ms = 120 } })");
 
     // ---- dwell-stable gaze selection: the status `gaze.hoveredName` should become our monitor ----
     const bool gazing = XR::waitForJson(
@@ -173,7 +173,7 @@ TEST_CASE(xr_gaze_grab) {
     }
 
     // Restore the head + the dwell default for later tests sharing the session.
-    getFromSocket("/keyword openxr:gaze_dwell_ms 200");
+    getFromSocket("/eval hl.config({ openxr = { gaze_dwell_ms = 200 } })");
     remote->setHeadPose(xrt_vec3{0.f, 0.f, 0.f}, xrt_quat{0.f, 0.f, 0.f, 1.f});
     remote->pulse();
     std::this_thread::sleep_for(std::chrono::milliseconds(200));

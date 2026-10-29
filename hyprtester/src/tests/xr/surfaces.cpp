@@ -26,8 +26,8 @@ struct SSurfaceGuard {
     std::string testName;
     std::string monitorName;
     ~SSurfaceGuard() {
-        getFromSocket("/keyword openxr:surfaces 0");
-        getFromSocket("/keyword openxr:grab_filter 1"); // the shipped default
+        getFromSocket("/eval hl.config({ openxr = { surfaces = false } })");
+        getFromSocket("/eval hl.config({ openxr = { grab_filter = true } })"); // the shipped default
         if (!monitorName.empty())
             getFromSocket("/openxr destroy " + monitorName);
         if (XR::g_ctx.remote) {
@@ -73,7 +73,7 @@ static bool surfaceGrab(CTestCase* tc, const std::string& mon, SSurfaceGuard& gu
         return false;
     }
     // A rigid, unfiltered carry: the controller's motion is the monitor's motion.
-    getFromSocket("/keyword openxr:grab_filter 0");
+    getFromSocket("/eval hl.config({ openxr = { grab_filter = false } })");
     if (getFromSocket("/openxr create " + mon + " 1280x720 anchor:local pos:0,0,-1.5 size:1.5") != "ok") {
         logSkip("monitor create failed");
         return false;
@@ -158,8 +158,8 @@ TEST_CASE(xr_surface_snap_synthetic_table) {
     // A 3x3 m table 0.9 m below the monitor's center: its bottom edge (half the 0.84 m content plus
     // the chrome margin and bar) starts ~0.35 m above it.
     const float tableY = (*start)[1] - 0.9F;
-    EXPECT(getFromSocket(std::format("/keyword openxr:surfaces_synthetic table pos:{:.3f},{:.3f},{:.3f} size:3,3", (*start)[0], tableY, (*start)[2])), "ok");
-    EXPECT(getFromSocket("/keyword openxr:surfaces 1"), "ok");
+    EXPECT(getFromSocket(std::format("/eval hl.config({{ openxr = {{ surfaces_synthetic = 'table pos:{:.3f},{:.3f},{:.3f} size:3,3' }} }})", (*start)[0], tableY, (*start)[2])), "ok");
+    EXPECT(getFromSocket("/eval hl.config({ openxr = { surfaces = true } })"), "ok");
     ASSERT(XR::waitForJson("j/openxr", [](const std::string& j) { return j.find("\"source\": \"synthetic\"") != std::string::npos; }, std::chrono::milliseconds(5000)), true);
     NLog::green("xr_surface_snap_synthetic_table: table published at y {:.3f}", tableY);
 
@@ -213,14 +213,14 @@ TEST_CASE(xr_surface_off_never_snaps) {
     const std::string    mon = XR::monitorName(77);
     SSurfaceGuard        guard{this->failed, name(), ""};
     MonadoWire::xrt_vec3 hover{};
-    getFromSocket("/keyword openxr:surfaces 0");
+    getFromSocket("/eval hl.config({ openxr = { surfaces = false } })");
     if (!surfaceGrab(this, mon, guard, hover))
         return;
 
     const auto start = surfaceMonitorPos(getFromSocket("j/openxr"), mon);
     ASSERT(start.has_value(), true);
     const float tableY = (*start)[1] - 0.9F;
-    EXPECT(getFromSocket(std::format("/keyword openxr:surfaces_synthetic table pos:{:.3f},{:.3f},{:.3f} size:3,3", (*start)[0], tableY, (*start)[2])), "ok");
+    EXPECT(getFromSocket(std::format("/eval hl.config({{ openxr = {{ surfaces_synthetic = 'table pos:{:.3f},{:.3f},{:.3f} size:3,3' }} }})", (*start)[0], tableY, (*start)[2])), "ok");
 
     // The same descent, all the way to where the table is: no preview, ever.
     bool previewed = false;
@@ -255,8 +255,8 @@ struct SGazeSurfaceGuard {
     std::string monitorName;
     ~SGazeSurfaceGuard() {
         getFromSocket("/openxr gazerelease");
-        getFromSocket("/keyword openxr:surfaces 0");
-        getFromSocket("/keyword openxr:gaze_dwell_ms 200");
+        getFromSocket("/eval hl.config({ openxr = { surfaces = false } })");
+        getFromSocket("/eval hl.config({ openxr = { gaze_dwell_ms = 200 } })");
         if (!monitorName.empty())
             getFromSocket("/openxr destroy " + monitorName);
         if (XR::g_ctx.remote) {
@@ -281,7 +281,7 @@ static bool gazeSurfaceSetup(CTestCase* tc, const std::string& mon, SGazeSurface
     XR::g_ctx.remote->setHeadPose(MonadoWire::xrt_vec3{0.f, 0.f, 0.f}, MonadoWire::xrt_quat{0.f, 0.f, 0.f, 1.f});
     XR::g_ctx.remote->pulse();
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    getFromSocket("/keyword openxr:surfaces 0");
+    getFromSocket("/eval hl.config({ openxr = { surfaces = false } })");
     if (getFromSocket("/openxr create " + mon + " 1280x720 anchor:local pos:0,0,-1.5 size:1.5") != "ok") {
         XR::logSkip(tc->name(), "monitor create failed");
         return false;
@@ -294,9 +294,9 @@ static bool gazeSurfaceSetup(CTestCase* tc, const std::string& mon, SGazeSurface
 static bool declareTableInFrontOf(const std::array<float, 3>& at, float& tableY) {
     tableY                 = at[1] - 0.30F;
     const std::string spec = std::format("table pos:{:.3f},{:.3f},{:.3f} size:3,0.8", at[0], tableY, at[2] + 0.75F);
-    if (getFromSocket("/keyword openxr:surfaces_synthetic " + spec) != "ok")
+    if (getFromSocket("/eval hl.config({ openxr = { surfaces_synthetic = '" + spec + "' } })") != "ok")
         return false;
-    if (getFromSocket("/keyword openxr:surfaces 1") != "ok")
+    if (getFromSocket("/eval hl.config({ openxr = { surfaces = true } })") != "ok")
         return false;
     return XR::waitForJson("j/openxr", [](const std::string& j) { return j.find("\"source\": \"synthetic\"") != std::string::npos; }, std::chrono::milliseconds(5000));
 }
@@ -374,7 +374,7 @@ TEST_CASE(xr_surface_gaze_nudge_settles_on_table) {
         return;
 
     // No carry: SUPER+ALT+minus nudges the monitor the head dwells on.
-    getFromSocket("/keyword openxr:gaze_dwell_ms 120");
+    getFromSocket("/eval hl.config({ openxr = { gaze_dwell_ms = 120 } })");
     const bool gazing = XR::waitForJson(
         "j/openxr",
         [&](const std::string& r) {

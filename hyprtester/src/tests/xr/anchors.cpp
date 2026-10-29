@@ -293,8 +293,8 @@ TEST_CASE(xr_anchor_restore_across_session) {
             XR::waitForXrState("focused", std::chrono::milliseconds(15000));
             if (!monitorName.empty())
                 getFromSocket("/openxr destroy " + monitorName);
-            getFromSocket("/keyword openxr:recenter_on_plug 1");
-            getFromSocket("/keyword openxr:monitors_follow_session visible");
+            getFromSocket("/eval hl.config({ openxr = { recenter_on_plug = true } })");
+            getFromSocket("/eval hl.config({ openxr = { monitors_follow_session = 'visible' } })");
             if (XR::g_ctx.remote) {
                 using namespace MonadoWire;
                 XR::g_ctx.remote->setHeadPose(xrt_vec3{0.f, 0.f, 0.f}, xrt_quat{0.f, 0.f, 0.f, 1.f});
@@ -319,7 +319,7 @@ TEST_CASE(xr_anchor_restore_across_session) {
         return;
     }
 
-    ASSERT(getFromSocket("/keyword openxr:recenter_on_plug 1"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { recenter_on_plug = true } })"), std::string("ok"));
     // Pin the plug policy the way xr_plugged_follow_session does. Under the shipped `visible` default
     // on a runtime without XR_EXT_user_presence, the FIRST plug of a session is deferred behind
     // openxr:monitor_plug_settle_ms of sustained visibility — and the re-seat is armed by that plug,
@@ -327,7 +327,7 @@ TEST_CASE(xr_anchor_restore_across_session) {
     // plugs on session existence, which makes the edge prompt and the test about anchoring rather
     // than about the blip guard. The capture gate keys on visibility, not on plugging (doc 03 §8.3),
     // so this does not change what is being exercised.
-    ASSERT(getFromSocket("/keyword openxr:monitors_follow_session session"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { monitors_follow_session = 'session' } })"), std::string("ok"));
 
     // Stand the user 5 m from the runtime's origin, facing 25 deg off it — the geometry that makes a
     // stale LOCAL pose dangerous. yaw 25 deg about +Y.
@@ -490,7 +490,7 @@ TEST_CASE(xr_reseat_verb) {
                 getFromSocket("/openxr destroy " + a);
             if (!b.empty())
                 getFromSocket("/openxr destroy " + b);
-            getFromSocket("/keyword openxr:recenter hold");
+            getFromSocket("/eval hl.config({ openxr = { recenter = 'hold' } })");
             if (XR::g_ctx.remote) {
                 using namespace MonadoWire;
                 XR::g_ctx.remote->setHeadPose(xrt_vec3{0.f, 0.f, 0.f}, xrt_quat{0.f, 0.f, 0.f, 1.f});
@@ -614,7 +614,7 @@ TEST_CASE(xr_reseat_verb) {
     ASSERT_NOT(riseKey, std::string::npos);
     const float rise = std::stof(reply.substr(riseKey + 6));
     NLog::log("xr_reseat_verb: vertical move {:+.2f}m", rise);
-    // The fixture declares every anchor:local monitor at z = -1.5 (xr-test.conf's XR-conf-a plus the
+    // The fixture declares every anchor:local monitor at z = -1.5 (xr-test.lua's XR-conf-a plus the
     // two created above), so the authored distance is 1.5 m by construction. Pinning it here is what
     // makes the assertions below a test of the SEAT rather than a tautology against the reply.
     EXPECT_MAX_DELTA(authored, 1.5, 0.01);
@@ -772,9 +772,9 @@ TEST_CASE(xr_reseat_verb) {
 
     // The policy the status line reports, and the one that makes the headset's own recenter do this.
     EXPECT_CONTAINS(getFromSocket("/openxr"), std::string("recenter policy: hold"));
-    ASSERT(getFromSocket("/keyword openxr:recenter follow"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { recenter = 'follow' } })"), std::string("ok"));
     EXPECT_CONTAINS(getFromSocket("/openxr"), std::string("recenter policy: follow"));
-    ASSERT(getFromSocket("/keyword openxr:recenter hold"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { recenter = 'hold' } })"), std::string("ok"));
 
     NLog::green("xr_reseat_verb: the deliberate re-seat brought the layout to the user's new facing, rigidly and idempotently");
 }
@@ -788,7 +788,7 @@ TEST_CASE(xr_reseat_verb) {
 TEST_CASE(xr_declared_reload_keeps_pose) {
     XR_SKIP_IF_UNAVAILABLE();
 
-    static const std::string CONF_PATH = "xr-test.conf";
+    static const std::string CONF_PATH = "xr-test.lua";
     static const std::string MON       = "XR-conf-drift";
 
     std::string              original;
@@ -825,7 +825,7 @@ TEST_CASE(xr_declared_reload_keeps_pose) {
     SConfigGuard guard{this->failed, name(), original, false};
 
     if (original.empty()) {
-        XR::logSkip(name(), "could not read xr-test.conf from the cwd (hyprtester must run from hyprtester/)");
+        XR::logSkip(name(), "could not read xr-test.lua from the cwd (hyprtester must run from hyprtester/)");
         return;
     }
     if (!gateUp()) {
@@ -851,7 +851,7 @@ TEST_CASE(xr_declared_reload_keeps_pose) {
     const auto decl = [](const std::string& mode) {
         // depth_desktop: the live monitor scans out a per-eye pane pair, so every rule re-apply is a
         // packed-mode modeset — keep that path in the loop.
-        return "xrmonitor = " + MON + ", " + mode + ", anchor:local pos:-0.04,1.6,-1.2 yaw:10 adaptive:on roam:body\nopenxr {\n    depth_desktop = 1\n}\n";
+        return "hl.xr_monitor(\"" + MON + ", " + mode + ", anchor:local pos:-0.04,1.6,-1.2 yaw:10 adaptive:on roam:body\")\nhl.config({ openxr = { depth_desktop = true } })\n";
     };
     // A yawed (3DoF, like the XReal) head, held while we read so the verb context and the frame loop
     // agree on where the wearer is looking.
@@ -893,7 +893,7 @@ TEST_CASE(xr_declared_reload_keeps_pose) {
     const auto unchanged = reloadAndRead(decl("1920x1080@60"));
     EXPECT(dist3(placed, unchanged) >= 0.F && dist3(placed, unchanged) < 0.01F, true);
 
-    const auto unrelated = reloadAndRead(decl("1920x1080@60") + "openxr {\n    default_distance = 1.9\n}\n");
+    const auto unrelated = reloadAndRead(decl("1920x1080@60") + "hl.config({ openxr = { default_distance = 1.9 } })\n");
     EXPECT(dist3(placed, unrelated) >= 0.F && dist3(placed, unrelated) < 0.01F, true);
 
     const auto remoded = reloadAndRead(decl("2560x1600@60"));

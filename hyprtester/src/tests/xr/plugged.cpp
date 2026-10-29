@@ -53,7 +53,7 @@ namespace {
     class CPluggedClient {
       public:
         explicit CPluggedClient(const std::string& monitorName) {
-            if (getFromSocket("/dispatch focusmonitor " + monitorName) != "ok")
+            if (getFromSocket("/dispatch hl.dsp.focus({ monitor = '" + monitorName + "' })") != "ok")
                 throw std::runtime_error("focusmonitor failed");
 
             m_proc = makeShared<CProcess>(binaryDir + "/pointer-scroll", std::vector<std::string>{});
@@ -124,8 +124,8 @@ TEST_CASE(xr_plugged_follow_session) {
             // for later tests.
             getFromSocket("/openxr enable");
             XR::waitForXrState("focused", std::chrono::milliseconds(15000));
-            getFromSocket("/keyword openxr:monitors_follow_session visible");
-            getFromSocket("/keyword openxr:recenter_on_plug 1");
+            getFromSocket("/eval hl.config({ openxr = { monitors_follow_session = 'visible' } })");
+            getFromSocket("/eval hl.config({ openxr = { recenter_on_plug = true } })");
             if (failed)
                 XR::dumpXrArtifacts(testName);
         }
@@ -139,12 +139,12 @@ TEST_CASE(xr_plugged_follow_session) {
 
     // Pin existence-gating (see the file header) so the disable/enable round-trip below is
     // deterministic; the session is focused here, so this keeps the monitors plugged.
-    ASSERT(getFromSocket("/keyword openxr:monitors_follow_session session"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { monitors_follow_session = 'session' } })"), std::string("ok"));
     // report-20 issue C: recenter-on-plug re-seats anchor:local monitors on the FIRST plug of a
     // session — and a disable/enable IS a new session — which would reset the (a2) verb-moved pose
     // below. This test asserts the live anchor STATE survives the unplug/replug (research/18 §6.2),
     // a different invariant from recenter, so disable recenter here to isolate it (restored in guard).
-    ASSERT(getFromSocket("/keyword openxr:recenter_on_plug 0"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { recenter_on_plug = false } })"), std::string("ok"));
 
     // (a) session up => the declared fixture is PLUGGED: in the default j/monitors list, and
     //     status reports plugged: true.
@@ -263,7 +263,7 @@ TEST_CASE(xr_plugged_follow_session) {
         EXPECT(posSurvived, true);
     }
 
-    // report-20 issue E: the DECLARED pixel mode (xr-test.conf declares XR-conf-a as 1280x720@60)
+    // report-20 issue E: the DECLARED pixel mode (xr-test.lua declares XR-conf-a as 1280x720@60)
     // must survive the unplug/replug cycle. Before the fix, onConnect re-derived the mode from the
     // rule manager (no XR entry) and fell back to the headless default 1920x1080 — the persistent
     // declared-mode rule now keeps it. Assert against the CORE `j/monitors` width/height.
@@ -315,7 +315,7 @@ TEST_CASE(xr_plugged_create_while_sessionless) {
             XR::waitForXrState("focused", std::chrono::milliseconds(15000));
             if (!monitorName.empty())
                 getFromSocket("/openxr destroy " + monitorName);
-            getFromSocket("/keyword openxr:monitors_follow_session visible");
+            getFromSocket("/eval hl.config({ openxr = { monitors_follow_session = 'visible' } })");
             if (failed)
                 XR::dumpXrArtifacts(testName);
         }
@@ -329,7 +329,7 @@ TEST_CASE(xr_plugged_create_while_sessionless) {
 
     // Pin existence-gating (see the file header) so a sessionless create is deterministically
     // unplugged and a session start plugs it in, independent of the null runtime's visibility.
-    ASSERT(getFromSocket("/keyword openxr:monitors_follow_session session"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { monitors_follow_session = 'session' } })"), std::string("ok"));
 
     ASSERT(getFromSocket("/openxr disable"), std::string("ok"));
     ASSERT(XR::waitForXrState("disabled", std::chrono::milliseconds(10000)), true);
@@ -388,7 +388,7 @@ TEST_CASE(xr_plugged_survives_monitor_refresh) {
         ~SGuard() {
             getFromSocket("/openxr enable");
             XR::waitForXrState("focused", std::chrono::milliseconds(15000));
-            getFromSocket("/keyword openxr:monitors_follow_session visible");
+            getFromSocket("/eval hl.config({ openxr = { monitors_follow_session = 'visible' } })");
             if (failed)
                 XR::dumpXrArtifacts(testName);
         }
@@ -400,7 +400,7 @@ TEST_CASE(xr_plugged_survives_monitor_refresh) {
         return;
     }
 
-    ASSERT(getFromSocket("/keyword openxr:monitors_follow_session session"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { monitors_follow_session = 'session' } })"), std::string("ok"));
 
     // Unplug: stop the session so XR-conf-a is held disabled.
     ASSERT(getFromSocket("/openxr disable"), std::string("ok"));
@@ -438,7 +438,7 @@ TEST_CASE(xr_plugged_survives_monitor_refresh) {
 
     // Touch the real monitor's rule -> scheduleReload -> ensureMonitorStatus refreshes ALL monitors.
     // Pre-fix, this re-enabled the disabled XR-conf-a; post-fix it is skipped and stays disabled.
-    ASSERT(getFromSocket("/keyword monitor " + realName + ",preferred,auto,1"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.monitor({ output = '" + realName + "', mode = 'preferred', position = 'auto', scale = '1' })"), std::string("ok"));
 
     // Give the refresh a couple of render passes to land, then assert XR-conf-a is STILL unplugged:
     // absent from the default list, disabled in `monitors all`, plugged:false in status.

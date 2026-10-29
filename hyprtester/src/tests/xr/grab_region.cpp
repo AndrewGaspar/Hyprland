@@ -20,7 +20,7 @@
 // driver (no headset). The chrome layout is deterministic from the chrome_* geometry, so a
 // controller aiming a -Z ray from a chosen (x,y) offset lands the ray at (x,y) on the quad plane
 // and hits a known region. Because the shipped chrome_* defaults were re-tuned (2026-07-09, larger
-// margins/bar), the geometry-sensitive tests PIN the values their aim math assumes via keywords
+// margins/bar), the geometry-sensitive tests PIN the values their aim math assumes via hl.config
 // (margin 0.04, bar 0.05 @ 0.6 width, corner 0.06) rather than relying on ambient defaults, and the
 // guard restores the shipped defaults. Tests assert the gating decision (grabKind: none/move/resize)
 // and, for resize, that the opposite corner is pinned.
@@ -36,13 +36,13 @@ namespace {
         bool        restoreChrome       = false;
         ~SGuard() {
             if (restoreGrabAnywhere)
-                getFromSocket("/keyword openxr:grab_anywhere 1"); // back to default for later tests
+                getFromSocket("/eval hl.config({ openxr = { grab_anywhere = true } })"); // back to default for later tests
             if (restoreChrome) {
                 // Restore the SHIPPED defaults (live-tuned 2026-07-09), not the values a test pinned.
-                getFromSocket("/keyword openxr:chrome_margin 0.10");
-                getFromSocket("/keyword openxr:chrome_bar_height 0.08");
-                getFromSocket("/keyword openxr:chrome_bar_width_frac 0.8");
-                getFromSocket("/keyword openxr:chrome_corner_size 0.09");
+                getFromSocket("/eval hl.config({ openxr = { chrome_margin = 0.10 } })");
+                getFromSocket("/eval hl.config({ openxr = { chrome_bar_height = 0.08 } })");
+                getFromSocket("/eval hl.config({ openxr = { chrome_bar_width_frac = 0.8 } })");
+                getFromSocket("/eval hl.config({ openxr = { chrome_corner_size = 0.09 } })");
             }
             if (!monitorName.empty())
                 getFromSocket("/openxr destroy " + monitorName);
@@ -108,7 +108,7 @@ namespace {
                   m.pos[2] + right.z * (sx * w * 0.5f) + up.z * (sy * h * 0.5f)};
     }
 
-    // Shared: reach focused, (optionally run beforeCreate — e.g. set chrome_* keywords that only
+    // Shared: reach focused, (optionally run beforeCreate — e.g. set chrome_* options that only
     // take effect at monitor create), create a local monitor facing the viewer, activate the left
     // controller.
     bool setup(CTestCase* tc, const std::string& mon, SGuard& guard, const std::function<void()>& beforeCreate = {}) {
@@ -187,14 +187,14 @@ TEST_CASE(xr_grab_gating_body_vs_bar) {
     // 07-09 defaults), so the re-tuned shipped defaults don't move the bar band out from under it.
     guard.restoreChrome = true;
     if (!setup(this, mon, guard, [] {
-            getFromSocket("/keyword openxr:chrome_margin 0.04");
-            getFromSocket("/keyword openxr:chrome_bar_height 0.05");
-            getFromSocket("/keyword openxr:chrome_bar_width_frac 0.6");
-            getFromSocket("/keyword openxr:chrome_corner_size 0.06");
+            getFromSocket("/eval hl.config({ openxr = { chrome_margin = 0.04 } })");
+            getFromSocket("/eval hl.config({ openxr = { chrome_bar_height = 0.05 } })");
+            getFromSocket("/eval hl.config({ openxr = { chrome_bar_width_frac = 0.6 } })");
+            getFromSocket("/eval hl.config({ openxr = { chrome_corner_size = 0.06 } })");
         }))
         return;
 
-    ASSERT(getFromSocket("/keyword openxr:grab_anywhere 0"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { grab_anywhere = false } })"), std::string("ok"));
     guard.restoreGrabAnywhere = true;
 
     // 1. Body center: must NOT grab (grab_anywhere=false confines moves to the chrome).
@@ -267,8 +267,8 @@ TEST_CASE(xr_grab_corner_resize) {
     // big, easy target; restored to defaults by the guard. Content stays 1.5 m wide / 1280x720.
     guard.restoreChrome = true;
     if (!setup(this, mon, guard, [] {
-            getFromSocket("/keyword openxr:chrome_margin 0.2");
-            getFromSocket("/keyword openxr:chrome_corner_size 0.2");
+            getFromSocket("/eval hl.config({ openxr = { chrome_margin = 0.2 } })");
+            getFromSocket("/eval hl.config({ openxr = { chrome_corner_size = 0.2 } })");
         }))
         return;
 

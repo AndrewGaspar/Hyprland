@@ -121,7 +121,7 @@ TEST_CASE(xr_idle_inhibit) {
         std::string testName;
         ~SGuard() {
             // Always restore the default so later tests in this shared instance aren't affected.
-            getFromSocket("/keyword openxr:inhibit_idle 1");
+            getFromSocket("/eval hl.config({ openxr = { inhibit_idle = '1' } })");
             if (failed)
                 XR::dumpXrArtifacts(testName);
         }
@@ -136,10 +136,10 @@ TEST_CASE(xr_idle_inhibit) {
         return;
     }
 
-    // xr-test.conf doesn't override openxr:inhibit_idle, so it starts at its default (1). Make
+    // xr-test.lua doesn't override openxr:inhibit_idle, so it starts at its default (1). Make
     // that explicit and wait for the recheck so we have a known-good baseline regardless of test
     // order within the shared --xr run.
-    ASSERT(getFromSocket("/keyword openxr:inhibit_idle 1"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { inhibit_idle = '1' } })"), std::string("ok"));
     ASSERT(XR::waitForJson(
                "j/openxr", [&](const std::string& r) { return r.contains("\"inhibitingIdle\": true"); }, std::chrono::milliseconds(5000)),
            true);
@@ -157,7 +157,7 @@ TEST_CASE(xr_idle_inhibit) {
     NLog::green("xr_idle_inhibit: inhibit_idle=1 + focused -> no idle notification within 3s");
 
     // Flip off: recheck fires from the config.props_refreshed listener (doc 05 §6.3).
-    ASSERT(getFromSocket("/keyword openxr:inhibit_idle 0"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { inhibit_idle = '0' } })"), std::string("ok"));
     ASSERT(XR::waitForJson(
                "j/openxr", [&](const std::string& r) { return r.contains("\"inhibitingIdle\": false"); }, std::chrono::milliseconds(5000)),
            true);
@@ -168,7 +168,7 @@ TEST_CASE(xr_idle_inhibit) {
 
     // Restore: re-inhibiting must resume the (already-idled) notification.
     client->clear();
-    ASSERT(getFromSocket("/keyword openxr:inhibit_idle 1"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { inhibit_idle = '1' } })"), std::string("ok"));
     ASSERT(XR::waitForJson(
                "j/openxr", [&](const std::string& r) { return r.contains("\"inhibitingIdle\": true"); }, std::chrono::milliseconds(5000)),
            true);
@@ -200,7 +200,7 @@ TEST_CASE(xr_idle_inhibit_modes) {
         const bool& failed;
         std::string testName;
         ~SGuard() {
-            getFromSocket("/keyword openxr:inhibit_idle present");
+            getFromSocket("/eval hl.config({ openxr = { inhibit_idle = 'present' } })");
             if (failed)
                 XR::dumpXrArtifacts(testName);
         }
@@ -225,7 +225,7 @@ TEST_CASE(xr_idle_inhibit_modes) {
 
     // Helper: set the mode and wait for status to show BOTH the resolved mode and the expected bit.
     const auto setModeExpect = [&](const std::string& value, const std::string& resolvedMode, bool inhibiting) {
-        if (getFromSocket("/keyword openxr:inhibit_idle " + value) != "ok")
+        if (getFromSocket("/eval hl.config({ openxr = { inhibit_idle = '" + value + "' } })") != "ok")
             return false;
         const std::string wantMode    = "\"idleInhibitMode\": \"" + resolvedMode + "\"";
         const std::string wantInhibit = std::string("\"inhibitingIdle\": ") + (inhibiting ? "true" : "false");

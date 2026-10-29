@@ -35,7 +35,7 @@ TEST_CASE(xr_disable_teardown) {
             // Restore the default stop disposition, then always try to bring the session back
             // up for any XR tests that run after this one in the same shared Hyprland+Monado
             // instance (docs/openxr/06-testing.md §2.1 — one instance for the whole --xr run).
-            getFromSocket("/keyword openxr:destroy_monitors_on_stop 0");
+            getFromSocket("/eval hl.config({ openxr = { destroy_monitors_on_stop = false } })");
             getFromSocket("/openxr enable");
             XR::waitForXrState("focused", std::chrono::milliseconds(15000));
             if (failed)
@@ -49,8 +49,8 @@ TEST_CASE(xr_disable_teardown) {
         return;
     }
 
-    // Opt into option-a full removal (read at stop() time; a plain keyword-set suffices).
-    ASSERT(getFromSocket("/keyword openxr:destroy_monitors_on_stop 1"), std::string("ok"));
+    // Opt into option-a full removal (read at stop() time; a plain hl.config set suffices).
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { destroy_monitors_on_stop = true } })"), std::string("ok"));
 
     const std::string mon = XR::monitorName(15);
     ASSERT(getFromSocket("/openxr create " + mon + " 1280x720"), std::string("ok"));

@@ -102,16 +102,16 @@ TEST_CASE(xr_stereo_quad_pair) {
 
     // The rule goes in BEFORE the client maps, so the declaration is there the first time the fold
     // runs and the test is not racing a re-evaluation.
-    ASSERT(getFromSocket("/keyword windowrule stereo sbs always, match:class ^(xr_stereo_pair)$"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.window_rule({ stereo = 'sbs always', match = { class = '^(xr_stereo_pair)$' } })"), std::string("ok"));
     // The CONTENT producer's domain is an XR monitor that is NOT producing panes of its own — see
     // the header note. Set this BEFORE the monitor is created so it is never packed at all.
-    ASSERT(getFromSocket("/keyword openxr:depth_desktop 0"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { depth_desktop = false } })"), std::string("ok"));
 
     CScopeGuard ruleGuard = {[&]() {
         // `off` is the one layout that wins outright — leave nothing behind for later cases.
-        getFromSocket("/keyword windowrule stereo off, match:class ^(xr_stereo_pair)$");
-        getFromSocket("/keyword openxr:stereo_quad_pair 1");
-        getFromSocket("/keyword openxr:depth_desktop 1");
+        getFromSocket("/eval hl.window_rule({ stereo = 'off', match = { class = '^(xr_stereo_pair)$' } })");
+        getFromSocket("/eval hl.config({ openxr = { stereo_quad_pair = true } })");
+        getFromSocket("/eval hl.config({ openxr = { depth_desktop = true } })");
         Tests::killAllWindows();
     }};
 
@@ -125,7 +125,7 @@ TEST_CASE(xr_stereo_quad_pair) {
     // nothing when unused" baseline every later assertion is measured against.
     ASSERT(waitForPair(MON, "off", 1), true);
 
-    ASSERT(getFromSocket("/dispatch focusmonitor " + MON), std::string("ok"));
+    ASSERT(getFromSocket("/dispatch hl.dsp.focus({ monitor = '" + MON + "' })"), std::string("ok"));
     auto kitty = Tests::spawnKitty("xr_stereo_pair");
     if (!kitty) {
         XR::logSkip(name(), "kitty did not spawn (env limitation)");
@@ -142,14 +142,14 @@ TEST_CASE(xr_stereo_quad_pair) {
     // THE COVERAGE GATE. A small floating window is declared stereo (with `always`, so nothing at
     // the window level is holding it) and still must not pair, because the pair splits the whole
     // content rect and this window is not the whole content rect.
-    ASSERT(getFromSocket("/dispatch setfloating class:xr_stereo_pair"), std::string("ok"));
-    ASSERT(getFromSocket("/dispatch resizewindowpixel exact 400 300, class:xr_stereo_pair"), std::string("ok"));
+    ASSERT(getFromSocket("/dispatch hl.dsp.window.float({ action = 'set', window = 'class:xr_stereo_pair' })"), std::string("ok"));
+    ASSERT(getFromSocket("/dispatch hl.dsp.window.resize({ x = 400, y = 300, window = 'class:xr_stereo_pair' })"), std::string("ok"));
     Tests::sync();
     ASSERT(waitForPair(MON, "off", 1), true);
 
     // Now let it own the output: the declaration engages and the monitor costs a PAIR.
-    ASSERT(getFromSocket("/dispatch focuswindow class:xr_stereo_pair"), std::string("ok"));
-    ASSERT(getFromSocket("/dispatch fullscreen 0"), std::string("ok"));
+    ASSERT(getFromSocket("/dispatch hl.dsp.focus({ window = 'class:xr_stereo_pair' })"), std::string("ok"));
+    ASSERT(getFromSocket("/dispatch hl.dsp.window.fullscreen()"), std::string("ok"));
     ASSERT(waitForPair(MON, "sbs", 2), true);
     // ...and this pair belongs to the CONTENT producer, which is what decides the pointer un-map.
     // Reading `depth` here would mean the cursor is about to be un-mapped with the identity on an
@@ -157,19 +157,19 @@ TEST_CASE(xr_stereo_quad_pair) {
     EXPECT_CONTAINS(blockOf(getFromSocket("j/openxr"), MON), "\"stereoProducer\": \"content\"");
 
     // THE KILL SWITCH, which is the whole reason it exists: a runtime is showing something wrong
-    // and one keyword must take it back — without moving the window, without a reload, and without
+    // and one config change must take it back — without moving the window, without a reload, and without
     // waiting for the desktop to repaint (publishStereoPairTuning damages the monitor for exactly
     // this). Both fields must fall back together; `stereo: off, quads: 2` would mean the frame
     // thread never re-read the publish.
-    ASSERT(getFromSocket("/keyword openxr:stereo_quad_pair 0"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { stereo_quad_pair = false } })"), std::string("ok"));
     ASSERT(waitForPair(MON, "off", 1), true);
 
     // ...and it comes back, so the switch is a toggle rather than a one-way door.
-    ASSERT(getFromSocket("/keyword openxr:stereo_quad_pair 1"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { stereo_quad_pair = true } })"), std::string("ok"));
     ASSERT(waitForPair(MON, "sbs", 2), true);
 
     // Leaving fullscreen un-pairs it: the pair follows the coverage, not the rule.
-    ASSERT(getFromSocket("/dispatch fullscreen 0"), std::string("ok"));
+    ASSERT(getFromSocket("/dispatch hl.dsp.window.fullscreen()"), std::string("ok"));
     ASSERT(waitForPair(MON, "off", 1), true);
 
     NLog::green("xr_stereo_quad_pair: declaration -> pair -> kill switch -> pair -> un-pair, all observable in status");

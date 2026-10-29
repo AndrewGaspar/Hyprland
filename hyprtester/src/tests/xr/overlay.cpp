@@ -28,11 +28,10 @@ using namespace Hyprutils::Memory;
 // the default `--xr` run stays a no-op green for this case.
 //
 // The suite's Hyprland launches ONCE at startup with openxr:overlay OFF (default), so this test
-// flips it live: disable the exclusive session, bring hypxrpaper up as the primary, `keyword
-// openxr:overlay 1`, then re-enable — openxr:overlay is read in COpenXRManager::start() (which
-// `/openxr enable` calls directly), so a plain keyword-set before enable is enough; no
-// config.props_refreshed / parseKeyword special-case is required (unlike the enabled/inhibit_idle
-// hot-toggles). Everything is restored (overlay 0, exclusive session back, hypxrpaper killed) on
+// flips it live: disable the exclusive session, bring hypxrpaper up as the primary, `hl.config({
+// openxr = { overlay = true } })`, then re-enable — openxr:overlay is read in COpenXRManager::start()
+// (which `/openxr enable` calls directly), so a plain hl.config set before enable is enough; the
+// props_refreshed -> onConfigReload pass it triggers changes nothing for a disabled session. Everything is restored (overlay 0, exclusive session back, hypxrpaper killed) on
 // exit via the RAII guard, so subsequent tests inherit a normal focused session.
 namespace {
     struct SOverlayGuard {
@@ -41,9 +40,9 @@ namespace {
         SP<CProcess>  paper; // hypxrpaper primary session, PID-tracked
         ~SOverlayGuard() {
             // Restore the compositor to its default (exclusive, overlay off) session so later
-            // tests are unaffected: disable, clear the keyword, re-enable.
+            // tests are unaffected: disable, clear the option, re-enable.
             getFromSocket("/openxr disable");
-            getFromSocket("/keyword openxr:overlay 0");
+            getFromSocket("/eval hl.config({ openxr = { overlay = false } })");
             getFromSocket("/openxr enable");
             // Kill the primary app by tracked PID only (never by name).
             if (paper) {
@@ -116,7 +115,7 @@ TEST_CASE(xr_overlay_composition) {
     }
 
     // 3) Request overlay and bring HypXRland back up on top of hypxrpaper.
-    ASSERT(getFromSocket("/keyword openxr:overlay 1"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { overlay = true } })"), std::string("ok"));
     const std::string enableReply = getFromSocket("/openxr enable");
     if (enableReply != "ok") {
         XR::logSkip(name(), "overlay enable did not return ok (" + enableReply + ") — env instability");
@@ -134,7 +133,7 @@ TEST_CASE(xr_overlay_composition) {
     const std::string statusJson = getFromSocket("j/openxr");
     EXPECT_CONTAINS(statusJson, "\"overlay\": true");
     EXPECT_CONTAINS(statusJson, "Monado");
-    // The static xr-test.conf fixtures (XR-conf-a/b) rebind on session start — monitors present.
+    // The static xr-test.lua fixtures (XR-conf-a/b) rebind on session start — monitors present.
     EXPECT_CONTAINS(statusJson, "\"monitors\": [");
     EXPECT_CONTAINS(statusJson, "\"name\":");
 

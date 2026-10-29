@@ -144,9 +144,10 @@ static std::optional<SInstanceData> ourInstance() {
     NLog::log("usage: hyprtester [--OPTION [VALUE]]... [TEST_NAMES].\n");
     NLog::log(R"(Arguments:
     --help              -h         - Show this message again
-    --config FILE       -c FILE    - Specify config file to use (default: './test.lua')
+    --config FILE       -c FILE    - Specify config file to use (default: './test.lua', or './xr-test.lua' with --xr)
     --binary FILE       -b FILE    - Specify Hyprland binary to use (default: '../build/Hyprland')
     --plugin FILE       -p FILE    - Specify the location of the test plugin (default: './')
+    --xr                           - Run the OpenXR integration suite (needs -DWITH_XR_TESTS=ON)
     [TEST_NAMES]                   - Specify list of tests to run (separated by spaces).
                                      If omitted, all tests will run.)");
 
@@ -206,7 +207,7 @@ static SSettings parseSettings(const std::span<const char*> args) {
 
     // Default options
     if (settings.configPath.empty())
-        settings.configPath = validatePathOrDie(cwd / (settings.xrMode ? "xr-test.conf" : "test.lua"));
+        settings.configPath = validatePathOrDie(cwd / (settings.xrMode ? "xr-test.lua" : "test.lua"));
     if (settings.binaryPath.empty())
         settings.binaryPath = validatePathOrDie(cwd / "../build/Hyprland");
     if (settings.pluginPath.empty())
@@ -215,10 +216,10 @@ static SSettings parseSettings(const std::span<const char*> args) {
     return settings;
 }
 
-// Half of the resets go through test.lua's `hl.dsp.*` dispatchers; a classic hyprlang config
-// (--xr's xr-test.conf, the stereo front-end run's stereo-legacy.conf) has none of them, so those
-// runs skip that half.
-static bool preTestCleanup(bool nonLuaConfig = false) {
+// The XR suite keeps the cleanup minimal (kill windows/layers + reload): its session's focus and
+// cursor are part of what the XR tests observe (gaze/ray focus, monitor plugging), and it has never
+// run under the workspace/cursor resets the ordinary suite applies after every reload.
+static bool preTestCleanup(bool minimalCleanup = false) {
     bool failed = false;
 
     if (!Tests::killAllWindows()) {
@@ -234,9 +235,7 @@ static bool preTestCleanup(bool nonLuaConfig = false) {
         failed = true;
     }
 
-    // The remaining resets use Lua dispatchers (hl.dsp.*) that only exist under the
-    // standard test.lua config; a classic hyprlang config has none of them, so skip them.
-    if (nonLuaConfig)
+    if (minimalCleanup)
         return !failed;
 
     if (!getFromSocket("/activeworkspace").contains("workspace 1 (1)")) {
@@ -253,15 +252,15 @@ static bool preTestCleanup(bool nonLuaConfig = false) {
     return !failed;
 }
 
-static STestsRunResult runTests(std::vector<std::shared_ptr<CTestCase>>& testCases, bool nonLuaConfig = false) {
+static STestsRunResult runTests(std::vector<std::shared_ptr<CTestCase>>& testCases, bool minimalCleanup = false) {
     struct STestsRunResult res{.total = testCases.size(), .failedNames = {}};
 
     for (auto& tc : testCases) {
         // Clean up before every test
         NLog::yellow("Cleaning up");
 
-        if (!preTestCleanup(nonLuaConfig)) { // damn it, something really went wrong
-            if (nonLuaConfig) {
+        if (!preTestCleanup(minimalCleanup)) { // damn it, something really went wrong
+            if (minimalCleanup) {
                 NLog::red("pre-test cleanup failed; continuing (best-effort)");
             } else {
                 // std::exit still runs static destructors, so the isolation is released — keep its
@@ -284,9 +283,9 @@ static STestsRunResult runTests(std::vector<std::shared_ptr<CTestCase>>& testCas
     return res;
 }
 
-static void cleanupAndReport(const STestsRunResult& tInfo, bool nonLuaConfig = false) {
+static void cleanupAndReport(const STestsRunResult& tInfo) {
     NLog::green("dispatching exit");
-    getFromSocket(nonLuaConfig ? "/dispatch exit" : "/dispatch hl.dsp.exit()");
+    getFromSocket("/dispatch hl.dsp.exit()");
 
     NLog::log("\nSummary:\n\tPASSED: {}{}{}/{}", Colors::GREEN, tInfo.total - tInfo.failedNames.size(), Colors::RESET, tInfo.total);
     NLog::log("\tFAILED: {}{}{}/{}", Colors::RED, tInfo.failedNames.size(), Colors::RESET, tInfo.total);
@@ -351,19 +350,23 @@ static int runXrSuite(const SSettings& settings) {
     XR::g_ctx.runtimeDir = runDir;
 
     // Launch through a generated wrapper config so machine-specific knobs stay out of the
-    // tracked xr-test.conf (docs §6.5): the tracked config, then an optional untracked
-    // hyprtester/xr-test-local.conf, then an optional $HYPRTESTER_XR_GPU pin (dual-GPU boxes:
+    // tracked xr-test.lua (docs §6.5): the tracked config, then an optional untracked
+    // hyprtester/xr-test-local.lua, then an optional $HYPRTESTER_XR_GPU pin (dual-GPU boxes:
     // Hyprland's XR GPU must match the one monado's compositor picks, or swapchain creation
-    // crosses GPUs and crashes inside monado).
-    const Path launchConfig = Path(runDir) / "xr-wrapper.conf";
+    // crosses GPUs and crashes inside monado). Both files are pulled in with require() of an
+    // absolute path: a reload clears package.loaded for user modules, so tests that rewrite
+    // xr-test.lua (xr_config_declared, xr_declared_reload_keeps_pose) see their edit re-executed.
+    const Path launchConfig = Path(runDir) / "xr-wrapper.lua";
     {
-        const std::string localConf = std::string(HYPRTESTER_SOURCE_ROOT) + "/hyprtester/xr-test-local.conf";
+        // A Lua long-bracket literal needs no escaping for any path or node name.
+        const auto        LUASTR    = [](const std::string& s) { return std::format("[==[{}]==]", s); };
+        const std::string localConf = std::string(HYPRTESTER_SOURCE_ROOT) + "/hyprtester/xr-test-local.lua";
         std::ofstream     wrap(launchConfig);
-        wrap << "source = " << std::filesystem::absolute(settings.configPath).string() << "\n";
+        wrap << "require(" << LUASTR(std::filesystem::absolute(settings.configPath).string()) << ")\n";
         if (std::filesystem::is_regular_file(localConf))
-            wrap << "source = " << localConf << "\n";
+            wrap << "require(" << LUASTR(localConf) << ")\n";
         if (const auto* gpu = getenv("HYPRTESTER_XR_GPU"); gpu && *gpu)
-            wrap << "openxr:gpu = " << gpu << "\n";
+            wrap << "hl.config({ openxr = { gpu = " << LUASTR(gpu) << " } })\n";
     }
 
     const bool                                       monadoUp = orchestrator.start();
@@ -443,11 +446,11 @@ static int runXrSuite(const SSettings& settings) {
     } else
         cases = xrTestCases;
 
-    STestsRunResult result = runTests(cases, /*nonLuaConfig*/ true);
+    STestsRunResult result = runTests(cases, /*minimalCleanup*/ true);
 
     // Report + teardown.
     NLog::green("dispatching exit");
-    getFromSocket("/dispatch exit");
+    getFromSocket("/dispatch hl.dsp.exit()");
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     killHyprlandProc();
 
@@ -499,11 +502,6 @@ int main(int argc, char** argv, char** envp) {
         std::ranges::copy(clientTestCases, std::back_inserter(requestedTestCases));
         std::ranges::copy(mainTestCases, std::back_inserter(requestedTestCases));
     }
-
-    // Which front-end parsed the config decides what the harness may dispatch: the `hl.dsp.*`
-    // resets exist only under test.lua. `-c ./stereo-legacy.conf` runs the same tests against the
-    // classic monitor= / monitorv2 front-ends (research/24 §3.10).
-    const bool NONLUACONFIG = settings.configPath.extension() != ".lua";
 
     // Give the run its own $XDG_RUNTIME_DIR before anything is launched or enumerated
     // (RuntimeIsolation.hpp). Everything downstream — the compositor we spawn, the instance
@@ -575,9 +573,9 @@ int main(int argc, char** argv, char** envp) {
 
     NLog::yellow("Loaded plugin");
 
-    STestsRunResult result = runTests(requestedTestCases, NONLUACONFIG);
+    STestsRunResult result = runTests(requestedTestCases);
 
-    cleanupAndReport(result, NONLUACONFIG);
+    cleanupAndReport(result);
 
     // A clean run leaves nothing behind; a failed one keeps its dir, because the compositor log
     // inside it is the only record of the failure now that it no longer lands in the session's

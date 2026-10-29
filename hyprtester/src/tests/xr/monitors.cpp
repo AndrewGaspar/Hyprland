@@ -65,7 +65,7 @@ TEST_CASE(xr_monitor_create_destroy) {
                "j/monitors", [&](const std::string& r) { return r.contains(nameMarker); }, std::chrono::milliseconds(10000)),
            true);
 
-    // size_m ≈ openxr:default_size (1.6 default; xr-test.conf doesn't override it).
+    // size_m ≈ openxr:default_size (1.6 default; xr-test.lua doesn't override it).
     const std::string openxrJson = getFromSocket("j/openxr");
     const auto        pos        = XR::findAfter(openxrJson, nameMarker);
     ASSERT_NOT(pos, std::string::npos);
@@ -87,9 +87,9 @@ TEST_CASE(xr_monitor_create_destroy) {
 
 // xr_monitor_create_unnamed — doc 05 §3.3: `create` with no name mints the lowest free XR-<n>
 // (n >= 2) and reports it ("ok XR-<n>"); a freed name is reused; the mode-only form still applies
-// its mode; an unknown `profile:` is an error that creates nothing. (xr-test.conf is a classic
-// config, so it cannot carry hl.xr_defaults blocks — the resolver layering is covered by
-// tests/xr/xr_defaults.cpp; this case covers the live verb surface.)
+// its mode; an unknown `profile:` is an error that creates nothing. (xr-test.lua deliberately
+// carries no hl.xr_defaults blocks — the resolver layering is covered by tests/xr/xr_defaults.cpp;
+// this case covers the live verb surface.)
 TEST_CASE(xr_monitor_create_unnamed) {
     XR_SKIP_IF_UNAVAILABLE();
     SArtifactGuard guard{this->failed, name(), {}};
@@ -147,7 +147,7 @@ TEST_CASE(xr_monitor_create_unnamed) {
 // a float (1.6 is 1.60000002f) must still land on the monitor. The divisor gate used to demand exact
 // division, so 1920/1.6f = 1199.99998 declined and the headless PPI guess (2.0) stood — live on
 // XR-main with xr_defaults `scale = 1.6`, both at bind and after every reload/mode re-resolution.
-// The keyword re-runs the same reload applicator (reapplyXRDefaults -> registerDeclaredMonitorRule)
+// The hl.config set re-runs the same reload applicator (reapplyXRDefaults -> registerDeclaredMonitorRule)
 // that a file reload or an HMD-context change does, on both a mode-less create and an explicit mode.
 TEST_CASE(xr_monitor_default_scale_decimal) {
     XR_SKIP_IF_UNAVAILABLE();
@@ -184,7 +184,7 @@ TEST_CASE(xr_monitor_default_scale_decimal) {
     ASSERT(scaleIs(tall, 1.25F), true);
 
     // Re-resolution to a decimal scale: 1920x1080 -> 1200x675, 2560x1600 -> 1600x1000, both clean.
-    ASSERT(getFromSocket("/keyword openxr:default_monitor_scale 1.6"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { default_monitor_scale = 1.6 } })"), std::string("ok"));
     EXPECT(scaleIs(modeless, 1.6F), true);
     EXPECT(scaleIs(tall, 1.6F), true);
 
@@ -229,7 +229,7 @@ TEST_CASE(xr_monitor_view_toggle) {
         XR::logSkip(name(), "XR monitor never got plugged (monitors_follow_session gate never satisfied in this environment)");
         return;
     }
-    ASSERT(getFromSocket("/dispatch focusmonitor " + mon), std::string("ok"));
+    ASSERT(getFromSocket("/dispatch hl.dsp.focus({ monitor = '" + mon + "' })"), std::string("ok"));
     auto kitty = Tests::spawnKitty("xr_monitor_view_toggle");
     if (!kitty) {
         XR::logSkip(name(), "kitty did not spawn (env limitation)");
@@ -410,7 +410,7 @@ TEST_CASE(xr_force_linear_realloc) {
     // Path 2 (same-GPU host): drive it explicitly so the mechanics are still exercised.
     std::string mon;
     if (!sawRealloc || !sawStatus) {
-        ASSERT(getFromSocket("/keyword openxr:force_linear on"), std::string("ok")); // read fresh at create
+        ASSERT(getFromSocket("/eval hl.config({ openxr = { force_linear = 'on' } })"), std::string("ok")); // read fresh at create
         mon                          = XR::monitorName(13);
         const std::string nameMarker = "\"name\": \"" + mon + "\"";
         ASSERT(getFromSocket("/openxr create " + mon + " 1280x720"), std::string("ok"));
@@ -443,7 +443,7 @@ TEST_CASE(xr_force_linear_realloc) {
     if (!mon.empty()) {
         getFromSocket("/openxr destroy " + mon);
         guard.monitorNames.clear();
-        getFromSocket("/keyword openxr:force_linear auto");
+        getFromSocket("/eval hl.config({ openxr = { force_linear = 'auto' } })");
     }
 
     NLog::green("xr_force_linear_realloc: multigpu flip re-allocates the XR swapchain LINEAR (aquamarine 'multigpu, forcing linear' + 'modifier 0x0 : LINEAR'), status linear=true");
@@ -460,7 +460,7 @@ TEST_CASE(xr_force_linear_realloc) {
 //
 // The invariant this pins: EVERY living XR monitor's content path resolves to a real blit
 // ("dmabuf" on this cross-GPU host — never stuck "black"), including monitors created after a
-// destroy in the same burst. This host is genuinely cross-GPU (xr-test-local.conf pins a different
+// destroy in the same burst. This host is genuinely cross-GPU (xr-test-local.lua pins a different
 // node than the nested compositor allocates on), so the force-linear import path is live in-suite —
 // the exact condition that reproduced the blank.
 TEST_CASE(xr_monitor_churn_content) {
@@ -554,7 +554,7 @@ TEST_CASE(xr_monitor_destroy_client_survives) {
            true);
 
     // Park a client on the XR monitor's active workspace.
-    ASSERT(getFromSocket("/dispatch focusmonitor " + mon), std::string("ok"));
+    ASSERT(getFromSocket("/dispatch hl.dsp.focus({ monitor = '" + mon + "' })"), std::string("ok"));
     auto kitty = Tests::spawnKitty("xr_destroy_survivor");
     if (!kitty) {
         XR::logSkip(name(), "kitty did not spawn (env limitation)");
@@ -594,19 +594,20 @@ TEST_CASE(xr_monitor_destroy_client_survives) {
 // update-in-place + removal coverage; doc 06 marks the file-swap flavor "out of scope v1" but
 // it's cheap and the roadmap wants it).
 //
-// (a) the two config-declared fixtures (xr-test.conf) exist with their configured anchors;
+// (a) the two config-declared fixtures (xr-test.lua) exist with their configured anchors;
 // (b) a runtime monitor + `/reload` -> declared fixtures survive with stable ids (no
 //     destroy/create flicker), the runtime monitor is untouched;
-// (c) rewrite xr-test.conf to change XR-conf-a's size and drop XR-conf-b, `/reload` ->
+// (c) rewrite xr-test.lua to change XR-conf-a's size and drop XR-conf-b, `/reload` ->
 //     XR-conf-a updates IN PLACE (same id, new size_m), XR-conf-b is destroyed, the runtime
 //     monitor from (b) is still untouched.
 //
 // The config file is always restored (and reloaded again) by the RAII guard, regardless of
-// test outcome, so a crash mid-test never leaves xr-test.conf modified on disk.
+// test outcome, so a crash mid-test never leaves xr-test.lua modified on disk. (A Lua reload clears
+// package.loaded for user modules, so the wrapper's require() of the rewritten file re-executes it.)
 TEST_CASE(xr_config_declared) {
     XR_SKIP_IF_UNAVAILABLE();
 
-    static const std::string CONF_PATH = "xr-test.conf";
+    static const std::string CONF_PATH = "xr-test.lua";
 
     std::string original;
     {
@@ -640,7 +641,7 @@ TEST_CASE(xr_config_declared) {
     SConfigGuard guard{this->failed, name(), "", original, false};
 
     if (original.empty()) {
-        XR::logSkip(name(), "could not read xr-test.conf from the cwd (hyprtester must run from hyprtester/)");
+        XR::logSkip(name(), "could not read xr-test.lua from the cwd (hyprtester must run from hyprtester/)");
         return;
     }
 
@@ -695,11 +696,11 @@ TEST_CASE(xr_config_declared) {
         std::string        line;
         while (std::getline(iss, line)) {
             const auto p = line.find_first_not_of(" \t");
-            if (p != std::string::npos && line.compare(p, 9, "xrmonitor") == 0)
-                continue; // drop both original xrmonitor declarations; we re-add XR-conf-a below
+            if (p != std::string::npos && line.compare(p, 14, "hl.xr_monitor(") == 0)
+                continue; // drop both original declarations; we re-add XR-conf-a below
             modified += line + "\n";
         }
-        modified += "xrmonitor = XR-conf-a, 1280x720@60, anchor:local pos:0,1.4,-1.5 yaw:0, size:1.9\n";
+        modified += "hl.xr_monitor(\"XR-conf-a, 1280x720@60, anchor:local pos:0,1.4,-1.5 yaw:0, size:1.9\")\n";
     }
     {
         std::ofstream out(CONF_PATH, std::ios::trunc);
@@ -737,7 +738,7 @@ TEST_CASE(xr_config_declared) {
 }
 
 // xr_mirror — WP11 (doc 06 §6 row 9): zero-new-compositor-code mirroring via the ordinary
-// `monitor =` keyword's `mirror` verb (CMonitor::setMirror).
+// monitor rule's `mirror` field (hl.monitor{ mirror = … } -> CMonitor::setMirror).
 TEST_CASE(xr_mirror) {
     XR_SKIP_IF_UNAVAILABLE();
 
@@ -769,14 +770,14 @@ TEST_CASE(xr_mirror) {
                "j/openxr", [&](const std::string& r) { return r.contains("\"name\": \"" + mon + "\""); }, std::chrono::milliseconds(10000)),
            true);
 
-    // The mirror keyword resolves its target through the LIVE monitor list at apply time, and
+    // The mirror rule resolves its target through the LIVE monitor list at apply time, and
     // CMonitor::setMirror() silently no-ops when the name isn't found — nothing re-resolves the
     // rule when the target appears later. An XR monitor created inside the first-plug settle
     // window (report-20 issue D: monitors_follow_session=visible defers the first plug of a
     // session ~1.5s past the session-start visibility blip) starts life UNPLUGGED and only
     // enters that list on the plug edge — exactly the window this test used to race in-container
     // (the preceding test's reload bounces the session, re-arming the guard). Wait for the plug
-    // before touching the mirror keyword; if the plug never comes the env gate isn't satisfied,
+    // before applying the mirror rule; if the plug never comes the env gate isn't satisfied,
     // which is the same environmental class the other tests SKIP on.
     if (!XR::waitForJson(
             "j/monitors", [&](const std::string& r) { return r.contains("\"name\": \"" + mon + "\""); }, std::chrono::milliseconds(15000))) {
@@ -793,7 +794,7 @@ TEST_CASE(xr_mirror) {
     guard.createdHeadless2 = true;
 
     // The headless output takes a moment to actually connect/register before it's queryable or
-    // matchable by a `monitor =` rule; wait for it before applying the mirror keyword. Use
+    // matchable by a monitor rule; wait for it before applying the mirror rule. Use
     // "monitors all" throughout this test: a monitor actively mirroring another is excluded
     // from the plain `monitors()` list (CMonitorStateTracker erases `isMirror()` entries) and
     // only shows up via `allMonitors()` (`hyprctl monitors all`).
@@ -801,7 +802,7 @@ TEST_CASE(xr_mirror) {
                "j/monitors all", [&](const std::string& r) { return r.contains("\"name\": \"HEADLESS-2\""); }, std::chrono::milliseconds(10000)),
            true);
 
-    ASSERT(getFromSocket("/keyword monitor HEADLESS-2, preferred, auto, 1, mirror, " + mon), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.monitor({ output = 'HEADLESS-2', mode = 'preferred', position = 'auto', scale = '1', mirror = '" + mon + "' })"), std::string("ok"));
 
     ASSERT(XR::waitForJson(
                "j/monitors all",
@@ -813,8 +814,10 @@ TEST_CASE(xr_mirror) {
            true);
     NLog::green("xr_mirror: HEADLESS-2 mirrorOf == {} (the XR monitor's id)", xrId);
 
-    // Unset mirroring, restoring HEADLESS-2 to a normal output (doc 06 §6 row 9).
-    ASSERT(getFromSocket("/keyword monitor HEADLESS-2, preferred, auto, 1"), std::string("ok"));
+    // Unset mirroring, restoring HEADLESS-2 to a normal output (doc 06 §6 row 9). hl.monitor MERGES
+    // onto the output's existing rule (the classic `monitor =` keyword replaced it), so the revert
+    // has to clear `mirror` explicitly — leaving it out would keep mirroring.
+    ASSERT(getFromSocket("/eval hl.monitor({ output = 'HEADLESS-2', mode = 'preferred', position = 'auto', scale = '1', mirror = '' })"), std::string("ok"));
     ASSERT(XR::waitForJson(
                "j/monitors",
                [&](const std::string& r) {

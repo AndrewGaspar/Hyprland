@@ -78,13 +78,13 @@ struct SDonOffGuard {
     std::string testName;
     std::string monitorName;
     ~SDonOffGuard() {
-        getFromSocket("/keyword openxr:placement_memory legacy");
-        getFromSocket("/keyword openxr:don_settle_timeout_ms 3000");
+        getFromSocket("/eval hl.config({ openxr = { placement_memory = 'legacy' } })");
+        getFromSocket("/eval hl.config({ openxr = { don_settle_timeout_ms = 3000 } })");
         getFromSocket("/openxr enable");
         XR::waitForXrState("focused", std::chrono::milliseconds(15000));
         if (!monitorName.empty())
             getFromSocket("/openxr destroy " + monitorName);
-        getFromSocket("/keyword openxr:monitors_follow_session visible");
+        getFromSocket("/eval hl.config({ openxr = { monitors_follow_session = 'visible' } })");
         if (XR::g_ctx.remote) {
             XR::g_ctx.remote->setHeadPose(MonadoWire::xrt_vec3{0.f, 0.f, 0.f}, MonadoWire::xrt_quat{0.f, 0.f, 0.f, 1.f});
             XR::g_ctx.remote->setControllerActive(CRemoteClient::SIDE_LEFT, false);
@@ -136,8 +136,8 @@ TEST_CASE(xr_doff_legacy_upright_and_shadow) {
         XR::logSkip(name(), "no remote client available");
         return;
     }
-    ASSERT(getFromSocket("/keyword openxr:monitors_follow_session session"), std::string("ok"));
-    ASSERT(getFromSocket("/keyword openxr:placement_memory legacy"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { monitors_follow_session = 'session' } })"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { placement_memory = 'legacy' } })"), std::string("ok"));
     ASSERT(createAhead(remote, mon), true);
     guard.monitorName = mon;
 
@@ -170,8 +170,8 @@ TEST_CASE(xr_doff_intent_commits_dwell) {
         XR::logSkip(name(), "no remote client available");
         return;
     }
-    ASSERT(getFromSocket("/keyword openxr:monitors_follow_session session"), std::string("ok"));
-    ASSERT(getFromSocket("/keyword openxr:placement_memory intent"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { monitors_follow_session = 'session' } })"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { placement_memory = 'intent' } })"), std::string("ok"));
     ASSERT(createAhead(remote, mon), true);
     guard.monitorName = mon;
 
@@ -204,7 +204,7 @@ TEST_CASE(xr_reseat_commits_memory_and_forget) {
         XR::logSkip(name(), "no remote client available");
         return;
     }
-    ASSERT(getFromSocket("/keyword openxr:monitors_follow_session session"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { monitors_follow_session = 'session' } })"), std::string("ok"));
     ASSERT(createAhead(remote, mon), true);
     guard.monitorName = mon;
     {
@@ -268,16 +268,16 @@ TEST_CASE(xr_don_settle_hides_until_still) {
         XR::logSkip(name(), "no remote client available");
         return;
     }
-    ASSERT(getFromSocket("/keyword openxr:monitors_follow_session visible"), std::string("ok"));
-    ASSERT(getFromSocket("/keyword openxr:recenter_on_plug true"), std::string("ok"));
-    ASSERT(getFromSocket("/keyword openxr:placement_memory legacy"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { monitors_follow_session = 'visible' } })"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { recenter_on_plug = true } })"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { placement_memory = 'legacy' } })"), std::string("ok"));
     {
         // the gate is off under the shipped default: the don path is the legacy one
         const std::string st = getFromSocket("j/openxr");
         EXPECT(XR::fieldAfter(st, XR::findAfter(st, "\"donoff\""), "donGate"), std::string("false"));
     }
-    ASSERT(getFromSocket("/keyword openxr:placement_memory intent"), std::string("ok"));
-    ASSERT(getFromSocket("/keyword openxr:don_settle_timeout_ms 6000"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { placement_memory = 'intent' } })"), std::string("ok"));
+    ASSERT(getFromSocket("/eval hl.config({ openxr = { don_settle_timeout_ms = 6000 } })"), std::string("ok"));
     ASSERT(createAhead(remote, mon), true);
     guard.monitorName = mon;
     {
