@@ -14,7 +14,8 @@
 #       --pkgs      stop after committing :pkgs (no config tail).
 #       --config    re-run ONLY the config tail on the existing :pkgs image (fast
 #                   iteration) and recommit :session.
-#       --rebuild   force a clean rebuild of :base (and everything above it).
+#       --rebuild   force a clean rebuild of :base (podman --no-cache, so the
+#                   package set is really refreshed) and everything above it.
 #       --check-gpu after building, smoke-test GPU access (eglinfo/vulkaninfo).
 #
 #   shell [--gpu amd|nvidia|intel|/dev/dri/renderD*]
@@ -123,6 +124,12 @@
 #       wrapper around `machinectl shell dev@.host … bash -lc`.
 #
 #
+# ENV: HYPXR_CTR_SUFFIX (default empty) is appended to every image tag, volume and
+# container name this script uses (hypxrland-ctr:session-057a, hypxrland-build-057a,
+# hypxrland-ccache-057a, hypxrland-pacman-057a, containers hypxrland-057a-<role>-<pid>),
+# so a session validating another tree runs a fully separate image/build/ccache set
+# and never clobbers the default one. Use the same suffix for build + test/shell.
+#
 # SAFETY: this box's HOST compositor is also named "Hyprland". This script NEVER
 # kills by process name. Container teardown is `podman rm -f <tracked-name>`
 # only; every container name is unique per-invocation ($$) and tracked.
@@ -142,12 +149,24 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Shared GPU render-node resolver (vendor scan + env overrides + explicit path).
 # shellcheck source=lib/gpu.sh
 source "$REPO/scripts/lib/gpu.sh"
-IMG_BASE="hypxrland-ctr:base"
-IMG_PKGS="hypxrland-ctr:pkgs"
-IMG_SESSION="hypxrland-ctr:session"
-VOL_PACMAN="hypxrland-pacman"
-VOL_BUILD="hypxrland-build"
-VOL_CCACHE="hypxrland-ccache"
+# Resource-name suffix (HYPXR_CTR_SUFFIX, default empty = the historical names).
+# Every image tag, volume and container name below carries it, so a session that
+# validates a different tree (e.g. a rebase onto a new upstream) can run its own
+# image/build/ccache set side by side with the default one instead of clobbering
+# it: HYPXR_CTR_SUFFIX=-057a gives hypxrland-ctr:session-057a, hypxrland-build-057a,
+# containers hypxrland-057a-test-<pid>, ... Clean up by suffix only.
+CTR_SFX="${HYPXR_CTR_SUFFIX:-}"
+[[ $CTR_SFX =~ ^[A-Za-z0-9_.-]*$ ]] \
+    || { printf 'HYPXR_CTR_SUFFIX must match [A-Za-z0-9_.-]* (got %q)\n' "$CTR_SFX" >&2; exit 1; }
+IMG_BASE="hypxrland-ctr:base${CTR_SFX}"
+IMG_PKGS="hypxrland-ctr:pkgs${CTR_SFX}"
+IMG_SESSION="hypxrland-ctr:session${CTR_SFX}"
+VOL_PACMAN="hypxrland-pacman${CTR_SFX}"
+VOL_BUILD="hypxrland-build${CTR_SFX}"
+VOL_CCACHE="hypxrland-ccache${CTR_SFX}"
+# Container-name prefix: the suffix goes BEFORE the role so the default session
+# lookup (`^hypxrland-session-`) can never pick up a suffixed run's container.
+CTR_PREFIX="hypxrland${CTR_SFX}"
 CONTAINERFILE="$REPO/containers/Containerfile.base"
 INSTALL_SCRIPT="$REPO/containers/omarchy-install-ctr.sh"
 INSTALL_IN_CTR="/tmp/omarchy-install-ctr.sh"
@@ -387,7 +406,7 @@ check_gpu() {
     local -a devargs=("${REPLY_DEVARGS[@]}")
 
     log "GPU smoke test (--gpu $gpu, devices: ${devargs[*]})"
-    local ctr="hypxrland-gpucheck-$$"
+    local ctr="$CTR_PREFIX-gpucheck-$$"
     podman rm -f "$ctr" >/dev/null 2>&1 || true
     # Short-lived, NON-systemd run — we just want the diagnostics tools.
     podman run --rm --name "$ctr" --userns=keep-id --security-opt label=disable \
@@ -425,7 +444,7 @@ cmd_build() {
     [[ -f $CONTAINERFILE ]]   || die "missing $CONTAINERFILE"
     [[ -f $INSTALL_SCRIPT ]]  || die "missing $INSTALL_SCRIPT"
 
-    local ctr="hypxrland-build-$$"
+    local ctr="$CTR_PREFIX-build-$$"
     cleanup_build() { podman rm -f "$ctr" >/dev/null 2>&1 || true; }
     trap cleanup_build EXIT INT TERM
 
@@ -453,7 +472,12 @@ cmd_build() {
         log "Building base image $IMG_BASE (Containerfile.base)"
         # Context = containers/ (small; the Containerfile COPYs nothing, it clones
         # Omarchy from the web), so we don't ship the whole repo to the builder.
-        podman build -t "$IMG_BASE" -f "$CONTAINERFILE" "$REPO/containers"
+        # --rebuild must not be satisfied from podman's layer cache: the RUN lines are
+        # unchanged text on an unchanged parent, so a cached build would hand back the
+        # SAME stale package set (old hyprutils/aquamarine/protocols) it is meant to refresh.
+        local -a nocache=()
+        [[ $mode == rebuild ]] && nocache=(--no-cache)
+        podman build "${nocache[@]}" -t "$IMG_BASE" -f "$CONTAINERFILE" "$REPO/containers"
     else
         log "Base image $IMG_BASE present (use --rebuild to force)"
     fi
@@ -523,7 +547,7 @@ cmd_shell() {
     local -a devargs=("${REPLY_DEVARGS[@]}")
 
     ensure_volumes "$VOL_BUILD" "$VOL_CCACHE"
-    local ctr="hypxrland-shell-$$"
+    local ctr="$CTR_PREFIX-shell-$$"
     cleanup_shell() { podman rm -f "$ctr" >/dev/null 2>&1 || true; }
     trap cleanup_shell EXIT INT TERM
 
@@ -596,7 +620,7 @@ cmd_test() {
     local gpu_node=""
 
     ensure_volumes "$VOL_BUILD" "$VOL_CCACHE"
-    local ctr="hypxrland-test-$$"
+    local ctr="$CTR_PREFIX-test-$$"
     local removed=0
     cleanup_test() { [[ $removed -eq 1 || $keep -eq 1 ]] || { podman rm -f "$ctr" >/dev/null 2>&1 || true; }; }
     trap cleanup_test EXIT INT TERM
@@ -900,7 +924,7 @@ cmd_session() {
         fi
     fi
 
-    local ctr="hypxrland-session-$$"
+    local ctr="$CTR_PREFIX-session-$$"
     # Expand $ctr NOW: the EXIT trap can fire after this function's scope is gone (podman run
     # dying under set -e), where a `local` is unbound — and a partial container still needs
     # removing in exactly that case.
@@ -1029,8 +1053,8 @@ EOF
 cmd_exec() {
     [[ $# -ge 1 ]] || die "exec: need a command (e.g. $0 exec hyprctl openxr status)"
     local ctr
-    ctr=$(podman ps --format '{{.Names}}' 2>/dev/null | grep '^hypxrland-session-' | head -1 || true)
-    [[ -n $ctr ]] || die "no running hypxrland-session-* container (start one with: $0 session)"
+    ctr=$(podman ps --format '{{.Names}}' 2>/dev/null | grep "^$CTR_PREFIX-session-" | head -1 || true)
+    [[ -n $ctr ]] || die "no running $CTR_PREFIX-session-* container (start one with: $0 session)"
     # Quote each arg so the remote bash -lc sees them intact.
     local q="" a
     for a in "$@"; do q+="$(printf '%q ' "$a")"; done
