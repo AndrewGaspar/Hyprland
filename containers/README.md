@@ -170,6 +170,34 @@ The desktop is installed via **boot-install-commit** (not a `podman build` RUN):
 a `podman build` has no PID-1 systemd, so the packages/config run inside a live
 boot entered with `machinectl shell dev@.host` and are committed on top.
 
+### Side-by-side resource sets (`HYPXR_CTR_SUFFIX`)
+
+Every image tag, volume and container name above carries an optional suffix
+from `HYPXR_CTR_SUFFIX` (default empty = the names in this document). Use it
+whenever a second tree is validated at the same time as the default one — e.g. a
+rebase onto a new upstream whose build deps differ — so the two never share (or
+clobber) an image, a `/build` volume or a ccache:
+
+```sh
+export HYPXR_CTR_SUFFIX=-057a
+scripts/xr-container.sh build --rebuild         # hypxrland-ctr:{base,pkgs,session}-057a
+scripts/xr-container.sh test --build --gpu amd  # volumes hypxrland-{build,ccache}-057a
+scripts/xr-container.sh test --full --gpu amd   # container hypxrland-057a-test-<pid>
+```
+
+| Resource | Default | With `HYPXR_CTR_SUFFIX=-057a` |
+| --- | --- | --- |
+| images | `hypxrland-ctr:{base,pkgs,session}` | `hypxrland-ctr:{base,pkgs,session}-057a` |
+| volumes | `hypxrland-{build,ccache,pacman}` | `hypxrland-{build,ccache,pacman}-057a` |
+| containers | `hypxrland-<role>-<pid>` | `hypxrland-057a-<role>-<pid>` |
+
+The suffix sits *before* the role in container names, so the default `exec`
+lookup (`hypxrland-session-*`) never attaches to a suffixed session. Clean up a
+set with `podman rm`/`volume rm`/`rmi` on the suffixed names only. A suffixed set
+starts cold (fresh ccache and `/build`): the first `test` builds everything.
+`--rebuild` builds `:base` with `--no-cache`, so the package set really is
+refreshed rather than replayed from podman's layer cache.
+
 ## Quick start
 
 ```sh
