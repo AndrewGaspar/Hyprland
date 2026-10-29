@@ -1026,6 +1026,27 @@ static int hlGesture(lua_State* L) {
     return 0;
 }
 
+// `hl.config({ openxr = { enabled = true } })` at runtime (`hyprctl eval`, a keybind) is the user
+// re-asserting "on". The prop refresh it schedules reaches COpenXRManager::onConfigReload() like any
+// other key, but unforced — and the reload gate (OpenXR::xrReloadAction) rightly refuses to re-probe a
+// dormant UNAVAILABLE manager whose probe inputs did not change, so the re-assert silently did
+// nothing. The legacy `hyprctl keyword openxr:enabled 1` forced that probe (doc 05 §1.3, report-17
+// WP-L7); keep that here. Only a dynamic parse: a full reload re-applies an unchanged `enabled = true`
+// on every reload and must stay storm-gated. `false` needs nothing extra — the gate stops on it.
+static void xrForceProbeOnEnable(const std::string& fullKey, ILuaConfigValue& value) {
+#ifdef HAVE_OPENXR
+    if (fullKey != "openxr.enabled" || value.asInt() == 0 || !g_pEventLoopManager)
+        return;
+    g_pEventLoopManager->doLater([] {
+        if (g_pOpenXRManager)
+            g_pOpenXRManager->onConfigReload(/*forceProbe=*/true);
+    });
+#else
+    (void)fullKey;
+    (void)value;
+#endif
+}
+
 static int hlConfig(lua_State* L) {
     auto* self = sc<CConfigManager*>(lua_touserdata(L, lua_upvalueindex(1)));
 
@@ -1064,8 +1085,10 @@ static int hlConfig(lua_State* L) {
                     const auto err = it->second->parse(L);
                     if (err.errorCode != PARSE_ERROR_OK)
                         self->addError(std::format("{}: error setting '{}': {}", sourceInfo, it->first, err.message));
-                    else if (self->isDynamicParse())
+                    else if (self->isDynamicParse()) {
                         Supplementary::refresher()->scheduleRefresh(it->second->refreshBits());
+                        xrForceProbeOnEnable(fullKey, *it->second);
+                    }
                 }
             }
 

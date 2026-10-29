@@ -98,8 +98,10 @@ openxr {
 }
 ```
 
-`openxr:enabled` is a **hot** toggle — `hyprctl keyword openxr:enabled 1` (or `0`), or editing
-the config and reloading, starts/stops the session live. The session only actually comes up
+`openxr:enabled` is a **hot** toggle — `hyprctl eval 'hl.config({ openxr = { enabled = true } })'`
+(or `false`), or editing the config and reloading, starts/stops the session live. Setting it to
+`true` at runtime is an explicit re-assert and always probes, even when the value did not change
+(see "A config reload is not a retry" below). The session only actually comes up
 when an OpenXR runtime is available (a headset + its runtime, or Monado for testing); otherwise
 the state settles at `unavailable`, not an error, and — with `openxr:reprobe` (default on) — a
 backoff timer brings the session up automatically once the runtime starts or the headset is
@@ -115,8 +117,8 @@ clears the latch). `hyprctl openxr status` says so — `disabled (manually disab
 disabled" and started straight back up. Under a storm of reloads the disable lasted under a
 second and there was no way to turn XR off at all (live evidence 2026-08-21).
 
-To persist a change across compositor restarts, still edit the config or use
-`hyprctl keyword openxr:enabled ...`.
+To persist a change across compositor restarts, still edit the config (`hyprctl eval` changes
+only the running value, until the next reload).
 
 **A config reload is not a retry.** While the session is dormant in `unavailable`, a reload
 that changes nothing the *handshake* depends on (`enabled`, `gpu`, `runtime_json`,
@@ -127,7 +129,8 @@ reload is precisely what stops it from ever firing. Hot-tuning any of the *other
 knobs (chrome, grab, adaptive, luma key, layout2d, ...) applies live exactly as before — those
 are re-published on every reload; they just do not buy a handshake.
 
-If you want to force an attempt right now, ask for one: `hyprctl openxr enable` always probes.
+If you want to force an attempt right now, ask for one: `hyprctl openxr enable` always probes, and
+so does setting `enabled = true` from `hyprctl eval` (a runtime `hl.config`, unlike a reload).
 (With `openxr:reprobe = 0` there is no timer to retry instead, so a reload keeps working as the
 manual retry — rate-limited to `openxr:reprobe_interval_ms`.)
 
