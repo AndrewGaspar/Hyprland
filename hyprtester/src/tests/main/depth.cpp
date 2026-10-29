@@ -76,12 +76,14 @@ namespace {
     // every window's address, in the order `hyprctl clients` lists them. Two windows from the same
     // binary share a class and a title, so the address is the only handle that tells them apart.
     std::vector<std::string> clientAddresses() {
-        const auto               JSON = getFromSocket("j/clients");
-        static const std::string KEY  = "\"address\": \"";
+        const auto JSON = getFromSocket("j/clients");
+        // window addresses only: since 0.57 every client also carries `"workspace": { "address":
+        // "<addressable name>" }`, and a bare `"address": "` key would count each window twice
+        static const std::string KEY = "\"address\": \"0x";
 
         std::vector<std::string> out;
         for (auto pos = JSON.find(KEY); pos != std::string::npos; pos = JSON.find(KEY, pos + KEY.length())) {
-            const auto START = pos + KEY.length();
+            const auto START = pos + KEY.length() - 2; // keep the 0x
             const auto END   = JSON.find('"', START);
             if (END == std::string::npos)
                 break;
