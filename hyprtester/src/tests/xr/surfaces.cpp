@@ -158,7 +158,8 @@ TEST_CASE(xr_surface_snap_synthetic_table) {
     // A 3x3 m table 0.9 m below the monitor's center: its bottom edge (half the 0.84 m content plus
     // the chrome margin and bar) starts ~0.35 m above it.
     const float tableY = (*start)[1] - 0.9F;
-    EXPECT(getFromSocket(std::format("/eval hl.config({{ openxr = {{ surfaces_synthetic = 'table pos:{:.3f},{:.3f},{:.3f} size:3,3' }} }})", (*start)[0], tableY, (*start)[2])), "ok");
+    EXPECT(getFromSocket(std::format("/eval hl.config({{ openxr = {{ surfaces_synthetic = 'table pos:{:.3f},{:.3f},{:.3f} size:3,3' }} }})", (*start)[0], tableY, (*start)[2])),
+           "ok");
     EXPECT(getFromSocket("/eval hl.config({ openxr = { surfaces = true } })"), "ok");
     ASSERT(XR::waitForJson("j/openxr", [](const std::string& j) { return j.find("\"source\": \"synthetic\"") != std::string::npos; }, std::chrono::milliseconds(5000)), true);
     NLog::green("xr_surface_snap_synthetic_table: table published at y {:.3f}", tableY);
@@ -220,7 +221,8 @@ TEST_CASE(xr_surface_off_never_snaps) {
     const auto start = surfaceMonitorPos(getFromSocket("j/openxr"), mon);
     ASSERT(start.has_value(), true);
     const float tableY = (*start)[1] - 0.9F;
-    EXPECT(getFromSocket(std::format("/eval hl.config({{ openxr = {{ surfaces_synthetic = 'table pos:{:.3f},{:.3f},{:.3f} size:3,3' }} }})", (*start)[0], tableY, (*start)[2])), "ok");
+    EXPECT(getFromSocket(std::format("/eval hl.config({{ openxr = {{ surfaces_synthetic = 'table pos:{:.3f},{:.3f},{:.3f} size:3,3' }} }})", (*start)[0], tableY, (*start)[2])),
+           "ok");
 
     // The same descent, all the way to where the table is: no preview, ever.
     bool previewed = false;
