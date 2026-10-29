@@ -446,7 +446,7 @@ re-reads the mode on restart) → `xreal-ctl mode 3d` (HID switch to SBS) → **
 appears — see §0.1), verifying the connector comes up 3840-wide (revert + bail if not) → dpms nudge →
 **auto-set `openxr:gpu`** to the connector's DRM render node + `openxr:blend_mode = opaque` →
 **restart** `monado-xreal.service` (after importing `WAYLAND_DISPLAY`) → wait for monado's
-`monado_comp_ipc` socket → `hyprctl keyword openxr:runtime_json <xreal manifest>` → `hyprctl openxr
+`monado_comp_ipc` socket → `hyprctl eval 'hl.config({ openxr = { runtime_json = "<xreal manifest>" } })'` → `hyprctl openxr
 enable` → **explicitly move+fullscreen** the `openxr` window on the glasses' output (by address, not just
 a windowrule, so it never drifts to the laptop panel). The xreal Monado's `comp_main` opens a Wayland
 toplevel (class `openxr`, title `Monado`), landed fullscreen on the glasses' DP output at 3840×1080.
@@ -455,10 +455,9 @@ glasses to 2D and drives a single 1920×1080 head-tracked view.
 
 **`xr --direct`** (V2.2 DRM-lease / direct mode) takes the same HID/gpu/runtime steps but, instead of
 setting a DP mode and placing a window, it **flips the HypXRland `lease` monitor-rule flag on DP-5**
-(`hyprctl keyword monitor DP-5,preferred,auto,1,lease` under a classic config;
-`hyprctl eval 'hl.monitor({ output = "DP-5", mode = "preferred", position = "auto", scale = "1", lease = true })'`
-under a Lua config, where `hyprctl keyword` is a silent no-op — the script detects which once, via
-`hyprctl systeminfo`'s `configProvider`) so HypXRland stops driving DP-5 as a desktop and
+(`hyprctl eval 'hl.monitor({ output = "DP-5", mode = "preferred", position = "auto", scale = "1", lease = true })'`;
+Hyprland 0.57+ has no `hyprctl keyword`, and the script's classic branch — still selected via
+`hyprctl systeminfo`'s `configProvider` — is unreachable there) so HypXRland stops driving DP-5 as a desktop and
 **offers the connector via `wp_drm_lease_v1`**. It also writes a systemd drop-in
 (`monado-xreal.service.d/10-xreal-direct.conf`) that **`UnsetEnvironment=`s `XRT_COMPOSITOR_FORCE_WAYLAND`**
 (the base unit sets it `=1`) and sets `XRT_COMPOSITOR_FORCE_WAYLAND_DIRECT=1` +

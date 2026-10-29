@@ -406,7 +406,9 @@ mirroring:
 monitor = DP-1, preferred, auto, 1, mirror, XR-1
 ```
 
-(or at runtime: `hyprctl keyword monitor "DP-1, preferred, auto, 1, mirror, XR-1"`.)
+(Hyprland 0.57+ is Lua-only: `hl.monitor({ output = "DP-1", mode = "preferred", position = "auto", scale = "1", mirror = "XR-1" })`,
+or at runtime `hyprctl eval 'hl.monitor({ output = "DP-1", mode = "preferred", position = "auto", scale = "1", mirror = "XR-1" })'`.
+`hl.monitor` merges onto the output's existing rule, so undo it with `mirror = ""`.)
 
 - `applyMonitorRule` calls `CMonitor::setMirror("XR-1")` (`src/output/Monitor.cpp`),
   which resolves the source by name, moves DP-1's workspaces to a backup monitor, sets
