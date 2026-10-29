@@ -285,6 +285,13 @@ TEST_CASE(xr_don_settle_hides_until_still) {
         EXPECT(XR::fieldAfter(st, XR::findAfter(st, "\"donoff\""), "donGate"), std::string("true"));
     }
 
+    // Sit facing the monitor before taking the glasses off. Under placement_memory = intent the
+    // disable below commits a doff SEAT from the last quiet dwell, and the don re-seats relative to
+    // it — so without a dwell of our own (quietMin 0.75 s) the seat is whatever the PREVIOUS test
+    // left in the head history: after xr_reseat_commits_memory_and_forget (head turned to 180°) it
+    // committed that backwards dwell and the monitor came back at 25° + 180°.
+    swayHold(remote, 0.f, 0.f, 1500);
+
     getFromSocket("/openxr disable");
     ASSERT(XR::waitForXrState("disabled", std::chrono::milliseconds(10000)), true);
 
