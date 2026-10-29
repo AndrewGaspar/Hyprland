@@ -638,11 +638,6 @@ class COpenXRManager {
     void userEnable();
     bool manuallyDisabled() const;
 
-    // Legacy `hyprctl keyword monitor ...` also emits no reload/props-refreshed event. Re-evaluate
-    // per-field user ownership after that rule has been installed, then restore any XR-owned fields
-    // the user just handed back to auto.
-    void onMonitorRulesChanged();
-
     // "disabled" | "unavailable" | "starting" | "idle" | "visible" | "focused" | "stopping"
     static const char* stateToString(eXRManagerState state);
 

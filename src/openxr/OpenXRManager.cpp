@@ -3745,14 +3745,6 @@ void COpenXRManager::refreshMonitorRuleOwnership() {
         requestLayout2DSync();
 }
 
-void COpenXRManager::onMonitorRulesChanged() {
-    // MAIN THREAD. The legacy dynamic-monitor keyword updates the rule manager synchronously but
-    // emits neither config.reloaded nor config.props_refreshed. Keep this deliberately narrower
-    // than onConfigReload(): only ownership and the durable monitor-rule fields depend on it.
-    refreshMonitorRuleOwnership();
-    reassertMonitorModeRules();
-}
-
 void COpenXRManager::bindExistingLayers() {
     // Main thread, on start(): layers created while disabled bind to their still-live monitor
     // and get marked dirty; layers whose named monitor disappeared are dropped (doc 02).
