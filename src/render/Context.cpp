@@ -55,7 +55,14 @@ CRenderDataScope::CRenderDataScope(CRenderContext& ctx) :
 CRenderDataScope::~CRenderDataScope() {
     // Nested draws may only pop captures they pushed, never inherited captures.
     RASSERT(m_ctx.m_backdropCaptures.size() >= m_backdropDepth, "Nested draw popped an inherited backdrop capture");
-    m_ctx.m_data = std::move(m_data);
+    // The stereo-content crop's witness (research/24 §5.3) is a fact about the FRAME — a
+    // stereo-declared surface reached this composite — not draw state, and every nested scope
+    // draws into the same frame (a transformed window's source canvas, a backdrop, a scaled
+    // wallpaper). Restoring m_data must not un-say it, or a stereo window with an active transformer
+    // (motion blur, wobble) reports `stereoContent: false` for exactly the frames it moves.
+    const bool STEREOCONTENTDRAWN = m_ctx.m_data.stereoContentDrawn;
+    m_ctx.m_data                  = std::move(m_data);
+    m_ctx.m_data.stereoContentDrawn |= STEREOCONTENTDRAWN;
     m_ctx.m_backdropCaptures.resize(m_backdropDepth);
     if (m_ctx.sceneResources())
         m_ctx.sceneResources()->setBlurQueued(m_blurShouldRender);

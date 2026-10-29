@@ -1,4 +1,5 @@
 #include <render/StereoContent.hpp>
+#include <render/Context.hpp>
 
 #include <gtest/gtest.h>
 
@@ -593,4 +594,27 @@ TEST(StereoContent, aLetterboxOnTheUNSPLITAxisIsHarmless) {
         // ...and u alone for tab/htab, which is the same statement with the axes swapped.
         EXPECT_EQ(paneUVToContentUV({T, 0.5}, CONTENT_TAB, 0).x, paneUVToContentUV({T, 0.5}, CONTENT_TAB, 1).x);
     }
+}
+
+TEST(StereoContent, theWitnessSurvivesANestedDrawScope) {
+    // `stereoContent` in hyprctl monitors is ctx.m_data.stereoContentDrawn, raised by the crop while a
+    // surface is drawn. A window with an active transformer (motion blur, wobble) is drawn inside a
+    // nested CRenderDataScope, which restores m_data on exit — that must undo the nested draw state
+    // (the eye included) but keep the witness, which is a fact about the frame, not draw state.
+    Render::CRenderContext ctx;
+    ctx.m_data.stereoPane = 1;
+    {
+        auto state                    = ctx.saveDrawState();
+        ctx.m_data.stereoPane         = -1;
+        ctx.m_data.stereoContentDrawn = true;
+    }
+    EXPECT_EQ(ctx.m_data.stereoPane, 1);
+    EXPECT_TRUE(ctx.m_data.stereoContentDrawn);
+
+    // ...and a scope that draws nothing stereo does not clear a witness raised before it.
+    {
+        auto state                    = ctx.saveDrawState();
+        ctx.m_data.stereoContentDrawn = false;
+    }
+    EXPECT_TRUE(ctx.m_data.stereoContentDrawn);
 }
