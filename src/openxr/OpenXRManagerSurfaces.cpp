@@ -22,9 +22,9 @@
 #include "XRInput.hpp"
 #include "XRSession.hpp"
 #include "XRPlaneDetection.hpp"
+#include "XRIpc.hpp" // OpenXR::postIPCEvent
 #include "../debug/log/Logger.hpp"
 #include "../config/ConfigValue.hpp"
-#include "../managers/EventManager.hpp"
 #include "../managers/eventLoop/EventLoopManager.hpp"
 #include "../managers/eventLoop/EventLoopTimer.hpp"
 #include "../helpers/time/Time.hpp"
@@ -189,8 +189,8 @@ void COpenXRManager::onSurfaceSnapped(const SXRStateEvent& e) {
     }
     LOG(Log::DEBUG, "[OPENXR] surfaces: {} snapped onto {} plane {:#x} ({}) at [{:.2f}, {:.2f}, {:.2f}]", e.str, OpenXR::xrPlaneLabelName(rec.label), rec.planeId,
         OpenXR::xrSnapKindName(rec.kind), rec.contact.x, rec.contact.y, rec.contact.z);
-    if (!e.str.empty() && g_pEventManager)
-        g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitorsurface", std::format("{},{},{}", e.str, OpenXR::xrSnapKindName(rec.kind), OpenXR::xrPlaneLabelName(rec.label))});
+    if (!e.str.empty())
+        OpenXR::postIPCEvent("xrmonitorsurface", std::format("{},{},{}", e.str, OpenXR::xrSnapKindName(rec.kind), OpenXR::xrPlaneLabelName(rec.label)));
 }
 
 COpenXRManager::SXRSurfaceStatus COpenXRManager::surfaceStatus() {

@@ -24,7 +24,7 @@ class CXRPointerDevice : public IPointer {
         return p;
     }
 
-    virtual bool isVirtual() {
+    virtual bool isVirtual() const {
         return false; // mirrors CTestMouse: keeps per-device config (device[xr-pointer]{...})
     }
 

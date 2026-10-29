@@ -457,7 +457,7 @@ static bool blurSourceIsRaised(const PHLMONITOR& monitor) {
     for (uint32_t layer = Desktop::Depth::LAYER_BACKGROUND; layer <= Desktop::Depth::LAYER_BOTTOM; ++layer) {
         for (const auto& LSREF : monitor->m_layerSurfaceLayers[layer]) {
             const auto LS = LSREF.lock();
-            if (LS && LS->m_depth && LS->m_depth->value() > Desktop::Depth::MIN && LS->visible())
+            if (LS && LS->m_depth && LS->m_depth->value() > Desktop::Depth::MIN && LS->mapped())
                 return true;
         }
     }
@@ -488,7 +488,7 @@ bool IHyprRenderer::depthProducerActive(const PHLMONITOR& monitor) {
     for (const auto& LAYERS : monitor->m_layerSurfaceLayers) {
         for (const auto& LSREF : LAYERS) {
             const auto LS = LSREF.lock();
-            if (LS && LS->m_depth && LS->m_depth->value() > Desktop::Depth::MIN && LS->visible() && depthDamageSpread(LS, monitor) > 0.0)
+            if (LS && LS->m_depth && LS->m_depth->value() > Desktop::Depth::MIN && LS->mapped() && depthDamageSpread(LS, monitor) > 0.0)
                 return true;
         }
     }

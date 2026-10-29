@@ -1051,7 +1051,8 @@ ActionResult Actions::changeWorkspace(PHLWORKSPACE ws) {
     // backup to evacuate to), leaving this workspace welded to an output that can never show it.
     // Adopt it onto the focused monitor instead of focusing a disabled monitor.
     if (!PMONITORWORKSPACEOWNER->m_enabled) {
-        LOG(Log::DEBUG, "changeWorkspace: workspace {} is stranded on disabled monitor {}, adopting onto {}", ws->id(), PMONITORWORKSPACEOWNER->m_name, PMONITOR->m_name);
+        LOG(Log::DEBUG, "changeWorkspace: workspace {} is stranded on disabled monitor {}, adopting onto {}", ws->addressableName(), PMONITORWORKSPACEOWNER->m_name,
+            PMONITOR->m_name);
         State::Workspace::placementController()->moveWorkspaceToMonitor(ws, PMONITOR);
         PMONITORWORKSPACEOWNER = PMONITOR;
     }

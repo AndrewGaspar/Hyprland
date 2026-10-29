@@ -12,7 +12,7 @@
 #include "XRStereoPair.hpp"   // WP X1: the stereo quad-pair policy (pure)
 #include "OpenXRManager.hpp"
 #include "../config/ConfigValue.hpp"
-#include "../desktop/view/Window.hpp"
+#include "../desktop/view/window/Window.hpp"
 #include "../managers/fullscreen/FullscreenController.hpp"
 #include "../render/Renderer.hpp"     // WP X3: cursorDepthDamageSpread (main thread only)
 #include "../pointer/PointerManager.hpp"

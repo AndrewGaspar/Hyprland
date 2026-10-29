@@ -7,11 +7,14 @@
 #include <hyprutils/string/VarList.hpp>
 
 #include "OpenXRManager.hpp"
-#include "../debug/HyprCtl.hpp"
+#include "../ipc/s1/S1.hpp"
+#include "../ipc/s2/S2.hpp"
+#include "../Compositor.hpp"
 #include "../SharedDefs.hpp"
 #include "../helpers/MiscFunctions.hpp" // escapeJSONStrings
 
 using namespace Hyprutils::String;
+using namespace IPC::Socket1;
 
 // research/32: the `surfaces` object of the JSON status — the sources, every plane (solver frame:
 // LOCAL_FLOOR metres, normal = the plane's +Z, vertices plane-local) and the last snap.
@@ -73,7 +76,7 @@ static std::string donoffJson(const COpenXRManager::SXRDonOffStatus& d) {
                        d.lastDonReason);
 }
 
-static std::string openxrStatus(eHyprCtlOutputFormat format) {
+static std::string openxrStatus(eOutputFormat format) {
     const auto        STATE   = COpenXRManager::stateToString(g_pOpenXRManager->state());
     const std::string RUNTIME = g_pOpenXRManager->runtimeName();
     const std::string SYSTEM  = g_pOpenXRManager->systemName();
@@ -421,7 +424,7 @@ static std::string openxrStatus(eHyprCtlOutputFormat format) {
 // pointed AT SPEECH ONSET, not at parse time (docs/openxr/research/VOICE-CONTROL.md). The timestamp
 // is CLOCK_MONOTONIC ms — the same clock the daemon reads via clock_gettime(CLOCK_MONOTONIC); see
 // the CLOCK CONTRACT comment on SXRPoseRing in XRMath.hpp.
-static std::string openxrGaze(eHyprCtlOutputFormat format, const std::string& args) {
+static std::string openxrGaze(eOutputFormat format, const std::string& args) {
     // Parse an optional target timestamp: "at <ms>" or "--at-ms <ms>" (also bare "<ms>").
     CVarList    gv(args, 0, ' ');
     bool        haveAt = false;
@@ -501,7 +504,7 @@ static std::string openxrGaze(eHyprCtlOutputFormat format, const std::string& ar
     return out;
 }
 
-static std::string openxrRequest(eHyprCtlOutputFormat format, std::string request) {
+static std::string openxrRequest(eOutputFormat format, std::string request) {
     if (!g_pOpenXRManager)
         return "OpenXR manager not initialized";
 
@@ -671,19 +674,34 @@ static std::string openxrRequest(eHyprCtlOutputFormat format, std::string reques
         SUBCOMMAND);
 }
 
+void OpenXR::postIPCEvent(std::string event, std::string data) {
+    if (!g_pCompositor || !g_pCompositor->m_wlEventLoop)
+        return;
+
+    const auto& SOCK = IPC::Socket2::sock();
+    if (!SOCK)
+        return;
+
+    SOCK->postEvent({.event = std::move(event), .data = std::move(data)});
+}
+
 CXRIpc::CXRIpc() = default;
 
 CXRIpc::~CXRIpc() {
-    if (m_openxrCommand && g_pHyprCtl)
-        g_pHyprCtl->unregisterCommand(m_openxrCommand);
+    if (m_openxrCommand && IPC::Socket1::sock())
+        IPC::Socket1::sock()->unregisterCommand(m_openxrCommand);
 }
 
 void CXRIpc::registerCommands() {
-    if (!g_pHyprCtl)
+    if (!IPC::Socket1::sock())
         return;
 
-    // exact = false: "openxr" carries subcommands in the request string (like "output").
-    m_openxrCommand = g_pHyprCtl->registerCommand(SHyprCtlCommand{"openxr", false, openxrRequest});
+    // COMMAND_MATCH_PREFIX: "openxr" carries subcommands in the request string (like "output").
+    m_openxrCommand = IPC::Socket1::sock()->registerCommand(SCommand{
+        .name    = "openxr",
+        .match   = COMMAND_MATCH_PREFIX,
+        .handler = [](const SRequest& request) { return SResponse{openxrRequest(request.format, request.command)}; },
+    });
 }
 
 #endif

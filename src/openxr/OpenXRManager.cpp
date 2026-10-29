@@ -57,7 +57,6 @@
 #include "../debug/log/Logger.hpp"
 #include "../config/ConfigValue.hpp"
 #include "../event/EventBus.hpp"
-#include "../managers/EventManager.hpp"
 #include "../managers/eventLoop/EventLoopManager.hpp"
 #include "../managers/input/InputManager.hpp"
 #include "../output/Monitor.hpp"
@@ -67,14 +66,13 @@
 #include "../helpers/Format.hpp" // NFormatUtils::drmModifierName (post-reconfigure modifier log)
 #include "../render/Renderer.hpp" // damageMonitor (force a fresh present into the re-allocated buffers)
 #include "../desktop/state/FocusState.hpp"
-#include "../desktop/Workspace.hpp"                     // xrrule: the monitor's active workspace + last-focused window
-#include "../desktop/view/Window.hpp"                   // xrrule: m_class / m_title of the focused window
+#include "../workspace/HLWorkspace.hpp"                    // xrrule: the monitor's active workspace + last-focused window
+#include "../desktop/view/window/Window.hpp"               // xrrule: app id / title of the focused window
 #include "../managers/fullscreen/FullscreenController.hpp" // xrrule: the fullscreen window of a monitor
 #include "../managers/eventLoop/EventLoopTimer.hpp"     // xrrule: the transition-envelope tick
 #include "../config/shared/monitor/MonitorRuleManager.hpp"
 #include "../config/shared/monitor/MonitorRule.hpp"
 #include "../config/shared/xr/XRDeclarationManager.hpp"
-#include "../config/legacy/ConfigManager.hpp"
 #include "../helpers/time/Time.hpp"
 
 #include <aquamarine/backend/Backend.hpp>
@@ -291,15 +289,13 @@ void COpenXRManager::setState(eXRManagerState newState) {
     m_state = newState;
     requestEffectEval();
 
-    if (g_pEventManager)
-        g_pEventManager->postEvent(SHyprIPCEvent{"openxrsessionstate", stateToString(newState)});
+    OpenXR::postIPCEvent("openxrsessionstate", stateToString(newState));
 
     // openxractive is a derived boolean: active ⇔ state ∈ {visible, focused}. Post only on flip.
     const bool nowActive = newState == XR_STATE_RUNNING_VISIBLE || newState == XR_STATE_RUNNING_FOCUSED;
     if (nowActive != m_active) {
         m_active = nowActive;
-        if (g_pEventManager)
-            g_pEventManager->postEvent(SHyprIPCEvent{"openxractive", nowActive ? "1" : "0"});
+        OpenXR::postIPCEvent("openxractive", nowActive ? "1" : "0");
     }
 
     // Idle-inhibit is rechecked on every session-state transition (the hook itself lands in WP9).
@@ -1352,8 +1348,8 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
         case eXRStateEventType::GRAB:
             // The frame thread already resolved the monitor name at grab-begin/end time (it
             // carries a race with the layer-removed ack otherwise — doc 05 §5). Post verbatim.
-            if (!e.str.empty() && g_pEventManager)
-                g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitorgrab", e.str + (e.a ? ",1" : ",0")});
+            if (!e.str.empty())
+                OpenXR::postIPCEvent("xrmonitorgrab", e.str + (e.a ? ",1" : ",0"));
             // doc 05 §xrrule: a grab begin/end IS an anchor-state transition (-> carried / back).
             requestEffectEval();
             // report 12 §4: re-derive the 2D plane on the RELEASE edge only. Never on grab-begin —
@@ -1367,8 +1363,8 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
             break;
         case eXRStateEventType::ADAPTIVE:
             // research/13 §6.4: the terminal dock/undock edge (a = 1 undocked / 0 docked).
-            if (!e.str.empty() && g_pEventManager)
-                g_pEventManager->postEvent(SHyprIPCEvent{e.a ? "xrmonitorundocked" : "xrmonitordocked", e.str});
+            if (!e.str.empty())
+                OpenXR::postIPCEvent(e.a ? "xrmonitorundocked" : "xrmonitordocked", e.str);
             // doc 05 §xrrule: the docked <-> follow transition — the trigger the walking rule
             // (`xrrule = alpha 0.55, anchorstate:follow`) rides.
             requestEffectEval();
@@ -3373,8 +3369,7 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
     }
 
     // 6. Notify (doc 05 event surface).
-    if (g_pEventManager)
-        g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitoradded", params.m_name});
+    OpenXR::postIPCEvent("xrmonitoradded", params.m_name);
 
     // 7. The cross-GPU linear policy + swapchain-dirty flag were set in step 4b (before the mode
     //    apply). If a session is running the frame thread creates the swapchain on its next pass — it
@@ -3475,8 +3470,7 @@ void COpenXRManager::finalizeLayerRemoval(const std::string& name) {
     // Freeing capacity may re-activate a suspended quad (doc 02 recency policy).
     recomputeQuadActive();
 
-    if (g_pEventManager)
-        g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitorremoved", name});
+    OpenXR::postIPCEvent("xrmonitorremoved", name);
 
     // report 12 §4: the set changed. Without this the survivors keep the offsets that were computed
     // when the departed monitor still occupied a column, leaving a hole in the middle of the plane.
@@ -5462,7 +5456,7 @@ void COpenXRManager::reevaluateViewpoints() {
         }
 
         const auto MONITOR = WINDOW->m_monitor.lock();
-        if (!MONITOR || !WINDOW->m_isMapped || WINDOW->isHidden() || !WINDOW->m_workspace || !WINDOW->m_workspace->isVisible() || !WINDOW->wlSurface()->exists() ||
+        if (!MONITOR || !WINDOW->mapped() || WINDOW->isHidden() || !WINDOW->m_workspace || !WINDOW->m_workspace->visible() || !WINDOW->wlSurface()->exists() ||
             WINDOW->wlSurface()->resource() != SURFACE || !SURFACE->m_mapped || !viewpoint->subsurfaceTreeObservable() || SURFACE->hasVisibleSubsurface() ||
             SURFACE->m_current.offset != Vector2D{} ||
             !OpenXR::viewpointSBSBufferMapping(SURFACE->m_current.bufferSize, SURFACE->m_current.size, MONITOR->m_size, SURFACE->m_current.viewport.hasSource,
@@ -5631,8 +5625,8 @@ OpenXR::SXRRuleContext COpenXRManager::buildRuleContext(const PXRLAYER& layer) {
         return ctx;
 
     ctx.hasFocus   = true;
-    ctx.focusClass = win->m_class;
-    ctx.focusTitle = win->m_title;
+    ctx.focusClass = win->metadata().appID();
+    ctx.focusTitle = win->metadata().title();
     ctx.fullscreen = Fullscreen::controller() && Fullscreen::controller()->isFullscreen(win);
     return ctx;
 }
@@ -6117,8 +6111,8 @@ void COpenXRManager::reconcileDeclaredMonitors() {
                 // the old bit-equal-to-the-declaration check was reaching for, now stated once).
                 existing->m_anchorFrameRef   = st.anchorPose;
                 existing->m_anchorFrameStale = true;
-                if (anchorChanged && g_pEventManager && anchorModeChanged)
-                    g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitoranchor", d.m_name + "," + OpenXR::anchorModeToString(d.m_anchor)});
+                if (anchorChanged && anchorModeChanged)
+                    OpenXR::postIPCEvent("xrmonitoranchor", d.m_name + "," + OpenXR::anchorModeToString(d.m_anchor));
             }
             continue;
         }
@@ -6309,8 +6303,7 @@ void COpenXRManager::recomputeQuadActive() {
     for (auto& [name, nowActive] : flips) {
         if (!nowActive)
             LOG(Log::WARN, "[OPENXR] XR monitor '{}' quad suspended: over the runtime layer cap ({})", name, maxCount);
-        if (g_pEventManager)
-            g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitorquad", name + (nowActive ? ",1" : ",0")});
+        OpenXR::postIPCEvent("xrmonitorquad", name + (nowActive ? ",1" : ",0"));
     }
 }
 
@@ -6398,16 +6391,14 @@ std::expected<void, std::string> COpenXRManager::cmdSelect(const std::string& ar
         const size_t next = arg == "next" ? (cur + 1) % ordered.size() : (cur + ordered.size() - 1) % ordered.size();
         m_selectedMonitor = ordered[next]->m_monitorName;
         // GAP 3: fire a socket2 event so a voice daemon's dialogue state is push-driven (no poll).
-        if (g_pEventManager)
-            g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitorselect", m_selectedMonitor});
+        OpenXR::postIPCEvent("xrmonitorselect", m_selectedMonitor);
         return {};
     }
 
     if (!layerByName(arg))
         return std::unexpected<std::string>("no XR monitor named '" + arg + "'");
     m_selectedMonitor = arg;
-    if (g_pEventManager)
-        g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitorselect", m_selectedMonitor});
+    OpenXR::postIPCEvent("xrmonitorselect", m_selectedMonitor);
     return {};
 }
 
@@ -6955,8 +6946,7 @@ void COpenXRManager::syncLayout2D(bool force) {
         pinned > 0 ? std::format(" ({} pinned by monitor= rules)", pinned) : "");
 
     State::monitorLayoutController()->scheduleRecheck();
-    if (g_pEventManager)
-        g_pEventManager->postEvent(SHyprIPCEvent{"xrlayout2dsync", std::format("{}", chosen.size())});
+    OpenXR::postIPCEvent("xrlayout2dsync", std::format("{}", chosen.size()));
 }
 
 COpenXRManager::SXRLayout2DStatus COpenXRManager::layout2DStatus() {
@@ -7307,8 +7297,8 @@ std::expected<void, std::string> COpenXRManager::cmdAnchor(const std::string& ar
             return std::unexpected<std::string>("anchor: cannot re-anchor to that mode (head/body need head tracking, device needs a tracked controller)");
     }
 
-    if (modeChanged && g_pEventManager)
-        g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitoranchor", layer->m_monitorName + "," + OpenXR::anchorModeToString(newMode, hand)});
+    if (modeChanged)
+        OpenXR::postIPCEvent("xrmonitoranchor", layer->m_monitorName + "," + OpenXR::anchorModeToString(newMode, hand));
     // doc 05 §xrrule: local <-> head/body/device IS a docked <-> follow transition.
     if (modeChanged)
         requestEffectEval();
@@ -7535,8 +7525,7 @@ std::expected<void, std::string> COpenXRManager::cmdPlace(const std::string& arg
 
     // Placing re-anchors to local: fire the same event as an anchor-mode change so a status consumer
     // (and any bar) sees the mode transition.
-    if (g_pEventManager)
-        g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitoranchor", layer->m_monitorName + ",local"});
+    OpenXR::postIPCEvent("xrmonitoranchor", layer->m_monitorName + ",local");
     noteAuthored(layer->m_histId, "place"); // research/30 §7: an authored placement edit
     requestLayout2DSync();
     return {};
