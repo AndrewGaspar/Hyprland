@@ -82,7 +82,7 @@ CURATED_PKGS=(
   # --- compositor session (visible desktop) ---
   hyprland hyprland-guiutils         # stock compositor + dialogs; provides hyprctl (omarchy scripts call it). Dev binary from /build supersedes at run time.
   waybar mako swaybg
-  walker omarchy-walker              # [omarchy] launcher + its config integration
+  walker                             # [omarchy] launcher. (omarchy-walker, its old config-integration package, is gone from the [omarchy] repo; requesting it fails the whole batch transaction.)
   uwsm                               # session/env manager the omarchy autostart uses (uwsm-app scopes)
   swayosd                            # volume/brightness OSD session component
   hypridle hyprlock hyprpicker

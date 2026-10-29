@@ -57,15 +57,16 @@ cmake -S "$SRC" -B "$BUILD" -G Ninja \
 # separate executables out of the same build dir; nothing links them into `hyprtester`, so a
 # --target list that omits them leaves them missing. Tests that need one then SKIP — and a skip
 # counts as a PASS in this harness, so the suite stays green while silently losing coverage
-# (xr_idle_inhibit / xr_idle_inhibit_modes need `idle-notify`, xr_plugged_* need `pointer-scroll`).
-# Build them explicitly — this list must stay in sync with `clientNew()` in that CMakeLists, or
-# the missing ones go back to skipping silently.
+# (xr_idle_inhibit / xr_idle_inhibit_modes need `idle-notify`, xr_plugged_* need `pointer-scroll`)
+# — or FAIL with a reason that reads nothing like "the binary was never built" (the viewpoint pair
+# once failed all five of its cases on an empty stdout haystack).
 #
-# The viewpoint pair was omitted when it was added and did NOT skip: xrViewpointInactiveLifecycle
-# asserts on the client's stdout unconditionally, so a missing binary failed every one of its five
-# cases with an empty haystack — the whole viewpoint protocol suite has been red in-container, for a
-# reason that reads nothing like "the binary was never built".
-HYPRTESTER_CLIENTS=(pointer-warp surface-scale-transform pointer-scroll child-window xdg-interactive shortcut-inhibitor keyboard-modifiers idle-notify layer-surface output-info screencopy-crop screencopy-probe viewpoint-inactive viewpoint-demo)
+# So the list is read from `clientNew()` itself rather than kept in sync by hand: a hand-kept copy
+# already drifted once per client added, and the 0.57 upstream merge alone added seven
+# (pointer-constraints, xdg-activation, fullscreen-with-monitor, xdg-initial-maximize, popup-render,
+# wlr-foreign-toplevel, toplevel-capture).
+mapfile -t HYPRTESTER_CLIENTS < <(sed -nE 's/^[[:space:]]*clientNew\("([^"]+)".*/\1/p' "$SRC/hyprtester/CMakeLists.txt")
+[[ ${#HYPRTESTER_CLIENTS[@]} -gt 0 ]] || { echo "!! found no clientNew() targets in $SRC/hyprtester/CMakeLists.txt" >&2; exit 1; }
 
 echo "==> Building targets: Hyprland hyprtester ${HYPRTESTER_CLIENTS[*]}"
 cmake --build "$BUILD" --target Hyprland hyprtester "${HYPRTESTER_CLIENTS[@]}" -j"$JOBS"
