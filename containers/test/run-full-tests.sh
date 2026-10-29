@@ -124,10 +124,17 @@ export WAYLAND_DISPLAY="$WL"
 cd "$SRC/hyprtester" || { log "FATAL: cannot cd $SRC/hyprtester"; FINAL_RC=5; exit 5; }
 log "running: hyprtester --binary $BUILD/Hyprland ${TEST_NAMES[*]:-<all>}"
 set +e
+# Not `| tee`: when hyprtester dies abnormally (a case that throws aborts the whole harness), the
+# compositor it spawned survives holding a copy of the pipe's write end, tee never sees EOF and the
+# run hangs until someone removes the container. Log to the file directly and follow it for exactly
+# as long as hyprtester itself lives.
 "$BUILD/hyprtester/hyprtester" --binary "$BUILD/Hyprland" \
     --config ./test.lua --plugin ./plugin/hyprtestplugin.so \
-    "${TEST_NAMES[@]}" 2>&1 | tee -a "$RUN_LOG"
-rc="${PIPESTATUS[0]}"
+    "${TEST_NAMES[@]}" >>"$RUN_LOG" 2>&1 &
+HT_PID=$!
+tail -n +1 -f --pid="$HT_PID" "$RUN_LOG"
+wait "$HT_PID"
+rc=$?
 log "hyprtester exited rc=$rc"
 FINAL_RC="$rc"
 exit "$rc"
