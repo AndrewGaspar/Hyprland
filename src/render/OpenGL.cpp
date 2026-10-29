@@ -965,14 +965,21 @@ void CHyprOpenGLImpl::end(CRenderContext& ctx) {
                 // what `hyprctl monitors` reports as `stereoContent` (research/24 §5.3).
                 PMONITOR->m_stereoContentPanes = ctx.m_data.stereoContentDrawn && PMONITOR->stereoPaneCount() > 1;
 
+                // The last pane's composite is the one still in the offloaded buffer. Take its texture
+                // NOW: BINDOUTPUT() below rebinds ctx.m_data.currentFB to the output framebuffer (a
+                // renderbuffer with no texture), so reading currentFB inside the loop hands every pane
+                // after the first a null texture — a SEGV in renderTexturePrimitive the first time the
+                // depth producer composites twice.
+                const auto         LASTPANETEX = ctx.m_data.currentFB->getTexture();
+
                 SResolvedComposite shared;
                 if (!PERPANE)
-                    shared = RESOLVE(ctx.m_data.currentFB->getTexture());
+                    shared = RESOLVE(LASTPANETEX);
 
                 for (int i = 0; i < PMONITOR->stereoPaneCount(); ++i) {
                     SResolvedComposite perPane;
-                    if (PERPANE) // the last pane is the composite still in the offloaded buffer
-                        perPane = RESOLVE(i < sc<int>(ctx.m_data.stereoPaneFBs.size()) ? ctx.m_data.stereoPaneFBs[i]->getTexture() : ctx.m_data.currentFB->getTexture());
+                    if (PERPANE)
+                        perPane = RESOLVE(i < sc<int>(ctx.m_data.stereoPaneFBs.size()) ? ctx.m_data.stereoPaneFBs[i]->getTexture() : LASTPANETEX);
 
                     BINDOUTPUT();
                     const auto DEST = PMONITOR->stereoPaneDestBox(i);
