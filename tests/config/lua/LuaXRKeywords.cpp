@@ -1,9 +1,11 @@
-// The XR keywords have two config front ends: the classic `xrmonitor =` / `xrrule =` lines and
-// Lua's hl.xr_monitor / hl.xr_rule. The entire design of the Lua side is that it is NOT a second
-// parser — it names fields, emits the shared grammar's tokens, and hands them to the one parser the
-// classic keyword uses. These tests exist to keep that true: every one of them writes the same
-// declaration both ways and asserts the two land on identical state. If someone ever "optimizes"
-// the Lua path into its own parse, these fail immediately rather than a year later in a headset.
+// The XR keywords had two config front ends: the classic `xrmonitor =` / `xrrule =` lines and
+// Lua's hl.xr_monitor / hl.xr_rule. v0.57 removed the classic .conf layer, but its value grammar
+// lives on as the string form of hl.xr_monitor / hl.xr_rule (and as what `hyprctl openxr layout`
+// prints). The entire design of the Lua table form is that it is NOT a second parser — it names
+// fields, emits the shared grammar's tokens, and hands them to that one parser. These tests exist to
+// keep that true: every one of them writes the same declaration both ways and asserts the two land
+// on identical state. If someone ever "optimizes" the table path into its own parse, these fail
+// immediately rather than a year later in a headset.
 
 #include <config/lua/ConfigManager.hpp>
 #include <config/shared/xr/XRDeclarationManager.hpp>
@@ -16,8 +18,10 @@
 
 #include <re2/re2.h>
 
+#include <openxr/XRDispatch.hpp>
+
 #include <Compositor.hpp>
-#include <managers/KeybindManager.hpp>
+#include <keybinds/Manager.hpp>
 
 #include <gtest/gtest.h>
 
@@ -60,19 +64,19 @@ namespace Config::Lua {
 namespace {
     class CScopedCompositor {
       public:
-        CScopedCompositor() : m_prevCompositor(std::move(g_pCompositor)), m_prevKeybindManager(std::move(g_pKeybindManager)) {
-            g_pCompositor     = makeUnique<CCompositor>(true);
-            g_pKeybindManager = makeUnique<CKeybindManager>();
+        CScopedCompositor() : m_prevCompositor(std::move(g_pCompositor)), m_prevKeybindManager(std::move(Keybinds::mgr())) {
+            g_pCompositor   = makeUnique<CCompositor>(true);
+            Keybinds::mgr() = makeUnique<Keybinds::CKeybindManager>();
         }
 
         ~CScopedCompositor() {
-            g_pKeybindManager = std::move(m_prevKeybindManager);
-            g_pCompositor     = std::move(m_prevCompositor);
+            Keybinds::mgr() = std::move(m_prevKeybindManager);
+            g_pCompositor   = std::move(m_prevCompositor);
         }
 
       private:
-        UP<CCompositor>     m_prevCompositor;
-        UP<CKeybindManager> m_prevKeybindManager;
+        UP<CCompositor>               m_prevCompositor;
+        UP<Keybinds::CKeybindManager> m_prevKeybindManager;
     };
 
     class CTempDir {
@@ -877,8 +881,21 @@ TEST(ConfigLuaXRSurface, xrmonitorDispatcherIsBindableFromLua) {
     )LUA");
 
     EXPECT_EQ(fx.errors(), "");
-    ASSERT_TRUE(g_pKeybindManager);
-    EXPECT_EQ(std::ranges::count_if(g_pKeybindManager->m_keybinds, [](const auto& kb) { return kb->handler == "__lua"; }), 3);
+    ASSERT_TRUE(Keybinds::mgr());
+    ASSERT_EQ(Keybinds::mgr()->registry().size(), 3u);
+    for (const auto& bind : Keybinds::mgr()->registry().binds()) {
+        EXPECT_EQ(bind->metadata().handler, "HL.Dispatcher(xrmonitor)");
+    }
+}
+
+// The action behind hl.dsp.xrmonitor has no front end of its own (v0.57 deleted the legacy
+// dispatcher table it used to live in). With no XR manager — a build without OpenXR, or before the
+// manager exists — it must fail cleanly as UNAVAILABLE, never crash or pretend to succeed.
+TEST(ConfigLuaXRSurface, xrmonitorActionWithoutAManagerIsUnavailable) {
+    const auto RESULT = OpenXR::xrmonitorAction("gazegrab");
+    ASSERT_FALSE(RESULT.has_value());
+    EXPECT_EQ(RESULT.error().code, Config::Actions::eActionErrorCode::UNAVAILABLE);
+    EXPECT_FALSE(RESULT.error().message.empty());
 }
 
 // ---- the shipped example ----

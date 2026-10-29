@@ -15,6 +15,7 @@
 #include "../../../workspace/WorkspaceUtils.hpp"
 #include "../../../desktop/rule/windowRule/WindowRule.hpp"
 #include "../../../keybinds/Resolver.hpp"
+#include "../../../openxr/XRDispatch.hpp"
 
 using namespace Config;
 using namespace Config::Lua;
@@ -255,27 +256,13 @@ static int dsp_global(lua_State* L) {
 // The `xrmonitor` dispatcher, bindable from Lua (docs/openxr/05 §4).
 //
 // hl.dsp is a curated surface: every other entry here routes through Config::Actions. xrmonitor
-// does not — it is a fork dispatcher that lives only in the dispatcher table, and hl.dsp has no
-// by-name escape hatch to reach one. Without this entry the whole XR keybind surface (gazegrab,
-// gazepush, handinput, reseat, view, sync…) is simply unbindable from a Lua config, or bindable
-// only by shelling out to `hyprctl dispatch` on every press — which for a repeat-bound gazepush
-// means spawning a process per repeat while the user is holding a key in a headset.
-//
-// This calls the dispatcher through exactly the table lookup a classic `bind = …, xrmonitor, <verb>`
-// line goes through, so both front ends reach the same COpenXRManager methods.
+// is the fork's own action (src/openxr/XRDispatch.cpp). Without this entry the whole XR keybind
+// surface (gazegrab, gazepush, handinput, reseat, view, sync…) is simply unbindable from a Lua
+// config, or bindable only by shelling out to `hyprctl dispatch` on every press — which for a
+// repeating gazepush means spawning a process per repeat while the user is holding a key in a
+// headset. The verb switch reaches the same COpenXRManager methods `hyprctl openxr` does.
 static int dsp_xrmonitor(lua_State* L) {
-    if (!g_pKeybindManager)
-        return Internal::checkResult(L, CA::actionError("xrmonitor: keybind manager not initialized", ERR, C_UNAVAIL));
-
-    const auto IT = g_pKeybindManager->m_dispatchers.find("xrmonitor");
-    if (IT == g_pKeybindManager->m_dispatchers.end())
-        return Internal::checkResult(L, CA::actionError("xrmonitor: dispatcher not registered", ERR, C_UNAVAIL));
-
-    const auto RES = IT->second(lua_tostring(L, lua_upvalueindex(1)));
-    if (!RES.success)
-        return Internal::checkResult(L, CA::actionError(RES.error, ERR, C_EXECFAIL));
-
-    return Internal::checkResult(L, CA::SActionResult{.passEvent = RES.passEvent});
+    return Internal::checkResult(L, OpenXR::xrmonitorAction(lua_tostring(L, lua_upvalueindex(1))));
 }
 
 static int dsp_forceRendererReload(lua_State* L) {
@@ -395,8 +382,8 @@ static int hlGlobal(lua_State* L) {
     return 1;
 }
 
-// Takes the verb and its arguments as one string, the same text that follows `xrmonitor,` in a
-// classic bind: hl.dsp.xrmonitor("gazepush 0.1").
+// Takes the verb and its arguments as one string (what `hyprctl openxr` takes after the
+// subcommand word): hl.dsp.xrmonitor("gazepush 0.1").
 static int hlXRMonitorDispatch(lua_State* L) {
     auto str = Check::string(L, 1);
     if (!str)
