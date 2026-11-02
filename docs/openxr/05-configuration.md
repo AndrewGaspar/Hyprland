@@ -152,6 +152,7 @@ Every variable, grouped by area. The "applies" column notes when a change takes 
 | `ignore_kernel_taint` | bool | `false` | Start XR even when the kernel has **already taken an oops this boot** (`/proc/sys/kernel/tainted` bit 7, `TAINT_DIE`). By default bring-up is refused in that state, because it unavoidably initializes *every* installed GPU vendor driver — a pin cannot prevent it — and entering an already-corrupt one can take the machine down. Development escape hatch only; it still warns at each start, and the real fix is a reboot. See the "sick driver" note below and the session/graphics doc. | start |
 | `runtime_json` | string | `""` | Path to the OpenXR runtime manifest (`openxr_*.json`) the session should handshake against, overriding `XR_RUNTIME_JSON` / `active_runtime.json` **for this compositor's XR session only**. Empty = leave the login environment untouched (loader default). Read on the **main thread** at each session start and applied to the loader's `XR_RUNTIME_JSON` before the handshake; clearing it back to empty restores the runtime the process launched with, so it round-trips cleanly. This is how the XREAL flat↔XR toggle (`scripts/xreal-mode.sh`) selects the xreal-flavor Monado without disturbing a WiVRn `active_runtime`. Set live with `hyprctl keyword openxr:runtime_json <path>` then `hyprctl openxr disable && hyprctl openxr enable` to re-handshake. Surfaced in `status` as `runtime json:`. See the XREAL rig doc (07). | start |
 | `force_linear` | string | `auto` | Allocate LINEAR (cross-GPU-importable) buffers for XR monitors: `auto` (only when a cross-GPU split is detected) / `on` / `off`. Needed together with `gpu` when the runtime GPU differs from the desktop's render GPU. Linear costs some compositing throughput. | start (applied at monitor bind) |
+| `pace_static_monitors` | bool | `false` | Composite every visible XR monitor on **every runtime frame**, even when nothing on it changed — the pacing behaviour before [AndrewGaspar/Hyprland#1](https://github.com/AndrewGaspar/Hyprland/issues/1). Off (the default), the XR tick only composites a monitor with something new on it (damage, an animation, cursor motion, a client drawing, a screencopy) and a static monitor costs no render, present or blit: its quad re-shows the last image. A diagnostic and escape hatch; see the virtual-monitors doc §Frame pacing and the `pacing` status object (§5). | hot (read every frame) |
 | `blend_mode` | string | `auto` | Environment blend mode: `auto` (runtime's preferred) / `opaque` (monitors over a black void) / `alpha` (**passthrough** — monitors over your real room, on runtimes that support it, e.g. WiVRn on Quest 3) / `additive` (optical see-through). An explicit mode the runtime doesn't advertise falls back to the preferred one with a warning. | start |
 | `overlay` | bool | `false` | Run as an `XR_EXTX_overlay` session so monitors composite **on top of another VR app** (a game, or `hypxrpaper`) instead of owning the view. Needs a runtime with the extension — Monado and WiVRn have it; SteamVR-Linux does not (downgrades to a normal exclusive session with a warning). See §8. | start |
 | `overlay_z` | int | `1` | Overlay stacking order (`sessionLayersPlacement`); higher composites later / on top. The primary app is always beneath. Only meaningful with `overlay = true`. | start |
@@ -1430,7 +1431,8 @@ JSON (`hyprctl -j openxr`) — all keys always present:
             "contentPath": "",
             "linear": false,
             "adaptive": { "enabled": false, "phase": "docked", "roamMode": "body", "seatDistM": 0.0, "transitionT": 0.0 },
-            "layout2d": { "source": "auto", "col": 0, "row": 0, "x": 1920, "y": 0, "azDeg": -12.40, "elDeg": -3.10 }
+            "layout2d": { "source": "auto", "col": 0, "row": 0, "x": 1920, "y": 0, "azDeg": -12.40, "elDeg": -3.10 },
+            "pacing": { "framesPresented": 5312, "framesBlitted": 5312, "ticksPaced": 5320, "ticksIdle": 48211 }
         }
     ],
     "layout2d": {
@@ -1516,6 +1518,12 @@ Field notes:
   currently enabled), `contentPath` (diagnostic: what the output is scanning out), `linear`
   (cross-GPU linear buffers active — text form appends `(linear)`), `grabbed`/`grabKind`,
   `hovered`, and the adaptive sub-state (`phase`, `roamMode`, `seatDistM`, `transitionT`).
+- `pacing` (per monitor, JSON only) — cumulative counters for damage-gated pacing (the
+  virtual-monitors doc §Frame pacing). `framesPresented`: desktop frames handed to the XR layer;
+  `framesBlitted`: fresh blits of those into the swapchain; `ticksPaced` / `ticksIdle`: runtime
+  frames on which the XR tick did / did not ask this monitor for a composite. Sample twice and
+  diff: a static monitor's `framesPresented` stands still while `ticksIdle` climbs at the runtime
+  rate. With `openxr:pace_static_monitors = 1` every tick is a paced one.
 - `anchor.pose` — for `local`, the world pose; for `head`/`body`/`device`, the configured
   offset — **except while `grabbed` is `true`, when it is always the live world pose**, so a
   status-polling consumer tracks the controller during a grab. `quat` order is `[x, y, z, w]`.
