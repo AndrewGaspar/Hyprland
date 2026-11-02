@@ -23,13 +23,16 @@ real-time replays of `living-room-02` (lr02: 3353 stereo pairs, 112 s) and the g
   all guardrails pass). Do this first; it is a few lines.
 - **The structural refactor to start is an 8-bit, fixed-point, SIMD KLT tracker** (OpenCV-style) in
   place of Basalt's float patch tracker, on one 8-bit pyramid fed straight from the descramble pass.
-  A drop-in prototype cuts the frontend 60 → 18 M (−70 %) and SLAM total −51 %, but the backend gets
-  more tracks (+74 %) and quality fails the guardrails (ATE 1.6 cm, closure 2.6 cm), so it needs the
-  exposure normalisation / residual gating / point cap work before it can ship. Done right, SLAM total
-  lands at ~25–30 M per pair.
+  A drop-in prototype cuts the frontend 60 → 18 M (−70 %) and SLAM total −51 % (the backend gets
+  more tracks, +74 %). It fails the harness's trajectory-similarity guardrails (ATE 1.6 cm vs the
+  baseline run, closure 2.6 cm), but those are a lottery for any result-changing change (the tune
+  lane's finding); on the independent two-view metrics it is **better on revisit error (1.0–1.2 vs
+  1.57 cm)** and slightly worse on closure error (1.6 ± 0.4 vs 1.26 cm). Promising, not yet proven:
+  it needs the point cap (to give the backend cost back) and a ground-truth check. Done right, SLAM
+  total lands at ~25–30 M per pair.
 - **Motion-gated frame rate** (skip pairs while the head is slow, never after camera gaps) saves −34 %
-  on average on these recordings but nothing in the worst case, and costs ~0.4–0.9 cm of trajectory
-  accuracy as measured. Worth having later as a power mode, not as the main lever.
+  on average on these recordings but nothing in the worst case; its accuracy cost is small but
+  probably real (revisit error +0.25 cm on the pairs it keeps, closure error 1.26 → 2.4 cm). Worth having later as a power mode, not as the main lever.
 - **Fewer levels / fewer points** are config knobs that each cost measurable accuracy; not structural
   wins.
 - **GPU (Xe2) offload** would remove the frontend from the CPU at < 1 ms GPU time per pair, but it is a
@@ -133,15 +136,15 @@ Cove cycles). "Measured" = this doc's prototypes (§5);
 | # | option | saving | quality / latency risk | effort | deps | status |
 |---|---|---|---|---|---|---|
 | S1 | skip mask-covered cells in cam1 detection | **−17.4 M (−25 %)** measured; FE −29 % | none: all guardrails PASS | hours | — | prototype `BASALT_STRUCT_DETECT=2`; incremental agent (a) owns it |
-| C1 | 8-bit fixed-point SIMD KLT (OpenCV-style) for tracking + matching, with S1 | **−35.6 M (−51 %)** measured (FE −70 %, BE +74 %) | **FAIL as a drop-in** (ATE 1.6 cm, closure 2.6 cm); needs exposure normalisation / residual gating / point cap | 1–2 weeks to production | OpenCV `video` module (already a dependency family) | prototype `BASALT_STRUCT_KLT`; the structural refactor to start |
+| C1 | 8-bit fixed-point SIMD KLT (OpenCV-style) for tracking + matching, with S1 | **−35.6 M (−51 %)** measured (FE −70 %, BE +74 %) | fails the trajectory-similarity guardrails (ATE 1.6 cm, closure 2.6 cm); independent metrics: revisit error **better** (1.0–1.2 vs 1.57 cm), closure error 1.6 vs 1.26 cm; needs a point cap + ground truth | 1–2 weeks to production | OpenCV `video` module (already a dependency family) | prototype `BASALT_STRUCT_KLT`; the structural refactor to start |
 | C2 | 8-bit end to end, fused decode → level 0/1, one pyramid for LK + FAST | ~2–4 M est. (pyramid, widening, narrowing) + halves the working set (fits the LP E-core 4 MB L2) | none | days | Monado + Basalt VIT change | enabler for C1/O1; incremental agent (c) |
 | C3 | early-exit Gauss–Newton, no-GEMM products, precomputed gradients | 10–20 M est. on the patch tracker | none expected | days | — | incremental agent (b); moot if C1 lands |
-| S2 | motion-gated vision rate (skip pairs while gyro < 0.3 rad/s, never after gaps) | **−24 M (−34 %)** measured on average; **0 % in the worst case** | ATE +0.9 cm, closure 0.6 → 1.7 cm on lr02; without the gap guard lr01 on-SLAM 54 → 32 % | days (driver-side) | time-based keyframe policy in Basalt | prototype `BASALT_STRUCT_SKIP_BELOW` + `_GAP_MS`; later |
+| S2 | motion-gated vision rate (skip pairs while gyro < 0.3 rad/s, never after gaps) | **−24 M (−34 %)** measured on average; **0 % in the worst case** | ATE 0.9 cm vs baseline run; revisit error +0.25 cm on the kept pairs, closure error 1.26 → 2.4 cm; without the gap guard lr01 on-SLAM 54 → 32 % | days (driver-side) | time-based keyframe policy in Basalt | prototype `BASALT_STRUCT_SKIP_BELOW` + `_GAP_MS`; later |
 | S2' | fixed 15 Hz | −35 M (−50 %) measured (solo, old harness) | ATE 1.0 cm, closure 1.7 cm; same gap problem | trivial | — | not recommended alone |
-| S4 | fewer points (grid 45) | −25 M (−36 %) measured (solo, old harness) | closure 2.5 cm, ATE 0.9 cm; init jitter (the reason for grid 35) | config | — | keep as a knob; adaptive budget is the real version |
-| S3 | fewer pyramid levels (2 / 1) | −8 / −19 M (−11.5 / −27 %) measured (solo, old harness) | closure ~2 cm, ATE 0.7 / 1.2 cm | config | — | not worth it |
+| S4 | fewer points (grid 45) | −25 M (−36 %) measured (solo, old harness) | closure 2.5 cm, ATE 0.9 cm, revisit error 2.45 cm (worse); init jitter (the reason for grid 35) | config | — | keep as a knob; adaptive budget is the real version |
+| S3 | fewer pyramid levels (2 / 1) | −8 / −19 M (−11.5 / −27 %) measured (solo, old harness) | closure ~2 cm, ATE 0.7 / 1.2 cm, revisit 1.9 / 2.0 cm (worse) | config | — | not worth it |
 | S5 | mono frames with periodic stereo | ~−10 M est. (half the tracking on mono frames) | medium (scale via IMU only between stereo frames) | 1–2 weeks | frontend + keyframe changes | after C1, if still needed |
-| W1 | batch the IMU hand-off (signal every 8 samples / on frame push), batched VIT IMU push | ~0 cycles; −~750 wakeups/s | none (IMU leads frames by tens of ms) | hours | — | do with S1 |
+| W1 | batch the IMU hand-off (signal every few samples / on frame push), batched VIT IMU push | ~0 cycles; −~650–750 wakeups/s | none (IMU leads frames by tens of ms) | hours | — | **done** by the incremental lane (Monado `eff-imgpath`, every 4 samples + before each pair) |
 | P1 | place on LP E-cores; `uclamp_max` / EAS instead of hard pinning | power, not cycles | deadline only once S1 + C1 land | hours + measurement on the laptop | kernel ≥ 6.16, intel_pstate mode | measure on Lunar Lake after S1 |
 | PL | plane detection: run only while a consumer wants planes, or after the head moved | −4.1 M → ~0 when idle | none | hours | — | small; do anytime |
 | O1 | frontend on the Xe2 GPU (Vulkan compute) | −FE (−18 M after C1) +~0.5–1 ms GPU wall per pair | frame-pacing contention with the compositor (manageable with a low-priority compute queue) | 3–6 weeks + CPU fallback | Vulkan in Basalt or a VIT frontend hook | defer |
@@ -181,8 +184,10 @@ descramble and the frame allocation. Fixed 15 Hz (`BASALT_STRUCT_DECIMATE=2`) is
 the saving and the lower bound of quality.
 
 Measured (§5): gating at 0.3 rad/s skips 36 % of the pairs on lr02 (−34 % SLAM cycles per input
-pair) and fixed 15 Hz −50 %, but both move the trajectory by ~0.9–1.0 cm ATE and triple the closure
-error (0.6 → 1.7 cm); against the gold reference ATE goes 1.26 → 1.66 cm. On the gap-heavy lr01
+pair) and fixed 15 Hz −50 %, both move the trajectory by ~0.9–1.0 cm ATE from the baseline run, and on the
+independent metrics the motion-gated variant is slightly worse: revisit error 1.98 vs 1.73 cm on the
+59 frame pairs it keeps both frames of (null-ensemble sd 0.28), closure error vs two-view 2.36 vs
+1.26 cm. On the gap-heavy lr01
 recording, skipping without a guard halved the time on SLAM (54 → 32–35 %): re-acquisition after a
 camera gap needs every frame. With the guard (`BASALT_STRUCT_GAP_MS`: no skipping for 1 s after a gap)
 lr01 is unchanged (it then never skips). So this is a real but not free saving; it needs Basalt's
@@ -232,14 +237,20 @@ Measured (§5): the microbenchmark does Basalt's tracking + matching in 3.3 ms i
 pair (3.4×); inside Basalt (`BASALT_STRUCT_KLT=9` + `BASALT_STRUCT_DETECT=2`) the frontend drops
 **60.1 → 17.8 M cycles (−70 %)**, but the backend rises 9.1 → 15.8 M (+74 %: the KLT keeps more
 and longer tracks, 45 M vs 25 M backend instructions) and **quality fails the guardrails**: ATE 1.6
-cm, closure 2.6 cm, RPE1s 0.48 cm / 0.14° on lr02, and against the gold reference ATE 2.36 cm vs the
-baseline's 1.26. The direction is right, the drop-in is not good enough. What to try next, in order:
-the missing exposure normalisation (Basalt divides each patch by its mean; OpenCV LK compares raw
-intensities — normalise with a per-patch gain/bias or use the `OPTFLOW_LK_GET_MIN_EIGENVALS` error
-to reject), a residual threshold (`err` is ignored today), the IMU rotation as an affine pre-warp, and a cap on
-tracked points per cell so the backend sees the same observation count. A bigger window is not the
-fix: 11×11 costs more (FE 21.4 M) and fails the same way (ATE 1.57 cm). The 2–3 % shorter path
-length could be either lower pose jitter or a small scale bias; check that first. The production version keeps one
+cm, closure 2.6 cm, RPE1s 0.48 cm / 0.14° on lr02, ATE vs the gold reference 2.36 cm (baseline 1.26).
+But the tune lane showed those guardrails fail for 3 of 7 *null* perturbations of the baseline (a
+different trajectory ~0.5–1 cm away is the normal outcome of any change to which tracks are kept), so
+they cannot judge a tracker swap. On the independent two-view metrics (`$SCRATCH/tune/closure/`):
+revisit error over 118 frame pairs **1.20 / 1.04 cm (9×9 / 11×11) vs the baseline's 1.57** (null
+ensemble 1.79 ± 0.28) with rotation error 0.25–0.32° vs 0.38°, and closure error vs two-view
+1.66 ± 0.44 / 1.59 ± 0.33 cm vs 1.26. So the 8-bit KLT is at least not clearly worse, plausibly
+better. What to do next, in order: cap the tracked points per cell (or the backend's landmarks per
+keyframe) so the backend gets back to today's observation count and cost; check whether the 2–3 %
+shorter path is lower pose jitter or a small scale bias; get a ground-truth recording; use OpenCV's
+`err` / minimum-eigenvalue output to reject weak tracks; for scenes with auto-exposure changes (the
+recordings have a fixed 8 ms exposure) add a per-patch gain/bias, which Basalt gets from its mean
+normalisation and plain LK lacks. A bigger window is not needed: 11×11 costs more (FE 21.4 M) for
+about the same result. The production version keeps one
 8-bit pyramid (built with `cv::buildOpticalFlowPyramid` or a fused decode pass, below), uses it for
 both LK and FAST, and drops the `uint16_t` pyramid altogether.
 
@@ -393,10 +404,26 @@ build `sbase`: FE 61.1, SLAM 70.7 M; trajectory diff "ATE" vs the harness refere
 | grid 45 | 45.3 | −36.0 % | 2.49 | 0.88 | |
 | `DETECT=1` + skip + levels 2 | 29.1 | −58.8 % | 2.03 | 0.95 | lr01: on-SLAM 34.6 % (no gap guard) |
 
-For scale: the harness's gold config (much more effort, a different sane solution) sits at ATE
-1.25 cm / closure 3.7 cm from the baseline. Without ground truth, a trajectory that differs from the
-baseline by ~1 cm is not proven worse; the gold-relative ATE (1.26 → 1.66 for S2, → 2.36 for C1) is
-the better hint that these are real losses.
+**Reading the quality columns.** The guardrails compare against the baseline's own trajectory. The
+tune lane (`$SCRATCH/tune/NOTES.md`) showed that 3 of 7 null perturbations of the baseline (e.g.
+`max_recovered_dist2` 0.04 → 0.0375) already fail them: any change to which tracks survive lands on a
+different trajectory ~0.5–1 cm away. So for result-changing variants the FAILs above say "different",
+not "worse". The independent metrics from that lane (two-view SIFT/PnP estimates, no reference to
+the baseline) on lr02:
+
+| variant | revisit error, 118 pairs (RMS cm) | rotation (deg) | closure error vs two-view (cm) |
+|---|---:|---:|---:|
+| baseline (10 runs) | 1.57 | 0.38 | 1.26 ± 0.02 |
+| baseline null ensemble (tune lane, 8 configs) | 1.79 ± 0.28 | | |
+| S1 `DETECT=2` | 1.57 | 0.38 | 1.24 |
+| C1 `KLT=9` + S1 | **1.20** ± 0.09 | 0.25 | 1.66 ± 0.44 |
+| C1 `KLT=11` + S1 (paired) | **1.04** ± 0.11 | 0.32 | 1.59 ± 0.33 (its paired baseline 1.32) |
+| S2 skip + gap guard | 1.98 (59 kept pairs; baseline 1.73 on the same) | 0.38 | 2.36 ± 0.14 |
+| levels 2 / levels 1 (solo, old) | 1.92 / 2.03 | 0.44 / 0.63 | |
+| grid 45 (solo, old) | 2.45 | 0.38 | |
+
+So: S1 is identical; the KLT is better on revisit error and a little worse on closure (one number,
+noisy); S2, fewer levels and fewer points are somewhat worse. Ground truth would settle C1.
 
 **KLT microbenchmark** (`klt_bench`, OpenCV capped to AVX2 — its `calcOpticalFlowPyrLK` is not
 runtime-dispatched and runs at the SSE baseline of Arch's `-march=x86-64` build — one Zen 5c core,
@@ -426,17 +453,16 @@ what makes a KLT expensive. At 15 Hz the 9×9 KLT still holds ~95 % of its point
 
 1. **Now (incremental agents, already assigned):** S1 masked-cell skip (agent a; reuse
    `BASALT_STRUCT_DETECT=2`, Basalt `slam-eff-struct` ae92b7e), patch-tracker kernels (agent b), patch
-   caching / allocations / 8-bit input (agent c). Add W1 (IMU hand-off batching, Monado, hours) and PL
-   (plane detection only on demand) to the queue; neither needs the harness's cycle metric to justify
-   it.
+   caching / allocations / 8-bit input (agent c; its round 1 already batched the IMU hand-off, W1).
+   Add PL (plane detection only on demand) to the queue.
 2. **Start the structural refactor: C1 + C2 as one design** — an `OpticalFlow` variant in Basalt that
    owns one 8-bit pyramid per camera (built once, used by LK and FAST), tracks with a fixed-point SIMD
    KLT (OpenCV's `calcOpticalFlowPyrLK` first, own kernel later), and keeps Basalt's forward-backward
-   check, IMU-predicted guesses and grid bookkeeping. Quality work before cost work: add per-patch
-   gain/bias normalisation, use the LK error/min-eigenvalue to reject, cap points per cell so the
-   backend sees today's observation count, and the IMU rotation as an affine pre-warp (a bigger
-   window alone did not help). Ship only when it passes the harness guardrails (and ideally a recording with ground truth). Agent (b)'s
-   kernel work and this refactor overlap: if C1 lands, (b)'s work on the float patch tracker becomes
+   check, IMU-predicted guesses and grid bookkeeping. Next steps: cap points so the backend cost
+   comes back down, explain the shorter path, reject weak tracks on the LK error, add gain/bias for
+   auto-exposure. Judge it on the independent metrics (revisit error, closure error vs two-view, a
+   ground-truth recording), not on the trajectory-similarity guardrails, which any tracker swap
+   fails. Agent (b)'s kernel work and this refactor overlap: if C1 lands, (b)'s work on the float patch tracker becomes
    the fallback path only, so sequence (b) on the parts C1 keeps (detection, pyramid, bookkeeping).
 3. **Then measure on the Lunar Lake laptop:** pin to the LP E-cores (`XREAL_AIR_SLAM_CPUS`), power-saver,
    battery; package power via RAPL. Decide between hard pinning and `uclamp_max` (+ EAS if the kernel
@@ -450,13 +476,13 @@ what makes a KLT expensive. At 15 Hz the 9×9 KLT still holds ~95 % of its point
 
 - **Skymont per-clock throughput on this code** is the biggest unknown in every Lunar Lake number
   here. One replay pinned to an LP E-core on the laptop settles it.
-- **Ground truth.** The quality calls for S2, S3, S4 and C1 rest on differences from the baseline
-  trajectory and on start-to-end closure. A recording with an independent reference (fiducial at start
-  and end, or a motion-capture session) would turn "differs by 1 cm" into "is worse by x cm".
+- **Ground truth.** The quality calls for S2, S3, S4 and C1 rest on the two-view revisit and closure
+  metrics, which are independent of the baseline but approximate. A recording with a real reference
+  (fiducials, or a motion-capture session) would turn "differs by 1 cm" into "is worse by x cm".
 - **Can the camera run slower?** The UVC device lists one mode; whether `VIDIOC_S_PARM` accepts a
   longer frame interval (or a HID command does) is untested. A camera-side 15 Hz would also remove the
   USB transfer, the descramble and their wakeups.
-- **Why the KLT prototype keeps more tracks** (backend +74 %) and whether that, rather than the
-  tracker's precision, drives its accuracy loss.
+- **Why the KLT prototype keeps more tracks** (backend +74 %), whether that is also why its revisit
+  error is lower, and what a point cap does to both.
 - **Package power, not just cycles:** none of the savings here were measured in watts (no RAPL as a user
   on this box); the laptop measurement in step 3 should include the before/after of S1 and C1.
