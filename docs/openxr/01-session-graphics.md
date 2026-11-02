@@ -369,7 +369,8 @@ while m_running:
                                  # also destroy layers pending removal, then ack to main (doc 02)
 
     if session.m_xrState in {VISIBLE, FOCUSED}:            # pacing (doc 02)
-        for l in layers: l.monitor->m_output->scheduleFrame()
+        enqueue SCHEDULE_FRAMES                            # main: scheduleFrame() only the monitors
+                                                           # with something new (damage-gated)
 
     xrWaitFrame -> frameState (predictedDisplayTime)
     xrBeginFrame
@@ -381,6 +382,7 @@ while m_running:
             { CScopedGLContext ctx: blit dmabuf -> swapchain image }   # bind ONLY here
             release swapchain image
         else if the quad already has content: skip (it re-presents its last image)
+        else: ask main for a composite (m_wantFrame) — doc 02 §Frame pacing
 
     input.frame(predictedDisplayTime)                      # xrSyncActions, rays, grab (doc 04)
 

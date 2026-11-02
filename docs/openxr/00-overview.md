@@ -134,7 +134,7 @@ atomics). Details are in docs 01, 02, and 04.
 | Removal barrier | `m_pendingRemoval` (atomic); ack via channel [C] | atomic | main → frame → main | Main sets the flag; the frame thread drops the layer from its snapshot, destroys its swapchain/GL resources after the in-flight frame — dropping its refs **before** the ack — and only then does main destroy the output (doc 02). |
 | Run flag | `COpenXRManager::m_running` (atomic) | atomic | main → frame | `stop()` clears it, then joins. |
 | Session state, input events, acks | SPSC queue drained by an eventfd on the wayland event loop | lock-free SPSC | frame → main | The frame thread pushes and signals the eventfd; the main-thread callback drains and dispatches (socket2 emission, pointer injection, teardown acks). |
-| Frame pacing | `mon->m_output->scheduleFrame()` | none (aquamarine-internal) | frame → compositor | Called from the frame thread only while the session is VISIBLE or FOCUSED (doc 02). |
+| Frame pacing | `SCHEDULE_FRAMES` → `mon->scheduleFrame()`; `CXRMonitorLayer::m_wantFrame` (atomic) | frame→main queue (aquamarine's idle list is main-thread-only) | frame → main → compositor | Enqueued once per runtime frame while the session is VISIBLE or FOCUSED; the main thread schedules only monitors with damage/work or whose layer raised `m_wantFrame` (doc 02 §Frame pacing). |
 
 ### Lifecycle
 

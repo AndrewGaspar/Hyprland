@@ -152,19 +152,76 @@ happens on the main thread. Which blit path last produced content
 
 ## Frame pacing
 
-Headless outputs advertise a meaningless refresh rate and nothing else schedules
-frames on an idle output, so the XR session must drive them. While the session is
-**VISIBLE or FOCUSED**, the frame thread — once per `xrWaitFrame` iteration —
-enqueues a `SCHEDULE_FRAMES` event onto the frame→main queue. The **main thread**
-drains it and calls `mon->scheduleFrame()` for every bound, non-pending-removal
-layer.
+A headless output renders only when something schedules a frame on it, exactly like a DRM
+output: damage (`CMonitor::addDamage`), animation ticks, cursor motion, a client's
+`wl_surface.frame` request (`damageSurface`), screencopy, FIFO, and the XR-specific sources that
+damage the monitor themselves (the transparency envelope, the cross-GPU re-allocation, the don
+snapshot). aquamarine's headless backend paces those frames to the output's **mode refresh**:
+`CHeadlessOutput::scheduleFrame` defers the frame to `lastFrame + 1/refresh` with a timer, so a
+client that commits on every frame callback renders at the mode rate (60 Hz for the default
+`@60`), never unbounded.
 
-The scheduling call is deliberately main-thread-only: `CMonitor::scheduleFrame()`
-lands in aquamarine's idle-callback vector, which the main thread concurrently drains
-in `CBackend::dispatchIdle` with no lock — calling it from the frame thread would
-corrupt the heap. The result is that the runtime's frame cadence (e.g. 90 Hz) drives
-compositor renders of each visible XR monitor. When the session drops to
-idle/synchronized, pacing stops and the outputs return to damage-driven rendering.
+The XR session adds a tick on top of that. While the session is **VISIBLE or FOCUSED**, the frame
+thread — once per `xrWaitFrame` iteration — enqueues a `SCHEDULE_FRAMES` event onto the
+frame→main queue, and the **main thread** runs `schedulePacedFrames`, which walks the bound,
+non-pending-removal layers and calls `mon->scheduleFrame()` only for a monitor that has
+something new to show (`OpenXR::xrPaceShouldSchedule`):
+
+- the **frame thread asked for a buffer** (`CXRMonitorLayer::m_wantFrame`, see below), or
+- the **renderer says the monitor has work** — `IHyprRenderer::shouldRenderMonitor`: pending
+  damage, forced full frames, or a frame already requested. Every damage source already
+  schedules its own frame, so this is a backstop; `scheduleFrame` on an output that is already
+  due is a no-op, or
+- `hl.config({ openxr = { pace_static_monitors = true } })`, the escape hatch that restores the
+  old behaviour (read on the main thread each tick, so a runtime `hl.config` applies on the next
+  one).
+
+A monitor that matches none of these is left alone, and its quad keeps showing the swapchain
+image it last released, which the runtime re-composites every frame. A static monitor costs no
+render pass, no present, no buffer handoff and no blit. (Before
+[#1](https://github.com/AndrewGaspar/Hyprland/issues/1) the tick scheduled *every* XR monitor on
+every runtime frame; aquamarine's headless `scheduleFrame` raises `needsFrame` unconditionally,
+which defeats the renderer's damage early-out, so a static monitor paid a full begin/end pass,
+present, handoff and blit per runtime frame — 37% of a Lunar Lake iGPU's render engine for five
+static `sbs/depth` monitors.) The tick never makes a damaged monitor render faster than before:
+the headless mode-refresh pacing above applies to both paths.
+
+On a skipped tick a depth-paired monitor still republishes the XR ray cursor's depth target
+(`publishCursorDisparity`), which used to ride on every `presented`: the ray moving between
+windows at different depths need not damage anything. The pair *declaration* is not republished
+— it must stay tied to the buffer it describes.
+
+**The frame thread's half.** A layer that received no new buffer this frame is planned by
+`OpenXR::xrPlanStaleLayer`:
+
+| State | Action |
+|---|---|
+| content on screen, overlays unchanged | **keep**: no acquire, no blit; submit the quad as-is |
+| content on screen, chrome / cursor / uniform fade moving, snapshot fresh | **overlay**: acquire, restore the content snapshot, redraw the overlays (doc 04 §6) |
+| content on screen, overlays moving, snapshot stale | **keep** this frame and raise `m_wantFrame` — restoring would put an old desktop back |
+| no content since the swapchain was (re)created | **fill** (acquire + clear; the quad stays unsubmitted) and raise `m_wantFrame` |
+
+The no-content row is what gets a static monitor its first image after a bind, a session start
+or a mode-change swapchain recreate without waiting for incidental damage. Submitting a quad
+whose swapchain was not acquired this frame is valid OpenXR: the runtime uses the most recently
+released image.
+
+The scheduling call is deliberately main-thread-only: `CMonitor::scheduleFrame()` lands in
+aquamarine's idle-callback vector, which the main thread concurrently drains in
+`CBackend::dispatchIdle` with no lock — calling it from the frame thread would corrupt the heap.
+When the session drops to idle/synchronized the tick stops and the outputs are purely
+damage-driven.
+
+`hyprctl -j openxr` reports the per-monitor `pacing` counters (`framesPresented`,
+`framesBlitted`, `ticksPaced`, `ticksIdle`; configuration doc §5). `framesPresented` can run ahead of
+`framesBlitted`: a damaged monitor composites at its mode refresh, while the frame thread blits
+only the newest buffer, once per runtime frame (a 60 Hz monitor under a 20 Hz null compositor
+presents ~3× per blit). In the hermetic container (AMD, Monado null compositor at 20 Hz) five
+static 1920×1200 / 1080×1920 monitors went from 100 presents/s and ~17% of Hyprland's GPU time
+to 0 and 0%. The
+`xr_pacing_damage_gated` integration test asserts the contract end to end: static → no
+presents while idle ticks climb; `pace_static_monitors = true` → every tick; a workspace switch,
+cursor motion and a continuously drawing client → presents, then quiet again.
 
 ## Mode changes (swapchain recreate protocol)
 
@@ -254,9 +311,10 @@ aquamarine headless-output lifetime issue: `CHeadlessOutput::scheduleFrame()` qu
 the output's own frame callback (raw `this`, no liveness guard) into the backend's
 idle list, and neither `destroy()` nor the destructor removes it — freeing the output
 with a callback still queued would emit on freed memory on the next `dispatchIdle`.
-Because XR pacing schedules a frame on the output almost every runtime frame, this is
-a hot path during create/destroy churn. `destroyOutputDeferred` calls `destroy()`
-(which clears the frame listener, so the stale callback becomes an inert emit) and
+XR pacing used to schedule a frame on every output almost every runtime frame, which made
+this a hot path during create/destroy churn; with damage-gated pacing a queued callback is
+rarer, but a freshly created or damaged output is still scheduled, so the guard stays.
+`destroyOutputDeferred` calls `destroy()` (which clears the frame listener, so the stale callback becomes an inert emit) and
 then keeps a reference to the output alive inside a **sentinel idle event** queued
 after any pending callback, dropping the last reference only once the idle queue has
 drained past it.
@@ -425,9 +483,10 @@ or at runtime `hyprctl eval 'hl.monitor({ output = "DP-1", mode = "preferred", p
   headless source is indistinguishable from a DRM one. It composes cleanly with the XR
   quad blit, which independently consumes the *presented buffer* — the two consumers
   never touch the same object.
-- Pacing: XR-1 renders when the frame thread paces it (session visible) or when
-  damaged, and each new XR-1 frame damages its mirrors, so DP-1 updates at min(XR
-  cadence, DP-1 refresh). An idle session simply shows the last rendered frame.
+- Pacing: XR-1 renders when it is damaged (or the frame thread asks for a buffer —
+  §Frame pacing), and each new XR-1 frame damages its mirrors, so DP-1 updates at most at
+  min(XR-1 mode refresh, DP-1 refresh) and not at all while XR-1 is static. An idle
+  session simply shows the last rendered frame.
 
 ## Status observability
 
