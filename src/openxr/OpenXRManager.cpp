@@ -1426,18 +1426,60 @@ void COpenXRManager::dispatchStateEvent(const SXRStateEvent& e) {
                 Log::logger->log(Log::DEBUG, "[OPENXR] recenter: follow policy did not re-seat — {}", r.error());
             break;
         }
-        case eXRStateEventType::SCHEDULE_FRAMES: {
+        case eXRStateEventType::SCHEDULE_FRAMES:
             // Pacing on behalf of the frame thread (see the frame loop): scheduleFrame() is
             // main-thread-only (aquamarine idle-callback list has no lock).
-            std::scoped_lock lock(m_layersMu);
-            for (auto& l : m_layers) {
-                if (l->m_pendingRemoval.load(std::memory_order_acquire))
-                    continue;
-                if (auto mon = l->m_monitor.lock())
-                    mon->scheduleFrame();
-            }
+            schedulePacedFrames();
             break;
+    }
+}
+
+// MAIN THREAD. One XR tick's pacing (doc 02 §Frame pacing, AndrewGaspar/Hyprland#1).
+//
+// This used to schedule a frame on EVERY XR monitor on every runtime frame. aquamarine's headless
+// scheduleFrame() raises needsFrame unconditionally, and that defeats the renderer's damage
+// early-out: a monitor nothing had touched still paid a begin/end pass, a present, a buffer
+// handoff and a frame-thread blit per runtime frame (37% of a Lunar Lake iGPU for five static
+// sbs/depth monitors, enough to make Monado miss frames under PL1).
+//
+// None of that is needed. Every source of change on a headless output already schedules its own
+// frame through the path a DRM output uses (damage, animation ticks, cursor motion, frame-callback
+// requests via damageSurface, screencopy, FIFO, the transparency envelope, the don snapshot), and
+// aquamarine paces those to the monitor's mode refresh, as before. So a tick schedules a monitor
+// only when the frame thread asked for a buffer (xrPlanStaleLayer), when the renderer itself says
+// the monitor has work (a backstop: scheduleFrame on an already-due output is a no-op), or when
+// openxr:pace_static_monitors asks for the old every-tick behaviour.
+void COpenXRManager::schedulePacedFrames() {
+    static auto      PPACEALL = CConfigValue<Hyprlang::INT>("openxr:pace_static_monitors");
+    const bool       PACEALL  = *PPACEALL != 0;
+
+    std::scoped_lock lock(m_layersMu);
+    for (auto& l : m_layers) {
+        if (l->m_pendingRemoval.load(std::memory_order_acquire))
+            continue;
+
+        const auto MON = l->m_monitor.lock();
+        if (!MON || !MON->m_output)
+            continue;
+
+        const bool WANTSFRAME = l->m_wantFrame.exchange(false, std::memory_order_acq_rel);
+        const bool HASWORK    = g_pHyprRenderer && g_pHyprRenderer->shouldRenderMonitor(MON);
+        if (OpenXR::xrPaceShouldSchedule(PACEALL, WANTSFRAME, HASWORK)) {
+            MON->scheduleFrame();
+            ++l->m_ticksPaced;
+            continue;
         }
+
+        ++l->m_ticksIdle;
+
+        // The XR ray cursor's depth target is otherwise only republished from `presented`, which a
+        // static monitor no longer emits. The ray moving over a depth desktop moves the pointer
+        // between windows at different depths without necessarily damaging anything, so keep the
+        // target current here. Only the target: the pair DECLARATION must stay tied to the buffer
+        // it describes, and this tick hands over no buffer.
+        const auto DECL = OpenXR::Stereo::unpackDecl(l->m_stereoPairDecl.load(std::memory_order_acquire));
+        if (DECL.producer == OpenXR::Stereo::PRODUCER_DEPTH)
+            l->publishCursorDisparity(MON, true);
     }
 }
 
@@ -1764,11 +1806,12 @@ void COpenXRManager::frameThread() {
 
         const bool visible = m_session->m_xrState == XR_SESSION_STATE_VISIBLE || m_session->m_xrState == XR_SESSION_STATE_FOCUSED;
 
-        // Pacing (doc 02): drive compositor renders of each visible XR monitor at the XR
-        // cadence, VISIBLE/FOCUSED only — no scheduleFrame churn while idle. Routed through
-        // the frame->main queue: CMonitor::scheduleFrame() lands in aquamarine's idle-callback
-        // vector, which the main thread concurrently drains in CBackend::dispatchIdle with no
-        // lock — calling it from this thread corrupts the heap.
+        // Pacing (doc 02): once per XR frame, VISIBLE/FOCUSED only, let the main thread composite
+        // the XR monitors that have something new to show (schedulePacedFrames — a static monitor
+        // is left alone and its quad keeps the last released image). Routed through the
+        // frame->main queue: CMonitor::scheduleFrame() lands in aquamarine's idle-callback vector,
+        // which the main thread concurrently drains in CBackend::dispatchIdle with no lock —
+        // calling it from this thread corrupts the heap.
         if (visible && !active.empty())
             enqueue(SXRStateEvent{.type = eXRStateEventType::SCHEDULE_FRAMES});
 
@@ -1984,8 +2027,17 @@ void COpenXRManager::frameThread() {
                 ((chromeOn && chromeVisualChanged && (newAlpha > 0.f || l->m_chromeDrawnAlpha > 0.f)) || ((cursorEnabled || gazeCurEnabled) && (cursorChanged || dispChanged)) ||
                  fadeVisualChanged);
 
-            if (!buf && !wantAnimTick && l->m_hasContent)
-                continue;
+            // No new desktop buffer — the normal state of a static monitor now that the XR tick only
+            // composites monitors with something new on them (doc 02 §Frame pacing, #1). Keep the
+            // last released image unless an overlay must move, and ask the main thread for a fresh
+            // composite when there is nothing (or nothing clean) to show.
+            if (!buf) {
+                const auto STALE = OpenXR::xrPlanStaleLayer(l->m_hasContent, wantAnimTick, l->m_snapFresh);
+                if (STALE.wantFrame)
+                    l->m_wantFrame.store(true, std::memory_order_release);
+                if (STALE.action == OpenXR::XR_STALE_KEEP)
+                    continue;
+            }
 
             XrSwapchainImageAcquireInfo acqInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
             uint32_t                    imgIdx  = 0;
@@ -2021,6 +2073,7 @@ void COpenXRManager::frameThread() {
                 const XR_GLuint dst = l->m_swapchainImages[imgIdx];
                 if (buf) {
                     m_graphics->blitBuffer(buf, *l, dst, blackAlpha, blackKnee);
+                    l->m_framesBlitted.fetch_add(1, std::memory_order_relaxed);
                     if (!l->m_hasContent)
                         Log::logger->log(Log::DEBUG, "[OPENXR] first blit landed for XR monitor '{}' ({}x{})", l->m_monitorName, (int)l->m_swapchainSize.x,
                                          (int)l->m_swapchainSize.y);
@@ -3499,10 +3552,12 @@ void COpenXRManager::destroyOutputDeferred(SP<Aquamarine::IOutput> output) {
     // ~CHeadlessOutput removes that pending idle event. If the output is freed while a framecb is
     // still queued, the next CBackend::dispatchIdle() invokes it on freed memory —
     // events.frame.emit() on a dangling CSignal — which is exactly the observed crash
-    // (aquamarineFDWrite -> dispatchIdle -> emitInternal). Our XR frame pacing calls
-    // CMonitor::scheduleFrame() every runtime frame, so a headless XR output is almost always
-    // "due" (the immediate addIdleEvent path in scheduleFrame) when it is torn down during the
-    // heavy create/destroy churn of a config reload — hence the crash on most suite runs.
+    // (aquamarineFDWrite -> dispatchIdle -> emitInternal). XR frame pacing used to call
+    // CMonitor::scheduleFrame() on every XR output every runtime frame, so one was almost always
+    // "due" (the immediate addIdleEvent path in scheduleFrame) when it was torn down during the
+    // heavy create/destroy churn of a config reload — hence the crash on most suite runs. Pacing is
+    // damage-gated now (schedulePacedFrames), which makes a queued framecb rarer but not impossible:
+    // a freshly created or damaged output is scheduled exactly as before, so this stays.
     //
     // We cannot remove the pending idle event (framecb is private to CHeadlessOutput) nor patch the
     // system aquamarine library, so instead we guarantee the output outlives any stale callback.
@@ -6466,6 +6521,10 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
         info.surfacePreview              = l->m_surfacePreview.load(std::memory_order_relaxed);
         info.region                      = OpenXR::xrRegionName((OpenXR::eXRQuadRegion)l->m_hoverRegion.load(std::memory_order_relaxed)); // report 14
         info.contentPath                 = OpenXR::xrContentPathName(l->m_contentPath.load(std::memory_order_relaxed)); // WP-L2
+        info.framesPresented             = l->m_framesPresented.load(std::memory_order_relaxed);                        // doc 02 §Frame pacing
+        info.framesBlitted               = l->m_framesBlitted.load(std::memory_order_relaxed);
+        info.ticksPaced                  = l->m_ticksPaced;
+        info.ticksIdle                   = l->m_ticksIdle;
         // Cross-session restore (doc 03 §8.3): answers "will this monitor come back where I left it".
         info.restorable                  = l->m_restoreValid;
         info.restoreX                    = l->m_restoreOffset.pos.x;

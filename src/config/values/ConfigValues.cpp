@@ -789,6 +789,10 @@ std::vector<SP<IValue>> Values::getConfigValues() {
                    "allocate LINEAR buffers for XR monitors so the XR GPU can import them: auto (only when a cross-GPU split is detected, "
                    "default) | on | off. Needed when openxr:gpu is a different GPU than the desktop renders on; costs some compositing throughput",
                    "auto"),
+        MS<Bool>("openxr:pace_static_monitors",
+                 "composite every visible XR monitor on every runtime frame, even when nothing on it changed (the behaviour before damage-gated pacing). Off by default: a "
+                 "static XR monitor costs no render, present or blit and its quad re-shows the last image. A diagnostic and escape hatch. Read per frame (hot-toggles)",
+                 false),
         MS<String>("openxr:blend_mode", "environment blend mode: auto (runtime preferred) | opaque | alpha (passthrough) | additive. Read at session start", "auto"),
         MS<Float>("openxr:floor_offset", "fallback eye height in meters when the runtime lacks LOCAL_FLOOR", 1.5, {.min = 0.0, .max = 3.0}),
         MS<Float>("openxr:default_size", "default width of a new XR monitor quad, in meters", 1.6, {.min = 0.2, .max = 4.0}),

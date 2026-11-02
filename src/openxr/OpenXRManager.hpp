@@ -393,6 +393,14 @@ class COpenXRManager {
         // WP-L2: which blit path last filled this layer's swapchain — "none" | "dmabuf" | "cpu" |
         // "black". "black" flags a silent black-quad session (e.g. cross-GPU import failure).
         std::string contentPath = "none";
+        // Damage-gated pacing (doc 02 §Frame pacing, #1): cumulative counters. framesPresented =
+        // desktop buffers handed to the frame thread, framesBlitted = fresh swapchain blits,
+        // ticksPaced / ticksIdle = XR ticks that did / did not schedule this monitor. A static
+        // monitor's framesPresented stands still while its ticksIdle climbs at the runtime rate.
+        uint64_t framesPresented = 0;
+        uint64_t framesBlitted   = 0;
+        uint64_t ticksPaced      = 0;
+        uint64_t ticksIdle       = 0;
         // Cross-GPU: true iff this output's buffers are allocated LINEAR so the XR GPU can import
         // them (set when the XR runtime GPU differs from the buffer allocator; openxr:force_linear).
         bool        linear = false;
@@ -1103,6 +1111,7 @@ class COpenXRManager {
     void                   onFrameChannelReadable();                   // main thread: drain + dispatch
     void                   dispatchStateEvent(const SXRStateEvent& e); // main thread
     void                   dispatchInputEvent(const SXRInputEvent& e); // main thread (WP7 sink)
+    void                   schedulePacedFrames();                      // main thread: one XR tick's damage-gated pacing (doc 02)
 
     static eXRManagerState mapSessionState(int xrSessionState);
 

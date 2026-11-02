@@ -111,6 +111,7 @@ void CXRMonitorLayer::bindToMonitor(PHLMONITOR mon, std::function<void()> onGone
             m_latestBuffer = buf;           // SP keeps the buffer alive across threads
             m_haveNewFrame.store(true, std::memory_order_release);
         }
+        m_framesPresented.fetch_add(1, std::memory_order_relaxed);
     });
 
     // modeChanged: record the new pixel size for the frame thread to recreate the swapchain.

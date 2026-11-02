@@ -229,6 +229,22 @@ class CXRMonitorLayer {
     std::atomic<bool>       m_pendingRemoval{false}; // removal barrier flag
     std::atomic<bool>       m_removalAcked{false};   // frame thread acked removal once
 
+    // ---- damage-gated pacing (doc 02 §Frame pacing, AndrewGaspar/Hyprland#1) ----
+    // The XR tick schedules a compositor frame on this monitor only when something on it changed
+    // (COpenXRManager::schedulePacedFrames). m_wantFrame is the frame thread's half of that: it has
+    // no desktop image to show (first bind, swapchain recreate) or must redraw an overlay with no
+    // clean content snapshot to restore, so it needs a fresh buffer even though the desktop is
+    // static. Frame thread raises it, the main thread consumes it on the next SCHEDULE_FRAMES.
+    std::atomic<bool> m_wantFrame{false};
+    // Observability for `hyprctl openxr status` (the `pacing` object). Counters, never reset while
+    // the layer lives. m_framesPresented: buffers handed to the frame thread (main, presented
+    // listener). m_framesBlitted: fresh desktop blits into the swapchain (frame thread). m_ticksPaced /
+    // m_ticksIdle: XR ticks on which this monitor was scheduled / left alone (main).
+    std::atomic<uint64_t> m_framesPresented{0};
+    std::atomic<uint64_t> m_framesBlitted{0};
+    uint64_t              m_ticksPaced = 0; // main thread, under COpenXRManager::m_layersMu
+    uint64_t              m_ticksIdle  = 0; // main thread, under COpenXRManager::m_layersMu
+
     // One authorized surface may subscribe to one XR monitor layer. The mutex makes subscription
     // replacement + mailbox clearing atomic with frame publication, preventing stale-token races.
     std::mutex                            m_viewpointMu;
