@@ -412,6 +412,120 @@ Add `Environment=XREAL_AIR_PLANES=1` to the 6DoF drop-in; the journal says
 Offline: `monado-cli xreal-slam-replay` also writes `planes.csv` / `planes_final.csv`; without hardware,
 the simulated HMD serves static planes from `SIMULATED_PLANES="table:0,-0.55,-0.8,1.2,0.6;floor:0,-1.1,-1.5,3,3"`.
 
+### 1.7 Diagnostic capture: `scripts/xreal-capture` (flight recorder)
+
+When the 6DoF view swims, stutters or jumps, capture it *then*, without restarting anything and
+including the seconds **before** you reacted. With the cameras on (`XREAL_AIR_SLAM=1` or
+`XREAL_AIR_CAMERAS=1`) the xreal_air driver runs a flight recorder (`xreal_air_flight.h`): RAM rings
+always hold the last 60 s of the cheap signals, and a capture started at runtime writes them out
+first, then records live until stopped. Works with the packaged runtime (no debug GUI needed) and a
+checkout build alike. Nothing here restarts or signals the runtime or the compositor.
+
+```sh
+xreal-capture start                 # background; returns at once (auto-stop after 5 min, --for)
+xreal-capture mark "swim now"       # the key thing: "I see it NOW" (also works between captures)
+xreal-capture stop                  # finishes the bundle, prints its path + findings
+xreal-capture toggle --notify       # start if idle, else stop (for a keybind)
+xreal-capture arm 10                # also keep the last 10 s of camera frames in RAM (~176 MB)
+```
+
+Keybinds (Lua config; SUPER+ALT+M is taken by the monitor view):
+
+```lua
+-- XREAL diagnostic capture (HypXRland scripts/xreal-capture): record / stop, and "I see it NOW".
+local xc = "xreal-capture"   -- or the full path to <checkout>/scripts/xreal-capture
+hl.bind("SUPER + ALT + R", hl.dsp.exec_cmd(xc .. " toggle --notify"),
+        { description = "XREAL capture: start / stop" })
+hl.bind("SUPER + ALT + period", hl.dsp.exec_cmd(xc .. " mark --notify --source key swim"),
+        { description = "XREAL capture: mark (I see it now)" })
+```
+
+**What is always in RAM** (22 MB for 60 s, `XREAL_AIR_FLIGHT_LOOKBACK_S`): every IMU sample, every
+camera frame's telemetry (kernel / dequeue time: frame gaps and dequeue stalls), each new SLAM pose with
+the pose guard's verdict and world, t_slam's per-stage timing of each pose (no `SLAM_WRITE_CSVS`
+needed), every head pose handed out (6DoF or 3DoF) and the SLAM state changes (lost / acquired /
+resumed / reinit / diverged, wear, tracker restarts — never rate-limited, unlike the journal).
+Camera frames only when armed (`xreal-capture arm N`, or `XREAL_AIR_FLIGHT_FRAMES_S=N` in the unit):
+held by reference (no copy), ~17.6 MB of RAM per second.
+
+**Costs** (measured with a recorded 10 s slice fed at 1x, Zen 5 core, `tests_xreal_air_flight
+"[.bench]"`; a Lunar Lake E-core is slower, scale ~2x):
+
+| | CPU per second of data | user cycles / s | disk |
+|---|---|---|---|
+| rings only (always on) | +0.5 ms | ~+1 M | — |
+| frame look-back armed | +3 ms (page faults), +176 MB RSS at 10 s | ~+2 M | — |
+| capture `--no-cameras` | +5 ms | +11 M | 0.3–0.45 MB/s |
+| capture, cameras, raw | +7.5 ms | +17 M | 17.3 MB/s |
+| capture, cameras, zstd-1 (default) | +38 ms (3.8% of a core) | +154 M | 11.5 MB/s |
+| old `XREAL_AIR_EUROC_RECORD` PNG path, for comparison | +189 ms | +906 M | 9.8 MB/s |
+
+The writer is one nice-10 thread that reads the rings behind the producers: the sensor, camera and
+pose threads never wait for it or the disk; whatever it does not get to in time is counted
+(`dataset/capture.txt` `lost_*`). Limits: refuses to start with < 2 GB free at the target (the tool:
+< 4 GB with cameras), stops itself below 1 GB free, past 8 GB written, or after `max_s`.
+
+**A bundle** (`~/xreal-captures/xreal-<date>-<time>[-label]/`, `XREAL_CAPTURE_DIR`):
+
+| path | what |
+|---|---|
+| `README.md` | human summary: findings, headline numbers, marks with context, files |
+| `manifest.json` | versions (packages, runtime git tag, kernel, CPU), unit + process environment, toml + Basalt config, capture window, marks (monotonic + wall), counters, file list with meanings, replay recipe |
+| `summary.json` | quick analysis: SLAM latency p50/p90/p99/max + > 300 ms backlog clusters, tracking losses with times, pose-guard verdicts, 6DoF fraction, camera gaps > 60 ms + dequeue stalls, process + per-thread CPU, power profile / AC / battery / CPU pressure, journal missed-frame / warning counts, per mark: tracking state, latency and events around it, `findings` |
+| `dataset/` | the runtime's capture: `mav0/imu0`, `xreal/` (camera_frames.csv, imu_raw.csv, factory calibration, `frames.bin`), `flight/` (events, slam_poses, slam_timing, head_pose), `capture.txt` |
+| `host/` | HypXRland pose log (head 5 Hz + monitor anchors 1 Hz), per-thread CPU (`thread-cpu.csv`), power at start/stop, the runtime's journal (`journal.txt`, `journal.jsonl` with monotonic ns), unit file, toml, `hyprctl -j openxr` status/gaze at start/stop, marks |
+
+All dataset times are `CLOCK_MONOTONIC` ns (the journal's monotonic stamps are the same clock);
+`manifest.json` `capture.clock` maps them to wall time.
+
+**Replay** (frames recorded): `xreal-capture convert <bundle>` expands `frames.bin` into
+`dataset/mav0/cam{0,1}` PNGs (Monado `scripts/xreal-capture-to-euroc.py`, ~8 ms per pair), then
+
+```sh
+VIT_SYSTEM_LIBRARY_PATH=/usr/lib64/basalt-xreal/libbasalt.so.2 \
+XREAL_AIR_SLAM_CONFIG=/usr/share/basalt-xreal/xreal_air.toml \
+  /usr/libexec/monado-xreal/monado-cli xreal-slam-replay <bundle>/dataset <out>
+```
+
+(a checkout: `subprojects/monado/build-xreal/src/xrt/targets/cli/monado-cli` and your Basalt). The
+replay starts at the look-back's first frame, so arm the frame look-back if the moments before the
+press must replay too.
+
+#### For automation (agents, scripts, SSH)
+
+The CLI is the primary interface; the keybinds are a thin layer. Every command is non-interactive,
+takes `--json` (before or after the command) and prints exactly one JSON object, errors included
+(`{"ok": false, "error": "<word>", "message": ..., "code": N}`). It finds `XDG_RUNTIME_DIR`
+(`/run/user/<uid>`) and the Hyprland instance itself, so it works over SSH without a session
+environment; `--notify` is optional.
+
+| command | returns |
+|---|---|
+| `start [--for DUR] [--label T] [--cameras\|--no-cameras] [--lookback S] [--codec zstd\|raw] [--out DIR]` | at once: `{id, bundle, dataset, started, started_mono_ns, auto_stop_s, lookback_s, recording:{cameras, codec, frames_lookback_s, signals}}`; `--for` auto-stops (and finishes the bundle) on its own |
+| `mark TEXT` | `{text, mono_ns, wall, recording, bundle, in_runtime_ring}` |
+| `status` | `{active, capture:{id, bundle, elapsed_s, remaining_s, mb, pairs, dropped_pairs, lost_records, marks, runtime_recording, session_alive}, runtime:{running, pid, version, state, rings_s, frames_lookback_s, zstd}, slam:{tracking, world, pose_age_ms, pose_latency_ms}, disk_free_mb}` |
+| `stop` | `{bundle, reason, duration_s, size_mb, summary:{headline numbers}, findings:[...], already_stopped}`; a second `stop` returns `already_stopped: true` with the last bundle |
+| `run --for DUR [start options] [-- CMD ...]` | blocking: start, run CMD (or wait DUR), stop; the `stop` object plus `command_exit` |
+| `list` | `{bundles:[{id, bundle, label, started, duration_s, size_mb, marks, stop_reason, headline, finalized, packed}]}` |
+| `arm [S]` / `disarm` | `{frames_lookback_s, ram_mb_estimate}` |
+| `convert B` / `analyze B` / `pack B` | expand frames for replay / recompute `summary.json` / write `B.tar.zst` |
+
+Exit codes: 0 ok · 1 unexpected · 2 usage · 3 no runtime (or no flight recorder in it) · 4 busy (one
+capture at a time) · 5 refused by the runtime · 6 timeout · 7 not enough disk · 8 no such bundle.
+
+A scripted scenario: `xreal-capture run --for 60 --label "seated still" --json` (ask the user to sit
+still first), then read `summary.json` → `findings`, `tracking.loss_list`, `slam_latency_ms`,
+`camera.gap_list`, `marks[].context`; go to `dataset/` for detail.
+
+Transfer: `xreal-capture pack <bundle>` → `<bundle>.tar.zst`. Sizes: signals only ~0.3 MB/s of window
+(60 s look-back + 60 s live ≈ 40 MB, packs ~10x smaller); cameras add ~11.5 MB/s of live time (zstd
+frames barely shrink further: 60 s ≈ 0.7 GB), plus ~115 MB per 10 s of armed frame look-back.
+
+The control protocol underneath (for other tools): files `start` / `stop` / `mark` / `arm` with
+`key=value` lines renamed into `$XDG_RUNTIME_DIR/monado-xreal/capture/` (the packaged unit's
+`RuntimeDirectory`; `XREAL_AIR_FLIGHT_CTL` overrides), answered in `status` there; see
+`xreal_air_flight.h`. `XREAL_AIR_FLIGHT=0` turns the whole thing off.
+
 ---
 
 ## 2. The toggle

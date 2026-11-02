@@ -1,0 +1,1428 @@
+#!/usr/bin/env python3
+"""
+xreal-capture — on-demand diagnostic captures of the XREAL Air 2 Ultra 6DoF pipeline.
+
+Drives the Monado xreal_air flight recorder (subprojects/monado/src/xrt/drivers/xreal_air/
+xreal_air_flight.h) through its control directory and assembles everything around it into one
+self-contained bundle: the driver's data (including the seconds BEFORE the capture was asked for,
+from its always-on RAM rings), HypXRland's head pose and monitor anchors, per-thread CPU, power
+state, the runtime's journal, versions and configuration, a manifest.json and a precomputed
+summary.json.
+
+Made to be driven by scripts and agents first, keybinds second: every command is non-interactive,
+prints one JSON object with --json (errors too), and exits with a stable code.
+
+  xreal-capture start [--for DUR] [--label TEXT] [--cameras|--no-cameras] [--lookback S]
+                      [--codec zstd|raw] [--out DIR] [--notify] [--json]
+                                   start in the background, return at once
+  xreal-capture mark TEXT [--json]  "I see it NOW": a timestamped mark (also works between captures:
+                                   it stays in the runtime's event ring for the next look-back)
+  xreal-capture stop [--json]      stop, finish the bundle, print its path and summary (twice is fine)
+  xreal-capture toggle [--json]    start if idle, stop if recording (for a keybind)
+  xreal-capture status [--json]    capture in progress?, runtime, SLAM state, disk
+  xreal-capture list [--json]      bundles in the captures directory
+  xreal-capture run --for DUR [--label TEXT] [start options] [-- COMMAND ...]
+                                   blocking: capture while COMMAND runs (or for DUR), then stop
+  xreal-capture arm [SECONDS]      keep the last SECONDS (default 10) of camera frames in the
+                                   runtime's RAM (~17 MB per second) so captures reach back with
+                                   images too; `arm 0` / disarm frees it
+  xreal-capture disarm
+  xreal-capture convert BUNDLE     expand the stereo frames into EuRoC PNGs (for replay)
+  xreal-capture analyze BUNDLE     recompute summary.json
+  xreal-capture pack BUNDLE        BUNDLE.tar.zst for transfer
+
+Exit codes: 0 ok · 1 unexpected error · 2 usage · 3 no runtime / no flight recorder ·
+4 busy (a capture is already running) · 5 refused by the runtime · 6 timed out ·
+7 not enough free disk · 8 no such bundle.
+
+Environment (all optional, nothing here is host specific):
+  XREAL_CAPTURE_DIR        where bundles go (default ~/xreal-captures)
+  XREAL_CAPTURE_CTL        the runtime's control directory
+                           (default $XDG_RUNTIME_DIR/monado-xreal/capture)
+  XREAL_SERVICE_UNIT       the runtime's systemd user unit (default monado-xreal.service)
+  XREAL_CAPTURE_MIN_FREE_MB  refuse to start below this (default 4096 with cameras, 512 without)
+  XREAL_MONADO_SCRIPTS     where thread-cpu-log.py / xreal-capture-to-euroc.py live
+  HYPRCTL                  the hyprctl to use (default /usr/libexec/hypxrland/hyprctl, else PATH)
+
+Works over SSH and without a graphical session environment: it finds XDG_RUNTIME_DIR and the
+Hyprland instance itself. Read-only towards the session: it never restarts, stops or signals the
+runtime or the compositor.
+"""
+
+import argparse
+import bisect
+import csv
+import datetime
+import fcntl
+import glob
+import json
+import math
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+VERSION = 1
+
+EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_NO_RUNTIME, EXIT_BUSY = 0, 1, 2, 3, 4
+EXIT_REFUSED, EXIT_TIMEOUT, EXIT_LOW_DISK, EXIT_NOT_FOUND = 5, 6, 7, 8
+
+DEFAULT_MAX_S = 300  # 5 min: ~3.5 GB with cameras if a keybind start is forgotten
+JSON_OUT = False
+
+
+class Fail(Exception):
+    def __init__(self, code, error, message, **extra):
+        super().__init__(message)
+        self.code, self.error, self.message, self.extra = code, error, message, extra
+
+
+def emit(obj, human=None):
+    """One JSON object with --json, else a short human rendering."""
+    if JSON_OUT:
+        print(json.dumps(obj, indent=None, sort_keys=False))
+    elif human is not None:
+        print(human)
+    else:
+        for k, v in obj.items():
+            if k != "ok":
+                print(f"{k}: {json.dumps(v) if isinstance(v, (dict, list)) else v}")
+
+
+def now_wall_iso(t=None):
+    return datetime.datetime.fromtimestamp(time.time() if t is None else t).astimezone().isoformat(
+        timespec="milliseconds")
+
+
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return default
+
+
+def read_kv(path):
+    kv = {}
+    for line in read(path).splitlines():
+        k, sep, v = line.partition("=")
+        if sep:
+            kv[k] = v
+    return kv
+
+
+def write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def load_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def pid_alive(pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def parse_duration(s):
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(ms|s|m|min|h)?\s*", str(s))
+    if not m:
+        raise Fail(EXIT_USAGE, "usage", f"bad duration '{s}' (e.g. 90, 90s, 2m, 1h)")
+    v = float(m.group(1))
+    return v * {"ms": 0.001, None: 1, "s": 1, "m": 60, "min": 60, "h": 3600}[m.group(2)]
+
+
+def slug(text):
+    s = re.sub(r"[^A-Za-z0-9]+", "-", text or "").strip("-").lower()
+    return s[:40]
+
+
+def run_cmd(argv, timeout=10, env=None):
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return -1, "", str(e)
+
+
+# ---------------------------------------------------------------------------------------------
+# Finding the session, the runtime and the tools (also over SSH / without a session environment)
+# ---------------------------------------------------------------------------------------------
+
+def setup_env():
+    rt = os.environ.get("XDG_RUNTIME_DIR")
+    if not rt or not os.path.isdir(rt):
+        rt = f"/run/user/{os.getuid()}"
+        os.environ["XDG_RUNTIME_DIR"] = rt
+    # systemctl --user / busctl --user find the user bus here when DBUS_SESSION_BUS_ADDRESS is unset.
+    if not os.environ.get("DBUS_SESSION_BUS_ADDRESS") and os.path.exists(f"{rt}/bus"):
+        os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={rt}/bus"
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not sig or not os.path.exists(f"{rt}/hypr/{sig}"):
+        socks = sorted(glob.glob(f"{rt}/hypr/*/.socket.sock"), key=os.path.getmtime, reverse=True)
+        if socks:
+            os.environ["HYPRLAND_INSTANCE_SIGNATURE"] = os.path.basename(os.path.dirname(socks[0]))
+    return rt
+
+
+def runtime_dir():
+    return os.environ["XDG_RUNTIME_DIR"]
+
+
+def state_dir():
+    d = os.path.join(runtime_dir(), "xreal-capture")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return d
+
+
+def captures_root():
+    return os.path.abspath(os.path.expanduser(os.environ.get("XREAL_CAPTURE_DIR", "~/xreal-captures")))
+
+
+def ctl_dir():
+    return os.environ.get("XREAL_CAPTURE_CTL") or os.path.join(runtime_dir(), "monado-xreal", "capture")
+
+
+def unit_name():
+    return os.environ.get("XREAL_SERVICE_UNIT", "monado-xreal.service")
+
+
+def hyprctl_bin():
+    for c in (os.environ.get("HYPRCTL"), "/usr/libexec/hypxrland/hyprctl", shutil.which("hyprctl")):
+        if c and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def hyprctl_json(*args):
+    h = hyprctl_bin()
+    if h is None or not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return None
+    rc, out, _ = run_cmd([h, "-j", *args], timeout=3)
+    if rc != 0:
+        return None
+    try:
+        return json.loads(out)
+    except ValueError:
+        return None
+
+
+def monado_scripts_dirs():
+    here = os.path.dirname(os.path.realpath(__file__))
+    dirs = [os.environ.get("XREAL_MONADO_SCRIPTS"), "/usr/libexec/monado-xreal", "/usr/share/monado-xreal/scripts",
+            os.path.join(here, "..", "subprojects", "monado", "scripts")]
+    for r in (os.environ.get("HYPXRLAND_REPO"), "~/code/Hyprland", "~/code/hypxrland"):
+        if r:
+            dirs.append(os.path.join(os.path.expanduser(r), "subprojects", "monado", "scripts"))
+    return [d for d in dirs if d]
+
+
+def find_monado_script(name):
+    for d in monado_scripts_dirs():
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            return os.path.abspath(p)
+    return None
+
+
+def unit_show():
+    rc, out, _ = run_cmd(["systemctl", "--user", "show", unit_name(), "-p",
+                          "MainPID,ActiveState,FragmentPath,DropInPaths,ExecStart,Environment"], timeout=5)
+    kv = {}
+    if rc == 0:
+        for line in out.splitlines():
+            k, _, v = line.partition("=")
+            kv[k] = v
+    return kv
+
+
+def runtime_status():
+    """The flight recorder's status file, or None if no live runtime answers there."""
+    st = read_kv(os.path.join(ctl_dir(), "status"))
+    if not st or not pid_alive(st.get("pid")):
+        return None
+    return st
+
+
+def require_runtime():
+    st = runtime_status()
+    if st is None:
+        u = unit_show()
+        raise Fail(EXIT_NO_RUNTIME, "no_runtime",
+                   f"no Monado flight recorder answers in {ctl_dir()} (unit {unit_name()} is "
+                   f"{u.get('ActiveState') or 'unknown'}). Needs the xreal runtime running with 6DoF or the "
+                   "cameras on, built with xreal_air_flight (XREAL_AIR_FLIGHT not 0).",
+                   ctl=ctl_dir(), unit=unit_name(), unit_state=u.get("ActiveState"))
+    return st
+
+
+_cmd_counter = [0]
+
+
+def send_command(name, params, timeout=10.0):
+    """Drop a command file into the control directory and wait for the runtime's answer."""
+    ctl = ctl_dir()
+    _cmd_counter[0] += 1
+    cid = f"{os.getpid()}-{int(time.time() * 1000)}-{_cmd_counter[0]}"
+    body = "".join(f"{k}={v}\n" for k, v in params.items() if v is not None) + f"id={cid}\n"
+    tmp = os.path.join(ctl, f".{name}.{cid}.tmp")
+    with open(tmp, "w") as f:
+        f.write(body)
+    os.replace(tmp, os.path.join(ctl, name))
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        st = read_kv(os.path.join(ctl, "status"))
+        if st.get("cmd_id") == cid:
+            return st
+        if st and not pid_alive(st.get("pid")):
+            break
+        time.sleep(0.05)
+    try:
+        os.unlink(os.path.join(ctl, name))
+    except OSError:
+        pass
+    raise Fail(EXIT_TIMEOUT, "timeout", f"the runtime did not answer '{name}' within {timeout:.0f} s", ctl=ctl)
+
+
+def free_mb(path):
+    p = path
+    while p and not os.path.exists(p):
+        p = os.path.dirname(p)
+    try:
+        st = os.statvfs(p or "/")
+        return st.f_bavail * st.f_frsize / 2**20
+    except OSError:
+        return None
+
+
+def notify(summary, body=""):
+    if shutil.which("notify-send"):
+        run_cmd(["notify-send", "-a", "xreal-capture", "-t", "4000", summary, body], timeout=3)
+
+
+class StateLock:
+    """The single-capture lock: serializes start / stop / toggle transitions."""
+
+    def __init__(self, timeout=15):
+        self.f = open(os.path.join(state_dir(), "lock"), "w")
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise Fail(EXIT_BUSY, "busy", "another xreal-capture start/stop is in progress")
+                time.sleep(0.1)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.f.close()
+
+
+def active_info():
+    """The capture this tool is running, None if none (stale records are cleaned up)."""
+    path = os.path.join(state_dir(), "active.json")
+    a = load_json(path)
+    if a is None:
+        return None
+    if os.path.exists(os.path.join(a.get("bundle", ""), "host", "result.json")):
+        os.unlink(path)
+        return None
+    if a.get("session_pid") and not pid_alive(a["session_pid"]):
+        # Its background process died (killed, crashed, logged out): finish the bundle from here.
+        finalize(a["bundle"], "recovered: the session process was gone")
+        if os.path.exists(path):
+            os.unlink(path)
+        return None
+    return a
+
+
+# ---------------------------------------------------------------------------------------------
+# Host-side collection
+# ---------------------------------------------------------------------------------------------
+
+def power_state():
+    prof = ""
+    for argv in (["powerprofilesctl", "get"], ["tuned-adm", "active"]):
+        if shutil.which(argv[0]):
+            rc, out, _ = run_cmd(argv, timeout=3)
+            if rc == 0 and out.strip():
+                prof = out.strip().splitlines()[-1].split(":")[-1].strip()
+                break
+    ac, bats = None, []
+    for ps in glob.glob("/sys/class/power_supply/*"):
+        typ = read(f"{ps}/type").strip()
+        if typ == "Mains":
+            ac = read(f"{ps}/online").strip() == "1"
+        elif typ == "Battery":
+            b = {"name": os.path.basename(ps), "status": read(f"{ps}/status").strip(),
+                 "capacity_pct": read(f"{ps}/capacity").strip()}
+            pw = read(f"{ps}/power_now").strip()
+            if pw.isdigit():
+                b["power_w"] = int(pw) / 1e6
+            bats.append(b)
+    psi = read("/proc/pressure/cpu").strip().splitlines()
+    return {"wall": now_wall_iso(), "mono_ns": time.monotonic_ns(), "profile": prof, "ac_online": ac,
+            "batteries": bats, "psi_cpu": psi, "loadavg": read("/proc/loadavg").strip()}
+
+
+def process_env(pid, pattern=r"^(XRT_|XREAL_|VIT_|SLAM_|U_PACING|OXR_|MONADO|IPC_|EUROC|RUNTIME_DIRECTORY)"):
+    try:
+        with open(f"/proc/{int(pid)}/environ", "rb") as f:
+            items = f.read().split(b"\0")
+    except (OSError, ValueError):
+        return None
+    env = {}
+    for it in items:
+        k, _, v = it.decode(errors="replace").partition("=")
+        if k and re.match(pattern, k):
+            env[k] = v
+    return env
+
+
+def package_versions():
+    names = ["monado-xreal", "basalt-xreal", "hypxrland", "xreal-ctl", "kernel"]
+    out = {}
+    if shutil.which("rpm"):
+        for n in names:
+            rc, o, _ = run_cmd(["rpm", "-q", n], timeout=5)
+            out[n] = o.strip().splitlines() if rc == 0 else None
+    elif shutil.which("pacman"):
+        for n in names:
+            rc, o, _ = run_cmd(["pacman", "-Q", n], timeout=5)
+            out[n] = o.strip() if rc == 0 else None
+    return out
+
+
+def cpu_model():
+    for line in read("/proc/cpuinfo").splitlines():
+        if line.startswith("model name"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+class PoseLogger(threading.Thread):
+    """HypXRland's head pose at 5 Hz and the monitor anchors at 1 Hz (hyprctl -j openxr gaze/status)."""
+
+    def __init__(self, path):
+        super().__init__(daemon=True)
+        self.path, self.stop_ev, self.count = path, threading.Event(), 0
+
+    def run(self):
+        if hyprctl_bin() is None:
+            return
+        with open(self.path, "a") as f:
+            n = 0
+            while not self.stop_ev.is_set():
+                t0 = time.monotonic()
+                rec = {"t": time.time(), "mono_ns": time.monotonic_ns()}
+                g = hyprctl_json("openxr", "gaze")
+                if g is not None:
+                    rec["head"], rec["viewValid"] = g.get("head"), g.get("viewValid")
+                else:
+                    rec["gaze_err"] = "no answer"
+                if n % 5 == 0:
+                    s = hyprctl_json("openxr", "status")
+                    if s is not None:
+                        rec["world"] = s.get("worldFrame") or s.get("world_frame")
+                        rec["monitors"] = [{k: m.get(k) for k in ("name", "anchor", "size_m", "grabbed", "adaptive",
+                                                                    "anchorState")} for m in s.get("monitors", [])]
+                f.write(json.dumps(rec) + "\n")
+                f.flush()
+                n += 1
+                self.count = n
+                self.stop_ev.wait(max(0.0, 0.2 - (time.monotonic() - t0)))
+
+
+# ---------------------------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------------------------
+
+def cmd_start(args, quiet=False):
+    with StateLock():
+        a = active_info()
+        if a is not None:
+            raise Fail(EXIT_BUSY, "busy", f"already capturing to {a['bundle']}", id=a["id"], bundle=a["bundle"])
+        st = require_runtime()
+        if st.get("state") == "recording":
+            raise Fail(EXIT_BUSY, "busy", f"the runtime is already recording to {st.get('out')} (not started by "
+                       "this tool, or its state was lost); `xreal-capture stop` stops it", out=st.get("out"))
+
+        root = os.path.abspath(os.path.expanduser(args.out)) if args.out else captures_root()
+        need = float(os.environ.get("XREAL_CAPTURE_MIN_FREE_MB", 4096 if args.cameras else 512))
+        free = free_mb(root)
+        if free is not None and free < need:
+            raise Fail(EXIT_LOW_DISK, "low_disk", f"only {free:.0f} MB free at {root}, need {need:.0f} MB "
+                       "(XREAL_CAPTURE_MIN_FREE_MB)", free_mb=round(free), need_mb=need)
+
+        start_wall, start_mono = time.time(), time.monotonic_ns()
+        cid = datetime.datetime.fromtimestamp(start_wall).strftime("%Y%m%d-%H%M%S")
+        if args.label:
+            cid += "-" + slug(args.label)
+        bundle = os.path.join(root, f"xreal-{cid}")
+        n = 2
+        while os.path.exists(bundle):
+            bundle = os.path.join(root, f"xreal-{cid}-{n}")
+            n += 1
+        os.makedirs(os.path.join(bundle, "host"))
+
+        for_s = parse_duration(args.for_) if args.for_ else None
+        lookback = int(args.lookback) if args.lookback is not None else int(st.get("rings_s", 60))
+        params = {
+            "out": os.path.join(bundle, "dataset"),
+            "lookback_s": lookback,
+            "max_s": int(math.ceil(for_s)) if for_s else DEFAULT_MAX_S,
+            "frames": 1 if args.cameras else 0,
+            "codec": args.codec,
+        }
+        res = send_command("start", params)
+        if not res.get("cmd_result", "").startswith("ok"):
+            shutil.rmtree(bundle, ignore_errors=True)
+            msg = res.get("cmd_result", "").removeprefix("error: ")
+            code = EXIT_LOW_DISK if "MB free" in msg else EXIT_REFUSED
+            raise Fail(code, "refused", f"the runtime refused: {msg}", runtime_message=msg)
+
+        info = {
+            "id": os.path.basename(bundle), "bundle": bundle, "label": args.label or "",
+            "started_wall": start_wall, "started_iso": now_wall_iso(start_wall), "started_mono_ns": start_mono,
+            "for_s": for_s, "max_s": params["max_s"], "lookback_s": lookback, "cameras": bool(args.cameras),
+            "codec": args.codec if args.cameras else None, "notify": bool(args.notify), "unit": unit_name(),
+            "ctl": ctl_dir(), "runtime_pid": int(st.get("pid", 0)), "runtime_version": st.get("version"),
+            "frames_lookback_s": int(st.get("frames_lookback_s", 0) or 0), "tool_version": VERSION,
+        }
+        write_json(os.path.join(bundle, "host", "capture.json"), info)
+        with open(os.path.join(bundle, "host", "marks.jsonl"), "a"):
+            pass
+
+        log = open(os.path.join(bundle, "host", "session.log"), "a")
+        sess = subprocess.Popen([sys.executable, os.path.realpath(__file__), "_session", bundle],
+                                stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+                                close_fds=True)
+        info["session_pid"] = sess.pid
+        write_json(os.path.join(bundle, "host", "capture.json"), info)
+        write_json(os.path.join(state_dir(), "active.json"), info)
+
+    if args.notify:
+        notify("XREAL capture recording", f"{info['id']}" + (f" ({for_s:.0f} s)" if for_s else ""))
+    out = {
+        "ok": True, "id": info["id"], "bundle": bundle, "dataset": params["out"], "started": info["started_iso"],
+        "started_mono_ns": start_mono, "auto_stop_s": params["max_s"], "lookback_s": lookback,
+        "recording": {"cameras": info["cameras"], "codec": info["codec"],
+                      "frames_lookback_s": info["frames_lookback_s"],
+                      "signals": ["imu", "camera_frames", "slam_poses", "slam_timing", "head_pose", "events",
+                                  "hyprland_pose_log", "thread_cpu", "power", "journal"]},
+    }
+    if not quiet:
+        emit(out, f"recording to {bundle} (auto-stop after {params['max_s']} s, {lookback} s look-back"
+                  f"{', cameras' if info['cameras'] else ''})")
+    return out
+
+
+def cmd_session(args):
+    """The background half of a capture: loggers while it runs, then the bundle."""
+    bundle = args.bundle
+    info = load_json(os.path.join(bundle, "host", "capture.json"))
+    host = os.path.join(bundle, "host")
+    signal.signal(signal.SIGTERM, lambda *_: open(os.path.join(host, "stop-request"), "a").close())
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+    write_json(os.path.join(host, "power-start.json"), power_state())
+    for name, a in (("openxr-status-start.json", ("openxr", "status")), ("openxr-gaze-start.json", ("openxr", "gaze"))):
+        j = hyprctl_json(*a)
+        if j is not None:
+            write_json(os.path.join(host, name), j)
+
+    pose = PoseLogger(os.path.join(host, "pose-log.jsonl"))
+    pose.start()
+    cpu = None
+    tcl = find_monado_script("thread-cpu-log.py")
+    if tcl and pid_alive(info.get("runtime_pid")):
+        cpu = subprocess.Popen([sys.executable, tcl, "--pid", str(info["runtime_pid"]), "--interval", "1", "-o",
+                                os.path.join(host, "thread-cpu.csv")],
+                               stdout=subprocess.DEVNULL, stderr=open(os.path.join(host, "thread-cpu-summary.txt"), "w"))
+
+    dataset = os.path.join(bundle, "dataset")
+    reason = "stopped"
+    deadline = time.monotonic() + (info.get("for_s") or info.get("max_s") or DEFAULT_MAX_S) + 30
+    while True:
+        time.sleep(0.25)
+        req = os.path.join(host, "stop-request")
+        if os.path.exists(req):
+            reason = read(req).strip() or "stop requested"
+            break
+        st = read_kv(os.path.join(ctl_dir(), "status"))
+        if not st or not pid_alive(st.get("pid")):
+            reason = "runtime went away"
+            break
+        if st.get("state") != "recording" and st.get("last_out") == dataset:
+            reason = "runtime stopped: " + (st.get("last_stop_reason") or "?")
+            if reason.endswith("max_s reached") and info.get("for_s"):
+                reason = "--for elapsed"
+            break
+        if time.monotonic() > deadline:
+            reason = "session deadline"
+            break
+
+    pose.stop_ev.set()
+    if cpu is not None:
+        cpu.terminate()
+        try:
+            cpu.wait(5)
+        except subprocess.TimeoutExpired:
+            cpu.kill()
+    pose.join(3)
+    finalize(bundle, reason)
+    return 0
+
+
+def finalize(bundle, reason):
+    """Stop the runtime's capture if needed and write the bundle's files. Idempotent."""
+    host = os.path.join(bundle, "host")
+    with open(os.path.join(host, ".finalize.lock"), "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        done = load_json(os.path.join(host, "result.json"))
+        if done is not None:
+            return done
+        info = load_json(os.path.join(host, "capture.json"), {})
+        dataset = os.path.join(bundle, "dataset")
+
+        st = read_kv(os.path.join(ctl_dir(), "status"))
+        if st and pid_alive(st.get("pid")) and st.get("state") == "recording" and st.get("out") == dataset:
+            try:
+                send_command("stop", {"reason": reason.replace("\n", " ")}, timeout=60)
+            except Fail:
+                pass
+        stop_wall, stop_mono = time.time(), time.monotonic_ns()
+
+        write_json(os.path.join(host, "power-stop.json"), power_state())
+        for name, a in (("openxr-status.json", ("openxr", "status")), ("openxr-gaze.json", ("openxr", "gaze"))):
+            j = hyprctl_json(*a)
+            if j is not None:
+                write_json(os.path.join(host, name), j)
+
+        # The runtime's journal from a little before the look-back to now.
+        since = info.get("started_wall", stop_wall) - (info.get("lookback_s") or 0) - 10
+        jargs = ["journalctl", "--user", "-u", info.get("unit", unit_name()), "--since", f"@{since:.0f}",
+                 "--no-pager"]
+        rc, out, _ = run_cmd(jargs + ["-o", "short-iso-precise"], timeout=60)
+        with open(os.path.join(host, "journal.txt"), "w") as f:
+            f.write(out)
+        rc, out, _ = run_cmd(jargs + ["-o", "json", "--output-fields=MESSAGE,PRIORITY,_PID"], timeout=60)
+        with open(os.path.join(host, "journal.jsonl"), "w") as f:
+            for line in out.splitlines():
+                try:
+                    j = json.loads(line)
+                except ValueError:
+                    continue
+                msg = j.get("MESSAGE")
+                if isinstance(msg, list):
+                    msg = bytes(msg).decode(errors="replace")
+                f.write(json.dumps({"mono_ns": int(j.get("__MONOTONIC_TIMESTAMP", 0)) * 1000,
+                                    "wall_us": int(j.get("__REALTIME_TIMESTAMP", 0)),
+                                    "prio": int(j.get("PRIORITY", 6)), "pid": j.get("_PID"), "msg": msg}) + "\n")
+
+        # Versions, unit and runtime configuration.
+        u = unit_show()
+        rc, unit_txt, _ = run_cmd(["systemctl", "--user", "cat", info.get("unit", unit_name())], timeout=5)
+        with open(os.path.join(host, "unit.txt"), "w") as f:
+            f.write(unit_txt)
+        renv = process_env(info.get("runtime_pid")) or {}
+        toml_src = renv.get("XREAL_AIR_SLAM_CONFIG")
+        configs = {}
+        if toml_src and os.path.isfile(toml_src):
+            shutil.copy(toml_src, os.path.join(host, "xreal_air.toml"))
+            configs["xreal_air.toml"] = toml_src
+            m = re.search(r'^config-path\s*=\s*"([^"]+)"', read(toml_src), re.M)
+            if m and os.path.isfile(m.group(1)):
+                shutil.copy(m.group(1), os.path.join(host, "basalt_config.json"))
+                configs["basalt_config.json"] = m.group(1)
+        versions = {
+            "tool": VERSION, "runtime": info.get("runtime_version"), "packages": package_versions(),
+            "kernel": os.uname().release, "cpu": cpu_model(), "hostname": os.uname().nodename,
+            "hyprland": (hyprctl_json("version") or {}).get("commit"),
+        }
+
+        result = {"ok": True, "id": info.get("id"), "bundle": bundle, "reason": reason,
+                  "started": info.get("started_iso"), "stopped": now_wall_iso(stop_wall)}
+        summary = analyze_bundle(bundle)
+        write_json(os.path.join(bundle, "summary.json"), summary)
+
+        manifest = build_manifest(bundle, info, reason, stop_wall, stop_mono, versions, u, renv, configs, summary)
+        write_json(os.path.join(bundle, "manifest.json"), manifest)
+        write_readme(bundle, manifest, summary)
+
+        result.update({"duration_s": manifest["capture"]["window"].get("duration_s"),
+                       "size_mb": manifest["size_mb"], "summary": summary.get("headline", {}),
+                       "findings": summary.get("findings", [])})
+        write_json(os.path.join(host, "result.json"), result)
+
+        act = os.path.join(state_dir(), "active.json")
+        if (load_json(act) or {}).get("bundle") == bundle:
+            os.unlink(act)
+        write_json(os.path.join(state_dir(), "last.json"), result)
+        if info.get("notify"):
+            notify("XREAL capture saved", f"{info.get('id')}: {', '.join(summary.get('findings', [])[:3])}")
+        return result
+
+
+def cmd_stop(args, quiet=False):
+    with StateLock():
+        a = active_info()
+        if a is None:
+            # Nothing of ours. A capture someone else started in the runtime is stopped too.
+            st = runtime_status()
+            if st and st.get("state") == "recording":
+                send_command("stop", {"reason": "xreal-capture stop"})
+                out = {"ok": True, "already_stopped": False, "bundle": None, "runtime_out": st.get("out"),
+                       "message": "stopped a runtime capture not started by this tool"}
+                if not quiet:
+                    emit(out)
+                return out
+            last = load_json(os.path.join(state_dir(), "last.json"))
+            out = {"ok": True, "already_stopped": True, "bundle": (last or {}).get("bundle"), "last": last}
+            if not quiet:
+                emit(out, "not recording" + (f" (last: {last['bundle']})" if last else ""))
+            return out
+        bundle = a["bundle"]
+        with open(os.path.join(bundle, "host", "stop-request"), "w") as f:
+            f.write(args.reason if getattr(args, "reason", None) else "stop command")
+
+    # Stop the runtime's writer right away; the session process notices and finishes the bundle.
+    st = runtime_status()
+    if st and st.get("state") == "recording" and st.get("out") == os.path.join(bundle, "dataset"):
+        try:
+            send_command("stop", {"reason": "stop command"}, timeout=60)
+        except Fail:
+            pass
+    deadline = time.monotonic() + getattr(args, "timeout", 180)
+    result_path = os.path.join(bundle, "host", "result.json")
+    while not os.path.exists(result_path):
+        if not pid_alive(a.get("session_pid")):
+            finalize(bundle, "stop command (session process gone)")
+            break
+        if time.monotonic() > deadline:
+            raise Fail(EXIT_TIMEOUT, "timeout", "the bundle was not finished in time", bundle=bundle)
+        time.sleep(0.2)
+    result = load_json(result_path)
+    out = dict(result, already_stopped=False)
+    if not quiet:
+        emit(out, f"saved {bundle} ({result.get('size_mb', 0):.0f} MB, {result.get('reason')})\n"
+                  + "".join(f"  - {x}\n" for x in result.get("findings", [])).rstrip())
+    return out
+
+
+def cmd_toggle(args):
+    if active_info() is not None:
+        return cmd_stop(args)
+    return cmd_start(args)
+
+
+def cmd_mark(args):
+    text = " ".join(args.text).strip() or "mark"
+    mono, wall = time.monotonic_ns(), time.time()
+    rec = {"mono_ns": mono, "wall": wall, "wall_iso": now_wall_iso(wall), "text": text, "source": args.source}
+    sent = False
+    st = runtime_status()
+    if st is not None:
+        res = send_command("mark", {"label": text.replace("\n", " "), "mono_ns": mono}, timeout=5)
+        sent = res.get("cmd_result") == "ok"
+    a = active_info()
+    if a is not None:
+        with open(os.path.join(a["bundle"], "host", "marks.jsonl"), "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    if not sent and a is None:
+        raise Fail(EXIT_NO_RUNTIME, "no_runtime", "no runtime and no capture to mark")
+    out = {"ok": True, "text": text, "mono_ns": mono, "wall": rec["wall_iso"], "recording": a is not None,
+           "bundle": a["bundle"] if a else None, "in_runtime_ring": sent}
+    if args.notify:
+        notify("XREAL mark", text)
+    emit(out, f"marked '{text}'" + ("" if a else " (not recording: kept in the runtime's ring)"))
+    return out
+
+
+def cmd_status(args):
+    st = runtime_status()
+    a = active_info()
+    u = unit_show()
+    out = {"ok": True, "active": a is not None, "capture": None,
+           "runtime": {"running": st is not None, "unit": unit_name(), "unit_state": u.get("ActiveState"),
+                       "ctl": ctl_dir()},
+           "slam": None, "captures_dir": captures_root(), "disk_free_mb": None}
+    f = free_mb(captures_root())
+    out["disk_free_mb"] = round(f) if f is not None else None
+    if st is not None:
+        out["runtime"].update({"pid": int(st.get("pid", 0)), "version": st.get("version"),
+                               "state": st.get("state"), "rings_s": int(st.get("rings_s", 0) or 0),
+                               "frames_lookback_s": int(st.get("frames_lookback_s", 0) or 0),
+                               "zstd": st.get("zstd") == "1", "recording_out": st.get("out") or None})
+        if "slam_tracking" in st:
+            out["slam"] = {"tracking": st.get("slam_tracking") == "1", "world": int(st.get("slam_world", 0)),
+                           "head_age_ms": float(st.get("head_age_ms", 0))}
+            if "slam_pose_age_ms" in st:
+                out["slam"].update({"pose_age_ms": float(st["slam_pose_age_ms"]),
+                                    "pose_latency_ms": float(st["slam_pose_latency_ms"])})
+    if a is not None:
+        elapsed = (time.monotonic_ns() - a["started_mono_ns"]) / 1e9
+        mine = st is not None and st.get("out") == os.path.join(a["bundle"], "dataset")
+        out["capture"] = {
+            "id": a["id"], "bundle": a["bundle"], "label": a.get("label"), "started": a.get("started_iso"),
+            "elapsed_s": round(elapsed, 1), "for_s": a.get("for_s"),
+            "remaining_s": round(a["max_s"] - elapsed, 1) if a.get("max_s") else None,
+            "runtime_recording": bool(mine and st.get("state") == "recording"),
+            "mb": float(st.get("mb", 0)) if mine else None,
+            "pairs": int(st.get("pairs", 0)) if mine else None,
+            "dropped_pairs": int(st.get("lost_pairs", 0)) if mine else None,
+            "lost_records": int(st.get("lost_records", 0)) if mine else None,
+            "marks": sum(1 for _ in open(os.path.join(a["bundle"], "host", "marks.jsonl"))),
+            "session_alive": pid_alive(a.get("session_pid")),
+        }
+    human = (f"{'RECORDING ' + out['capture']['bundle'] + ' (' + str(out['capture']['elapsed_s']) + ' s)' if a else 'idle'}"
+             f"; runtime {'up' if st else 'not answering'}"
+             + (f", SLAM {'tracking' if out['slam']['tracking'] else 'NOT tracking'}" if out["slam"] else ""))
+    emit(out, human)
+    return out
+
+
+def bundle_entry(path):
+    m = load_json(os.path.join(path, "manifest.json"))
+    info = load_json(os.path.join(path, "host", "capture.json"), {})
+    s = load_json(os.path.join(path, "summary.json"), {})
+    e = {"id": os.path.basename(path), "bundle": path, "label": info.get("label"), "started": info.get("started_iso"),
+         "finalized": m is not None}
+    if m:
+        e.update({"duration_s": m["capture"]["window"].get("duration_s"), "size_mb": m.get("size_mb"),
+                  "marks": len(m.get("marks", [])), "stop_reason": m["capture"].get("stop_reason"),
+                  "cameras": m["capture"].get("cameras"), "headline": s.get("headline"),
+                  "packed": os.path.exists(path.rstrip("/") + ".tar.zst")})
+    return e
+
+
+def cmd_list(args):
+    root = captures_root()
+    entries = [bundle_entry(p) for p in sorted(glob.glob(os.path.join(root, "xreal-*"))) if os.path.isdir(p)]
+    out = {"ok": True, "captures_dir": root, "bundles": entries}
+    emit(out, "\n".join(f"{e['id']}  {e.get('duration_s') or '?'} s  {e.get('size_mb') or '?'} MB  "
+                        f"{'' if e['finalized'] else '(unfinished) '}{e.get('label') or ''}" for e in entries)
+         or f"no bundles in {root}")
+    return out
+
+
+def cmd_run(args):
+    if not args.for_:
+        raise Fail(EXIT_USAGE, "usage", "run needs --for")
+    dur = parse_duration(args.for_)
+    started = cmd_start(args, quiet=True)
+    rc = None
+    stop_reason = "--for elapsed"
+    try:
+        if args.command:
+            cmd = args.command[1:] if args.command[0] == "--" else args.command
+            p = subprocess.Popen(cmd)
+            try:
+                rc = p.wait(timeout=dur)
+                stop_reason = "command exited"
+            except subprocess.TimeoutExpired:
+                p.terminate()
+                try:
+                    rc = p.wait(5)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    rc = p.wait()
+        else:
+            end = time.monotonic() + dur
+            while time.monotonic() < end and active_info() is not None:
+                time.sleep(0.2)
+    except KeyboardInterrupt:
+        stop_reason = "interrupted"
+    args.reason = stop_reason
+    out = cmd_stop(args, quiet=True)
+    out.update({"started": started["started"], "command_exit": rc})
+    emit(out, f"saved {out['bundle']}")
+    return out
+
+
+def cmd_arm(args, seconds=None):
+    s = int(args.seconds if seconds is None else seconds)
+    require_runtime()
+    res = send_command("arm", {"frames_s": s})
+    got = int(res.get("frames_lookback_s", 0) or 0)
+    out = {"ok": True, "frames_lookback_s": got, "ram_mb_estimate": round(got * 30 * 2 * 480 * 640 / 2**20)}
+    emit(out, f"camera frame look-back {got} s (~{out['ram_mb_estimate']} MB of RAM in the runtime)")
+    return out
+
+
+def resolve_bundle(arg):
+    for p in (arg, os.path.join(captures_root(), arg), os.path.join(captures_root(), "xreal-" + arg)):
+        if p and os.path.isdir(os.path.join(p, "dataset")):
+            return os.path.abspath(p)
+    raise Fail(EXIT_NOT_FOUND, "not_found", f"no bundle '{arg}'")
+
+
+def cmd_convert(args):
+    b = resolve_bundle(args.bundle)
+    conv = find_monado_script("xreal-capture-to-euroc.py")
+    if conv is None:
+        raise Fail(EXIT_ERROR, "missing_tool", "xreal-capture-to-euroc.py not found (XREAL_MONADO_SCRIPTS)")
+    argv = [sys.executable, conv, os.path.join(b, "dataset")] + (["--format", args.format] if args.format else [])
+    rc, o, e = run_cmd(argv, timeout=24 * 3600)
+    if rc != 0:
+        raise Fail(EXIT_ERROR, "convert_failed", (e or o).strip()[-500:])
+    out = {"ok": True, "bundle": b, "dataset": os.path.join(b, "dataset"), "message": o.strip()}
+    emit(out, o.strip())
+    return out
+
+
+def cmd_analyze(args):
+    b = resolve_bundle(args.bundle)
+    s = analyze_bundle(b)
+    write_json(os.path.join(b, "summary.json"), s)
+    emit({"ok": True, "bundle": b, "summary": s}, json.dumps(s, indent=2))
+
+
+def cmd_pack(args):
+    b = resolve_bundle(args.bundle)
+    if not shutil.which("zstd"):
+        raise Fail(EXIT_ERROR, "missing_tool", "zstd not installed")
+    dst = b.rstrip("/") + ".tar.zst"
+    rc, o, e = run_cmd(["tar", "-C", os.path.dirname(b), "-I", "zstd -T0 -3", "-cf", dst, os.path.basename(b)],
+                       timeout=24 * 3600)
+    if rc != 0:
+        raise Fail(EXIT_ERROR, "pack_failed", e.strip()[-500:])
+    out = {"ok": True, "bundle": b, "archive": dst, "size_mb": round(os.path.getsize(dst) / 2**20, 1)}
+    emit(out, f"{dst} ({out['size_mb']} MB)")
+    return out
+
+
+# ---------------------------------------------------------------------------------------------
+# Manifest, README and the quick analysis
+# ---------------------------------------------------------------------------------------------
+
+FILE_MEANINGS = {
+    "manifest.json": "this capture's machine-readable description",
+    "summary.json": "precomputed quick analysis (latency, losses, camera gaps, CPU, power, marks)",
+    "README.md": "human summary",
+    "dataset/": "the runtime's flight capture: EuRoC layout minus images (see dataset/README.txt)",
+    "dataset/capture.txt": "what the runtime recorded and lost (written_* / lost_*), its stop reason",
+    "dataset/mav0/imu0/data.csv": "EuRoC IMU, 1 kHz, factory IMU frame, CLOCK_MONOTONIC ns",
+    "dataset/xreal/camera_frames.csv": "every camera frame: v4l2 seq, kernel / dequeue time (frame gaps, stalls)",
+    "dataset/xreal/imu_raw.csv": "every IMU sample, raw + calibrated, with device/host timestamps",
+    "dataset/xreal/frames.bin": "stereo pairs (zstd or raw); `xreal-capture convert` expands them for replay",
+    "dataset/xreal/factory_calibration.json": "the glasses' factory calibration, verbatim",
+    "dataset/flight/events.csv": "SLAM state changes, marks, capture start/stop (ts_ns,type,text)",
+    "dataset/flight/slam_poses.csv": "each new SLAM pose as the driver saw it, latency, guard verdict, world",
+    "dataset/flight/slam_timing.csv": "t_slam per-stage timestamps per pose (= SLAM_WRITE_CSVS timing.csv)",
+    "dataset/flight/head_pose.csv": "every head pose the runtime handed out (slam=1: 6DoF, 0: 3DoF)",
+    "host/capture.json": "how the capture was started",
+    "host/marks.jsonl": "marks with monotonic + wall time",
+    "host/pose-log.jsonl": "HypXRland head pose 5 Hz + monitor anchors 1 Hz (hyprctl -j openxr gaze/status)",
+    "host/thread-cpu.csv": "per-thread CPU of the runtime, 1 s, with power profile / AC / battery / PSI",
+    "host/journal.txt": "the runtime's journal from before the look-back to the stop",
+    "host/journal.jsonl": "the same with CLOCK_MONOTONIC ns (mono_ns) per line",
+    "host/unit.txt": "systemctl --user cat of the runtime's unit",
+    "host/xreal_air.toml": "the Basalt pipeline settings the runtime used",
+    "host/basalt_config.json": "the Basalt config.json that toml points at",
+    "host/power-start.json": "power profile, AC, batteries, CPU pressure at start (power-stop.json: at stop)",
+    "host/openxr-status.json": "hyprctl -j openxr status at stop (-start: at start)",
+    "host/openxr-gaze.json": "hyprctl -j openxr gaze at stop (-start: at start)",
+    "host/session.log": "this tool's background process log",
+}
+
+
+def dir_size_mb(path):
+    total = 0
+    for dp, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(dp, f))
+            except OSError:
+                pass
+    return round(total / 2**20, 1)
+
+
+def load_marks(bundle):
+    """The tool's marks (host/marks.jsonl) plus the runtime's (marks sent while no capture ran, or by
+    other tools, that the look-back brought in), by time."""
+    marks, seen = [], set()
+    for line in read(os.path.join(bundle, "host", "marks.jsonl")).splitlines():
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        marks.append(m)
+        seen.add(m["mono_ns"])
+    info = load_json(os.path.join(bundle, "host", "capture.json"), {})
+    offset = info.get("started_wall", 0) - info.get("started_mono_ns", 0) / 1e9 if info else None
+    for r in csv_rows(os.path.join(bundle, "dataset", "flight", "events.csv")):
+        if len(r) < 3 or r[1] != "mark" or not r[0].isdigit() or int(r[0]) in seen:
+            continue
+        text = re.sub(r" \(read \d+ ms later\)$", "", ",".join(r[2:]))
+        wall = int(r[0]) / 1e9 + offset if offset else None
+        marks.append({"mono_ns": int(r[0]), "wall": wall, "wall_iso": now_wall_iso(wall) if wall else None,
+                      "text": text, "source": "runtime"})
+    marks.sort(key=lambda m: m["mono_ns"])
+    return marks
+
+
+def build_manifest(bundle, info, reason, stop_wall, stop_mono, versions, unit, renv, configs, summary):
+    cap = read_kv(os.path.join(bundle, "dataset", "capture.txt"))
+    files = {}
+    for rel, meaning in FILE_MEANINGS.items():
+        p = os.path.join(bundle, rel)
+        if os.path.exists(p):
+            files[rel] = {"meaning": meaning,
+                          "bytes": None if rel.endswith("/") else os.path.getsize(p)}
+    win = summary.get("window", {})
+    counters = {k: (int(v) if v.lstrip("-").isdigit() else v) for k, v in cap.items()
+                if k.startswith(("written_", "lost_"))}
+    return {
+        "schema": "xreal-capture/manifest/1",
+        "id": info.get("id"), "label": info.get("label"),
+        "capture": {
+            "started": info.get("started_iso"), "started_mono_ns": info.get("started_mono_ns"),
+            "stopped": now_wall_iso(stop_wall), "stopped_mono_ns": stop_mono, "stop_reason": reason,
+            "runtime_stop_reason": cap.get("stop_reason"), "for_s": info.get("for_s"), "max_s": info.get("max_s"),
+            "lookback_s": info.get("lookback_s"), "cameras": info.get("cameras"), "codec": info.get("codec"),
+            "frames_lookback_s": info.get("frames_lookback_s"),
+            "window": win,
+            "clock": {"mono_to_wall_offset_s": info.get("started_wall", 0) - info.get("started_mono_ns", 0) / 1e9,
+                      "note": "wall = mono_ns/1e9 + offset (same boot). Dataset and journal mono_ns are "
+                              "CLOCK_MONOTONIC."},
+        },
+        "marks": [dict(m, t_s=round((m["mono_ns"] - win["start_mono_ns"]) / 1e9, 3) if win.get("start_mono_ns")
+                       else None) for m in load_marks(bundle)],
+        "counters": counters,
+        "versions": versions,
+        "runtime": {"unit": info.get("unit"), "unit_fragment": unit.get("FragmentPath"),
+                    "unit_dropins": unit.get("DropInPaths"), "unit_environment": unit.get("Environment"),
+                    "process_environment": renv, "pid": info.get("runtime_pid"), "configs": configs,
+                    "ctl": info.get("ctl")},
+        "files": files,
+        "size_mb": dir_size_mb(bundle),
+        "replay": "xreal-capture convert <bundle>; then VIT_SYSTEM_LIBRARY_PATH=<libbasalt.so> "
+                  "XREAL_AIR_SLAM_CONFIG=<xreal_air.toml> monado-cli xreal-slam-replay <bundle>/dataset <out>",
+    }
+
+
+def write_readme(bundle, manifest, summary):
+    h = summary.get("headline", {})
+    lines = [
+        f"# XREAL capture {manifest['id']}",
+        "",
+        f"{manifest['capture']['started']} → {manifest['capture']['stopped']} "
+        f"({manifest['capture']['window'].get('duration_s', '?')} s of data incl. "
+        f"{manifest['capture']['lookback_s']} s look-back), stop: {manifest['capture']['stop_reason']}.",
+        f"Label: {manifest.get('label') or '-'}. Cameras: {'yes' if manifest['capture']['cameras'] else 'no'}. "
+        f"Size: {manifest['size_mb']} MB.",
+        "",
+        "## Findings (quick analysis, summary.json)",
+        "",
+    ]
+    lines += [f"- {f}" for f in summary.get("findings", [])] or ["- nothing stood out"]
+    lines += ["", "## Headline numbers", ""]
+    lines += [f"- {k}: {v}" for k, v in h.items()]
+    if manifest["marks"]:
+        lines += ["", "## Marks", ""]
+        for m, ms in zip(manifest["marks"], summary.get("marks", [])):
+            lines.append(f"- t={m.get('t_s')} s ({m['wall_iso']}): {m['text']} — {ms.get('context', '')}")
+    lines += ["", "## Files", ""]
+    lines += [f"- `{k}`: {v['meaning']}" for k, v in manifest["files"].items()]
+    lines += ["", "## Replay", "", "```", "xreal-capture convert " + bundle,
+              "VIT_SYSTEM_LIBRARY_PATH=/usr/lib64/basalt-xreal/libbasalt.so.2 \\",
+              "XREAL_AIR_SLAM_CONFIG=/usr/share/basalt-xreal/xreal_air.toml \\",
+              "  /usr/libexec/monado-xreal/monado-cli xreal-slam-replay " + bundle + "/dataset replay-out", "```",
+              "", "All dataset times are CLOCK_MONOTONIC ns; manifest.json `capture.clock` maps them to wall time.", ""]
+    with open(os.path.join(bundle, "README.md"), "w") as f:
+        f.write("\n".join(lines))
+
+
+def pct(sorted_vals, p):
+    if not sorted_vals:
+        return None
+    k = min(len(sorted_vals) - 1, max(0, int(round(p / 100 * (len(sorted_vals) - 1)))))
+    return sorted_vals[k]
+
+
+def csv_rows(path, skip_comment=True):
+    try:
+        with open(path, newline="") as f:
+            for row in csv.reader(f):
+                if not row or (skip_comment and row[0].startswith("#")):
+                    continue
+                yield row
+    except OSError:
+        return
+
+
+def clusters(points, gap_s=1.0):
+    """[(t, value)] sorted -> [{t_start, t_end, n, worst}] runs no more than gap_s apart."""
+    out = []
+    for t, v in points:
+        if out and t - out[-1]["t_end"] <= gap_s:
+            c = out[-1]
+            c["t_end"], c["n"], c["worst"] = t, c["n"] + 1, max(c["worst"], v)
+        else:
+            out.append({"t_start": t, "t_end": t, "n": 1, "worst": v})
+    for c in out:
+        c["t_start"], c["t_end"], c["worst"] = round(c["t_start"], 2), round(c["t_end"], 2), round(c["worst"], 1)
+    return out
+
+
+def analyze_bundle(bundle):
+    """A quick pass over the bundle: enough for an agent to triage without heavy tooling."""
+    ds = os.path.join(bundle, "dataset")
+    info = load_json(os.path.join(bundle, "host", "capture.json"), {})
+    cap = read_kv(os.path.join(ds, "capture.txt"))
+    s = {"schema": "xreal-capture/summary/1", "id": info.get("id"),
+         "times": "t / t_s are seconds after window.start_mono_ns (CLOCK_MONOTONIC)"}
+
+    # The window: from the oldest IMU sample (the look-back) to the newest.
+    imu_t = [int(r[2]) for r in csv_rows(os.path.join(ds, "xreal", "imu_raw.csv")) if r[0] != "euroc_ns"]
+    t0 = imu_t[0] if imu_t else int(info.get("started_mono_ns", 0))
+    t1 = imu_t[-1] if imu_t else t0
+    st_mono = info.get("started_mono_ns") or t0
+    s["window"] = {"start_mono_ns": t0, "end_mono_ns": t1, "duration_s": round((t1 - t0) / 1e9, 1),
+                   "lookback_covered_s": round((st_mono - t0) / 1e9, 1),
+                   "start_wall": now_wall_iso(info.get("started_wall", 0) - (st_mono - t0) / 1e9)
+                   if info.get("started_wall") else None}
+
+    def rel(ns):
+        return round((int(ns) - t0) / 1e9, 3)
+
+    gaps = [b - a for a, b in zip(imu_t, imu_t[1:])]
+    s["imu"] = {"samples": len(imu_t), "rate_hz": round((len(imu_t) - 1) / ((t1 - t0) / 1e9), 1) if t1 > t0 else None,
+                "gaps_over_5ms": sum(1 for g in gaps if g > 5e6),
+                "max_gap_ms": round(max(gaps) / 1e6, 1) if gaps else None}
+
+    # SLAM latency per pose (t_slam timing: last minus first stamp).
+    lat = []
+    for r in csv_rows(os.path.join(ds, "flight", "slam_timing.csv")):
+        try:
+            a, b = int(r[0]), int(r[-1])
+        except ValueError:
+            continue
+        lat.append((rel(a), (b - a) / 1e6))
+    v = sorted(x for _, x in lat)
+    s["slam_latency_ms"] = {"poses": len(v), "p50": round(pct(v, 50), 1) if v else None,
+                            "p90": round(pct(v, 90), 1) if v else None, "p99": round(pct(v, 99), 1) if v else None,
+                            "max": round(v[-1], 1) if v else None,
+                            "over_300ms": sum(1 for x in v if x > 300),
+                            "backlog_clusters": clusters([(t, x) for t, x in lat if x > 300])[:30]}
+
+    verdicts, worlds = {}, set()
+    for r in csv_rows(os.path.join(ds, "flight", "slam_poses.csv")):
+        if r[0] == "ts_ns":
+            continue
+        verdicts[r[-1]] = verdicts.get(r[-1], 0) + 1
+        worlds.add(r[-2])
+    s["slam_poses"] = {"count": sum(verdicts.values()), "verdicts": verdicts, "worlds": len(worlds)}
+
+    # State changes.
+    events = []
+    for r in csv_rows(os.path.join(ds, "flight", "events.csv")):
+        if r[0] == "ts_ns":
+            continue
+        try:
+            events.append({"t": rel(r[0]), "mono_ns": int(r[0]), "type": r[1], "text": ",".join(r[2:])})
+        except ValueError:
+            pass
+    events.sort(key=lambda e: e["mono_ns"])
+    losses, open_loss = [], None
+    for e in events:
+        if e["t"] < 0:
+            continue  # Before the window: context in "events", not counted.
+        if e["type"] == "tracking" and e["text"].startswith("lost"):
+            open_loss = {"t_lost": e["t"], "detail": e["text"]}
+        elif e["type"] == "tracking" and e["text"].startswith("acquired") and open_loss is not None:
+            open_loss.update({"t_acquired": e["t"], "duration_s": round(e["t"] - open_loss["t_lost"], 2)})
+            losses.append(open_loss)
+            open_loss = None
+    if open_loss is not None:
+        losses.append(dict(open_loss, t_acquired=None, duration_s=None))
+    s["tracking"] = {"losses": len(losses), "loss_list": losses[:50],
+                     "events_by_type": {}, "events": [e for e in events if e["type"] != "capture"][:200]}
+    for e in events:
+        key = e["type"] + ":" + e["text"].split()[0] if e["text"] else e["type"]
+        s["tracking"]["events_by_type"][key] = s["tracking"]["events_by_type"].get(key, 0) + 1
+
+    # Output pose: how much of the time the head followed SLAM.
+    head_t, head_slam = [], []
+    for r in csv_rows(os.path.join(ds, "flight", "head_pose.csv")):
+        if r[0] == "query_ns":
+            continue
+        head_t.append(int(r[0]))
+        head_slam.append(r[9] == "1")
+    s["output"] = {"queries": len(head_t),
+                   "rate_hz": round(len(head_t) / ((head_t[-1] - head_t[0]) / 1e9), 1) if len(head_t) > 1 else None,
+                   "slam_fraction": round(sum(head_slam) / len(head_slam), 3) if head_slam else None}
+
+    # Camera frames: kernel-level gaps (frames thrown away) and dequeue stalls (the camera thread blocked).
+    cams = {0: [], 1: []}
+    deq = []
+    for r in csv_rows(os.path.join(ds, "xreal", "camera_frames.csv")):
+        if r[0] == "cam":
+            continue
+        try:
+            c, kern, dq = int(r[0]), int(r[2]), int(r[3])
+        except ValueError:
+            continue
+        if c in cams and kern > 0:
+            cams[c].append(kern)
+            deq.append((rel(kern), (dq - kern) / 1e6))
+    gap_list = []
+    for c, ts in cams.items():
+        ts.sort()
+        for a, b in zip(ts, ts[1:]):
+            if b - a > 60e6:
+                gap_list.append({"cam": c, "t": rel(a), "gap_ms": round((b - a) / 1e6, 1)})
+    gap_list.sort(key=lambda g: g["t"])
+    dv = sorted(x for _, x in deq)
+    s["camera"] = {"frames": len(cams[0]) + len(cams[1]),
+                   "pair_rate_hz": round((len(cams[0]) - 1) / ((cams[0][-1] - cams[0][0]) / 1e9), 1)
+                   if len(cams[0]) > 1 else None,
+                   "gaps_over_60ms": len(gap_list), "gap_list": gap_list[:50],
+                   "dequeue_delay_ms": {"p50": round(pct(dv, 50), 1) if dv else None,
+                                        "p99": round(pct(dv, 99), 1) if dv else None,
+                                        "max": round(dv[-1], 1) if dv else None,
+                                        "over_100ms": sum(1 for x in dv if x > 100)},
+                   "stall_clusters": clusters([(t, x) for t, x in deq if x > 100])[:30]}
+
+    # Capture integrity.
+    s["capture"] = {"written_pairs": int(cap.get("written_pairs", 0) or 0),
+                    "dropped_pairs": int(cap.get("lost_pairs", 0) or 0),
+                    "lost_records": sum(int(v) for k, v in cap.items() if k.startswith("lost_") and k != "lost_pairs"
+                                        and v.lstrip("-").isdigit()),
+                    "runtime_stop_reason": cap.get("stop_reason")}
+
+    # Per-thread CPU and power, from thread-cpu-log.py.
+    threads, samples, power = {}, {}, {"profiles": set(), "ac_online": set(), "bat_status": set(), "bat_w": [],
+                                       "psi_some10": []}
+    for r in csv_rows(os.path.join(bundle, "host", "thread-cpu.csv"), skip_comment=False):
+        if r[0] == "t_s":
+            continue
+        try:
+            t, tid, comm, cpu_pct = float(r[0]), r[3], r[4], float(r[5])
+        except (ValueError, IndexError):
+            continue
+        th = threads.setdefault(tid, {"comm": comm, "sum": 0.0, "n": 0, "max": 0.0, "types": {}})
+        th["sum"] += cpu_pct
+        th["n"] += 1
+        th["max"] = max(th["max"], cpu_pct)
+        th["types"][r[7]] = th["types"].get(r[7], 0) + 1
+        samples[t] = samples.get(t, 0.0) + cpu_pct
+        power["profiles"].add(r[15])
+        power["ac_online"].add(r[16])
+        power["bat_status"].add(r[17])
+        if r[18]:
+            power["bat_w"].append(float(r[18]))
+        if r[19]:
+            power["psi_some10"].append(float(r[19]))
+    top = sorted(threads.items(), key=lambda kv: -kv[1]["sum"] / max(1, kv[1]["n"]))[:10]
+    tot = sorted(samples.values())
+    s["cpu"] = {"process_mean_pct": round(sum(tot) / len(tot), 1) if tot else None,
+                "process_p95_pct": round(pct(tot, 95), 1) if tot else None,
+                "top_threads": [{"tid": tid, "comm": t["comm"], "mean_pct": round(t["sum"] / t["n"], 1),
+                                 "max_pct": round(t["max"], 1), "core_types": t["types"]} for tid, t in top]}
+    ps = load_json(os.path.join(bundle, "host", "power-start.json"), {})
+    s["power"] = {"profiles": sorted(x for x in power["profiles"] if x) or ([ps.get("profile")] if ps else []),
+                  "ac_online": sorted(x for x in power["ac_online"] if x) or [ps.get("ac_online")],
+                  "battery_status": sorted(x for x in power["bat_status"] if x),
+                  "battery_w_mean": round(sum(power["bat_w"]) / len(power["bat_w"]), 1) if power["bat_w"] else None,
+                  "psi_cpu_some10_mean": round(sum(power["psi_some10"]) / len(power["psi_some10"]), 1)
+                  if power["psi_some10"] else None,
+                  "psi_cpu_some10_max": max(power["psi_some10"]) if power["psi_some10"] else None}
+
+    # Journal: compositor misses, errors, inside the window.
+    missed = warn = err = 0
+    for line in read(os.path.join(bundle, "host", "journal.txt")).splitlines():
+        if "probably missed frame" in line:
+            missed += 1
+    for line in read(os.path.join(bundle, "host", "journal.jsonl")).splitlines():
+        try:
+            j = json.loads(line)
+        except ValueError:
+            continue
+        if t0 <= j["mono_ns"] <= t1 + 5e9:
+            warn += j["prio"] == 4
+            err += j["prio"] <= 3
+    s["journal"] = {"missed_frame_warnings": missed, "warnings_in_window": warn, "errors_in_window": err}
+
+    # Around each mark: was it tracking, how late was SLAM, were there gaps, what happened.
+    marks = []
+    for m in load_marks(bundle):
+        t = rel(m["mono_ns"])
+        i = bisect.bisect_left(head_t, m["mono_ns"])
+        tracking = head_slam[min(i, len(head_slam) - 1)] if head_slam else None
+        near_lat = [x for tt, x in lat if t - 5 <= tt <= t + 2]
+        near_gaps = [g for g in gap_list if t - 5 <= g["t"] <= t + 2]
+        near_ev = [e for e in events if t - 10 <= e["t"] <= t + 3 and e["type"] not in ("mark", "capture")]
+        ctx = []
+        ctx.append("6DoF" if tracking else "3DoF (not following SLAM)" if tracking is not None else "no head data")
+        if near_lat:
+            ctx.append(f"SLAM latency max {max(near_lat):.0f} ms in the 5 s before")
+        if near_gaps:
+            ctx.append(f"{len(near_gaps)} camera gaps")
+        if near_ev:
+            ctx.append("; ".join(f"{e['type']} {e['text']} at {e['t'] - t:+.1f} s" for e in near_ev[-4:]))
+        marks.append({"t": t, "text": m["text"], "wall": m.get("wall_iso"), "tracking": tracking,
+                      "latency_max_ms_5s_before": round(max(near_lat), 1) if near_lat else None,
+                      "camera_gaps_near": len(near_gaps), "events_near": near_ev, "context": ", ".join(ctx)})
+    s["marks"] = marks
+
+    # Headline + findings for triage.
+    L = s["slam_latency_ms"]
+    s["headline"] = {
+        "duration_s": s["window"]["duration_s"], "slam_latency_p50_ms": L["p50"], "slam_latency_p99_ms": L["p99"],
+        "frames_over_300ms": L["over_300ms"], "tracking_losses": s["tracking"]["losses"],
+        "slam_fraction": s["output"]["slam_fraction"], "camera_gaps": s["camera"]["gaps_over_60ms"],
+        "process_cpu_mean_pct": s["cpu"]["process_mean_pct"], "power_profile": ",".join(s["power"]["profiles"]),
+        "marks": len(marks), "dropped_pairs": s["capture"]["dropped_pairs"],
+    }
+    f = []
+    if s["tracking"]["losses"]:
+        f.append(f"{s['tracking']['losses']} SLAM tracking losses (3DoF with the position held, then a glide back)")
+    if L["over_300ms"]:
+        f.append(f"SLAM backlog: {L['over_300ms']} poses later than 300 ms in "
+                 f"{len(L['backlog_clusters'])} clusters (worst {L['max']:.0f} ms) — CPU starvation?")
+    if s["camera"]["gaps_over_60ms"]:
+        f.append(f"{s['camera']['gaps_over_60ms']} camera frame gaps > 60 ms (V4L2 buffers full while the camera "
+                 "thread was blocked)")
+    if s["camera"]["dequeue_delay_ms"]["over_100ms"]:
+        f.append(f"{s['camera']['dequeue_delay_ms']['over_100ms']} frames dequeued > 100 ms late")
+    rv = s["slam_poses"]["verdicts"]
+    for k in ("reinit", "diverged", "suspect"):
+        if rv.get(k):
+            f.append(f"{rv[k]} SLAM poses judged '{k}' by the pose guard")
+    if s["journal"]["missed_frame_warnings"]:
+        f.append(f"{s['journal']['missed_frame_warnings']} compositor missed-frame warnings in the journal")
+    if s["power"]["psi_cpu_some10_max"] and s["power"]["psi_cpu_some10_max"] > 20:
+        f.append(f"CPU pressure up to {s['power']['psi_cpu_some10_max']}% (some, avg10)")
+    if "0" in s["power"]["ac_online"] or False in s["power"]["ac_online"]:
+        f.append("on battery (" + ",".join(s["power"]["profiles"]) + ")")
+    if s["capture"]["dropped_pairs"] or s["capture"]["lost_records"]:
+        f.append(f"the capture itself lost {s['capture']['dropped_pairs']} pairs / {s['capture']['lost_records']} "
+                 "records (writer behind)")
+    s["findings"] = f
+    return s
+
+
+# ---------------------------------------------------------------------------------------------
+
+def main(argv):
+    global JSON_OUT
+    ap = argparse.ArgumentParser(prog="xreal-capture", description=__doc__.split("\n\n")[1],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--json", action="store_true", help="one JSON object on stdout (errors too)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def start_opts(p):
+        p.add_argument("--for", dest="for_", help="auto-stop after this long (90, 90s, 2m)")
+        p.add_argument("--label", default="", help="free text, also in the bundle name")
+        g = p.add_mutually_exclusive_group()
+        g.add_argument("--cameras", dest="cameras", action="store_true", default=True,
+                       help="record the stereo pairs (default; replayable)")
+        g.add_argument("--no-cameras", dest="cameras", action="store_false",
+                       help="signals only: tiny, but no replay")
+        p.add_argument("--lookback", type=int, help="seconds before now to include (default: all the runtime has)")
+        p.add_argument("--codec", choices=("zstd", "raw"), default="zstd")
+        p.add_argument("--out", help="bundles directory (default $XREAL_CAPTURE_DIR or ~/xreal-captures)")
+        p.add_argument("--notify", action="store_true", help="desktop notification")
+        p.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+
+    p = sub.add_parser("start", help="start a capture in the background")
+    start_opts(p)
+    p = sub.add_parser("stop", help="stop and finish the bundle")
+    p.add_argument("--timeout", type=float, default=180)
+    p.add_argument("--notify", action="store_true")
+    p.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p = sub.add_parser("toggle", help="start if idle, else stop")
+    start_opts(p)
+    p.add_argument("--timeout", type=float, default=180)
+    p = sub.add_parser("mark", help="timestamped mark")
+    p.add_argument("text", nargs="*")
+    p.add_argument("--source", default="cli")
+    p.add_argument("--notify", action="store_true")
+    p.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    for name in ("status", "list"):
+        p = sub.add_parser(name)
+        p.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p = sub.add_parser("run", help="blocking capture around a command")
+    start_opts(p)
+    p.add_argument("--timeout", type=float, default=180)
+    p.add_argument("command", nargs=argparse.REMAINDER)
+    p = sub.add_parser("arm", help="camera frame look-back in the runtime's RAM")
+    p.add_argument("seconds", nargs="?", type=int, default=10)
+    p.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p = sub.add_parser("disarm")
+    p.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    for name in ("convert", "analyze", "pack"):
+        p = sub.add_parser(name)
+        p.add_argument("bundle")
+        p.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+        if name == "convert":
+            p.add_argument("--format", choices=("png", "pgm"))
+    p = sub.add_parser("_session")
+    p.add_argument("bundle")
+
+    try:
+        args = ap.parse_args(argv)
+    except SystemExit as e:
+        if "--json" in argv and e.code not in (0, None):
+            print(json.dumps({"ok": False, "error": "usage", "message": "bad arguments, see --help", "code": 2}))
+        return EXIT_USAGE if e.code not in (0, None) else 0
+    JSON_OUT = bool(getattr(args, "json", False))
+    setup_env()
+
+    try:
+        if args.cmd == "_session":
+            return cmd_session(args)
+        if args.cmd == "disarm":
+            cmd_arm(args, seconds=0)
+            return EXIT_OK
+        {"start": cmd_start, "stop": cmd_stop, "toggle": cmd_toggle, "mark": cmd_mark, "status": cmd_status,
+         "list": cmd_list, "run": cmd_run, "arm": cmd_arm, "convert": cmd_convert, "analyze": cmd_analyze,
+         "pack": cmd_pack}[args.cmd](args)
+        return EXIT_OK
+    except Fail as f:
+        err = {"ok": False, "error": f.error, "message": f.message, "code": f.code, **f.extra}
+        if JSON_OUT:
+            print(json.dumps(err))
+        else:
+            print(f"xreal-capture: {f.message}", file=sys.stderr)
+        if getattr(args, "notify", False):
+            notify("XREAL capture failed", f.message)
+        return f.code
+    except Exception as e:  # Still one JSON object for a caller that parses stdout.
+        if JSON_OUT:
+            print(json.dumps({"ok": False, "error": "internal", "message": f"{type(e).__name__}: {e}", "code": 1}))
+            return EXIT_ERROR
+        raise
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
