@@ -1459,6 +1459,45 @@ namespace OpenXR {
         return std::fabs(cu - pu) > epsilonUV || std::fabs(cv - pv) > epsilonUV;
     }
 
+    // ---- damage-gated pacing (doc 02 §Frame pacing, AndrewGaspar/Hyprland#1) ----
+    // What the frame thread does with a layer whose desktop handed over NO new buffer this frame.
+    // Since the XR tick stopped forcing a composite on static monitors this is the common case, so
+    // it has to be right for every kind of layer, not just the cheap one.
+    enum eXRStaleLayerAction : uint8_t {
+        XR_STALE_KEEP = 0, // submit the quad as-is: the runtime re-composites the last released image (no acquire, no blit)
+        XR_STALE_OVERLAY,  // animation-only frame: restore the clean content snapshot, re-draw chrome/cursors/fade over it
+        XR_STALE_FILL,     // no content since the swapchain was (re)created: acquire and clear it (the quad stays unsubmitted)
+    };
+
+    struct SXRStaleLayerPlan {
+        eXRStaleLayerAction action    = XR_STALE_KEEP;
+        bool                wantFrame = false; // ask the main thread to composite this monitor (CXRMonitorLayer::m_wantFrame)
+    };
+
+    // hasContent: a desktop blit has landed since the swapchain was (re)created. wantAnimTick: the
+    // overlays (chrome fade, cursor, disparity ease, uniform fade) differ from what was last drawn.
+    // snapFresh: the content snapshot was taken on the LAST fresh blit, so restoring it reproduces
+    // the current desktop. An overlay redraw from a stale snapshot would put an old desktop back on
+    // screen, so instead keep the current image one more frame and ask for a fresh buffer.
+    inline SXRStaleLayerPlan xrPlanStaleLayer(bool hasContent, bool wantAnimTick, bool snapFresh) {
+        if (!hasContent)
+            return {.action = XR_STALE_FILL, .wantFrame = true};
+        if (!wantAnimTick)
+            return {.action = XR_STALE_KEEP, .wantFrame = false};
+        if (!snapFresh)
+            return {.action = XR_STALE_KEEP, .wantFrame = true};
+        return {.action = XR_STALE_OVERLAY, .wantFrame = false};
+    }
+
+    // Main thread, once per XR tick per layer: composite this monitor now? paceAll is the
+    // openxr:pace_static_monitors kill switch (the pre-#1 behaviour: every tick). layerWantsFrame is
+    // the frame thread's request above. monitorHasWork is the renderer's own "this monitor needs a
+    // frame" predicate (pending damage, forced full frames, a frame already requested) — a backstop
+    // only, since every damage source already schedules its own frame.
+    inline bool xrPaceShouldSchedule(bool paceAll, bool layerWantsFrame, bool monitorHasWork) {
+        return paceAll || layerWantsFrame || monitorHasWork;
+    }
+
     // Endpoint-cursor color for a state, from the openxr:cursor_col_* palette.
     inline uint32_t xrCursorColorFor(eXRCursorState st, uint32_t idle, uint32_t grabbable, uint32_t press, uint32_t grab) {
         switch (st) {

@@ -232,6 +232,12 @@ static std::string openxrStatus(eOutputFormat format) {
                 "knee": {:.3f},
                 "kneeSource": "{}",
                 "transitioning": {}
+            }},
+            "pacing": {{
+                "framesPresented": {},
+                "framesBlitted": {},
+                "ticksPaced": {},
+                "ticksIdle": {}
             }}
         }})#",
                                 m.name, m.id, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.quatX, m.quatY, m.quatZ, m.quatW, m.grabbed ? "true" : "false", m.grabKind,
@@ -241,7 +247,7 @@ static std::string openxrStatus(eOutputFormat format) {
                                 m.commit, m.provenance, m.provenanceAgeS, m.provenanceSeatS, m.l2dSource, m.l2dCol, m.l2dRow, m.l2dX, m.l2dY, m.l2dAzDeg, m.l2dElDeg,
                                 m.surfaceAttached ? "true" : "false", m.surfacePlane, m.surfaceKind, m.surfacePlaneLost ? "true" : "false", m.surfacePreview ? "true" : "false",
                                 m.fxAlpha, m.fxAlphaTarget, m.fxAlphaSrc, m.fxBlackAlpha, m.fxBlackAlphaTarget, m.fxBlackAlphaSrc, m.fxKnee, m.fxKneeSrc,
-                                m.fxTransitioning ? "true" : "false");
+                                m.fxTransitioning ? "true" : "false", m.framesPresented, m.framesBlitted, m.ticksPaced, m.ticksIdle);
             if (i + 1 < MONS.size())
                 mons += ",\n";
             else

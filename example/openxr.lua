@@ -110,6 +110,12 @@ hl.config({
         -- `hyprctl openxr status` shows `(linear)` per monitor when active.
         -- force_linear = "auto",
 
+        -- Damage-gated pacing: an XR monitor is composited only when something on it changed, and a
+        -- static one costs nothing while its quad keeps showing the last image. Set to true to
+        -- composite every visible XR monitor on every runtime frame instead (the old behaviour;
+        -- diagnostics only).
+        -- pace_static_monitors = false,
+
         -- Environment blend mode: "auto" | "opaque" | "alpha" | "additive". Read at session start
         -- only.
         --   auto     (default) — use the runtime's preferred/first-advertised mode.
