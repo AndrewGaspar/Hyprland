@@ -1013,6 +1013,12 @@ bool CMonitor::applyMonitorRule(Config::CMonitorRule&& pMonitorRule) {
     m_stereoVirtualMode = RULE->m_stereoVirtualMode;
     sanitizeStereoMode(REQUESTEDMODE);
 
+#ifdef HYPRLAND_AQUAMARINE_HAS_MAX_BPC
+    // aquamarine >= 0.16.0 (259c8b5) no longer picks max_bpc from the scanout format; unset, a
+    // DRM connector runs at its maximum. Headless and Wayland outputs ignore it. See CMakeLists.txt.
+    m_output->state->setMaxBpc(RULE->m_enable10bit ? 10 : 8);
+#endif
+
     static constexpr auto formats10bit = std::to_array<uint32_t>({DRM_FORMAT_XRGB2101010, DRM_FORMAT_XBGR2101010});
     static constexpr auto formats8bit  = std::to_array<uint32_t>({DRM_FORMAT_XRGB8888, DRM_FORMAT_XBGR8888});
 
