@@ -14,6 +14,7 @@
 #include <format>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using Hyprutils::Utils::CScopeGuard;
@@ -26,6 +27,7 @@ using Hyprutils::Utils::CScopeGuard;
 //
 //   - a static monitor stops presenting while the XR tick keeps running (ticksIdle climbs),
 //   - openxr.pace_static_monitors = true brings the every-tick behaviour back,
+//   - an unrelated runtime config change and a full reload cost at most a one-off composite,
 //   - an animation on the monitor (a workspace switch) renders, and then it goes quiet again,
 //   - cursor motion over it renders,
 //   - a client drawing continuously keeps getting frame callbacks (it would stall otherwise).
@@ -165,6 +167,26 @@ TEST_CASE(xr_pacing_damage_gated) {
     // brief burst: nothing in onConfigReload() may leave a static monitor composited every tick.
     if (!waitQuiet(MON, std::chrono::milliseconds(700), std::chrono::milliseconds(5000)))
         MARK_TEST_FAILED("the monitor did not go quiet again after pace_static_monitors returned to false");
+
+    // 3b. Config changes that have nothing to do with this monitor. On 0.57 every runtime `hl.config`
+    //     re-runs COpenXRManager::onConfigReload() one idle tick later, and a full reload re-runs it
+    //     after re-executing the whole script. Both may cost a static monitor a one-off composite
+    //     (the reload's damage paths are change-gated), never a return to the every-tick behaviour.
+    //     `chrome_fade_ms = 150` re-states the default: the value does not change, the reload runs.
+    for (const auto& [WHAT, CMD] : std::vector<std::pair<std::string, std::string>>{
+             {"an unrelated hl.config", "/eval hl.config({ openxr = { chrome_fade_ms = 150 } })"},
+             {"a full reload", "/reload"},
+         }) {
+        const auto BEFORE = pacingOf(MON);
+        ASSERT(getFromSocket(CMD), std::string("ok"));
+        if (!waitQuiet(MON, std::chrono::milliseconds(700), std::chrono::milliseconds(5000))) {
+            const auto D = deltaOver(MON, std::chrono::milliseconds(1000));
+            MARK_TEST_FAILED("{} left the static monitor composited: {} presents / {} paced ticks in 1s, long after it", WHAT, D.presented, D.paced);
+            return;
+        }
+        const auto AFTER = pacingOf(MON);
+        NLog::green("xr_pacing_damage_gated: {}: {} presents, {} blits until quiet again", WHAT, AFTER.presented - BEFORE.presented, AFTER.blitted - BEFORE.blitted);
+    }
 
     // 4. An animation renders until it is done. A workspace switch on the monitor slides (and
     //    focusing the monitor warps the cursor onto it); both must reach the XR layer.

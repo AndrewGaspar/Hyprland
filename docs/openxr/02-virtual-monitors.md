@@ -212,6 +212,16 @@ aquamarine's idle-callback vector, which the main thread concurrently drains in
 When the session drops to idle/synchronized the tick stops and the outputs are purely
 damage-driven.
 
+**Config changes and reloads.** Since 0.57 every runtime `hl.config(…)` — whatever key it sets —
+re-runs `COpenXRManager::onConfigReload()` one idle tick later (the prop refresh), and a full reload
+runs it after re-executing the script. That does not defeat the gate: the reload's damage paths are
+change-gated (`publishBlackAlphaTuning`, `publishStereoPairTuning`, `publishDepthDesktopTuning`,
+the chrome-geometry swapchain recreate, the mode rules' compare-before-apply), so an unrelated change
+costs a static monitor nothing or a one-off composite. A change that does reshape a monitor — chrome
+geometry, `depth_desktop`, a plug flip from `monitors_follow_session` — recreates its swapchain, and
+the no-content row of the stale-layer table above gets it one fresh composite; then it is static
+again.
+
 `hyprctl -j openxr` reports the per-monitor `pacing` counters (`framesPresented`,
 `framesBlitted`, `ticksPaced`, `ticksIdle`; configuration doc §5). `framesPresented` can run ahead of
 `framesBlitted`: a damaged monitor composites at its mode refresh, while the frame thread blits
@@ -220,8 +230,9 @@ presents ~3× per blit). In the hermetic container (AMD, Monado null compositor 
 static 1920×1200 / 1080×1920 monitors went from 100 presents/s and ~17% of Hyprland's GPU time
 to 0 and 0%. The
 `xr_pacing_damage_gated` integration test asserts the contract end to end: static → no
-presents while idle ticks climb; `pace_static_monitors = true` → every tick; a workspace switch,
-cursor motion and a continuously drawing client → presents, then quiet again.
+presents while idle ticks climb; `pace_static_monitors = true` → every tick; an unrelated
+`hl.config` and a full reload → quiet again within seconds; a workspace switch, cursor motion and a
+continuously drawing client → presents, then quiet again.
 
 ## Mode changes (swapchain recreate protocol)
 
