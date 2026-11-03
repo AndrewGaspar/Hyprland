@@ -252,6 +252,20 @@ set(HYPRUTILS_VERSION "${hyprutils_dep_VERSION}")
 set(HYPRCURSOR_VERSION "${hyprcursor_dep_VERSION}")
 set(HYPRGRAPHICS_VERSION "${hyprgraphics_dep_VERSION}")
 
+# HypXRland: aquamarine 0.16.0 (259c8b5) stopped deriving max_bpc from the scanout
+# format and added COutputState::setMaxBpc(); without a call to it every DRM output
+# runs at the connector's maximum. Monitor.cpp calls it (upstream e0e9c8437) only
+# when this is defined, so the tree still builds against 0.15.x. aquamarine has no
+# version macro, so gate on the pkg-config version. A git snapshot between 259c8b5
+# and the 0.16.0 bump still reports 0.15.1 and leaves this off. Drop the gate once
+# AQUAMARINE_MINIMUM_VERSION reaches 0.16.0.
+if(aquamarine_dep_VERSION VERSION_GREATER_EQUAL 0.16.0)
+  add_compile_definitions(HYPRLAND_AQUAMARINE_HAS_MAX_BPC)
+  message(STATUS "aquamarine ${aquamarine_dep_VERSION}: max_bpc follows the monitor bitdepth (HYPRLAND_AQUAMARINE_HAS_MAX_BPC)")
+else()
+  message(STATUS "aquamarine ${aquamarine_dep_VERSION}: no setMaxBpc(), max_bpc left to aquamarine")
+endif()
+
 
 find_package(Git QUIET)
 
