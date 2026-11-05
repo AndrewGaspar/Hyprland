@@ -411,10 +411,11 @@ are in the configuration page.
 
 A monitor can be bent around the viewer instead of submitted flat — mostly so a virtual
 ultrawide (5120x1440, a 3 m arc) wraps around you instead of being a slab whose ends are
-far away and seen at a steep angle. `curve` is a per-monitor option (`xrmonitor … curve:auto`,
-`hl.xr_monitor{ curve = "auto" }`, an `hl.xr_defaults` block or profile, `create … curve:2.5`,
-or the `xrmonitor curve <radius>|auto|flat` verb at runtime — doc 05). Unset means flat, and a
-flat monitor takes exactly the code path it always did.
+far away and seen at a steep angle. `curve` is a per-monitor option (`hl.xr_monitor{ curve = "auto" }`
+or a `curve:auto` token in its string form, an `hl.xr_defaults` block or profile, `create … curve:2.5`,
+or the `curve <radius>|auto|flat` verb at runtime — `hyprctl openxr curve auto` /
+`hl.dsp.xrmonitor("curve auto")`, doc 05). Unset means flat, and a flat monitor takes exactly the
+code path it always did.
 
 **The model** (`src/openxr/XRCurve.hpp`). The monitor keeps the handle it has always had: the
 anchor solves the pose of the **content centre** and `size:` is the content width. A curved
