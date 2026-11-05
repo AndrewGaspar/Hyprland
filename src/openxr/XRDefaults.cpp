@@ -136,6 +136,11 @@ std::expected<void, std::string> OpenXR::validateXRDefaultsBlock(const SXRDefaul
         return std::unexpected(std::format("distance must be > 0 meters, got {}", fmtFloat(*block.distance)));
     if (block.resolution && (block.resolution->x <= 0 || block.resolution->y <= 0))
         return std::unexpected("mode must be a positive WxH");
+    // Re-validated even though every front end goes through parseXRCurve, so a block built any other
+    // way cannot smuggle in a radius the geometry would have to clamp silently.
+    if (block.curve && block.curve->mode == XR_CURVE_RADIUS &&
+        (!std::isfinite(block.curve->radius) || block.curve->radius < XR_CURVE_RADIUS_MIN || block.curve->radius > XR_CURVE_RADIUS_MAX))
+        return std::unexpected(std::format("curve radius must be between {} and {} metres, got {}", XR_CURVE_RADIUS_MIN, XR_CURVE_RADIUS_MAX, fmtFloat(block.curve->radius)));
     return {};
 }
 
@@ -163,6 +168,7 @@ std::expected<SXRResolvedDefaults, std::string> OpenXR::resolveXRDefaults(const 
     out.scale       = {.value = globals.scale};
     out.size        = {.value = globals.size};
     out.distance    = {.value = globals.distance};
+    out.curve       = {.value = globals.curve};
 
     // Two passes over the same list: base blocks first, then the profile's, so a profile layered on
     // top always wins regardless of where in the config its blocks sit.
@@ -186,6 +192,8 @@ std::expected<SXRResolvedDefaults, std::string> OpenXR::resolveXRDefaults(const 
                 out.size = {.value = *b.size, .source = SRC, .block = IDX};
             if (b.distance)
                 out.distance = {.value = *b.distance, .source = SRC, .block = IDX};
+            if (b.curve)
+                out.curve = {.value = *b.curve, .source = SRC, .block = IDX};
         }
     };
     apply(false);
@@ -197,6 +205,8 @@ std::expected<SXRResolvedDefaults, std::string> OpenXR::resolveXRDefaults(const 
     }
     if (explicitFields.size)
         out.size = {.value = *explicitFields.size, .source = XR_DEFSRC_EXPLICIT};
+    if (explicitFields.curve)
+        out.curve = {.value = *explicitFields.curve, .source = XR_DEFSRC_EXPLICIT};
 
     return out;
 }

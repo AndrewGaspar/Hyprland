@@ -189,6 +189,11 @@ namespace {
                 if (*r <= 0.f)
                     return std::unexpected<std::string>("size must be positive");
                 out.m_sizeMeters = *r;
+            } else if (key == "curve") {
+                auto r = OpenXR::parseXRCurve(val);
+                if (!r)
+                    return std::unexpected(r.error());
+                out.m_curve = *r;
             } else if (key == "adaptive") {
                 sawAdaptive = true;
                 if (val == "on" || val == "true" || val == "1")
@@ -748,7 +753,7 @@ namespace {
 }
 
 std::string OpenXR::serializeXRMonitorLine(const std::string& name, Vector2D resolution, std::optional<float> refreshHz, const SXRAnchorState& anchor, const SXRPose& pose,
-                                            float sizeMeters) {
+                                           float sizeMeters, const SXRCurveSpec& curve) {
     std::string mode = std::format("{}x{}", (int)resolution.x, (int)resolution.y);
     if (refreshHz.has_value() && *refreshHz > 0.f)
         mode += std::format("@{:.0f}", *refreshHz);
@@ -799,7 +804,11 @@ std::string OpenXR::serializeXRMonitorLine(const std::string& name, Vector2D res
             spec += std::format(" carry:{}", anchor.adaptive.carryOffset ? "on" : "off");
     }
 
-    return std::format("xrmonitor = {}, {}, {}, size:{:.2f}", name, mode, spec, sizeMeters);
+    // The curve round-trips as configured (`auto` stays auto and re-wraps around whoever loads it),
+    // not as the radius it happens to have resolved to this session.
+    const std::string curveTok = curve.mode == XR_CURVE_FLAT ? std::string{} : std::format(" curve:{}", xrCurveName(curve));
+
+    return std::format("xrmonitor = {}, {}, {}, size:{:.2f}{}", name, mode, spec, sizeMeters, curveTok);
 }
 
 std::expected<void, std::string> OpenXR::parseXRMonitorMode(const std::string& mode, SXRMonitorParams& out) {
@@ -864,6 +873,24 @@ std::expected<SXRMonitorParams, std::string> OpenXR::parseXRMonitorCreateArgs(co
             return std::unexpected<std::string>("create: profile: needs a name");
         sawProfile = true;
         it         = tokens.erase(it);
+    }
+
+    // `curve:` likewise, so `create XR-wide 5120x1440 curve:auto` works without an anchor spec (the
+    // anchor grammar accepts it too; pulling it out here simply makes it position-independent).
+    bool sawCurve = false;
+    for (auto it = tokens.begin(); it != tokens.end();) {
+        if (!it->starts_with("curve:")) {
+            ++it;
+            continue;
+        }
+        if (sawCurve)
+            return std::unexpected<std::string>("create: curve: given more than once");
+        auto c = parseXRCurve(it->substr(std::string_view("curve:").size()));
+        if (!c)
+            return std::unexpected("create: " + c.error());
+        params.m_curve = *c;
+        sawCurve       = true;
+        it             = tokens.erase(it);
     }
 
     size_t idx = 0;

@@ -167,6 +167,7 @@ namespace {
         // adaptive field — the whole reason the parser builds the quaternion rather than storing
         // degrees.
         EXPECT_TRUE(lua.m_anchor == classic.m_anchor);
+        EXPECT_EQ(lua.m_curve, classic.m_curve);
     }
 
     std::string rePattern(const std::shared_ptr<const re2::RE2>& re) {
@@ -437,6 +438,34 @@ TEST(ConfigLuaXRMonitor, whenMustBeATable) {
     EXPECT_NE(fx.errors().find("'when' must be a table"), std::string::npos) << fx.errors();
 }
 
+// `curve` (docs/openxr/02 "Curved monitors"): every Lua spelling lands on the classic token.
+TEST(ConfigLuaXRMonitor, curveSpellingsMatchTheClassicToken) {
+    CXRLuaFixture fx;
+
+    fx.run(R"LUA(
+        hl.xr_monitor({ name = "XR-a", mode = "5120x1440", anchor = "local", pos = { 0, 1.2, -1.9 }, size = 3.0, curve = "auto" })
+        hl.xr_monitor({ name = "XR-b", mode = "5120x1440", anchor = "local", pos = { 0, 1.2, -1.9 }, size = 3.0, curve = 2.5 })
+        hl.xr_monitor({ name = "XR-c", mode = "5120x1440", anchor = "local", pos = { 0, 1.2, -1.9 }, size = 3.0, curve = true })
+        hl.xr_monitor({ name = "XR-d", mode = "5120x1440", anchor = "local", pos = { 0, 1.2, -1.9 }, size = 3.0, curve = false })
+    )LUA");
+
+    EXPECT_EQ(fx.errors(), "");
+    ASSERT_EQ(declaredMonitors().size(), 4u);
+    expectSameMonitor(declaredMonitors()[0], classicMonitor("XR-a, 5120x1440, anchor:local pos:0,1.2,-1.9 size:3.0 curve:auto"));
+    expectSameMonitor(declaredMonitors()[1], classicMonitor("XR-b, 5120x1440, anchor:local pos:0,1.2,-1.9 size:3.0 curve:2.5"));
+    expectSameMonitor(declaredMonitors()[2], classicMonitor("XR-c, 5120x1440, anchor:local pos:0,1.2,-1.9 size:3.0 curve:auto"));
+    expectSameMonitor(declaredMonitors()[3], classicMonitor("XR-d, 5120x1440, anchor:local pos:0,1.2,-1.9 size:3.0 curve:flat"));
+}
+
+TEST(ConfigLuaXRMonitor, badCurveIsAConfigError) {
+    CXRLuaFixture fx;
+
+    fx.run(R"LUA( hl.xr_monitor({ name = "XR-a", anchor = "local", pos = { 0, 1.2, -1.9 }, curve = "wobbly" }) )LUA");
+
+    EXPECT_TRUE(declaredMonitors().empty());
+    EXPECT_NE(fx.errors().find("curve: expected auto, flat or a radius"), std::string::npos) << fx.errors();
+}
+
 // ---- hl.xr_defaults (doc 05 §3.3) ----
 
 namespace {
@@ -478,6 +507,41 @@ TEST(ConfigLuaXRDefaults, theDocumentedXRealAndQuestBlocks) {
 
     EXPECT_EQ(declaredDefaults()[3].profile, "tall");
     EXPECT_EQ(*declaredDefaults()[3].resolution, (Vector2D{1080, 1920}));
+}
+
+TEST(ConfigLuaXRDefaults, curveInBlocksAndProfiles) {
+    CXRLuaFixture fx;
+
+    fx.run(R"LUA(
+        hl.xr_defaults({ profile = "ultrawide", mode = "5120x1440@60", size = 3.0, curve = "auto" })
+        hl.xr_defaults({ profile = "arc", curve = 2.5 })
+        hl.xr_defaults({ curve = true })
+        hl.xr_defaults({ curve = "flat" })
+    )LUA");
+
+    EXPECT_EQ(fx.errors(), "");
+    ASSERT_EQ(declaredDefaults().size(), 4u);
+    EXPECT_EQ(declaredDefaults()[0].curve->mode, OpenXR::XR_CURVE_AUTO);
+    EXPECT_EQ(declaredDefaults()[1].curve->mode, OpenXR::XR_CURVE_RADIUS);
+    EXPECT_FLOAT_EQ(declaredDefaults()[1].curve->radius, 2.5F);
+    EXPECT_EQ(declaredDefaults()[2].curve->mode, OpenXR::XR_CURVE_AUTO);
+    EXPECT_EQ(declaredDefaults()[3].curve->mode, OpenXR::XR_CURVE_FLAT);
+}
+
+TEST(ConfigLuaXRDefaults, badCurveIsAConfigError) {
+    CXRLuaFixture fx;
+
+    fx.run(R"LUA(
+        hl.xr_defaults({ curve = "wobbly" })
+        hl.xr_defaults({ curve = 0.05 })
+        hl.xr_defaults({ curve = {} })
+    )LUA");
+
+    EXPECT_TRUE(declaredDefaults().empty());
+    const auto ERRS = fx.errors();
+    EXPECT_NE(ERRS.find("curve: expected auto, flat or a radius"), std::string::npos) << ERRS;
+    EXPECT_NE(ERRS.find("curve: radius must be between"), std::string::npos) << ERRS;
+    EXPECT_NE(ERRS.find("'curve' must be a radius"), std::string::npos) << ERRS;
 }
 
 TEST(ConfigLuaXRDefaults, unknownFieldIsAConfigError) {
