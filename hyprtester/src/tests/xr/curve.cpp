@@ -169,7 +169,16 @@ TEST_CASE(xr_curve) {
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     const float d25 = gazeHitDist(mon);
     if (d0 < 0.f || d25 < 0.f) {
-        XR::logSkip(name(), "gaze never selected the monitor (known env instability)");
+        // Tell "the gaze cannot reach monitors in this environment" (xr_gaze_grab skips the same
+        // way here) apart from "the gaze reaches the quad but misses the cylinder": flatten and ask
+        // again. A flat hit where the curved one missed is a curved hit-test bug, not the env.
+        setHeadYawDeg(0.f);
+        ASSERT(getFromSocket("/openxr curve flat"), std::string("ok"));
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        if (const float dF = gazeHitDist(mon); dF > 0.f)
+            MARK_TEST_FAILED("the gaze hits the FLAT monitor at {:.3f} m but missed the curved one (curved 0 deg {:.3f}, 25 deg {:.3f})", dF, d0, d25);
+        else
+            XR::logSkip(name(), "gaze never selected the monitor, curved or flat (known env instability; xr_gaze_grab skips likewise)");
         return;
     }
     if (std::fabs(d0 - DIST) > 0.03f || std::fabs(d25 - DIST) > 0.03f)
