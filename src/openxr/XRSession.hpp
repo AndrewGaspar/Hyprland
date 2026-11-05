@@ -116,6 +116,10 @@ class CXRSession {
     bool       m_hasUserPresence      = false;
     bool       m_supportsUserPresence = false;
 
+    // XR_KHR_composition_layer_cylinder advertised AND enabled (curved monitors). Written once before
+    // the frame thread starts; read by it per frame and by the main thread for status.
+    bool m_hasCylinder = false;
+
     // report-20 issue B1: set by getSystem() when xrGetSystem fails with XR_ERROR_FORM_FACTOR_UNAVAILABLE
     // — the spec's "runtime up, headset not connected/donned, poll me later" result. Lets the manager's
     // dormant re-probe distinguish "waiting for the runtime" from "waiting for the headset". Reset to

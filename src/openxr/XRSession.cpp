@@ -123,6 +123,13 @@ bool CXRSession::createInstance() {
     if (m_hasUserPresence)
         exts.push_back(XR_EXT_USER_PRESENCE_EXTENSION_NAME);
 
+    // Curved monitors (docs/openxr/02 "Curved monitors"): XR_KHR_composition_layer_cylinder whenever
+    // the runtime offers it — enabling it costs nothing until a monitor asks for a curve. Absent, a
+    // curved monitor is submitted as its flat quad and says so in status (one WARN per monitor).
+    m_hasCylinder = hasExt(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
+    if (m_hasCylinder)
+        exts.push_back(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
+
     // Overlay session (doc 01): enable XR_EXTX_overlay only when requested (openxr:overlay) AND
     // advertised by the runtime. Requested-but-unsupported downgrades to a normal session with a
     // one-time WARN — never fail startup for this. m_isOverlay is the actual decision, consumed by
@@ -161,9 +168,10 @@ bool CXRSession::createInstance() {
     if (XR_SUCCEEDED(xrGetInstanceProperties(m_instance, &props)))
         m_runtimeName = props.runtimeName;
 
-    LOG(Log::DEBUG, "[OPENXR] instance created (runtime: {}, local_floor: {}, hand_interaction: {}, hand_tracking: {}, overlay: {}, user_presence: {}, plane_detection: {})",
+    LOG(Log::DEBUG,
+        "[OPENXR] instance created (runtime: {}, local_floor: {}, hand_interaction: {}, hand_tracking: {}, overlay: {}, user_presence: {}, plane_detection: {}, cylinder: {})",
         m_runtimeName.empty() ? "?" : m_runtimeName, m_hasLocalFloor, m_hasHandInteraction, m_hasHandTracking, m_isOverlay, m_hasUserPresence,
-        m_hasPlaneDetection ? "enabled" : (m_planeDetectionAdvertised ? "advertised" : "no"));
+        m_hasPlaneDetection ? "enabled" : (m_planeDetectionAdvertised ? "advertised" : "no"), m_hasCylinder);
     return true;
 }
 

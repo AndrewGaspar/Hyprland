@@ -61,6 +61,9 @@ ActionResult OpenXR::xrmonitorAction(const std::string& args) {
         return fromExpected(g_pOpenXRManager->cmdDistance(rest));
     if (verb == "center")
         return fromExpected(g_pOpenXRManager->cmdCenter());
+    // docs/openxr/02 "Curved monitors": curve <radius m>|auto|flat on the selected monitor.
+    if (verb == "curve")
+        return fromExpected(g_pOpenXRManager->cmdCurve(rest));
     // doc 03 §8.4: "bring my monitors to me" — rigidly re-seat the whole anchor:local group around
     // the current head. cmdReseat returns a message rather than void (the hyprctl transport prints
     // it); a dispatcher has nowhere to put a success string, so it is logged there and dropped here.

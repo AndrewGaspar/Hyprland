@@ -109,6 +109,7 @@ struct SXRPointerTarget {
     OpenXR::SXRPose           worldPose;        // FULL quad (content + chrome margins) center pose
     float                     w = 0.F;          // FULL quad width in meters
     float                     h = 0.F;          // FULL quad height in meters
+    float                     radius = 0.F;          // curved monitors: submitted cylinder radius, 0 = flat (XRCurve.hpp)
     std::string               name;             // monitor name (grab event payload / re-lookup by name)
     OpenXR::CXRAnchor*        anchor = nullptr;
     OpenXR::SXRChromeGeometry chrome;           // WP-G1: normalized chrome layout for hit classification + content-uv remap

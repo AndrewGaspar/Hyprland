@@ -91,6 +91,8 @@ static std::string openxrStatus(eOutputFormat format) {
     const std::string BLOCKED = g_pOpenXRManager->blockedReason();
     const std::string BLEND   = g_pOpenXRManager->blendModeName();
     const bool        OVERLAY = g_pOpenXRManager->isOverlay();
+    // Curved monitors: does this session's runtime draw cylinder layers at all (else curves go flat).
+    const bool        CYLINDER     = g_pOpenXRManager->cylinderSupported();
     const bool        MONITOR_VIEW = g_pOpenXRManager->monitorViewVisible();
     // report 09: luma-keyed transparency ("black-as-alpha"). Reports the CONFIGURED value, the
     // EFFECTIVE one (forced off unless the blend mode composites over passthrough/additive) and the
@@ -188,6 +190,14 @@ static std::string openxrStatus(eOutputFormat format) {
             "stereoProducer": "{}",
             "chrome": {},
             "quads": {},
+            "curve": {{
+                "spec": "{}",
+                "source": "{}",
+                "radiusM": {:.3f},
+                "angleDeg": {:.1f},
+                "active": {},
+                "flatReason": "{}"
+            }},
             "adaptive": {{
                 "enabled": {},
                 "phase": "{}",
@@ -242,9 +252,10 @@ static std::string openxrStatus(eOutputFormat format) {
         }})#",
                                 m.name, m.id, m.sizeMeters, m.anchorMode, m.posX, m.posY, m.posZ, m.quatX, m.quatY, m.quatZ, m.quatW, m.grabbed ? "true" : "false", m.grabKind,
                                 m.hovered ? "true" : "false", m.region, m.plugged ? "true" : "false", m.contentPath, m.linear ? "true" : "false", m.stereo, m.producer,
-                                m.chrome ? "true" : "false", m.quads, m.adaptiveEnabled ? "true" : "false", m.adaptivePhase, m.adaptiveRoamMode, m.adaptiveSeatDist, m.adaptiveT,
-                                m.anchorState, m.restorable ? "true" : "false", m.restoreX, m.restoreY, m.restoreZ, m.staged ? "true" : "false", m.stagedX, m.stagedY, m.stagedZ,
-                                m.commit, m.provenance, m.provenanceAgeS, m.provenanceSeatS, m.l2dSource, m.l2dCol, m.l2dRow, m.l2dX, m.l2dY, m.l2dAzDeg, m.l2dElDeg,
+                                m.chrome ? "true" : "false", m.quads, m.curve, m.curveSource, m.curveRadius, m.curveAngleDeg, m.curveActive ? "true" : "false", m.curveFlatReason,
+                                m.adaptiveEnabled ? "true" : "false", m.adaptivePhase, m.adaptiveRoamMode, m.adaptiveSeatDist, m.adaptiveT, m.anchorState,
+                                m.restorable ? "true" : "false", m.restoreX, m.restoreY, m.restoreZ, m.staged ? "true" : "false", m.stagedX, m.stagedY, m.stagedZ, m.commit,
+                                m.provenance, m.provenanceAgeS, m.provenanceSeatS, m.l2dSource, m.l2dCol, m.l2dRow, m.l2dX, m.l2dY, m.l2dAzDeg, m.l2dElDeg,
                                 m.surfaceAttached ? "true" : "false", m.surfacePlane, m.surfaceKind, m.surfacePlaneLost ? "true" : "false", m.surfacePreview ? "true" : "false",
                                 m.fxAlpha, m.fxAlphaTarget, m.fxAlphaSrc, m.fxBlackAlpha, m.fxBlackAlphaTarget, m.fxBlackAlphaSrc, m.fxKnee, m.fxKneeSrc,
                                 m.fxTransitioning ? "true" : "false", m.framesPresented, m.framesBlitted, m.ticksPaced, m.ticksIdle);
@@ -264,6 +275,7 @@ static std::string openxrStatus(eOutputFormat format) {
     "blendMode": "{}",
     "blackAlpha": {{ "configured": {:.3f}, "effective": {:.3f}, "knee": {:.3f}, "active": {}, "gatedOff": {} }},
     "overlay": {},
+    "cylinderLayers": {},
     "monitorView": "{}",
     "selected": "{}",
     "monitorsFollowSession": "{}",
@@ -296,15 +308,15 @@ static std::string openxrStatus(eOutputFormat format) {
 }}
 )#",
                            STATE, RUNTIME, SYSTEM, RTGPU, RTJSON, BLOCKED, BLEND, BLACK.configured, BLACK.effective, BLACK.knee, BLACK.active ? "true" : "false",
-                           BLACK.gatedOff ? "true" : "false", OVERLAY ? "true" : "false", MONITOR_VIEW ? "shown" : "hidden", SELECTED, FOLLOW, UNPLUG_PEND, RECENTER, PRESENCE,
-                           RESTORE_CAPTURE ? "true" : "false", donoffJson(DONOFF), WORLD.available ? "true" : "false", WORLD.located ? "true" : "false",
-                           WORLD.tracked ? "true" : "false", WORLD.x, WORLD.y, WORLD.z, WORLD.yawDeg, WORLD.probes, WORLD.changes, WORLD.unresolvable, VISIBLE, REPROBE_WAIT,
-                           REPROBE_MS, REPROBE_WATCH ? "true" : "false", MANUAL_DISABLE ? "true" : "false", INHIBITING_IDLE ? "true" : "false", INHIBIT_MODE, HANDIN.mode,
-                           HANDIN.state, GAZE.source, GAZE.hoveredMonitor, GAZE.hoveredName, GAZE.carrying ? "true" : "false", GAZE.carryMonitor, GAZE.dist,
-                           HANDS[0].hands ? "hands" : "controllers", HANDS[0].gesture, HANDS[0].filtered ? "true" : "false", HANDS[1].hands ? "hands" : "controllers",
-                           HANDS[1].gesture, HANDS[1].filtered ? "true" : "false", L2D.enabled ? "true" : "false", L2D.frozen ? "true" : "false", L2D.refValid ? "true" : "false",
-                           L2D.refYawDeg, L2D.placed, L2D.rows, L2D.width, L2D.height, L2D.vertical, L2D.attach, L2D.pxPerDegree, surfacesJson(SURF), MONS.empty() ? "" : "\n",
-                           mons);
+                           BLACK.gatedOff ? "true" : "false", OVERLAY ? "true" : "false", CYLINDER ? "true" : "false", MONITOR_VIEW ? "shown" : "hidden", SELECTED, FOLLOW,
+                           UNPLUG_PEND, RECENTER, PRESENCE, RESTORE_CAPTURE ? "true" : "false", donoffJson(DONOFF), WORLD.available ? "true" : "false",
+                           WORLD.located ? "true" : "false", WORLD.tracked ? "true" : "false", WORLD.x, WORLD.y, WORLD.z, WORLD.yawDeg, WORLD.probes, WORLD.changes,
+                           WORLD.unresolvable, VISIBLE, REPROBE_WAIT, REPROBE_MS, REPROBE_WATCH ? "true" : "false", MANUAL_DISABLE ? "true" : "false",
+                           INHIBITING_IDLE ? "true" : "false", INHIBIT_MODE, HANDIN.mode, HANDIN.state, GAZE.source, GAZE.hoveredMonitor, GAZE.hoveredName,
+                           GAZE.carrying ? "true" : "false", GAZE.carryMonitor, GAZE.dist, HANDS[0].hands ? "hands" : "controllers", HANDS[0].gesture,
+                           HANDS[0].filtered ? "true" : "false", HANDS[1].hands ? "hands" : "controllers", HANDS[1].gesture, HANDS[1].filtered ? "true" : "false",
+                           L2D.enabled ? "true" : "false", L2D.frozen ? "true" : "false", L2D.refValid ? "true" : "false", L2D.refYawDeg, L2D.placed, L2D.rows, L2D.width,
+                           L2D.height, L2D.vertical, L2D.attach, L2D.pxPerDegree, surfacesJson(SURF), MONS.empty() ? "" : "\n", mons);
     }
 
     const std::string FOLLOWLINE = UNPLUG_PEND >= 0 ? std::format("{} (unplug in {}ms)", FOLLOW, UNPLUG_PEND) : FOLLOW;
@@ -351,15 +363,16 @@ static std::string openxrStatus(eOutputFormat format) {
         std::string("unavailable (this runtime offers no STAGE space)") :
         std::format("[{:.2f}, {:.2f}, {:.2f}] yaw {:.1f} deg ({}{}), {} probe(s), {} change(s), {} unresolvable", WORLD.x, WORLD.y, WORLD.z, WORLD.yawDeg,
                     WORLD.located ? "located" : "NOT locatable", WORLD.located && !WORLD.tracked ? ", inferred" : "", WORLD.probes, WORLD.changes, WORLD.unresolvable);
-    std::string       out =
-        std::format("state: {}\n{}runtime: {}\nsystem: {}\nruntime gpu: {}\nruntime json: {}\nblend mode: {}\nblack alpha: {}\noverlay: {}\nmonitor view: {}\nselected: {}\nmonitors "
-                    "follow session: {}\nrecenter policy: {}\nvisible: "
-                    "{}\npresence: {}\nidle "
-                    "inhibited: {} (mode {})\nplacement capture: {}\nworld frame (STAGE): {}\nhand input: {} "
-                    "({})\ngaze ({}): {}\ninput: left {}, right {}\n2d-plane sync: {}\n",
-                    STATELINE, BLOCKEDLINE, RUNTIME, SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, RTJSON.empty() ? "(loader default)" : RTJSON, BLEND, BLACKLINE, OVERLAY ? "yes" : "no",
-                    MONITOR_VIEW ? "shown" : "hidden", SELECTED.empty() ? "(none)" : SELECTED, FOLLOWLINE, RECENTER, VISIBLE, PRESENCE, INHIBITING_IDLE ? "yes" : "no", INHIBIT_MODE, RESTORE_CAPTURE ? "on" : "off",
-                    WORLDLINE, HANDIN.state, HANDIN.mode, GAZE.source, GAZELINE, handLabel(HANDS[0]), handLabel(HANDS[1]), L2DLINE);
+    std::string       out = std::format("state: {}\n{}runtime: {}\nsystem: {}\nruntime gpu: {}\nruntime json: {}\nblend mode: {}\nblack alpha: {}\noverlay: {}\ncylinder layers: "
+                                  "{}\nmonitor view: {}\nselected: {}\nmonitors "
+                                  "follow session: {}\nrecenter policy: {}\nvisible: "
+                                  "{}\npresence: {}\nidle "
+                                  "inhibited: {} (mode {})\nplacement capture: {}\nworld frame (STAGE): {}\nhand input: {} "
+                                  "({})\ngaze ({}): {}\ninput: left {}, right {}\n2d-plane sync: {}\n",
+                                  STATELINE, BLOCKEDLINE, RUNTIME, SYSTEM, RTGPU.empty() ? "unknown" : RTGPU, RTJSON.empty() ? "(loader default)" : RTJSON, BLEND, BLACKLINE,
+                                  OVERLAY ? "yes" : "no", CYLINDER ? "yes" : "no", MONITOR_VIEW ? "shown" : "hidden", SELECTED.empty() ? "(none)" : SELECTED, FOLLOWLINE, RECENTER,
+                                  VISIBLE, PRESENCE, INHIBITING_IDLE ? "yes" : "no", INHIBIT_MODE, RESTORE_CAPTURE ? "on" : "off", WORLDLINE, HANDIN.state, HANDIN.mode,
+                                  GAZE.source, GAZELINE, handLabel(HANDS[0]), handLabel(HANDS[1]), L2DLINE);
     // research/30 §12.2: one line for the don/doff FSM and the last doff verdict.
     out += std::format(
         "don/doff: {} (wear signal {}, {}DoF, origin gen {}, placement_memory {}){}\n", DONOFF.state, DONOFF.wearSignal, DONOFF.dof, DONOFF.originGen, DONOFF.placementMemory,
@@ -392,6 +405,10 @@ static std::string openxrStatus(eOutputFormat format) {
         // byte-identical to before. `quads` alongside it is the tell for a pair the budget refused.
         if (m.stereo != "off")
             out += std::format(" stereo: {}/{} ({} quad{}{})", m.stereo, m.producer, m.quads, m.quads == 1 ? "" : "s", m.chrome ? "" : ", chrome off");
+        // Curved monitors: only mentioned when one was asked for, so a flat session reads as before.
+        if (m.curve != "flat")
+            out += m.curveActive ? std::format(" curve: {} (R {:.2f}m, {:.0f} deg, {})", m.curve, m.curveRadius, m.curveAngleDeg, m.curveSource) :
+                                   std::format(" curve: {} ({}) — flat: {}", m.curve, m.curveSource, m.curveFlatReason);
         out += "\n";
         // Situational transparency (doc 05 §xrrule): the effective values + WHERE each came from, so
         // "why is this monitor ghosted" is answerable in one command. `-> x` shows a live transition.
@@ -582,6 +599,10 @@ static std::string openxrRequest(eOutputFormat format, std::string request) {
         auto r = g_pOpenXRManager->cmdDistance(ARGS);
         return r ? "ok" : r.error();
     }
+    if (SUBCOMMAND == "curve") {
+        auto r = g_pOpenXRManager->cmdCurve(ARGS);
+        return r ? "ok" : r.error();
+    }
     if (SUBCOMMAND == "center") {
         auto r = g_pOpenXRManager->cmdCenter();
         return r ? "ok" : r.error();
@@ -674,10 +695,10 @@ static std::string openxrRequest(eOutputFormat format, std::string request) {
     if (SUBCOMMAND == "gaze")
         return openxrGaze(format, ARGS);
 
-    return std::format(
-        "unknown openxr subcommand '{}'. Valid: status, enable, disable, create, destroy, select, anchor, move, rotate, scale, distance, center, reseat, forget, donoff, place, "
-        "alpha, blackalpha, adaptive, dock, undock, roam, gazegrab, gazerelease, gazepush, handinput, view, gaze, layout, sync-layout",
-        SUBCOMMAND);
+    return std::format("unknown openxr subcommand '{}'. Valid: status, enable, disable, create, destroy, select, anchor, move, rotate, scale, distance, curve, center, reseat, "
+                       "forget, donoff, place, "
+                       "alpha, blackalpha, adaptive, dock, undock, roam, gazegrab, gazerelease, gazepush, handinput, view, gaze, layout, sync-layout",
+                       SUBCOMMAND);
 }
 
 void OpenXR::postIPCEvent(std::string event, std::string data) {

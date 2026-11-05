@@ -437,6 +437,30 @@ class CXRMonitorLayer {
     // differ when the budget refuses a pair, which is the one failure mode with no visual tell.
     std::atomic<uint8_t> m_quadsSubmitted{0};
 
+    // ---- curved monitors (docs/openxr/02 "Curved monitors", XRCurve.hpp) ----
+    // The spec in force (xr_defaults ladder, or the `curve` verb): main writes, frame reads, both under
+    // COpenXRManager::m_layersMu. The frame thread snapshots it into a plain float per frame inside
+    // the solve lock — the submission and hit tests never look at it again.
+    OpenXR::SXRCurveSpec m_curve;
+    // The `curve` verb set it: xr_defaults re-resolution must not undo that (as m_sizeUserOwned).
+    bool m_curveUserOwned = false;
+    // auto: the frozen radius (0 = not resolved yet) and the "re-wrap around the head" request. Under
+    // m_layersMu; the request is raised by main (placement verbs, a changed spec) or by the frame
+    // thread (re-seat, a carry that changed depth) and consumed by the frame thread on the next
+    // frame with a valid head.
+    float m_curveAutoR       = 0.F;
+    bool  m_curveAutoPending = true;
+    // FRAME THREAD only: was a grab/carry active last frame (the release edge re-derives auto R if
+    // the carry changed the monitor's distance), and the viewer-outside hysteresis latch.
+    bool m_curveCarried = false;
+    bool m_curveOutside = false;
+    // FRAME THREAD -> main (status, cursor crossing): the radius actually SUBMITTED this frame (0 =
+    // flat, either by config or by fallback) and, when a curve was asked for but not drawn, why
+    // (OpenXR::eXRCurveFlatReason). Plain atomics.
+    std::atomic<float>   m_curveRadiusLive{0.F};
+    std::atomic<float>   m_curveAngleLive{0.F}; // its central angle, radians (0 = flat)
+    std::atomic<uint8_t> m_curveFlatReason{0};
+
     // Whether the chrome draw pass ran for this monitor LAST FRAME (WP X4). Frame thread → main
     // thread (status only). It exists because chrome suppression is a frame-thread decision with no
     // other outside view: X1 suppresses chrome on a CONTENT pair and X4 restores it on a DEPTH pair,

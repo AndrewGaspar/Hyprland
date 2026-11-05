@@ -51,6 +51,7 @@
 #include <vector>
 
 #include "XRMath.hpp"
+#include "XRCurve.hpp"
 #include "../helpers/math/Math.hpp"
 
 namespace OpenXR {
@@ -131,6 +132,7 @@ namespace OpenXR {
         SXRPose pose;          // content-quad centre, LOCAL_FLOOR metres
         float   wMeters = 0.F; // content width
         float   hMeters = 0.F; // content height (= wMeters * contentPxH / contentPxW)
+        float   radius  = 0.F; // curved monitors: the submitted cylinder radius, 0 = flat (XRCurve.hpp)
     };
 
     struct SXRCrossPick {
@@ -310,7 +312,7 @@ namespace OpenXR {
                 // Pass 1 is exact; pass 2 expands the half-extents by the angular margin subtended
                 // at THIS quad's distance, so the forgiveness is constant in the user's view.
                 const float slack = pass == 0 ? 0.F : tanTol * (q.pose.pos - eye).length();
-                const SXRQuadHit hit = rayQuadIntersect(q.pose, eye, dir, q.wMeters, q.hMeters, slack);
+                const SXRQuadHit hit   = rayMonitorIntersect(q.pose, eye, dir, q.wMeters, q.hMeters, q.radius, slack);
                 if (!hit.hit || hit.t >= bestT)
                     continue;
                 bestT         = hit.t;
