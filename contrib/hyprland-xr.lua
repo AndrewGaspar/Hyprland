@@ -224,6 +224,18 @@ hl.xr_defaults({ when = { hmd = "Quest 3" }, mode = "2560x1440@90", scale = 1.25
 -- layers over the headset block, so it keeps that headset's scale.
 hl.xr_defaults({ profile = "tall", mode = "1080x1920@90", size = 0.8 })
 
+-- Curved monitors (docs 02 "Curved monitors", 05 §3.3): `curve` bends a monitor around you — "auto"
+-- wraps it around your head (radius = its distance from you when placed, frozen until a re-seat /
+-- center / `xrmonitor curve auto`), a number is a radius in metres, "flat" (or unset) is the flat
+-- quad. `size` is then the ARC length. It works on hl.xr_monitor, in xr_defaults blocks and in
+-- profiles, e.g. a 32:9 ultrawide for the XReal that wraps a 3 m arc ~1.9 m away (~90 degrees):
+--
+--   hl.xr_defaults({ profile = "ultrawide", when = { hmd = "desc:Nreal Air 2 Ultra 0x88888800" },
+--                    mode = "5120x1440@60", scale = 1.6, size = 3.0, distance = 1.9, curve = "auto" })
+--   hl.bind("SUPER + ALT + W", hl.dsp.xrmonitor("create profile:ultrawide"), { description = "Create a curved ultrawide" })
+--
+-- and at runtime, on the selected monitor: hl.dsp.xrmonitor("curve auto" | "curve 2.5" | "curve flat").
+
 -- XR monitor to bring up at launch. Arrange it in-headset by grabbing, then run
 -- `hyprctl openxr layout` and persist the arrangement. That command still prints a paste-ready
 -- CLASSIC `xrmonitor = …` line, which is why hl.xr_monitor also takes one as a string:

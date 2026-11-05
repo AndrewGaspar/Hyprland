@@ -596,14 +596,19 @@ Declares that a virtual monitor should exist and where it lives in 3D space. Ord
 `xrmonitor` only controls existence and 3D placement.
 
 ```
-xrmonitor = <name>, <WxH>[@Hz], <anchor-spec>[, size:<meters>]
+xrmonitor = <name>, <WxH>[@Hz], <anchor-spec>[, size:<meters>][ curve:auto|flat|<radius m>]
 ```
 
 - `<name>` — output name, conventionally `XR-`-prefixed (e.g. `XR-code`).
 - `<WxH>[@Hz]` — pixel mode; refresh optional (default 60).
 - `<anchor-spec>` — space-separated `key:value` sub-tokens. Coordinates are meters in the
   OpenXR convention: **+X right, +Y up, −Z forward**.
-- `size:` — the quad's content width in meters (default `openxr:default_size`).
+- `size:` — the quad's content width in meters (default `openxr:default_size`). On a curved
+  monitor this is the **arc length**.
+- `curve:` — bend the monitor around you (doc 02 "Curved monitors"). `auto` wraps it around your
+  head (radius = its distance from you at placement); a number is an explicit radius in meters
+  (`0.3`–`100`); `flat` (the default when unset) keeps the flat quad. An explicit `curve:flat`
+  overrides a curving `hl.xr_defaults` profile.
 
 | Anchor mode | Spec | Meaning |
 |---|---|---|
@@ -614,6 +619,7 @@ xrmonitor = <name>, <WxH>[@Hz], <anchor-spec>[, size:<meters>]
 
 ```ini
 xrmonitor = XR-code,    2560x1440@90, anchor:local pos:0,1.4,-1.5 yaw:0, size:1.8
+xrmonitor = XR-wide,    5120x1440@60, anchor:local pos:0,1.4,-1.9 yaw:0, size:3.0 curve:auto
 xrmonitor = XR-chat,    1280x720,     anchor:head offset:0.4,-0.2,-1.0, size:0.6
 xrmonitor = XR-music,   1920x1080@60, anchor:body offset:-0.8,1.2,-1.2, size:0.9
 xrmonitor = XR-palette, 800x800,      anchor:device:left offset:0,0.08,-0.05, size:0.25
@@ -644,7 +650,8 @@ Lua: leave it and `size` out to take them from `hl.xr_defaults`, §3.3), `when` 
 declaration to one headset (§3.3), `anchor` is
 the anchor mode — bare (`"local"`) or fully qualified (`"anchor:local"`), both accepted — and every
 remaining `key:value` sub-token of the classic spec is a field of the same name. Vector fields
-(`pos`, `offset`, `roam_offset`) take `{ x, y, z }` or the `"x,y,z"` string.
+(`pos`, `offset`, `roam_offset`) take `{ x, y, z }` or the `"x,y,z"` string. `curve` takes
+`"auto"`, `"flat"`, a radius in meters, or a boolean (`true` = `"auto"`, `false` = `"flat"`).
 
 ```lua
 hl.xr_monitor({
@@ -661,6 +668,7 @@ hl.xr_monitor({
     return_radius = 1.0,      -- `return` is a Lua keyword; `["return"] = 1.0` also works
 })
 
+hl.xr_monitor({ name = "XR-wide",    mode = "5120x1440@60", anchor = "local",    pos = { 0, 1.4, -1.9 }, size = 3.0, curve = "auto" })
 hl.xr_monitor({ name = "XR-chat",    mode = "1280x720", anchor = "head",         offset = { 0.4, -0.2, -1.0 }, size = 0.6 })
 hl.xr_monitor({ name = "XR-palette", mode = "800x800",  anchor = "device:left",  offset = { 0, 0.08, -0.05 },  size = 0.25 })
 ```
@@ -766,11 +774,13 @@ hl.xr_defaults({
     scale    = 1.6,             -- optional: monitor scale; 0 = Hyprland's PPI guess
     size     = 0.8,             -- optional: quad width, meters
     distance = 1.2,             -- optional: placement distance for a NEW monitor, meters
+    curve    = "auto",          -- optional: "auto" | "flat" | radius in meters | true/false (doc 02)
 })
 ```
 
 Every field is optional. An unknown key, a malformed `mode`, `size`/`distance` that are not
-positive, a negative `scale`, or a bad `when` is a config error that drops that block and keeps
+positive, a negative `scale`, a `curve` that is not `auto`/`flat`/a radius in `0.3`–`100` m, or a
+bad `when` is a config error that drops that block and keeps
 loading the rest of the config. Blocks are rebuilt from scratch on every reload, so they never pile
 up.
 
@@ -815,16 +825,17 @@ hand_tracking …, passthrough …`.
 
 #### Resolution — which value a monitor gets
 
-Each field (mode, scale, size, distance) is resolved on its own, lowest layer first:
+Each field (mode, scale, size, distance, curve) is resolved on its own, lowest layer first:
 
 1. **Globals**: `openxr:default_monitor_scale`, `openxr:default_size`, `openxr:default_distance`,
-   and the headless 1920x1080@60.
+   the headless 1920x1080@60, and `curve` flat (there is no global curve: a curve is always opted
+   into).
 2. **Base blocks** (no `profile`) whose `when` matches, in config order. For each field, a later
    block overrides an earlier one, and a block that does not set a field leaves it alone.
 3. **Profile blocks** (`profile` equals the requested profile) whose `when` matches, in config order,
    field by field. A profile block always beats a base block, wherever each one sits in the config.
-4. **Explicit values**: the mode and `size` in the `hl.xr_monitor` declaration or in the `create`
-   args. These beat every block.
+4. **Explicit values**: the mode, `size` and `curve` in the `hl.xr_monitor` declaration or in the
+   `create` args. These beat every block.
 
 A `monitor =` / `hl.monitor` rule for the output still outranks all four (§3.1, §3.2). Asking for a
 profile that **no block names** is an error from the `create` call. A profile that exists but whose
@@ -869,6 +880,7 @@ that came from defaults**:
 | scale | Re-derived through the §3.2 rung, so it keeps the whole-logical-pixel gate and the exclusions for adopted and stereo outputs. | A `monitor =` rule gives an explicit scale (§3.2). A display-settings GUI override also still wins. |
 | size (quad width) | The quad grows or shrinks **in place**, with its center and orientation unchanged. | The declaration or create args gave a `size`, **or you resized it at runtime** (a grab-resize, or `xrmonitor scale`). From then on the width is yours for the monitor's lifetime. |
 | distance | **Never.** It only decides where a *new* monitor is placed. An existing monitor is never moved. | Always. |
+| curve | The monitor bends or flattens **in place**; an `auto` curve re-wraps around your head. | The declaration or create args gave a `curve`, **or you set one at runtime** (`xrmonitor curve`) — until the declaration's own `curve` changes. |
 
 `hyprctl openxr status` shows the provenance per monitor:
 
@@ -897,6 +909,8 @@ hl.xr_defaults({ when = { hmd = "Quest 3" }, mode = "2560x1440@90", scale = 1.25
 
 -- A portrait panel for a feed or chat. It layers over the headset block, so it keeps that scale.
 hl.xr_defaults({ profile = "tall", mode = "1080x1920@90", size = 0.8 })
+-- A 32:9 ultrawide that wraps around you (doc 02 "Curved monitors"): a 3 m arc ~1.9 m away.
+hl.xr_defaults({ profile = "ultrawide", mode = "5120x1440@60", size = 3.0, distance = 1.9, curve = "auto" })
 
 -- No mode, no size, and no hl.monitor line for XR-main: each one would outrank the defaults.
 hl.xr_monitor({ name = "XR-main", anchor = "local", pos = { 0.017, 1.457, -1.408 }, yaw = 5.3, pitch = 3.0 })
@@ -904,6 +918,7 @@ hl.xr_monitor({ name = "XR-main", anchor = "local", pos = { 0.017, 1.457, -1.408
 -- Mint XR-2, XR-3, ... shaped for whichever headset is on.
 hl.bind("SUPER + ALT + N", hl.dsp.xrmonitor("create"),              { description = "Create a new XR monitor" })
 hl.bind("SUPER + ALT + X", hl.dsp.xrmonitor("create profile:tall"), { description = "Create a tall XR monitor" })
+hl.bind("SUPER + ALT + W", hl.dsp.xrmonitor("create profile:ultrawide"), { description = "Create a curved ultrawide XR monitor" })
 ```
 
 A full, loadable version of this lives in `contrib/hyprland-xr.lua`.
@@ -1140,7 +1155,7 @@ hl.bind("SUPER + CTRL + Home", hl.dsp.xrmonitor("reseat"), { description = "Re-s
 
 | Verb | Args | Effect |
 |---|---|---|
-| `create` | `[name] [WxH[@Hz]] [profile:<p>] [anchor-spec]` | Create a runtime-owned XR monitor. **Name optional**: without one, the lowest free `XR-<n>` (n ≥ 2) that is neither an existing monitor nor any declared `xrmonitor` name is minted, and `hyprctl openxr create` replies `ok <name>` (a named create still replies `ok`). The first token is the name unless it is mode-shaped (`WxH[@Hz]`), an `anchor:` token or another `key:value` token, so every older form parses unchanged. Mode, scale, quad width and placement distance come from the §3.3 ladder: the args' mode/`size:` win, then the `profile:<p>` blocks (an unknown profile is an error), then the base `hl.xr_defaults` blocks for the bound headset, then 1920x1080@60 / `openxr:default_monitor_scale` / `default_size` / `default_distance`. Mode and scale are durable across reloads (§3.1, §3.2), so a monitor minted by a keybind or voice command needs no `monitor =` line at all. Anchor defaults to `anchor:local`, placed facing you at the resolved distance. |
+| `create` | `[name] [WxH[@Hz]] [profile:<p>] [curve:<c>] [anchor-spec]` | Create a runtime-owned XR monitor. **Name optional**: without one, the lowest free `XR-<n>` (n ≥ 2) that is neither an existing monitor nor any declared `xrmonitor` name is minted, and `hyprctl openxr create` replies `ok <name>` (a named create still replies `ok`). The first token is the name unless it is mode-shaped (`WxH[@Hz]`), an `anchor:` token or another `key:value` token, so every older form parses unchanged. Mode, scale, quad width and placement distance come from the §3.3 ladder: the args' mode/`size:` win, then the `profile:<p>` blocks (an unknown profile is an error), then the base `hl.xr_defaults` blocks for the bound headset, then 1920x1080@60 / `openxr:default_monitor_scale` / `default_size` / `default_distance`. Mode and scale are durable across reloads (§3.1, §3.2), so a monitor minted by a keybind or voice command needs no `monitor =` line at all. Anchor defaults to `anchor:local`, placed facing you at the resolved distance. |
 | `destroy` | `<name\|active>` | Destroy the named monitor, or the selected one. |
 | `select` | `<name\|next\|prev>` | Set the explicit selection target for the verbs below. |
 | `anchor` | `<name\|active> <mode-spec>` | Re-anchor without moving the quad visually: `local`, `head [offset:x,y,z]`, `body [offset:x,y,z]`, `device:left\|right [offset:x,y,z]`. |
@@ -1148,6 +1163,7 @@ hl.bind("SUPER + CTRL + Home", hl.dsp.xrmonitor("reseat"), { description = "Re-s
 | `rotate` | `<dyaw> [dpitch]` | Rotate, degrees (pitch clamped ±85°). |
 | `scale` | `<f\|+d\|-d>` | Bare number multiplies the width; signed number adds/subtracts meters. Clamped 0.2–4.0 m. |
 | `distance` | `<±m>` | Push/pull along the view ray. Clamped 0.3–5.0 m. |
+| `curve` | `<radius m>\|auto\|flat` | Bend the **selected** monitor around you, or flatten it (doc 02 "Curved monitors"). `auto` wraps it around your head where it is **now** — run it again after moving to re-centre the arc on yourself. A runtime value: `hl.xr_defaults` re-resolution leaves it alone until the declaration's own `curve` changes. |
 | `center` | *(none)* | Re-place centered in view at `openxr:default_distance` (anchor mode preserved). Acts on the **selected** monitor only. |
 | `reseat` | *(none)* | **Bring my monitors to me.** Rigidly move the whole `anchor:local` group so it sits in front of you *as it is currently arranged* — your layout arrives, with its relative geometry intact; nothing is reset to its config line. `head`/`body`/`device`-anchored monitors are skipped (they already ride you). Idempotent: pressing it again from the same spot does nothing. A clean no-op with a reason when there is no session, no live head pose, or nothing `anchor:local` to move. Bind it (see below) — this is the answer to "I swivelled my chair and my monitors are behind me". |
 | `place` | `<name\|active> at <x>,<y>,<z>` | Re-anchor `<name>` to `local`, **moving** its center to the given `LOCAL_FLOOR` point (meters), facing the headset. Unlike `anchor local` (which freezes the quad at its current pose), `place` teleports it to a supplied point — exactly the point `hyprctl openxr gaze` returns, so a voice/script layer can drop a monitor where the user was looking. |
@@ -1359,6 +1375,7 @@ runtime json: (loader default)
 blend mode: opaque
 black alpha: off
 overlay: no
+cylinder layers: yes
 monitor view: shown
 selected: XR-code
 monitors follow session: visible
@@ -1383,6 +1400,15 @@ pre-don IPC answers but lacks the required extensions — classified as a headse
 cadence). While a grace-period unplug is pending, the follow line reads e.g.
 `visible (unplug in 12000ms)`.
 
+`cylinder layers:` (`cylinderLayers`) says whether this session's runtime enabled
+`XR_KHR_composition_layer_cylinder`; without it every curved monitor renders flat. A monitor that
+asked for a curve appends ` curve: auto (R 1.90m, 92 deg, profile)` to its line when it is drawn
+curved, or ` curve: auto (profile) — flat: <reason>` when it is not; the per-monitor JSON `curve`
+object carries the spec, its source (`global`/`xr_defaults`/`profile`/`explicit`, or `runtime` after
+an `xrmonitor curve`), the radius (the one submitted, else the one it would use), the central angle,
+whether a cylinder is being submitted (`active`) and `flatReason` (no extension, depth desktop,
+viewpoint portal, or the viewer being outside the cylinder — doc 02).
+
 `recenter policy:` is `hold` or `follow` (`openxr:recenter`, doc 03 §8.4). It is on the status page
 because the single most confusing thing about recentering is that pressing the headset's button can
 *correctly* do nothing to your monitors — this line says which contract is in force before you go
@@ -1401,6 +1427,7 @@ JSON (`hyprctl -j openxr`) — all keys always present:
     "blendMode": "opaque",
     "blackAlpha": { "configured": 1.000, "effective": 1.000, "knee": 0.100, "active": false, "gatedOff": false },
     "overlay": false,
+    "cylinderLayers": true,
     "monitorView": "shown",
     "selected": "XR-code",
     "monitorsFollowSession": "visible",
@@ -1430,6 +1457,7 @@ JSON (`hyprctl -j openxr`) — all keys always present:
             "plugged": true,
             "contentPath": "",
             "linear": false,
+            "curve": { "spec": "flat", "source": "global", "radiusM": 0.000, "angleDeg": 0.0, "active": false, "flatReason": "" },
             "adaptive": { "enabled": false, "phase": "docked", "roamMode": "body", "seatDistM": 0.0, "transitionT": 0.0 },
             "layout2d": { "source": "auto", "col": 0, "row": 0, "x": 1920, "y": 0, "azDeg": -12.40, "elDeg": -3.10 },
             "pacing": { "framesPresented": 5312, "framesBlitted": 5312, "ticksPaced": 5320, "ticksIdle": 48211 }

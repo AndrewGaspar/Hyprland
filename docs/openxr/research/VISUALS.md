@@ -119,7 +119,7 @@ one struct-chaining change that unblocks three features. Then the tracks paralle
 | C4 | Themed `drawChrome` v2 (SDF/atlas: rounded corners, pill bar, gradient, sprites) | look |
 | C5 | Sheen + glow effects, power-gated | look |
 | C6 | Power modes (`chrome_power=high/low/auto`, headroom estimator, hysteresis) | auto tuning |
-| C7 | Cylinder monitors (opt-in `curve` → cylinder layer, arc hit-test) | WiVRn advertise |
+| C7 | Cylinder monitors (opt-in `curve` → cylinder layer, arc hit-test) — **v1 implemented**, see doc 02 "Curved monitors" | WiVRn advertise |
 | C8 | Themed haptics (`XR_FB_haptic_pcm` waveforms) | haptics |
 | C9 | Companion IPC feed (event-granular geometry/state over socket2 + `openxr layout`) | No |
 | C10 | `hypxrchrome` companion skeleton (overlay client: shadow blobs + focus vignette) | compositing |
