@@ -15,6 +15,7 @@
 #include "../config/supplementary/propRefresher/PropRefresher.hpp" // ePropRefreshProp (xrRefreshConcernsXR)
 #include "XRAnchor.hpp" // OpenXR::SXRAnchorState + eXRAnchorMode/eXRHand (unconditional pure math)
 #include "XRDefaults.hpp" // OpenXR::SXRWhen (xr_monitor `when`) + the xr_defaults resolver
+#include "XRCurve.hpp"    // OpenXR::SXRCurveSpec (the `curve:` token)
 
 namespace OpenXR {
     // Environment blend mode (doc 01). A HAVE_OPENXR-free mirror of XrEnvironmentBlendMode so the
@@ -601,14 +602,15 @@ namespace OpenXR {
     // per doc 03 §7 — the anchor's live solved world pose for LOCAL, the persistent stored offset
     // for head/body/device) and by the round-trip unit test (tests/xr/parser.cpp) that this value,
     // reparsed through parseXRMonitorLine, reproduces an equivalent SXRMonitorParams.
-    // `anchor.anchorPose` is ignored — `pose` is what gets printed.
+    // `anchor.anchorPose` is ignored — `pose` is what gets printed. `curve` is appended as a
+    // `curve:` token only when the monitor is curved, so a flat monitor's value is unchanged.
     std::string serializeXRMonitorValue(const std::string& name, Vector2D resolution, std::optional<float> refreshHz, const SXRAnchorState& anchor, const SXRPose& pose,
-                                        float sizeMeters);
+                                        float sizeMeters, const SXRCurveSpec& curve = {});
 
     // ...wrapped as one paste-ready Lua config line: `hl.xr_monitor("<value>")`. v0.57 removed
     // the classic `xrmonitor =` keyword, so this is what `hyprctl openxr layout` prints.
     std::string serializeXRMonitorLine(const std::string& name, Vector2D resolution, std::optional<float> refreshHz, const SXRAnchorState& anchor, const SXRPose& pose,
-                                       float sizeMeters);
+                                       float sizeMeters, const SXRCurveSpec& curve = {});
 }
 
 // Parameters describing one XR monitor. Every create path (config keyword, dispatcher,
@@ -619,6 +621,9 @@ struct SXRMonitorParams {
     std::optional<Vector2D> m_resolution;  // WxH pixel mode; absent => headless default (1920x1080)
     std::optional<float>    m_refreshRate; // @Hz part; absent => headless default (60)
     std::optional<float>    m_sizeMeters;  // quad width in meters; absent => *openxr:default_size
+    // `curve:` (auto | flat | radius m, docs/openxr/02 "Curved monitors"); absent => xr_defaults /
+    // flat. An explicit `curve:flat` is a value, not an absence: it overrides a curving profile.
+    std::optional<OpenXR::SXRCurveSpec> m_curve;
 
     // Parsed anchor as the canonical doc-03 state (WP5). anchorPose.rot is built from the
     // parsed yaw/pitch; widthMeters is left at its default here (seeded from m_sizeMeters /

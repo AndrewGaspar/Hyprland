@@ -268,6 +268,7 @@ namespace {
         XR_TOK_BOOL,       // on/off — how the anchor grammar spells a flag
         XR_TOK_VEC3,       // "x,y,z"; the table form {x, y, z} is accepted and formatted to it
         XR_TOK_NUM_OR_STR, // a number, or a keyword like "off" (xrrule's blackalpha)
+        XR_TOK_CURVE,      // a radius, "auto"/"flat", or a boolean (true = auto, false = flat)
     };
 
     struct SXRFieldDesc {
@@ -298,6 +299,7 @@ namespace {
         {"return_radius", []() -> ILuaConfigValue* { return new CLuaConfigFloat(0.F); }, XR_TOK_FLOAT, "return"},
         {"return", []() -> ILuaConfigValue* { return new CLuaConfigFloat(0.F); }, XR_TOK_FLOAT, "return"},
         {"carry", []() -> ILuaConfigValue* { return new CLuaConfigBool(false); }, XR_TOK_BOOL, "carry"},
+        {"curve", []() -> ILuaConfigValue* { return new CLuaConfigString(STRVAL_EMPTY); }, XR_TOK_CURVE, "curve"},
     };
 
     // hl.xr_rule's effects — the half BEFORE the comma in `xrrule = <effects>, <conditions>`.
@@ -1306,6 +1308,18 @@ namespace {
             return std::unexpected("expected \"x,y,z\" or { x, y, z }");
         }
 
+        if (desc.kind == XR_TOK_CURVE) {
+            // The token value parseXRCurve reads. A boolean is the natural Lua spelling of "curve it /
+            // do not", so it maps onto the two keywords rather than being a type error.
+            if (lua_isboolean(L, -1))
+                return lua_toboolean(L, -1) ? std::string("auto") : std::string("flat");
+            if (lua_isnumber(L, -1))
+                return xrNum(lua_tonumber(L, -1));
+            if (lua_isstring(L, -1))
+                return std::string(lua_tostring(L, -1));
+            return std::unexpected("expected a radius in metres, \"auto\", \"flat\" or a boolean");
+        }
+
         if (desc.kind == XR_TOK_NUM_OR_STR) {
             if (lua_isnumber(L, -1))
                 return xrNum(lua_tonumber(L, -1));
@@ -1524,7 +1538,7 @@ static int hlXRMonitor(lua_State* L) {
     return 0;
 }
 
-// hl.xr_defaults({ profile?, when?, mode?, scale?, size?, distance? }) — per-HMD defaults for XR
+// hl.xr_defaults({ profile?, when?, mode?, scale?, size?, distance?, curve? }) — per-HMD defaults for XR
 // monitors, and named shape profiles for `create profile:<name>` (doc 05 §3.3). Lua only: the
 // classic `.conf` front end is going away upstream, so no keyword twin is added.
 static int hlXRDefaults(lua_State* L) {
@@ -1575,8 +1589,24 @@ static int hlXRDefaults(lua_State* L) {
                 block.size = sc<float>(lua_tonumber(L, -1));
             else
                 block.distance = sc<float>(lua_tonumber(L, -1));
+        } else if (key == "curve") {
+            // Same spellings as hl.xr_monitor's curve (and the classic `curve:` token): a radius in
+            // metres, "auto" / "flat", or a boolean.
+            std::expected<OpenXR::SXRCurveSpec, std::string> c;
+            if (lua_type(L, -1) == LUA_TBOOLEAN)
+                c = OpenXR::parseXRCurve(lua_toboolean(L, -1) ? "auto" : "flat");
+            else if (lua_type(L, -1) == LUA_TNUMBER)
+                c = OpenXR::parseXRCurve(std::format("{}", lua_tonumber(L, -1)));
+            else if (lua_type(L, -1) == LUA_TSTRING)
+                c = OpenXR::parseXRCurve(lua_tostring(L, -1));
+            else
+                c = std::unexpected(std::string("'curve' must be a radius in metres, \"auto\", \"flat\" or a boolean"));
+            if (!c)
+                err = c.error();
+            else
+                block.curve = *c;
         } else
-            err = std::format("unknown field '{}' (valid: profile, when, mode, scale, size, distance)", key);
+            err = std::format("unknown field '{}' (valid: profile, when, mode, scale, size, distance, curve)", key);
 
         if (!err.empty()) {
             lua_pop(L, 2);

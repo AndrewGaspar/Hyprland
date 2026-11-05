@@ -1,4 +1,6 @@
 #include <openxr/XRCurve.hpp>
+#include <openxr/XRDefaults.hpp>
+#include <openxr/XRMonitorConfig.hpp>
 
 #include <gtest/gtest.h>
 
@@ -296,4 +298,112 @@ TEST(XRCurve, SurfaceTMatchesTheBoundedHit) {
     const auto TF = rayMonitorSurfaceT(ahead(R), Vec3{}, Vec3{0.F, 0.F, -1.F}, 0.F);
     ASSERT_TRUE(TF.has_value());
     EXPECT_NEAR(*TF, R, 1e-5F);
+}
+
+// ---- config surface: the classic `curve:` token, create args, layout round-trip, xr_defaults ----
+
+TEST(XRCurveConfig, XRMonitorLineToken) {
+    const auto P = parseXRMonitorLine("XR-wide, 5120x1440@60, anchor:local pos:0,1.2,-1.9 size:3.0 curve:auto");
+    ASSERT_TRUE(P.has_value()) << P.error();
+    ASSERT_TRUE(P->m_curve.has_value());
+    EXPECT_EQ(P->m_curve->mode, XR_CURVE_AUTO);
+
+    const auto R = parseXRMonitorLine("XR-wide, 5120x1440, anchor:head offset:0,0,-1.9 curve:2.5");
+    ASSERT_TRUE(R.has_value()) << R.error();
+    EXPECT_EQ(R->m_curve->mode, XR_CURVE_RADIUS);
+    EXPECT_FLOAT_EQ(R->m_curve->radius, 2.5F);
+
+    // An explicit flat is a VALUE (it overrides a curving profile), not an absence.
+    const auto F = parseXRMonitorLine("XR-1, 1920x1080, anchor:local pos:0,1.2,-1.5 curve:flat");
+    ASSERT_TRUE(F.has_value());
+    ASSERT_TRUE(F->m_curve.has_value());
+    EXPECT_EQ(F->m_curve->mode, XR_CURVE_FLAT);
+
+    // Unset stays unset (the defaults ladder decides).
+    EXPECT_FALSE(parseXRMonitorLine("XR-1, 1920x1080, anchor:local pos:0,1.2,-1.5")->m_curve.has_value());
+
+    const auto BAD = parseXRMonitorLine("XR-1, 1920x1080, anchor:local pos:0,1.2,-1.5 curve:wobbly");
+    ASSERT_FALSE(BAD.has_value());
+    EXPECT_NE(BAD.error().find("curve"), std::string::npos);
+}
+
+TEST(XRCurveConfig, CreateArgsTakeCurveAnywhere) {
+    const auto A = parseXRMonitorCreateArgs("XR-wide 5120x1440 curve:auto");
+    ASSERT_TRUE(A.has_value()) << A.error();
+    EXPECT_EQ(A->m_name, "XR-wide");
+    EXPECT_EQ(A->m_curve->mode, XR_CURVE_AUTO);
+    EXPECT_FALSE(A->m_anchorProvided);
+
+    const auto B = parseXRMonitorCreateArgs("curve:1.9 XR-wide 5120x1440 anchor:local pos:0,1.2,-1.9");
+    ASSERT_TRUE(B.has_value()) << B.error();
+    EXPECT_FLOAT_EQ(B->m_curve->radius, 1.9F);
+    EXPECT_TRUE(B->m_anchorProvided);
+
+    EXPECT_FALSE(parseXRMonitorCreateArgs("XR-wide curve:auto curve:flat").has_value());
+    EXPECT_FALSE(parseXRMonitorCreateArgs("XR-wide curve:").has_value());
+}
+
+TEST(XRCurveConfig, LayoutLineRoundTrips) {
+    SXRAnchorState anchor;
+    anchor.mode = XR_ANCHOR_LOCAL;
+    const SXRPose pose{Vec3{0.F, 1.2F, -1.9F}, Quat{}};
+    for (const char* c : {"auto", "2.5"}) {
+        const auto        SPEC = *parseXRCurve(c);
+        const std::string LINE = serializeXRMonitorValue("XR-wide", Vector2D(5120, 1440), 60.F, anchor, pose, 3.0F, SPEC);
+        EXPECT_NE(LINE.find(std::string(" curve:") + c), std::string::npos) << LINE;
+        const auto BACK = parseXRMonitorLine(LINE);
+        ASSERT_TRUE(BACK.has_value()) << BACK.error();
+        ASSERT_TRUE(BACK->m_curve.has_value());
+        EXPECT_EQ(*BACK->m_curve, SPEC);
+    }
+    // The paste-ready Lua line wraps the same value.
+    EXPECT_NE(serializeXRMonitorLine("XR-wide", Vector2D(5120, 1440), 60.F, anchor, pose, 3.0F, *parseXRCurve("auto")).find(" curve:auto\")"), std::string::npos);
+    // A flat monitor's line is byte-identical to before the option existed.
+    const std::string FLAT = serializeXRMonitorLine("XR-1", Vector2D(1920, 1080), 60.F, anchor, pose, 1.6F);
+    EXPECT_EQ(FLAT.find("curve"), std::string::npos);
+    EXPECT_EQ(FLAT, serializeXRMonitorLine("XR-1", Vector2D(1920, 1080), 60.F, anchor, pose, 1.6F, SXRCurveSpec{}));
+}
+
+TEST(XRCurveConfig, DefaultsLadderResolvesCurveWithProvenance) {
+    SXRSystemContext ctx;
+    ctx.bound      = true;
+    ctx.systemName = "Monado: XREAL Air 2 Ultra";
+
+    std::vector<SXRDefaultsBlock> blocks;
+    SXRDefaultsBlock              base;
+    base.size = 1.32F;
+    blocks.push_back(base);
+    SXRDefaultsBlock wide;
+    wide.profile    = "ultrawide";
+    wide.resolution = Vector2D{5120, 1440};
+    wide.size       = 3.0F;
+    wide.curve      = SXRCurveSpec{.mode = XR_CURVE_AUTO};
+    blocks.push_back(wide);
+
+    // no profile: globals say flat
+    const auto PLAIN = resolveXRDefaults(blocks, "", ctx, {});
+    ASSERT_TRUE(PLAIN.has_value());
+    EXPECT_EQ(PLAIN->curve.value.mode, XR_CURVE_FLAT);
+    EXPECT_EQ(PLAIN->curve.source, XR_DEFSRC_GLOBAL);
+
+    // the profile curves it
+    const auto UW = resolveXRDefaults(blocks, "ultrawide", ctx, {});
+    ASSERT_TRUE(UW.has_value());
+    EXPECT_EQ(UW->curve.value.mode, XR_CURVE_AUTO);
+    EXPECT_EQ(UW->curve.source, XR_DEFSRC_PROFILE);
+    EXPECT_EQ(UW->curve.block, 1);
+
+    // an explicit value (even flat) outranks the profile
+    const auto EX = resolveXRDefaults(blocks, "ultrawide", ctx, {}, SXRExplicitFields{.curve = SXRCurveSpec{}});
+    ASSERT_TRUE(EX.has_value());
+    EXPECT_EQ(EX->curve.value.mode, XR_CURVE_FLAT);
+    EXPECT_EQ(EX->curve.source, XR_DEFSRC_EXPLICIT);
+}
+
+TEST(XRCurveConfig, DefaultsBlockValidatesRadius) {
+    SXRDefaultsBlock b;
+    b.curve = SXRCurveSpec{.mode = XR_CURVE_RADIUS, .radius = 2.F};
+    EXPECT_TRUE(validateXRDefaultsBlock(b).has_value());
+    b.curve->radius = 0.05F;
+    EXPECT_FALSE(validateXRDefaultsBlock(b).has_value());
 }

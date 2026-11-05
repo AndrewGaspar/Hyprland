@@ -403,6 +403,8 @@ def parse_descriptor_fields(root: Path) -> dict[str, dict[str, str]]:
     # `return` is accepted at runtime but is a Lua keyword, so only the writable spelling is
     # declared — a stub field named `return` is not something LuaLS can offer as a completion.
     out["HL.XRMonitorSpec"].pop("return", None)
+    # `curve`: a radius in metres, "auto" / "flat", or a boolean (true = auto) — docs/openxr/02.
+    out["HL.XRMonitorSpec"]["curve"] = "number|'auto'|'flat'|boolean"
     out["HL.XRRuleSpec"]["blackalpha"] = "number|'off'"
     out["HL.XRRuleSpec"]["match"] = "HL.XRRuleMatch"
     # `when` (doc 05 §3.3) — on hl.xr_monitor and hl.xr_defaults. Parsed by hand in the binding (no
@@ -421,6 +423,7 @@ def parse_descriptor_fields(root: Path) -> dict[str, dict[str, str]]:
         "scale": "number",
         "size": "number",
         "distance": "number",
+        "curve": "number|'auto'|'flat'|boolean",
     }
 
     return out

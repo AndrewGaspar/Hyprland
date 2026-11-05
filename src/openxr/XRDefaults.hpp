@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "../helpers/math/Math.hpp"
+#include "XRCurve.hpp"
 
 namespace re2 {
     class RE2;
@@ -97,6 +98,7 @@ namespace OpenXR {
         std::optional<float>    scale;       // monitor scale; 0 = hand back to the PPI heuristic
         std::optional<float>    size;        // quad width, meters
         std::optional<float>    distance;    // initial placement distance, meters
+        std::optional<SXRCurveSpec> curve;       // flat | auto | radius (docs/openxr/02 "Curved monitors")
     };
 
     // Field validation shared by every front end. scale >= 0 (0 = PPI guess); size/distance > 0.
@@ -118,6 +120,7 @@ namespace OpenXR {
         float    scale       = 1.25F;
         float    size        = 1.6F;
         float    distance    = 1.5F;
+        SXRCurveSpec curve; // flat: there is no openxr:default_curve, a curve is always opted into
     };
 
     // Values the declaration / create args gave explicitly. They outrank every block.
@@ -125,6 +128,7 @@ namespace OpenXR {
         std::optional<Vector2D> resolution;
         std::optional<float>    refreshRate;
         std::optional<float>    size;
+        std::optional<SXRCurveSpec> curve;
 
         bool                    operator==(const SXRExplicitFields&) const = default;
     };
@@ -144,6 +148,7 @@ namespace OpenXR {
         SXRResolvedField<float>    scale;
         SXRResolvedField<float>    size;
         SXRResolvedField<float>    distance;
+        SXRResolvedField<SXRCurveSpec> curve;
 
         bool                       operator==(const SXRResolvedDefaults&) const = default;
     };
