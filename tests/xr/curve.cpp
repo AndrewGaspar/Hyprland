@@ -5,6 +5,8 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <optional>
+#include <utility>
 
 using namespace OpenXR;
 
@@ -251,6 +253,97 @@ TEST(XRCurve, ContentPoseToSurfaceCenterKeepsTheAxis) {
     const Vec3 axis = xrCylinderFromSurface(S, quadW, quadH, 1.5F).pose.pos; // same (vertical) axis
     EXPECT_NEAR(axis.x, 0.F, 1e-4F);
     EXPECT_NEAR(axis.z, 0.F, 1e-4F);
+}
+
+// ---- what Monado actually draws ----
+
+// A line-for-line port of Monado's compute-renderer cylinder lookup (src/xrt/compositor/shaders/
+// layer.comp, do_cylinder): ray in the layer's model space -> the texture coordinate it samples, or
+// nothing (transparent). Only the FAR intersection is used, longitude is linear in angle, and the
+// vertical coordinate is height in radii.
+static std::optional<std::pair<float, float>> monadoCylinderSample(const Vec3& ro, const Vec3& rdIn, float radius, float centralAngle, float aspectRatio) {
+    const Vec3  rd   = rdIn.normalized();
+    const float card = rd.y;
+    const float caoc = ro.y;
+    const float a    = 1.F - card * card;
+    const float b    = ro.dot(rd) - caoc * card;
+    const float c    = ro.dot(ro) - caoc * caoc - radius * radius;
+    float       h    = b * b - a * c;
+    if (h < 0.F)
+        return std::nullopt;
+    h             = std::sqrt(h);
+    const float t = (-b + h) / a;
+    if (t < 0.F)
+        return std::nullopt;
+    const Vec3  dir  = (ro + rd * t).normalized();
+    const float lon  = std::atan2(dir.x, -dir.z) / (2.F * PI) + 0.5F;
+    const float y    = -dir.y / std::sqrt(1.F - dir.y * dir.y);
+    const float chan = centralAngle / (2.F * PI);
+    const float hgt  = centralAngle / aspectRatio;
+    const float uhan = 0.5F + chan / 2.F, lhan = 0.5F - chan / 2.F;
+    if (!(y < hgt / 2.F && y > -hgt / 2.F && lon < uhan && lon > lhan))
+        return std::nullopt;
+    return std::pair{(lon - lhan) / (uhan - lhan), (y + hgt / 2.F) / hgt};
+}
+
+TEST(XRCurve, HitTestMatchesMonadoCylinderSampling) {
+    // XReal-ish: a 3.0 x 0.84 m arc at R 1.9, the head at eye height on the axis. Eyes at +/- IPD/2,
+    // then a 6DoF lean, then a step back beyond the axis.
+    const float   W = 3.0F, H = 0.84F, R = 1.9F;
+    const SXRPose P{Vec3{0.F, 1.2F, -R}, Quat{}};
+    const auto    CYL  = xrCylinderFromSurface(P, W, H, R);
+    const Quat    INV  = qInverse(CYL.pose.rot);
+    const Vec3    HEAD = CYL.pose.pos;
+    for (const Vec3& eye : {HEAD + Vec3{-0.032F, 0.F, 0.F}, HEAD + Vec3{0.032F, 0.F, 0.F}, HEAD + Vec3{0.25F, -0.1F, 0.4F}, HEAD + Vec3{0.F, 0.05F, 0.9F}}) {
+        ASSERT_TRUE(xrCurveFullyVisibleFrom(P, W, R, eye, 0.F));
+        for (float u : {0.03F, 0.3F, 0.5F, 0.77F, 0.97F}) {
+            for (float v : {0.1F, 0.5F, 0.85F}) {
+                const Vec3 target = monitorPointFromUV(P, W, H, R, u, v);
+                const Vec3 dir    = (target - eye).normalized();
+                const auto OURS   = rayMonitorIntersect(P, eye, dir, W, H, R);
+                const auto THEIRS = monadoCylinderSample(qRotate(INV, eye - CYL.pose.pos), qRotate(INV, dir), CYL.radius, CYL.centralAngle, CYL.aspectRatio);
+                ASSERT_TRUE(OURS.hit);
+                ASSERT_TRUE(THEIRS.has_value());
+                EXPECT_NEAR(OURS.u, THEIRS->first, 1e-4F);
+                EXPECT_NEAR(OURS.v, THEIRS->second, 1e-4F);
+                EXPECT_NEAR(OURS.u, u, 1e-4F);
+                EXPECT_NEAR(OURS.v, v, 1e-4F);
+            }
+        }
+    }
+}
+
+TEST(XRCurve, VisibilityMatchesWhereMonadoDrawsTheArc) {
+    const float   W = 3.0F, H = 0.84F, R = 1.9F;
+    const SXRPose P{Vec3{0.F, 1.2F, -R}, Quat{}};
+    const auto    CYL = xrCylinderFromSurface(P, W, H, R);
+    const Quat    INV = qInverse(CYL.pose.rot);
+    // Does the runtime draw EVERY sampled column of the arc for this eye?
+    auto drawsWholeArc = [&](const Vec3& eye) {
+        for (float u = 0.02F; u < 0.99F; u += 0.04F) {
+            const Vec3 dir = (monitorPointFromUV(P, W, H, R, u, 0.5F) - eye).normalized();
+            if (!monadoCylinderSample(qRotate(INV, eye - CYL.pose.pos), qRotate(INV, dir), CYL.radius, CYL.centralAngle, CYL.aspectRatio))
+                return false;
+        }
+        return true;
+    };
+    const Vec3 HEAD = CYL.pose.pos;
+    // inside / behind the axis: drawn, and we agree
+    for (const Vec3& eye : {HEAD, HEAD + Vec3{1.2F, 0.F, 0.5F}, HEAD + Vec3{0.F, 0.F, 3.F}}) {
+        EXPECT_TRUE(drawsWholeArc(eye));
+        EXPECT_TRUE(xrCurveFullyVisibleFrom(P, W, R, eye));
+    }
+    // behind the monitor, and out beyond its right end: Monado would drop part of it, and we say so
+    // (so the frame loop submits a quad instead of a half-invisible cylinder)
+    for (const Vec3& eye : {Vec3{0.F, 1.2F, -2.5F}, HEAD + Vec3{2.6F, 0.F, -1.6F}}) {
+        EXPECT_FALSE(drawsWholeArc(eye));
+        EXPECT_FALSE(xrCurveFullyVisibleFrom(P, W, R, eye));
+    }
+    // the margin makes the test conservative near the wall
+    EXPECT_TRUE(xrCurveFullyVisibleFrom(P, W, R, HEAD + Vec3{0.F, 0.F, -1.85F}, 0.F));
+    EXPECT_FALSE(xrCurveFullyVisibleFrom(P, W, R, HEAD + Vec3{0.F, 0.F, -1.85F}, 0.1F));
+    // flat is always "visible"
+    EXPECT_TRUE(xrCurveFullyVisibleFrom(P, W, 0.F, Vec3{0.F, 0.F, -9.F}));
 }
 
 // ---- flat stays flat ----
