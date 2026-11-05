@@ -9,6 +9,7 @@
 #include <linux/input-event-codes.h> // BTN_LEFT
 
 #include "XRSession.hpp"
+#include "XRCurve.hpp"
 #include "../debug/log/Logger.hpp"
 #include "../config/ConfigValue.hpp"
 #include "../helpers/time/Time.hpp"
@@ -503,19 +504,9 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
         m_emit(ev);
     };
 
-    // Ray-plane parameter t only (no bounds test) — used by the §6 cone-forgiveness pass to size
-    // the slack (tan(cone) * t) before re-testing bounds with rayQuadIntersect.
-    auto planeT = [](const OpenXR::SXRPose& Q, const OpenXR::Vec3& o, const OpenXR::Vec3& d) -> std::optional<float> {
-        const OpenXR::Quat qi = OpenXR::qInverse(Q.rot);
-        const OpenXR::Vec3 lo = OpenXR::qRotate(qi, o - Q.pos);
-        const OpenXR::Vec3 ld = OpenXR::qRotate(qi, d);
-        if (std::fabs(ld.z) < 1e-6F)
-            return std::nullopt;
-        const float t = -lo.z / ld.z;
-        if (t <= 0.F)
-            return std::nullopt;
-        return t;
-    };
+    // Ray-surface parameter t only (no bounds test) — the plane, or a curved monitor's cylinder —
+    // used by the §6 cone-forgiveness and magnet passes to size the slack (tan(cone) * t) before
+    // re-testing bounds with rayMonitorIntersect.
 
     // 1. Ray cast per hand: nearest-t hit across all targets wins (occlusion). A grabbing hand
     //    casts nothing (WP8). Hits are classified against each quad's chrome layout (WP-G1): a
@@ -573,16 +564,12 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                 // Cone magnetism (Stage C, chrome-only): expand each quad's bounds by slack =
                 // tan(magnet_angle)*t so a near-miss still registers; classifyQuadRegionForgiving then
                 // snaps ONLY to a grab handle (never BODY). slack 0 (magnet off) == the old exact test.
-                const OpenXR::Quat qi = OpenXR::qInverse(t.worldPose.rot);
-                const OpenXR::Vec3 lo = OpenXR::qRotate(qi, origin - t.worldPose.pos);
-                const OpenXR::Vec3 ld = OpenXR::qRotate(qi, dir);
-                float              slack = 0.f;
-                if (magnetSlackTan > 0.f && std::fabs(ld.z) >= 1e-6f) {
-                    const float tp = -lo.z / ld.z;
-                    if (tp > 0.f)
-                        slack = magnetSlackTan * tp;
+                float slack = 0.f;
+                if (magnetSlackTan > 0.f) {
+                    if (const auto tp = OpenXR::rayMonitorSurfaceT(t.worldPose, origin, dir, t.radius))
+                        slack = magnetSlackTan * *tp;
                 }
-                const OpenXR::SXRQuadHit hit = OpenXR::rayQuadIntersect(t.worldPose, origin, dir, t.w, t.h, slack);
+                const OpenXR::SXRQuadHit hit = OpenXR::rayMonitorIntersect(t.worldPose, origin, dir, t.w, t.h, t.radius, slack);
                 if (hit.hit && hit.t < bestT) {
                     bestT      = hit.t;
                     bestTgt    = &t;
@@ -727,11 +714,11 @@ void CXRInput::processPointer(const std::vector<SXRPointerTarget>& targets, uint
                     const OpenXR::Vec3      dir    = OpenXR::qRotate(aim.rot, OpenXR::Vec3{0.f, 0.f, -1.f});
                     float                   bestT  = std::numeric_limits<float>::max();
                     for (const auto& t : targets) {
-                        const auto pt = planeT(t.worldPose, origin, dir);
+                        const auto pt = OpenXR::rayMonitorSurfaceT(t.worldPose, origin, dir, t.radius);
                         if (!pt)
                             continue;
                         const float              slack = std::tan(XR_GRAB_CONE_DEG * (float)M_PI / 180.F) * (*pt);
-                        const OpenXR::SXRQuadHit hit   = OpenXR::rayQuadIntersect(t.worldPose, origin, dir, t.w, t.h, slack);
+                        const OpenXR::SXRQuadHit hit   = OpenXR::rayMonitorIntersect(t.worldPose, origin, dir, t.w, t.h, t.radius, slack);
                         if (!hit.hit || hit.t >= bestT)
                             continue;
                         const OpenXR::eXRQuadRegion  reg = OpenXR::classifyQuadHit(hit.u, hit.v, t.chrome);

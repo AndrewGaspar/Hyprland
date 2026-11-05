@@ -245,6 +245,10 @@ bool COpenXRManager::isOverlay() const {
     return m_session && m_session->m_isOverlay;
 }
 
+bool COpenXRManager::cylinderSupported() const {
+    return m_session && m_session->m_hasCylinder;
+}
+
 std::array<COpenXRManager::SXRHandInputInfo, 2> COpenXRManager::handInputInfos() const {
     // WP-G5: reflect each hand's active device for `hyprctl openxr status`. m_input's per-hand kind
     // is an atomic mirror (main-thread safe to read); hand_grab is read from config here.
@@ -2354,6 +2358,9 @@ void COpenXRManager::frameThread() {
 
         std::vector<OpenXR::SXRSolveResult> results(active.size());
         std::vector<bool>                   solved(active.size(), false);
+        // Curved monitors: each layer's radius for this frame (0 = flat), snapshotted under the layer
+        // lock below so the submission and hit tests read a plain float (XRCurve.hpp).
+        std::vector<float>                  curveBase(active.size(), 0.F);
         bool                                anyRoaming = false; // research/16 Part A: AUTO gate OR-term
         // Re-seat tally, logged after the lock is dropped (doc 03 §8.3/§8.4). The RESTORE kind splits
         // its count by offset source; the GROUP kind moves the whole arrangement at once, or refuses.
@@ -2512,8 +2519,11 @@ void COpenXRManager::frameThread() {
                 // research/28 §F: whichever kind ran, these monitors have just been placed against a
                 // head located in the CURRENT reference space. Their poses mean something again, which
                 // is the permission the capture below has been waiting for.
-                for (auto* l : targets)
+                for (auto* l : targets) {
                     l->m_anchorFrameStale = false;
+                    // re-seated around this head: an auto curve re-wraps around it (resolved below)
+                    l->m_curveAutoPending = true;
+                }
 
                 // doc 03 §8.4: and the head they were just placed for is the eye height every later
                 // capture measures them against (see the staging block below)
@@ -2714,6 +2724,32 @@ void COpenXRManager::frameThread() {
                     solved[i]               = true;
                 }
             }
+
+            // Curved monitors (docs/openxr/02 "Curved monitors"). `auto` puts the head on the cylinder's
+            // axis: R is the head -> monitor distance, measured here (the frame thread owns the head)
+            // the first frame after the monitor was placed and then FROZEN, so a rigid drag carries
+            // the arc as one piece instead of re-bending it. It re-wraps on a placement request
+            // (create, re-seat, center, place, distance, a changed spec — m_curveAutoPending) and on
+            // the release of a carry that changed the monitor's DEPTH: a lateral or rotational drag
+            // keeps R, a push/pull would otherwise leave the viewer off the axis it was sized for.
+            for (size_t i = 0; i < active.size(); ++i) {
+                auto&      l       = active[i];
+                const bool carried = l->m_anchor.grabbed() || l->m_anchor.gazeGrabbed();
+                if (l->m_curve.mode == OpenXR::XR_CURVE_AUTO && solved[i] && viewValid) {
+                    const float dist = OpenXR::xrCurveAutoRadius(viewPose.pos, results[i].worldPose.pos);
+                    if (!carried && l->m_curveCarried && l->m_curveAutoR > 0.F && std::fabs(dist - l->m_curveAutoR) > std::max(0.1F, 0.05F * l->m_curveAutoR))
+                        l->m_curveAutoPending = true;
+                    if (l->m_curveAutoPending) {
+                        Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}': auto curve wrapped around the head at R {:.2f}m (was {:.2f}m)", l->m_monitorName, dist,
+                                         l->m_curveAutoR);
+                        l->m_curveAutoR       = dist;
+                        l->m_curveAutoPending = false;
+                    }
+                    l->m_curveCarried = carried;
+                } else if (l->m_curve.mode != OpenXR::XR_CURVE_AUTO)
+                    l->m_curveCarried = false;
+                curveBase[i] = OpenXR::xrCurveBaseRadius(l->m_curve, l->m_curveAutoR, tune.defaultDistance);
+            }
         }
         // research/16 Part A: publish "any monitor roaming" for the AUTO hand-input gate (main-thread
         // status reads it too). Plain atomic — never a refcount op.
@@ -2745,7 +2781,14 @@ void COpenXRManager::frameThread() {
             Log::logger->log(Log::DEBUG, "[OPENXR] re-seated {} anchor:local monitor(s) to the head: {} restored from the last wearing, {} from their declared rig", reseatRestored + reseatDeclared,
                              reseatRestored, reseatDeclared);
 
-        std::vector<XrCompositionLayerQuad>              quads;
+        // One composition layer: a quad, or a cylinder for a curved monitor. Submission ORDER is the
+        // depth order (below), so the two kinds share one array rather than living in two.
+        union UXRLayer {
+            XrCompositionLayerBaseHeader  base;
+            XrCompositionLayerQuad        quad;
+            XrCompositionLayerCylinderKHR cyl;
+        };
+        std::vector<UXRLayer>                            quads;
         std::vector<const XrCompositionLayerBaseHeader*> layerPtrs;
         // WP X1: a stereo monitor submits a PAIR (one quad per eye), so the worst case is two per
         // layer. Over-reserving is free; under-reserving would only cost a realloc, but layerPtrs is
@@ -2868,8 +2911,45 @@ void COpenXRManager::frameThread() {
             const float                      quadH  = res.heightMeters / (chrome.contentFracH() > 0.f ? chrome.contentFracH() : 1.f);
             const OpenXR::SXRPose            quadCenterPose = OpenXR::contentPoseToQuadCenter(quadPose, chrome, quadW, quadH);
             // Cache the full quad meters for next frame's drawCursor (metric cursor sizing, report 14).
+            // On a curve these are arc length x height, so metres-per-uv is unchanged.
             l->m_quadWMeters = quadW;
             l->m_quadHMeters = quadH;
+
+            // Curved monitors (XRCurve.hpp): submit a cylinder when one was asked for AND can be drawn
+            // whole. Otherwise this monitor is a quad this frame — and its hit tests below use the same
+            // radius (0), so what the ray hits is always what is on screen. The depth desktop and the
+            // viewpoint portal stay flat in v1; the runtime draws only the far intersection of an eye
+            // ray with the cylinder, so a viewer behind the monitor or past an end of the arc gets the
+            // quad (with hysteresis — a head hovering at the boundary must not flicker the shape).
+            float                      curveR     = 0.F;
+            OpenXR::eXRCurveFlatReason flatReason = OpenXR::XR_CURVEFLAT_NONE;
+            if (curveBase[i] > 0.F) {
+                const float R = OpenXR::xrCurveEffectiveRadius(curveBase[i], quadW);
+                if (!m_session->m_hasCylinder)
+                    flatReason = OpenXR::XR_CURVEFLAT_UNSUPPORTED;
+                else if (DECL.producer == OpenXR::Stereo::PRODUCER_DEPTH)
+                    flatReason = OpenXR::XR_CURVEFLAT_DEPTH;
+                else if (l->viewpointSubscription())
+                    flatReason = OpenXR::XR_CURVEFLAT_VIEWPOINT;
+                else {
+                    if (viewValid) {
+                        // Both eyes are within IPD/2 of the head: a 4 cm margin covers them, and leaving
+                        // the flat state needs twice that.
+                        const OpenXR::SXRPose surf = OpenXR::contentPoseToSurfaceCenter(res.worldPose, chrome, quadW, quadH, R);
+                        l->m_curveOutside          = !OpenXR::xrCurveFullyVisibleFrom(surf, quadW, R, viewPose.pos, l->m_curveOutside ? 0.08F : 0.04F);
+                    }
+                    if (l->m_curveOutside)
+                        flatReason = OpenXR::XR_CURVEFLAT_OUTSIDE;
+                    else
+                        curveR = R;
+                }
+            }
+            l->m_curveRadiusLive.store(curveR, std::memory_order_relaxed);
+            l->m_curveAngleLive.store(OpenXR::xrCurveCentralAngle(curveR, quadW), std::memory_order_relaxed);
+            if (const auto PREV = l->m_curveFlatReason.exchange((uint8_t)flatReason, std::memory_order_relaxed);
+                PREV != (uint8_t)flatReason && flatReason != OpenXR::XR_CURVEFLAT_NONE)
+                Log::logger->log(flatReason == OpenXR::XR_CURVEFLAT_UNSUPPORTED ? Log::WARN : Log::DEBUG, "[OPENXR] XR monitor '{}': curved but submitted flat ({})",
+                                 l->m_monitorName, OpenXR::xrCurveFlatReasonName(flatReason));
 
             // The content rect inside the swapchain, in imageRect's coordinate space: bottom-left,
             // the same flip blitBuffer computes as `contentGL`. For a mono layer this is the whole
@@ -2887,6 +2967,22 @@ void COpenXRManager::frameThread() {
             quad.subImage.imageArrayIndex = 0;
             quad.pose                     = xrFromPose(quadCenterPose);
             quad.size                     = {quadW, quadH};
+
+            // The same image on a cylinder: same flags, space, swapchain and per-eye rect handling; the
+            // layer pose sits on the axis (a rigid transform of the content pose, so a device-space
+            // submission late-latches it exactly as it does the quad).
+            XrCompositionLayerCylinderKHR cyl = {XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR};
+            if (curveR > 0.F) {
+                const auto CG                = OpenXR::xrCylinderFromSurface(OpenXR::contentPoseToSurfaceCenter(quadPose, chrome, quadW, quadH, curveR), quadW, quadH, curveR);
+                cyl.layerFlags               = quad.layerFlags;
+                cyl.space                    = quadSpace;
+                cyl.subImage.swapchain       = l->m_swapchain;
+                cyl.subImage.imageArrayIndex = 0;
+                cyl.pose                     = xrFromPose(CG.pose);
+                cyl.radius                   = CG.radius;
+                cyl.centralAngle             = CG.centralAngle;
+                cyl.aspectRatio              = CG.aspectRatio;
+            }
 
             // THE PAIR (research/24 §5.1a, F2). Two quads at one pose, one image, no GL work at all:
             // the runtime's own sampler crops each eye to its half, which it was going to sample
@@ -2907,7 +3003,14 @@ void COpenXRManager::frameThread() {
                 const auto RECT = DEPTHPACKED ? OpenXR::Stereo::paneFullRect(l->m_paneGeom, eye) : OpenXR::Stereo::paneImageRect(CONTENTRECT, STEREOLAYOUT, eye);
                 quad.eyeVisibility = !STEREOPAIR ? XR_EYE_VISIBILITY_BOTH : (eye == 0 ? XR_EYE_VISIBILITY_LEFT : XR_EYE_VISIBILITY_RIGHT);
                 quad.subImage.imageRect = {{RECT.x, RECT.y}, {RECT.w, RECT.h}};
-                quads.push_back(quad);
+                UXRLayer entry{};
+                if (curveR > 0.F) {
+                    cyl.eyeVisibility      = quad.eyeVisibility;
+                    cyl.subImage.imageRect = quad.subImage.imageRect;
+                    entry.cyl              = cyl;
+                } else
+                    entry.quad = quad;
+                quads.push_back(entry);
             }
             l->m_quadsSubmitted.store((uint8_t)(STEREOPAIR ? 2 : 1), std::memory_order_relaxed);
 
@@ -2926,9 +3029,10 @@ void COpenXRManager::frameThread() {
                     worldRef.pos.y -= floorOffset;
                 SXRPointerTarget pt;
                 pt.id        = MONID;
-                pt.worldPose = OpenXR::contentPoseToQuadCenter(worldRef, chrome, quadW, quadH);
+                pt.worldPose = OpenXR::contentPoseToSurfaceCenter(worldRef, chrome, quadW, quadH, curveR);
                 pt.w         = quadW;
                 pt.h         = quadH;
+                pt.radius    = curveR; // the shape actually submitted, so hits match the screen
                 pt.name      = l->m_monitorName;
                 pt.anchor    = &l->m_anchor;
                 pt.chrome    = chrome;
@@ -2941,7 +3045,7 @@ void COpenXRManager::frameThread() {
             }
         }
         for (auto& q : quads)
-            layerPtrs.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&q));
+            layerPtrs.push_back(&q.base);
 
         // Ray pointer (doc 04 §3-§5) + grab machine (doc 04 §6, WP8): cast every hand's aim ray
         // against the visible quads and emit motion/button/axis/frame/grab across the frame->main
@@ -3249,7 +3353,7 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
 
     // 1b. Resolve the xr_defaults ladder (doc 05 §3.3): explicit args > the requested profile's
     //     blocks > base blocks > openxr:default_* globals. An unknown profile is the caller's error.
-    const OpenXR::SXRExplicitFields EXPLICIT{.resolution = params.m_resolution, .refreshRate = params.m_refreshRate, .size = params.m_sizeMeters};
+    const OpenXR::SXRExplicitFields EXPLICIT{.resolution = params.m_resolution, .refreshRate = params.m_refreshRate, .size = params.m_sizeMeters, .curve = params.m_curve};
     auto                            resolved = OpenXR::resolveXRDefaults(Config::xrDeclarationMgr()->defaults(), params.m_profile, m_xrContext, xrDefaultsGlobals(), EXPLICIT);
     if (!resolved)
         return std::unexpected(resolved.error());
@@ -3261,6 +3365,9 @@ std::expected<PXRLAYER, std::string> COpenXRManager::createXRMonitor(const SXRMo
     layer->m_profile       = params.m_profile;
     layer->m_resolved      = *resolved;
     layer->m_pinGlobalMode = pinGlobalMode;
+    // Not yet visible to the frame thread (pushed into m_layers below), so no lock. An auto curve
+    // resolves its radius on the first frame with a head pose (m_curveAutoPending starts raised).
+    layer->m_curve = resolved->curve.value;
 
     // Seed the anchoring engine (WP5). widthMeters is the live quad width; height derives from
     // the pixel mode each frame.
@@ -5985,7 +6092,7 @@ void COpenXRManager::gazeSelectPass(const std::vector<SXRPointerTarget>& targets
             const float d = (t.worldPose.pos - origin).length();
             slack         = hystTan * d;
         }
-        const OpenXR::SXRQuadHit hit = OpenXR::rayQuadIntersect(t.worldPose, origin, dir, t.w, t.h, slack);
+        const OpenXR::SXRQuadHit hit = OpenXR::rayMonitorIntersect(t.worldPose, origin, dir, t.w, t.h, t.radius, slack);
         if (!hit.hit)
             continue;
         if (t.id == prevStable) {
@@ -6141,9 +6248,15 @@ void COpenXRManager::reconcileDeclaredMonitors() {
     for (const auto& d : declared) {
         auto existing = layerByName(d.m_name);
         if (existing && existing->m_declaredByConfig) {
-            const OpenXR::SXRExplicitFields EXPLICIT{.resolution = d.m_resolution, .refreshRate = d.m_refreshRate, .size = d.m_sizeMeters};
+            const OpenXR::SXRExplicitFields EXPLICIT{.resolution = d.m_resolution, .refreshRate = d.m_refreshRate, .size = d.m_sizeMeters, .curve = d.m_curve};
             const bool                      hadExplicitSize = existing->m_explicit.size.has_value();
-            existing->m_explicit                            = EXPLICIT;
+            // A re-declared curve is the config speaking again: it takes the monitor back from a
+            // runtime `curve` verb (reapplyXRDefaults below then applies it).
+            if (existing->m_explicit.curve != EXPLICIT.curve) {
+                std::scoped_lock lock(m_layersMu);
+                existing->m_curveUserOwned = false;
+            }
+            existing->m_explicit = EXPLICIT;
 
             // Anchor / size change -> re-anchor to the new declared state (doc 05 §2.5 / doc 03).
             // An explicit size compares declared-vs-declared: comparing the LIVE width here meant a
@@ -6178,6 +6291,8 @@ void COpenXRManager::reconcileDeclaredMonitors() {
                 // the old bit-equal-to-the-declaration check was reaching for, now stated once).
                 existing->m_anchorFrameRef   = st.anchorPose;
                 existing->m_anchorFrameStale = true;
+                // re-declared placement: an auto curve re-wraps around the head it now sits in front of
+                existing->m_curveAutoPending = true;
                 if (anchorChanged && g_pEventManager && anchorModeChanged)
                     g_pEventManager->postEvent(SHyprIPCEvent{"xrmonitoranchor", d.m_name + "," + OpenXR::anchorModeToString(d.m_anchor)});
             }
@@ -6285,6 +6400,18 @@ void COpenXRManager::reapplyXRDefaults() {
         }
 
         layer->m_resolved = resolved;
+
+        // Curve: like the width, never once the user set it at runtime (`xrmonitor curve`). A changed
+        // spec re-resolves an auto radius around the current head.
+        {
+            std::scoped_lock lock(m_layersMu);
+            if (!layer->m_curveUserOwned && layer->m_curve != resolved.curve.value) {
+                Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}': curve {} -> {} via {}", layer->m_monitorName, OpenXR::xrCurveName(layer->m_curve),
+                                 OpenXR::xrCurveName(resolved.curve.value), OpenXR::xrDefaultSourceName(resolved.curve.source));
+                layer->m_curve            = resolved.curve.value;
+                layer->m_curveAutoPending = true;
+            }
+        }
 
         if (modeChanged || sizeChanged)
             Log::logger->log(Log::DEBUG, "[OPENXR] XR monitor '{}': xr_defaults re-resolved (mode {} via {}, scale {} via {}, size {}m via {})", layer->m_monitorName,
@@ -6599,6 +6726,21 @@ std::vector<COpenXRManager::SXRMonitorInfo> COpenXRManager::monitorInfos() {
         info.producer   = OpenXR::Stereo::producerToString(DECL.producer);
         info.chrome     = l->m_chromeLive.load(std::memory_order_relaxed);
         info.quads      = (int)l->m_quadsSubmitted.load(std::memory_order_relaxed);
+        // Curved monitors: the spec, its provenance (a runtime `curve` verb outranks the ladder), the
+        // radius it is built on and what the frame thread actually drew.
+        info.curve       = OpenXR::xrCurveName(l->m_curve);
+        info.curveSource = l->m_curveUserOwned ? "runtime" : OpenXR::xrDefaultSourceName(l->m_resolved.curve.source);
+        {
+            const float LIVE   = l->m_curveRadiusLive.load(std::memory_order_relaxed);
+            info.curveActive   = LIVE > 0.f;
+            info.curveRadius   = LIVE > 0.f ? LIVE : OpenXR::xrCurveBaseRadius(l->m_curve, l->m_curveAutoR, l->m_resolved.distance.value);
+            info.curveAngleDeg = l->m_curveAngleLive.load(std::memory_order_relaxed) * 180.f / (float)M_PI;
+            info.curveFlatReason =
+                l->m_curve.mode == OpenXR::XR_CURVE_FLAT ? "" : OpenXR::xrCurveFlatReasonName((OpenXR::eXRCurveFlatReason)l->m_curveFlatReason.load(std::memory_order_relaxed));
+            if (l->m_curve.mode != OpenXR::XR_CURVE_FLAT && !info.curveActive && info.curveFlatReason.empty())
+                info.curveFlatReason =
+                    m_session ? (m_session->m_hasCylinder ? "not submitted yet" : OpenXR::xrCurveFlatReasonName(OpenXR::XR_CURVEFLAT_UNSUPPORTED)) : "no session";
+        }
         if (auto mon = l->m_monitor.lock()) {
             info.id      = mon->m_id;
             info.plugged = mon->m_enabled; // research/18: unplugged (disabled) while sessionless
@@ -6660,7 +6802,7 @@ std::string COpenXRManager::layoutDump() {
             const OpenXR::SXRPose livePose = useLive ? l->m_anchor.lastWorld() : st.anchorPose;
 
             lines.push_back(OpenXR::serializeXRMonitorLine(l->m_monitorName, Vector2D{(double)w, (double)h}, hz > 0.f ? std::optional<float>(hz) : std::nullopt, st, livePose,
-                                                             st.widthMeters));
+                                                           st.widthMeters, l->m_curve));
         }
     }
     for (auto& ln : lines)
@@ -7106,6 +7248,9 @@ void COpenXRManager::refreshCrossQuads(int64_t nowMs) {
         q.pose    = l->m_anchor.lastWorld();
         q.wMeters = st.widthMeters;
         q.hMeters = st.widthMeters * (float)(pxH / pxW);
+        // the radius the frame thread SUBMITTED (0 when flat or flattened): the content arc lies on
+        // the same cylinder as the full surface, so the content pose + this radius describe it
+        q.radius = l->m_curveRadiusLive.load(std::memory_order_relaxed);
         m_crossQuads.push_back(q);
         m_crossQuadLayers.push_back(l);
     }
@@ -7218,7 +7363,7 @@ std::optional<Vector2D> COpenXRManager::redirectCursorCrossing(const Vector2D& o
     }
 
     // 5. The exit point on the source quad's EXTENDED plane, and the line of sight through it.
-    const OpenXR::Vec3 through = OpenXR::quadPointFromUV(srcQuad->pose, srcQuad->wMeters, srcQuad->hMeters, (float)exitUV->x, (float)exitUV->y);
+    const OpenXR::Vec3 through = OpenXR::monitorPointFromUV(srcQuad->pose, srcQuad->wMeters, srcQuad->hMeters, srcQuad->radius, (float)exitUV->x, (float)exitUV->y);
     const auto         pick    = OpenXR::xrPickCrossTarget(head.headPos, through, cands, srcQuad->id, OpenXR::XR_CROSS_TOLERANCE_DEG);
     if (!pick.ok)
         return std::nullopt; // nothing over there — the layout's answer is as good as any
@@ -7543,6 +7688,9 @@ std::expected<void, std::string> COpenXRManager::cmdDistance(const std::string& 
         std::scoped_lock lock(m_layersMu);
         if (!layer->m_anchor.applyDistance(*dm, ctx))
             return std::unexpected<std::string>("distance: head tracking unavailable or no current pose");
+        // a depth change: an auto curve keeps the head on its axis (a pushed-away monitor would
+        // otherwise leave the viewer outside a cylinder sized for the old distance)
+        layer->m_curveAutoPending = true;
     }
     noteAuthored(layer->m_histId, "distance"); // research/30 §7: an authored placement edit
     requestLayout2DSync();
@@ -7560,12 +7708,41 @@ std::expected<void, std::string> COpenXRManager::cmdCenter() {
         std::scoped_lock lock(m_layersMu);
         if (!layer->m_anchor.applyCenter(ctx, (float)*PDEFDIST))
             return std::unexpected<std::string>("center: head tracking unavailable");
+        layer->m_curveAutoPending = true; // re-centred on the head: re-wrap an auto curve around it
     }
     // report 12 §3a/§4: `center` is a "this is how I'm sitting now" moment, so it RE-LATCHES the desk
     // orientation the whole world-monitor projection is measured against, then re-derives the plane.
     latchLayout2DReference();
     noteAuthored(layer->m_histId, "center"); // research/30 §7: an authored placement edit
     requestLayout2DSync();
+    return {};
+}
+
+std::expected<void, std::string> COpenXRManager::cmdCurve(const std::string& args) {
+    // docs/openxr/02 "Curved monitors": `curve <radius m>|auto|flat` on the selected monitor. Like
+    // `scale`, a runtime setting the xr_defaults ladder will not undo until the config re-declares the
+    // monitor's curve. `auto` (re-)wraps around the head where it is NOW, so issuing it again is also
+    // the way to re-centre the arc on yourself after moving.
+    const auto tokens = splitWs(args);
+    if (tokens.size() != 1)
+        return std::unexpected<std::string>("curve: expected <radius m>|auto|flat");
+    auto spec = OpenXR::parseXRCurve(tokens[0]);
+    if (!spec)
+        return std::unexpected(spec.error());
+
+    auto layer = resolveSelected();
+    if (!layer)
+        return std::unexpected<std::string>("no XR monitor selected");
+
+    {
+        std::scoped_lock lock(m_layersMu);
+        layer->m_curve            = *spec;
+        layer->m_curveUserOwned   = true;
+        layer->m_curveAutoPending = true;
+    }
+    if (spec->mode != OpenXR::XR_CURVE_FLAT && m_session && !m_session->m_hasCylinder)
+        Log::logger->log(Log::WARN, "[OPENXR] XR monitor '{}': curve {} requested, but this runtime does not offer XR_KHR_composition_layer_cylinder; it stays flat",
+                         layer->m_monitorName, OpenXR::xrCurveName(*spec));
     return {};
 }
 
@@ -7597,6 +7774,7 @@ std::expected<void, std::string> COpenXRManager::cmdPlace(const std::string& arg
         const OpenXR::Quat curRot = layer->m_anchor.hasLastWorld() ? layer->m_anchor.lastWorld().rot : layer->m_anchor.state().anchorPose.rot;
         const OpenXR::SXRPose W   = OpenXR::placeAtFacing(*pt, ctx.view.pos, ctx.viewValid, curRot);
         layer->m_anchor.placeLocalAt(W);
+        layer->m_curveAutoPending = true; // a placement: an auto curve re-wraps around the head
     }
 
     // Placing re-anchors to local: fire the same event as an anchor-mode change so a status consumer

@@ -102,6 +102,9 @@ class COpenXRManager {
     // Whether the current session is an XR_EXTX_overlay session (doc 01). Actual state, not the
     // openxr:overlay request — false when no session exists or the runtime lacked the extension.
     bool               isOverlay() const;
+    // Whether the current session enabled XR_KHR_composition_layer_cylinder (curved monitors). False
+    // with no session; a curved monitor then renders flat.
+    bool cylinderSupported() const;
 
     // ---- luma-keyed transparency, "black-as-alpha" (openxr:black_alpha, report 09) ----
     // Live state for `hyprctl openxr status`: the CONFIGURED alpha-for-black, the EFFECTIVE one the
@@ -337,6 +340,7 @@ class COpenXRManager {
     std::expected<void, std::string> cmdScale(const std::string& args);    // <f|+d|-d>
     std::expected<void, std::string> cmdDistance(const std::string& args); // <±m>
     std::expected<void, std::string> cmdCenter();                          // (none)
+    std::expected<void, std::string> cmdCurve(const std::string& args);    // <radius m>|auto|flat
 
     // --- the deliberate re-seat (doc 03 §8.4). "Bring my monitors to me": rigidly re-seat the whole
     // anchor:local group around the current head, preserving its internal arrangement — the exact
@@ -389,6 +393,15 @@ class COpenXRManager {
         // report 14: the ray-hover REGION the frame thread last published for this quad — "none" |
         // "body" | "bar" | "corner-*" | "margin". Sticky-hover-stabilized; scriptable for tests.
         std::string region   = "none";
+        // Curved monitors (docs/openxr/02): the spec in force and where it came from, the radius the
+        // geometry is built on (frozen auto R, or the explicit one; 0 = flat), what the frame thread
+        // actually submitted, and why a requested curve is being drawn flat.
+        std::string curve         = "flat";
+        std::string curveSource   = "global";
+        float       curveRadius   = 0.f;
+        float       curveAngleDeg = 0.f;
+        bool        curveActive   = false;
+        std::string curveFlatReason;
         bool        plugged  = false; // research/18: the headless output is currently enabled
         // WP-L2: which blit path last filled this layer's swapchain — "none" | "dmabuf" | "cpu" |
         // "black". "black" flags a silent black-quad session (e.g. cross-GPU import failure).
