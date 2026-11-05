@@ -407,11 +407,80 @@ Declared monitors persist their declared mode (via the persistent monitor rule) 
 re-materialize on the next session start. The keyword grammar and reconcile semantics
 are in the configuration page.
 
+## Curved monitors
+
+A monitor can be bent around the viewer instead of submitted flat — mostly so a virtual
+ultrawide (5120x1440, a 3 m arc) wraps around you instead of being a slab whose ends are
+far away and seen at a steep angle. `curve` is a per-monitor option (`xrmonitor … curve:auto`,
+`hl.xr_monitor{ curve = "auto" }`, an `hl.xr_defaults` block or profile, `create … curve:2.5`,
+or the `xrmonitor curve <radius>|auto|flat` verb at runtime — doc 05). Unset means flat, and a
+flat monitor takes exactly the code path it always did.
+
+**The model** (`src/openxr/XRCurve.hpp`). The monitor keeps the handle it has always had: the
+anchor solves the pose of the **content centre** and `size:` is the content width. A curved
+monitor lays that rectangle on a vertical cylinder whose axis is the pose's +Y line, **R metres
+in front of the centre along its normal** (the viewer's side). So:
+
+- `size` is **arc length**; the central angle is `width / R` and `aspectRatio = width / height`
+  (the `XrCompositionLayerCylinderKHR` contract). Both come from the FULL surface — content plus
+  the chrome margins — exactly as the quad size does.
+- pitch tilts the cylinder with the pose; nothing shears.
+- the axis is derived from the pose, so a **rigid move carries axis and arc together**: a
+  curved monitor never slides around its arc.
+- R is clamped to ≥ 0.3 m, and raised just enough to keep the central angle ≤ 180° (past that the
+  ends turn back towards you and wrap behind).
+
+**`auto`** puts your head on the axis, so every column of the monitor is the same distance away.
+R is the head → monitor distance **measured on the frame thread** (it owns the head pose) on the
+first frame after the monitor is placed, then **frozen**. It re-wraps around the head on a
+placement: create, a changed spec, a re-seat (`xrmonitor reseat`, a recenter under
+`openxr:recenter = follow`, the first plug of a session), `center`, `place`, `distance`,
+`xrmonitor curve auto` — and when a grab or gaze carry is released having changed the monitor's
+**depth** by more than max(10 cm, 5%). A lateral or rotational drag keeps R. An explicit radius never
+changes by itself.
+
+**Submission.** `XR_KHR_composition_layer_cylinder` is enabled whenever the runtime advertises it
+(`cylinder layers:` in status). A curved monitor submits one `XrCompositionLayerCylinderKHR`
+(two for the stereo content pair, one per eye with `eyeVisibility`, like the quad pair) with the
+same flags, space, swapchain and image rects as its quad would have; the layer pose is on the axis.
+Quads and cylinders share one submission array, so the depth sort and the layer-count cap are
+unchanged. The frame thread snapshots each layer's radius inside the solve lock; nothing it does
+with curves touches a refcount or a string config value.
+
+**When it is drawn flat anyway** (status: ` — flat: <reason>`, JSON `curve.flatReason`):
+
+- the runtime lacks the extension (logged once as a WARN);
+- the depth desktop / a depth-packed pair, and the viewpoint portal — both flat in v1;
+- **the viewer is outside the cylinder where it matters.** Runtimes draw a cylinder layer from the
+  inside: Monado's compute renderer (`layer.comp` `do_cylinder`) samples only the FAR
+  intersection of each eye ray with the infinite cylinder. From inside the cylinder, and from
+  behind its axis, the whole arc is drawn; from behind the monitor or out past one end, part of it
+  would go transparent. `xrCurveFullyVisibleFrom` decides that per frame (with a 4 cm margin that
+  covers both eyes and an 8 cm band to come back, so a head at the boundary does not flicker the
+  shape) and the monitor is submitted as its quad meanwhile.
+
+**Hit testing follows what is drawn.** Every ray consumer goes through one entry point,
+`rayMonitorIntersect(pose, origin, dir, w, h, radius, slack)`, with the radius that was actually
+submitted this frame (0 when flat or flattened): the hand ray and its magnet/grab-cone slack, gaze
+selection and the gaze hit point (so voice deixis — "put it *here*" — lands on the curve), and
+ray-cast cursor crossing. The cylinder test hits the inside face only, with the same arc-length /
+height slack semantics as the quad; uv is arc-length along u and height along v, so chrome
+classification, the content-uv remap, cursor drawing and hover hysteresis are shape-agnostic. The
+inverse (`monitorPointFromUV`, `monitorNormalAtUV`) continues past the arc's ends along the end
+tangent, so a cursor-crossing overshoot keeps pointing outwards. `tests/xr/curve.cpp` pins the uv
+to a port of Monado's `do_cylinder` for eyes at ±IPD/2, a 6DoF lean and a step back.
+
+**Known flat assumptions left in v1:** corner-resize pins the opposite corner of the flat chord (the
+width still changes at fixed R, but the pinned corner drifts slightly on a strongly curved monitor);
+surface snapping (research/32) lays the centre pose on the plane and the arc's ends bow off it; the
+depth sort and the 2D-plane sync use the centre point; the viewpoint portal and the depth desktop
+stay flat; there is no spherical (vertical) curvature.
+
 ## Layer-count limit
 
 `CXRSession::m_maxLayerCount` is `XrSystemGraphicsProperties::maxLayerCount` from
 `xrGetSystemProperties` (the spec guarantees at least 16). Every layer we submit in
-`xrEndFrame` is a quad, and their total must not exceed that cap.
+`xrEndFrame` is a quad (or a curved monitor's cylinder), and their total must not exceed that cap.
 
 The policy is **recency-wins** and creating a monitor never fails for cap reasons: the
 newest monitor always functions as an output and gets a quad. When the active-quad
