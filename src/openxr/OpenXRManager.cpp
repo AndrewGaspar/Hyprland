@@ -2917,18 +2917,23 @@ void COpenXRManager::frameThread() {
 
             // Curved monitors (XRCurve.hpp): submit a cylinder when one was asked for AND can be drawn
             // whole. Otherwise this monitor is a quad this frame — and its hit tests below use the same
-            // radius (0), so what the ray hits is always what is on screen. The depth desktop and the
-            // viewpoint portal stay flat in v1; the runtime draws only the far intersection of an eye
-            // ray with the cylinder, so a viewer behind the monitor or past an end of the arc gets the
-            // quad (with hysteresis — a head hovering at the boundary must not flicker the shape).
+            // radius (0), so what the ray hits is always what is on screen. The viewpoint portal stays
+            // flat in v1; the runtime draws only the far intersection of an eye ray with the cylinder,
+            // so a viewer behind the monitor or past an end of the arc gets the quad (with hysteresis —
+            // a head hovering at the boundary must not flicker the shape).
+            //
+            // The depth desktop's eye pair DOES curve. With openxr:depth_desktop on (the default)
+            // every XR-created monitor is depth-packed, so flattening it would make `curve` a no-op
+            // for everyone; and its submission is the content pair's exactly — one pose, one
+            // geometry, a per-eye imageRect + eyeVisibility — so each eye's cylinder is the same
+            // surface showing its own pane. Disparity in pane pixels becomes disparity in arc angle,
+            // which is if anything MORE uniform than on a plane (every column is R from the axis).
             float                      curveR     = 0.F;
             OpenXR::eXRCurveFlatReason flatReason = OpenXR::XR_CURVEFLAT_NONE;
             if (curveBase[i] > 0.F) {
                 const float R = OpenXR::xrCurveEffectiveRadius(curveBase[i], quadW);
                 if (!m_session->m_hasCylinder)
                     flatReason = OpenXR::XR_CURVEFLAT_UNSUPPORTED;
-                else if (DECL.producer == OpenXR::Stereo::PRODUCER_DEPTH)
-                    flatReason = OpenXR::XR_CURVEFLAT_DEPTH;
                 else if (l->viewpointSubscription())
                     flatReason = OpenXR::XR_CURVEFLAT_VIEWPOINT;
                 else {

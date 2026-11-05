@@ -224,7 +224,6 @@ bool OpenXR::xrCurveFullyVisibleFrom(const SXRPose& Q, float w, float radius, co
 const char* OpenXR::xrCurveFlatReasonName(eXRCurveFlatReason r) {
     switch (r) {
         case XR_CURVEFLAT_UNSUPPORTED: return "runtime lacks XR_KHR_composition_layer_cylinder";
-        case XR_CURVEFLAT_DEPTH: return "depth desktop stays flat";
         case XR_CURVEFLAT_VIEWPOINT: return "viewpoint portal stays flat";
         case XR_CURVEFLAT_OUTSIDE: return "viewer outside the cylinder";
         default: return "";

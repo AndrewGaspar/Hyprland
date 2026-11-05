@@ -137,7 +137,6 @@ namespace OpenXR {
     enum eXRCurveFlatReason : uint8_t {
         XR_CURVEFLAT_NONE = 0,    // not flattened (flat by config, or actually curved)
         XR_CURVEFLAT_UNSUPPORTED, // the runtime does not offer XR_KHR_composition_layer_cylinder
-        XR_CURVEFLAT_DEPTH,       // the depth desktop / depth-packed pair stays flat in v1
         XR_CURVEFLAT_VIEWPOINT,   // the viewpoint portal stays flat in v1
         XR_CURVEFLAT_OUTSIDE,     // the viewer is where the runtime would not draw the whole arc
     };

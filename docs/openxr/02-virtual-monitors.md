@@ -428,7 +428,8 @@ changes by itself.
 
 **Submission.** `XR_KHR_composition_layer_cylinder` is enabled whenever the runtime advertises it
 (`cylinder layers:` in status). A curved monitor submits one `XrCompositionLayerCylinderKHR`
-(two for the stereo content pair, one per eye with `eyeVisibility`, like the quad pair) with the
+(two for a stereo pair — the depth desktop's eye panes or a client's stereo content — one per eye
+with `eyeVisibility`, like the quad pair) with the
 same flags, space, swapchain and image rects as its quad would have; the layer pose is on the axis.
 Quads and cylinders share one submission array, so the depth sort and the layer-count cap are
 unchanged. The frame thread snapshots each layer's radius inside the solve lock; nothing it does
@@ -437,7 +438,9 @@ with curves touches a refcount or a string config value.
 **When it is drawn flat anyway** (status: ` — flat: <reason>`, JSON `curve.flatReason`):
 
 - the runtime lacks the extension (logged once as a WARN);
-- the depth desktop / a depth-packed pair, and the viewpoint portal — both flat in v1;
+- the viewpoint portal — flat in v1 (the depth desktop is NOT flattened: with
+  `openxr:depth_desktop` on, the default, every XR-created monitor is depth-packed, and its eye
+  pair submits exactly like the content pair, so each eye gets a cylinder showing its own pane);
 - **the viewer is outside the cylinder where it matters.** Runtimes draw a cylinder layer from the
   inside: Monado's compute renderer (`layer.comp` `do_cylinder`) samples only the FAR
   intersection of each eye ray with the infinite cylinder. From inside the cylinder, and from
@@ -460,8 +463,10 @@ to a port of Monado's `do_cylinder` for eyes at ±IPD/2, a 6DoF lean and a step 
 **Known flat assumptions left in v1:** corner-resize pins the opposite corner of the flat chord (the
 width still changes at fixed R, but the pinned corner drifts slightly on a strongly curved monitor);
 surface snapping (research/32) lays the centre pose on the plane and the arc's ends bow off it; the
-depth sort and the 2D-plane sync use the centre point; the viewpoint portal and the depth desktop
-stay flat; there is no spherical (vertical) curvature.
+depth sort and the 2D-plane sync use the centre point; the depth desktop's disparity is still
+computed in pane pixels for a plane (on the arc that becomes a uniform angular disparity — expected
+to read the same, unverified in the headset); the viewpoint portal stays flat; there is no spherical
+(vertical) curvature.
 
 ## Layer-count limit
 
