@@ -122,12 +122,24 @@ namespace OpenXR {
     // offset is along the axis either way. Same chrome geometry, same full-surface metres.
     SXRPose contentPoseToSurfaceCenter(const SXRPose& contentPose, const SXRChromeGeometry& g, float quadW, float quadH, float radius);
 
+    // Can a viewer at `eye` see the WHOLE arc of a curved surface? The runtime draws a cylinder layer
+    // by intersecting each eye ray with the infinite cylinder and sampling only the FAR (exit)
+    // intersection (Monado layer.comp do_cylinder; the gfx mesh path draws the same inside face), so
+    // an arc point is visible exactly when the ray from the eye LEAVES the cylinder there — i.e. when
+    // the eye is on the axis side of that point's tangent plane: dot(eye_h, n_out(theta)) < R in the
+    // cylinder's horizontal plane. Inside the cylinder that always holds; behind the axis it holds for
+    // any arc up to 180 degrees; behind the monitor, or out beyond an end, part of the arc would go
+    // transparent. `margin` (metres) shrinks R for the test so both eyes (+/- IPD/2 from the head) and a
+    // flicker band are covered. Always true for flat.
+    bool xrCurveFullyVisibleFrom(const SXRPose& Q, float w, float radius, const Vec3& eye, float margin = 0.F);
+
     // Why a monitor that asked for a curve is being submitted flat (status + the one-time log).
     enum eXRCurveFlatReason : uint8_t {
         XR_CURVEFLAT_NONE = 0,    // not flattened (flat by config, or actually curved)
         XR_CURVEFLAT_UNSUPPORTED, // the runtime does not offer XR_KHR_composition_layer_cylinder
         XR_CURVEFLAT_DEPTH,       // the depth desktop / depth-packed pair stays flat in v1
         XR_CURVEFLAT_VIEWPOINT,   // the viewpoint portal stays flat in v1
+        XR_CURVEFLAT_OUTSIDE,     // the viewer is where the runtime would not draw the whole arc
     };
     const char* xrCurveFlatReasonName(eXRCurveFlatReason r);
 }

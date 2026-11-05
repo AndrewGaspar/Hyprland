@@ -206,11 +206,27 @@ SXRPose OpenXR::contentPoseToSurfaceCenter(const SXRPose& contentPose, const SXR
     return SXRPose{axis + qRotate(S, Vec3{0.F, 0.F, -radius}), S};
 }
 
+bool OpenXR::xrCurveFullyVisibleFrom(const SXRPose& Q, float w, float radius, const Vec3& eye, float margin) {
+    if (!(radius > 0.F))
+        return true;
+    const Vec3  e    = qRotate(qInverse(Q.rot), eye - cylinderCentre(Q, radius)); // cylinder-local
+    const float half = std::min(w * 0.5F / radius, XR_CURVE_MAX_ANGLE);
+    // f(theta) = e . n_out(theta) = e.x sin(theta) - e.z cos(theta): a sinusoid in theta, so its
+    // maximum over [-half, half] is at an end or at its interior peak atan2(e.x, -e.z).
+    const auto  f      = [&](float th) { return e.x * std::sin(th) - e.z * std::cos(th); };
+    float       peak   = std::max(f(-half), f(half));
+    const float thStar = std::atan2(e.x, -e.z);
+    if (std::fabs(thStar) <= half)
+        peak = std::max(peak, f(thStar));
+    return peak < radius - margin;
+}
+
 const char* OpenXR::xrCurveFlatReasonName(eXRCurveFlatReason r) {
     switch (r) {
         case XR_CURVEFLAT_UNSUPPORTED: return "runtime lacks XR_KHR_composition_layer_cylinder";
         case XR_CURVEFLAT_DEPTH: return "depth desktop stays flat";
         case XR_CURVEFLAT_VIEWPOINT: return "viewpoint portal stays flat";
+        case XR_CURVEFLAT_OUTSIDE: return "viewer outside the cylinder";
         default: return "";
     }
 }
