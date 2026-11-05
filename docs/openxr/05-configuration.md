@@ -1429,8 +1429,8 @@ asked for a curve appends ` curve: auto (R 1.90m, 92 deg, profile)` to its line 
 curved, or ` curve: auto (profile) — flat: <reason>` when it is not; the per-monitor JSON `curve`
 object carries the spec, its source (`global`/`xr_defaults`/`profile`/`explicit`, or `runtime` after
 an `xrmonitor curve`), the radius (the one submitted, else the one it would use), the central angle,
-whether a cylinder is being submitted (`active`) and `flatReason` (no extension, depth desktop,
-viewpoint portal, or the viewer being outside the cylinder — doc 02).
+whether a cylinder is being submitted (`active`) and `flatReason` (no extension, the viewpoint
+portal, or the viewer being outside the cylinder — doc 02).
 
 `recenter policy:` is `hold` or `follow` (`openxr:recenter`, doc 03 §8.4). It is on the status page
 because the single most confusing thing about recentering is that pressing the headset's button can
