@@ -1429,8 +1429,10 @@ asked for a curve appends ` curve: auto (R 1.90m, 92 deg, profile)` to its line 
 curved, or ` curve: auto (profile) — flat: <reason>` when it is not; the per-monitor JSON `curve`
 object carries the spec, its source (`global`/`xr_defaults`/`profile`/`explicit`, or `runtime` after
 an `xrmonitor curve`), the radius (the one submitted, else the one it would use), the central angle,
-whether a cylinder is being submitted (`active`) and `flatReason` (no extension, the viewpoint
-portal, or the viewer being outside the cylinder — doc 02).
+whether a cylinder is being submitted (`curveActive`) and `curveFlatReason` (no extension, the
+viewpoint portal, or the viewer being outside the cylinder — doc 02). Its keys are `curve`-prefixed
+on purpose: scripts that scrape a monitor block for the first `"source"` or `"active"` after its
+name keep finding the field they always found.
 
 `recenter policy:` is `hold` or `follow` (`openxr:recenter`, doc 03 §8.4). It is on the status page
 because the single most confusing thing about recentering is that pressing the headset's button can
@@ -1480,7 +1482,7 @@ JSON (`hyprctl -j openxr`) — all keys always present:
             "plugged": true,
             "contentPath": "",
             "linear": false,
-            "curve": { "spec": "flat", "source": "global", "radiusM": 0.000, "angleDeg": 0.0, "active": false, "flatReason": "" },
+            "curve": { "curveSpec": "flat", "curveSource": "global", "curveRadiusM": 0.000, "curveAngleDeg": 0.0, "curveActive": false, "curveFlatReason": "" },
             "adaptive": { "enabled": false, "phase": "docked", "roamMode": "body", "seatDistM": 0.0, "transitionT": 0.0 },
             "layout2d": { "source": "auto", "col": 0, "row": 0, "x": 1920, "y": 0, "azDeg": -12.40, "elDeg": -3.10 },
             "pacing": { "framesPresented": 5312, "framesBlitted": 5312, "ticksPaced": 5320, "ticksIdle": 48211 }

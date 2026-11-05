@@ -191,12 +191,12 @@ static std::string openxrStatus(eOutputFormat format) {
             "chrome": {},
             "quads": {},
             "curve": {{
-                "spec": "{}",
-                "source": "{}",
-                "radiusM": {:.3f},
-                "angleDeg": {:.1f},
-                "active": {},
-                "flatReason": "{}"
+                "curveSpec": "{}",
+                "curveSource": "{}",
+                "curveRadiusM": {:.3f},
+                "curveAngleDeg": {:.1f},
+                "curveActive": {},
+                "curveFlatReason": "{}"
             }},
             "adaptive": {{
                 "enabled": {},
