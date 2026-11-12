@@ -30,6 +30,10 @@ class CPlugin {
     std::vector<WP<SHyprCtlCommand>>        m_registeredHyprctlCommands;
     std::vector<std::string>                m_registeredAlgos;
     std::vector<WP<Config::Values::IValue>> m_registeredApiValues;
+
+    // the file actually dlopen'd, which differs from m_path when a HypXRland build stood in.
+    // Last, so the layout plugins see for the members above is unchanged.
+    std::string m_loadedFrom = "";
 };
 
 class CPluginSystem {

@@ -621,6 +621,13 @@ function(protocolWayland)
   set(PROTOCOL_SOURCES "${PROTOCOL_SOURCES}" PARENT_SCOPE)
 endfunction()
 
+# HypXRland builds of system plugins (<dir>/<package dir>/<name>.so) that the plugin loader uses
+# in place of stock-Hyprland plugin paths, see src/plugins/PluginPath.hpp. Set on the one source
+# file so the define set plugins compile with stays unchanged.
+set(HYPXR_PLUGIN_DIR "${CMAKE_INSTALL_FULL_LIBDIR}/hypxrland/plugins" CACHE STRING "Directory of HypXRland plugin builds")
+set_source_files_properties(src/plugins/PluginPath.cpp PROPERTIES COMPILE_DEFINITIONS "HYPXR_PLUGIN_DIR=\"${HYPXR_PLUGIN_DIR}\"")
+message(STATUS "HypXRland plugin builds: ${HYPXR_PLUGIN_DIR}")
+
 if(TARGET OpenGL::GL)
   target_link_libraries(hyprland_lib PUBLIC OpenGL::EGL OpenGL::GL glslang::glslang glslang::glslang-default-resource-limits glslang::SPIRV Threads::Threads)
 else()

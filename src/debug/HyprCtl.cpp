@@ -1898,9 +1898,12 @@ static std::string dispatchPlugin(eHyprCtlOutputFormat format, std::string reque
     "author": "{}",
     "handle": "{:x}",
     "version": "{}",
-    "description": "{}"
+    "description": "{}",
+    "path": "{}",
+    "loadedFrom": "{}"
 }},)#",
-                    escapeJSONStrings(p->m_name), escapeJSONStrings(p->m_author), rc<uintptr_t>(p->m_handle), escapeJSONStrings(p->m_version), escapeJSONStrings(p->m_description));
+                    escapeJSONStrings(p->m_name), escapeJSONStrings(p->m_author), rc<uintptr_t>(p->m_handle), escapeJSONStrings(p->m_version), escapeJSONStrings(p->m_description),
+                    escapeJSONStrings(p->m_path), escapeJSONStrings(p->m_loadedFrom));
             }
             trimTrailingComma(result);
             result += "]";
@@ -1911,6 +1914,8 @@ static std::string dispatchPlugin(eHyprCtlOutputFormat format, std::string reque
             for (auto const& p : PLUGINS) {
                 result += std::format("\nPlugin {} by {}:\n\tHandle: {:x}\n\tVersion: {}\n\tDescription: {}\n", p->m_name, p->m_author, rc<uintptr_t>(p->m_handle), p->m_version,
                                       p->m_description);
+                if (!p->m_loadedFrom.empty() && p->m_loadedFrom != p->m_path)
+                    result += std::format("\tLoaded from: {} (for {})\n", p->m_loadedFrom, p->m_path);
             }
         }
 

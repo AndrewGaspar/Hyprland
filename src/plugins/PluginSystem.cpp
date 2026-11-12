@@ -1,4 +1,5 @@
 #include "PluginSystem.hpp"
+#include "PluginPath.hpp"
 
 #include <dlfcn.h>
 #include <ranges>
@@ -74,11 +75,22 @@ std::expected<CPlugin*, std::string> CPluginSystem::loadPluginInternal(const std
         return std::unexpected("Cannot load a plugin twice!");
     }
 
+    // m_path stays the requested path: config reloads, unloads and hyprctl all address plugins by it
+    const auto LOAD_PATH = Plugins::resolveLoadPath(path);
+    if (std::ranges::any_of(m_loadedPlugins, [&](const auto& other) { return other->m_loadedFrom == LOAD_PATH; })) {
+        Log::logger->log(Log::ERR, " [PluginSystem] Cannot load a plugin twice! {} is already loaded", LOAD_PATH);
+        return std::unexpected("Cannot load a plugin twice!");
+    }
+
+    if (LOAD_PATH != path)
+        Log::logger->log(Log::DEBUG, " [PluginSystem] Loading {} from its HypXRland build {}", path, LOAD_PATH);
+
     auto* const PLUGIN = m_loadedPlugins.emplace_back(makeUnique<CPlugin>()).get();
 
-    PLUGIN->m_path = path;
+    PLUGIN->m_path       = path;
+    PLUGIN->m_loadedFrom = LOAD_PATH;
 
-    HANDLE MODULE = dlopen(path.c_str(), RTLD_LAZY);
+    HANDLE MODULE = dlopen(LOAD_PATH.c_str(), RTLD_LAZY);
 
     if (!MODULE) {
         std::string strerr = dlerror();
