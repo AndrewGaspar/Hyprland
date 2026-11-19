@@ -29,8 +29,8 @@ scripts/hypxr-setup.sh monado           # the optional XREAL runtime, opt-in onl
 It never runs `sudo` and never resets a repo with uncommitted changes. Root steps are **printed**
 for you at the end, and re-checked on the next run.
 
-`scripts/fishfood.sh` is unchanged and still the right tool for the everyday "pull and rebuild the
-compositor" loop. `hypxr-setup.sh` is the whole-stack bootstrap: it is the one that knows about the
+`scripts/fishfood.sh` is still the right tool for the everyday "pull and rebuild the compositor"
+loop (it also rebuilds the compositor's plugins, see **The compositor's plugins** in §2.4). `hypxr-setup.sh` is the whole-stack bootstrap: it is the one that knows about the
 other seven components, and it is the one to use when a checkout has fallen far behind.
 
 ---
@@ -290,6 +290,40 @@ and SDDM lists it next to "Hyprland". On Fedora, omedora *packages* its own sess
 (`hyprland-omedora` owns `/usr/share/wayland-sessions/omedora.desktop`) — this hand-installed file
 sits alongside it and **GDM** lists both.
 
+**The compositor's plugins.** A Hyprland plugin only loads into the exact compositor build it was
+compiled against: the version check compares the Hyprland commit plus the aquamarine, hyprutils and
+hyprgraphics versions. The packaged plugins (`hyprshare` and `omarchy-hyprland-titlebars-hypxr`,
+under `/usr/lib/hypxrland/plugins/`) match the *packaged* compositor, so a fishfood session would
+print "Version mismatch" for both. After every compositor build, `fishfood.sh setup`/`update` and
+this component therefore run `scripts/fishfood-plugins.sh build`, which
+
+1. stages a plugin SDK from the fishfood tree into `~/code/hypxrland/build/plugin-sdk/` — the same
+   files the `hypxrland-headers` package installs (`src/` and `protocols/` headers, plus
+   `hyprland.pc` with its prefix pointed at the stage);
+2. builds each plugin exactly as its PKGBUILD in `~/code/hypxr-pkgs` (at `origin/master`) does:
+   same source tarball and sha256 (read from the PKGBUILD on every run, so the pins live in one
+   place), same `make`/CMake invocation, same makepkg `CFLAGS`/`CXXFLAGS`/`LDFLAGS` (`!lto`,
+   `!debug`), and the same "carries this build's commit hash" check — only the paths point at the
+   stage. The one difference: the `.so` is not stripped;
+3. deploys them with an atomic rename into `~/code/hypxrland/build/plugins/<pkg>/<name>.so`, the
+   directory the fishfood binary is configured with (`-DHYPXR_PLUGIN_DIR`, override with
+   `HYPXRLAND_FISHFOOD_PLUGIN_DIR`). A running session keeps the old file mapped.
+
+The binary then serves those copies for both paths configs actually load:
+`/usr/lib/omarchy-hyprland-titlebars/titlebars.so` (Omarchy's stock path) and
+`/usr/lib/hypxrland/plugins/hyprshare/hyprshare.so` (`hyprland-xr.lua`). See
+`src/plugins/PluginPath.hpp`; `hyprctl plugin list -j` shows each plugin's `loadedFrom`. The
+packages must stay installed, because both configs check that the requested file exists before
+loading it. The plugin dir sits in the build dir so plugins live and die with the binary they
+match, and a test build of another worktree can never overwrite them.
+
+A failed plugin build never fails the compositor update. It is reported loudly, and the old `.so`
+is left in place even though it no longer loads. `scripts/fishfood.sh plugins` rebuilds just the
+plugins, and `scripts/fishfood-plugins.sh status` reports `ok`/`STALE`/`MISSING` for each. When a
+PKGBUILD's *build steps* change (new flags, a patch file, a second source), the matching
+`build_*` function in `fishfood-plugins.sh` must change with it. A PKGBUILD with more than one
+source fails the build instead of producing something the package does not.
+
 **wivrn.** Clones the fork, adds the worktree `~/code/wivrn-<tag>` on branch
 `hypxr-patches-<tag>`, and builds `build-server` with:
 
@@ -499,7 +533,9 @@ unplug and the laptop panel comes back (the display autopilot rides hypxrva's fl
 ## 6. Related
 
 - `scripts/hypxr-setup.sh` — the script this page documents.
-- `scripts/fishfood.sh` — the compositor-only update loop (`setup` / `update` / `gen-session`).
+- `scripts/fishfood.sh` — the compositor-only update loop (`setup` / `update` / `plugins` /
+  `gen-session`).
+- `scripts/fishfood-plugins.sh` — builds the packaged plugins against the fishfood build.
 - `~/.config/hypr/scripts/setup-xr-display.sh` — the per-machine display-toggle installer.
 - `~/.config/hypr/AGENTS.md` — the dotfiles branching strategy.
 - `docs/openxr/05-configuration.md` — every `openxr:*` variable, `xrmonitor`, `xrrule`.
