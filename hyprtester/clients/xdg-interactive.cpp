@@ -6,6 +6,7 @@
 #include <print>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <sys/mman.h>
 #include <sys/poll.h>
 #include <utility>
@@ -16,6 +17,7 @@
 #include <wayland.hpp>
 #include <xdg-shell.hpp>
 #include <xdg-toplevel-tag-v1.hpp>
+#include <viewporter.hpp>
 
 #include <hyprutils/math/Vector2D.hpp>
 #include <hyprutils/memory/SharedPtr.hpp>
@@ -32,6 +34,8 @@ struct SWlState {
     CSharedPointer<CCWlShm>                   wlShm;
     CSharedPointer<CCXdgWmBase>               xdgShell;
     CSharedPointer<CCXdgToplevelTagManagerV1> xdgTagMgr;
+    CSharedPointer<CCWlSubcompositor>         subcompositor;
+    CSharedPointer<CCWpViewporter>            viewporter;
 
     CSharedPointer<CCWlShmPool>               shmPool;
     CSharedPointer<CCWlBuffer>                shmBuf;
@@ -45,6 +49,15 @@ struct SWlState {
     CSharedPointer<CCXdgSurface>              xdgSurf;
     CSharedPointer<CCXdgToplevel>             xdgToplevel;
     Vector2D                                  geom = {500, 400};
+
+    CSharedPointer<CCWlSurface>               subSurf;
+    CSharedPointer<CCWlSubsurface>            subsurface;
+    CSharedPointer<CCWpViewport>              subViewport;
+    CSharedPointer<CCWlShmPool>               subPool;
+    CSharedPointer<CCWlBuffer>                subBuf;
+    int                                       subFd   = -1;
+    void*                                     subData = nullptr;
+    size_t                                    subSize = 0;
 
     CSharedPointer<CCWlPointer>               pointer;
     uint32_t                                  enterSerial        = 0;
@@ -63,6 +76,23 @@ static bool debug, started, shouldExit;
 // buffer.
 static std::string toplevelTag;
 static bool        paintQuadrants;
+
+// --subsurface full|inset (research/24 §5.3): put the window's picture in a wl_subsurface with its
+// own wp_viewport instead of the main surface, the way Wine's Wayland driver presents a game (the
+// "client surface", wayland_surface.c). The main surface keeps its unpainted black buffer; the
+// subsurface gets a small quadrant-painted buffer scaled by its viewport to either the whole window
+// (`full`, what Wine does for a borderless/fullscreen game) or the middle 3/4 of it (`inset`, a
+// partial overlay the stereo crop must leave alone).
+enum eSubsurfaceMode : uint8_t {
+    SUBSURFACE_NONE = 0,
+    SUBSURFACE_FULL,
+    SUBSURFACE_INSET,
+};
+static eSubsurfaceMode subsurfaceMode = SUBSURFACE_NONE;
+
+// deliberately not the window's size or aspect: the viewport destination is what sizes it
+static constexpr int SUBSURFACE_BUFFER_W = 320;
+static constexpr int SUBSURFACE_BUFFER_H = 180;
 
 template <typename... Args>
 //NOLINTNEXTLINE
@@ -134,6 +164,12 @@ static bool bindRegistry(SWlState& state) {
         } else if (NAME == "xdg_wm_base") {
             debugLog("  > binding to global: {} (version {}) with id {}", name, version, id);
             state.xdgShell = makeShared<CCXdgWmBase>((wl_proxy*)wl_registry_bind((wl_registry*)state.registry->resource(), id, &xdg_wm_base_interface, 1));
+        } else if (NAME == "wl_subcompositor") {
+            debugLog("  > binding to global: {} (version {}) with id {}", name, version, id);
+            state.subcompositor = makeShared<CCWlSubcompositor>((wl_proxy*)wl_registry_bind((wl_registry*)state.registry->resource(), id, &wl_subcompositor_interface, 1));
+        } else if (NAME == "wp_viewporter") {
+            debugLog("  > binding to global: {} (version {}) with id {}", name, version, id);
+            state.viewporter = makeShared<CCWpViewporter>((wl_proxy*)wl_registry_bind((wl_registry*)state.registry->resource(), id, &wp_viewporter_interface, 1));
         } else if (NAME == "xdg_toplevel_tag_manager_v1") {
             debugLog("  > binding to global: {} (version {}) with id {}", name, version, id);
             state.xdgTagMgr =
@@ -156,18 +192,86 @@ static bool bindRegistry(SWlState& state) {
 // buffer a pane sampled — an uncropped window shows all four, a side-by-side crop shows the left two
 // stretched across the box, an over-under crop the top two. The colours only ever have to be
 // distinguishable from each OTHER; see hyprtester/clients/screencopy-probe.cpp for why.
-static void paintBuffer(SWlState& state, int width, int height, size_t stride) {
-    if (!paintQuadrants || !state.shmData)
-        return;
-
+static void paintQuadrantsInto(void* data, int width, int height, size_t stride) {
     static constexpr uint32_t QUADRANTS[4] = {0x00FF0000, 0x0000FF00, 0x000000FF, 0x00FFFF00}; // TL red, TR green, BL blue, BR yellow
 
-    auto*                     bytes = static_cast<uint8_t*>(state.shmData);
+    auto*                     bytes = static_cast<uint8_t*>(data);
     for (int y = 0; y < height; ++y) {
         auto* row = reinterpret_cast<uint32_t*>(bytes + static_cast<size_t>(y) * stride);
         for (int x = 0; x < width; ++x)
             row[x] = QUADRANTS[(y >= height / 2 ? 2 : 0) + (x >= width / 2 ? 1 : 0)];
     }
+}
+
+static void paintBuffer(SWlState& state, int width, int height, size_t stride) {
+    if (!paintQuadrants || !state.shmData)
+        return;
+
+    paintQuadrantsInto(state.shmData, width, height, stride);
+}
+
+// The content subsurface: created once, painted once. Its position and viewport destination follow
+// the window on every configure (placeContentSubsurface).
+static bool setupContentSubsurface(SWlState& state) {
+    if (!state.subcompositor || !state.viewporter) {
+        clientLog("wl_subcompositor / wp_viewporter is not available");
+        return false;
+    }
+
+    const size_t      STRIDE = SUBSURFACE_BUFFER_W * 4;
+    const size_t      SIZE   = STRIDE * SUBSURFACE_BUFFER_H;
+    const std::string NAME   = std::format("/wl-shm-xdg-interactive-sub-{}", getpid());
+
+    state.subFd = shm_open(NAME.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (state.subFd < 0)
+        return false;
+
+    if (shm_unlink(NAME.c_str()) < 0 || ftruncate(state.subFd, SIZE) < 0)
+        return false;
+
+    state.subData = mmap(nullptr, SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, state.subFd, 0);
+    if (state.subData == MAP_FAILED) {
+        state.subData = nullptr;
+        return false;
+    }
+    state.subSize = SIZE;
+    paintQuadrantsInto(state.subData, SUBSURFACE_BUFFER_W, SUBSURFACE_BUFFER_H, STRIDE);
+
+    state.subPool = makeShared<CCWlShmPool>(state.wlShm->sendCreatePool(state.subFd, SIZE));
+    state.subBuf  = makeShared<CCWlBuffer>(state.subPool->sendCreateBuffer(0, SUBSURFACE_BUFFER_W, SUBSURFACE_BUFFER_H, STRIDE, WL_SHM_FORMAT_XRGB8888));
+    state.subSurf = makeShared<CCWlSurface>(state.wlCompositor->sendCreateSurface());
+    if (!state.subPool->resource() || !state.subBuf->resource() || !state.subSurf->resource())
+        return false;
+
+    state.subsurface  = makeShared<CCWlSubsurface>(state.subcompositor->sendGetSubsurface(state.subSurf.get(), state.surf.get()));
+    state.subViewport = makeShared<CCWpViewport>(state.viewporter->sendGetViewport(state.subSurf->resource()));
+    if (!state.subsurface->resource() || !state.subViewport->resource())
+        return false;
+
+    state.subsurface->sendPlaceAbove(state.surf.get());
+    return true;
+}
+
+// Synchronized subsurface: its commit (and the position) is applied with the parent's next commit,
+// so the content and the window it covers always change size together.
+static void placeContentSubsurface(SWlState& state) {
+    if (!state.subSurf)
+        return;
+
+    const int W = std::max(1, static_cast<int>(state.geom.x));
+    const int H = std::max(1, static_cast<int>(state.geom.y));
+
+    if (subsurfaceMode == SUBSURFACE_INSET) {
+        state.subsurface->sendSetPosition(W / 8, H / 8);
+        state.subViewport->sendSetDestination(std::max(1, W * 3 / 4), std::max(1, H * 3 / 4));
+    } else {
+        state.subsurface->sendSetPosition(0, 0);
+        state.subViewport->sendSetDestination(W, H);
+    }
+
+    state.subSurf->sendAttach(state.subBuf.get(), 0, 0);
+    state.subSurf->sendDamageBuffer(0, 0, SUBSURFACE_BUFFER_W, SUBSURFACE_BUFFER_H);
+    state.subSurf->sendCommit();
 }
 
 static bool createShm(SWlState& state, Vector2D geom) {
@@ -287,6 +391,7 @@ static bool setupToplevel(SWlState& state) {
 
         state.xdgSurf->sendSetWindowGeometry(0, 0, state.geom.x, state.geom.y);
         state.xdgSurf->sendAckConfigure(serial);
+        placeContentSubsurface(state);
         state.surf->sendAttach(state.shmBuf.get(), 0, 0);
         state.surf->sendCommit();
 
@@ -310,6 +415,9 @@ static bool setupToplevel(SWlState& state) {
         state.xdgTagMgr->sendSetToplevelTag(state.xdgToplevel->resource(), toplevelTag.c_str());
         clientLog("tag {}", toplevelTag);
     }
+
+    if (subsurfaceMode != SUBSURFACE_NONE && !setupContentSubsurface(state))
+        return false;
 
     state.surf->sendAttach(nullptr, 0, 0);
     state.surf->sendCommit();
@@ -451,8 +559,14 @@ int main(int argc, char** argv) {
             paintQuadrants = true;
         else if (ARG == "--tag" && i + 1 < argc)
             toplevelTag = argv[++i];
-        else {
-            clientLog("usage: xdg-interactive [--debug] [--paint] [--tag <xdg-toplevel-tag>]");
+        else if (ARG == "--subsurface" && i + 1 < argc && std::string_view{argv[i + 1]} == "full") {
+            subsurfaceMode = SUBSURFACE_FULL;
+            ++i;
+        } else if (ARG == "--subsurface" && i + 1 < argc && std::string_view{argv[i + 1]} == "inset") {
+            subsurfaceMode = SUBSURFACE_INSET;
+            ++i;
+        } else {
+            clientLog("usage: xdg-interactive [--debug] [--paint] [--tag <xdg-toplevel-tag>] [--subsurface full|inset]");
             return -1;
         }
     }
@@ -506,6 +620,10 @@ int main(int argc, char** argv) {
         munmap(state.shmData, state.shmMapSize);
     if (state.shmFd >= 0)
         close(state.shmFd);
+    if (state.subData)
+        munmap(state.subData, state.subSize);
+    if (state.subFd >= 0)
+        close(state.subFd);
     state = {};
 
     wl_display_disconnect(display);
