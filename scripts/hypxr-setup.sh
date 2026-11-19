@@ -20,7 +20,8 @@
 #               what is missing. Never runs it.
 #   dotfiles    ~/.config/hypr (device branch) + setup-xr-display.sh
 #   env         ~/.config/uwsm/env session-environment additions
-#   compositor  ~/code/hypxrland worktree + build + the wayland-session entry
+#   compositor  ~/code/hypxrland worktree + build + the wayland-session entry,
+#               plus the packaged plugins rebuilt against that build
 #   wivrn       the patched wivrn-server worktree + unit override + config + pairing
 #   voice       hypxrvoice (models, build, config, user unit)
 #   hud         hypxrhud (build, /usr/local install, two user units)
@@ -234,6 +235,8 @@ REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)          # this Hyprland c
 FISHFOOD="${HYPXRLAND_FISHFOOD:-$CODE/hypxrland}"
 FISHFOOD_BRANCH="${HYPXRLAND_FISHFOOD_BRANCH:-fishfood}"
 FISHFOOD_TRACK="${HYPXRLAND_FISHFOOD_TRACK:-hypxrland}"
+# compiled into the fishfood binary as HYPXR_PLUGIN_DIR; must agree with scripts/fishfood.sh
+FISHFOOD_PLUGIN_DIR="${HYPXRLAND_FISHFOOD_PLUGIN_DIR:-$FISHFOOD/build/plugins}"
 WIVRN_TAG="${HYPXR_WIVRN_TAG:-26.6.2}"
 WIVRN_SRC="${HYPXR_WIVRN_SRC:-$CODE/wivrn}"
 WIVRN_WT="${HYPXR_WIVRN_WORKTREE:-$CODE/wivrn-$WIVRN_TAG}"
@@ -269,6 +272,7 @@ print_profile() {
     printf '    %-26s %s\n' "GPU policy"             "$( ((HYBRID_GPU)) && echo 'hybrid (NVIDIA present — masks apply)' || echo 'single GPU (no masks needed)')"
     printf '    %-26s %s\n' "dotfiles branch"        "$(git -C "$DOTFILES" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '<no checkout>')"
     printf '    %-26s %s\n' "compositor worktree"    "$(tilde "$FISHFOOD") [$FISHFOOD_BRANCH]"
+    printf '    %-26s %s\n' "compositor plugin dir"  "$(tilde "$FISHFOOD_PLUGIN_DIR")"
     printf '    %-26s %s\n' "wivrn worktree"         "$(tilde "$WIVRN_WT") [$WIVRN_BRANCH]"
 }
 
@@ -964,7 +968,8 @@ comp_compositor() {
         git -C "$FISHFOOD" fetch --tags origin >/dev/null 2>&1 || true
         cmake -S "$FISHFOOD" -B "$build" -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache >/dev/null \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DHYPXR_PLUGIN_DIR="$FISHFOOD_PLUGIN_DIR" >/dev/null \
             || { fail "cmake configure failed"; return 1; }
         # The build treats OpenXR as optional and silently compiles it out. A
         # HypXRland build without XR is never what anyone wanted — fail loudly.
@@ -978,6 +983,20 @@ comp_compositor() {
         mkdir -p "$build/bin"
         ln -sf "$build/hyprctl/hyprctl" "$build/bin/hyprctl"
         did "built $(tilde "$build")/Hyprland ($(git -C "$FISHFOOD" rev-parse --short HEAD))"
+    fi
+
+    # ---- the plugins the packages ship, rebuilt against this build ----------
+    # A plugin only loads into the exact build it was compiled against; the binary serves these
+    # copies for the stock and packaged plugin paths. A failure here never fails the compositor.
+    if ((CHECK_ONLY)); then
+        HYPXRLAND_FISHFOOD="$FISHFOOD" "$REPO/scripts/fishfood-plugins.sh" status \
+            && ok "plugins match this build" \
+            || warn "plugins missing or stale; rebuild: $(tilde "$REPO")/scripts/fishfood.sh plugins"
+    elif HYPXRLAND_FISHFOOD="$FISHFOOD" HYPXRLAND_FISHFOOD_JOBS="$JOBS" "$REPO/scripts/fishfood-plugins.sh" build; then
+        did "plugins rebuilt into $(tilde "$FISHFOOD_PLUGIN_DIR")"
+    else
+        warn "plugin build FAILED (output above): they will not load in the fishfood session"
+        note "the compositor is fine; retry with $(tilde "$REPO")/scripts/fishfood.sh plugins"
     fi
 
     # ---- the session launcher + the wayland-session entry -------------------

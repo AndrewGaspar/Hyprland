@@ -9,12 +9,18 @@
 #
 #   fishfood.sh setup        one-time: create worktree + build + emit session file
 #   fishfood.sh update       fast-forward fishfood -> hypxrland tip and rebuild
+#   fishfood.sh plugins      rebuild only the plugins against the current build
 #   fishfood.sh gen-session  (re)generate the .desktop file + print install cmd
+#
+# setup and update also rebuild the plugins the packages ship (hyprshare, Omarchy's titlebars)
+# against this build, into $HYPXRLAND_FISHFOOD_PLUGIN_DIR (default <build>/plugins), which the
+# binary is configured to load them from (scripts/fishfood-plugins.sh). A plugin that fails to
+# build never fails the update; it is reported loudly, because its old copy no longer loads.
 #
 # The session file install needs root; this script never runs sudo itself —
 # it prints the command for the user to run.
 #
-# SCOPE: this script owns the COMPOSITOR only, and `update` is a fast-forward.
+# SCOPE: this script owns the COMPOSITOR (and its plugins) only, and `update` is a fast-forward.
 # For the whole HypXRland stack (WiVRn, hypxrvoice, hypxrhud, hypxrva,
 # hypxrpaper, the dotfiles device branch, the session environment), and for the
 # update path that survives a force-push of the hypxrland branch — fetch + hard
@@ -33,12 +39,19 @@ CONF=${HYPXRLAND_FISHFOOD_CONF:-$HOME/.config/hypr/hyprland-xr.lua}
 BUILD=$WORKTREE/build
 DESKTOP_OUT=${XDG_DATA_HOME:-$HOME/.local/share}/hypxrland/omarchy-xr-fishfood.desktop
 JOBS=${HYPXRLAND_FISHFOOD_JOBS:-8} # deliberately modest: this box has frozen twice under heavy parallel builds
+# Where this build serves its own plugin builds from, compiled into the binary (HYPXR_PLUGIN_DIR):
+# requests for /usr/lib/<pkg>/<name>.so and /usr/lib/hypxrland/plugins/<pkg>/<name>.so load
+# <dir>/<pkg>/<name>.so instead when it exists. Inside the build dir, so the plugins live and die
+# with the binary they match, and another worktree's build can never overwrite them.
+PLUGIN_DIR=${HYPXRLAND_FISHFOOD_PLUGIN_DIR:-$BUILD/plugins}
+PLUGINS_FAILED=0
 
 build() {
     cmake -S "$WORKTREE" -B "$BUILD" -G Ninja \
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+        -DHYPXR_PLUGIN_DIR="$PLUGIN_DIR"
     # The main build treats OpenXR as optional and silently compiles it out
     # when the loader is missing — a fishfood build without XR is never what
     # we want, so fail loudly here instead of shipping a vanilla Hyprland.
@@ -56,6 +69,26 @@ build() {
     mkdir -p "$BUILD/bin"
     ln -sf "$BUILD/hyprctl/hyprctl" "$BUILD/bin/hyprctl"
     echo "==> fishfood binary: $BUILD/Hyprland ($(git -C "$WORKTREE" rev-parse --short HEAD))"
+}
+
+# The plugins: built after the compositor, against its headers. Never fails the caller: the
+# compositor update already succeeded, and a plugin that cannot be built just stays broken (loudly).
+build_plugins() {
+    if HYPXRLAND_FISHFOOD="$WORKTREE" HYPXRLAND_FISHFOOD_JOBS="$JOBS" \
+        "$REPO/scripts/fishfood-plugins.sh" build; then
+        return 0
+    fi
+    PLUGINS_FAILED=1
+    echo "WARNING: plugin build FAILED (output above). The compositor is fine; the failed plugins" >&2
+    echo "         will not load in the fishfood session. Retry with: $REPO/scripts/fishfood.sh plugins" >&2
+}
+
+plugins_summary() {
+    ((PLUGINS_FAILED)) || return 0
+    echo >&2
+    echo "WARNING: the compositor was rebuilt but NOT every plugin was: the fishfood session will run" >&2
+    echo "         without them (\"Version mismatch\"). See the plugin output above, then run:" >&2
+    echo "           $REPO/scripts/fishfood.sh plugins" >&2
 }
 
 # The XReal runtime (monado-service + libopenxr_monado.so) lives in this worktree's
@@ -136,7 +169,9 @@ case ${1:-} in
         fi
         git -C "$WORKTREE" submodule update --init
         build
+        build_plugins
         gen_session
+        plugins_summary
         ;;
     update)
         git -C "$WORKTREE" merge --ff-only "$TRACK"
@@ -146,14 +181,21 @@ case ${1:-} in
         git -C "$WORKTREE" submodule sync --recursive
         git -C "$WORKTREE" submodule update --init
         build
+        build_plugins
         build_monado_xreal
         echo "==> done. Log out and pick Omarchy XR (fishfood) again (a running session keeps its old binary image)."
+        plugins_summary
+        ;;
+    plugins)
+        build_plugins
+        plugins_summary
+        ((!PLUGINS_FAILED))
         ;;
     gen-session)
         gen_session
         ;;
     *)
-        sed -n '2,15p' "${BASH_SOURCE[0]}"
+        sed -n '2,21p' "${BASH_SOURCE[0]}"
         exit 1
         ;;
 esac
