@@ -58,6 +58,27 @@ TEST_F(PluginPathTest, aDirectoryIsNotAPlugin) {
     EXPECT_EQ(Plugins::resolveLoadPath("/usr/lib/dir-pkg/dir.so", m_dir), "/usr/lib/dir-pkg/dir.so");
 }
 
+TEST_F(PluginPathTest, packagedHypXRlandPathUsesThisBuildsCopy) {
+    // a fishfood build keeps its plugins outside /usr; hyprland-xr.lua loads hyprshare by the
+    // hypxrland package's path, which must still reach the copy built against this binary
+    const auto EXPECTED = (m_dir / "titlebars-pkg" / "titlebars.so").string();
+    EXPECT_EQ(Plugins::resolveLoadPath("/usr/lib/hypxrland/plugins/titlebars-pkg/titlebars.so", m_dir), EXPECTED);
+    EXPECT_EQ(Plugins::resolveLoadPath("/usr/lib/hypxrland/plugins//titlebars-pkg/./titlebars.so", m_dir), EXPECTED);
+}
+
+TEST_F(PluginPathTest, packagedHypXRlandPathWithoutACopyLoadsAsAsked) {
+    EXPECT_EQ(Plugins::resolveLoadPath("/usr/lib/hypxrland/plugins/other-pkg/titlebars.so", m_dir), "/usr/lib/hypxrland/plugins/other-pkg/titlebars.so");
+    EXPECT_EQ(Plugins::resolveLoadPath("/usr/lib/hypxrland/plugins/titlebars.so", m_dir), "/usr/lib/hypxrland/plugins/titlebars.so");
+    EXPECT_EQ(Plugins::resolveLoadPath("/usr/lib/hypxrland/plugins/titlebars-pkg/sub/titlebars.so", m_dir), "/usr/lib/hypxrland/plugins/titlebars-pkg/sub/titlebars.so");
+    EXPECT_EQ(Plugins::resolveLoadPath("/usr/lib64/hypxrland/plugins/titlebars-pkg/titlebars.so", m_dir), "/usr/lib64/hypxrland/plugins/titlebars-pkg/titlebars.so");
+}
+
+TEST_F(PluginPathTest, packagedBuildLoadsItsOwnPluginsAsAsked) {
+    // the packaged build's plugin dir IS the packaged path, so its plugins resolve to themselves
+    EXPECT_EQ(Plugins::resolveLoadPath("/usr/lib/hypxrland/plugins/hyprshare/hyprshare.so", "/usr/lib/hypxrland/plugins"), "/usr/lib/hypxrland/plugins/hyprshare/hyprshare.so");
+}
+
 TEST_F(PluginPathTest, emptyPluginDirDisablesRedirects) {
     EXPECT_EQ(Plugins::resolveLoadPath("/usr/lib/titlebars-pkg/titlebars.so", ""), "/usr/lib/titlebars-pkg/titlebars.so");
+    EXPECT_EQ(Plugins::resolveLoadPath("/usr/lib/hypxrland/plugins/titlebars-pkg/titlebars.so", ""), "/usr/lib/hypxrland/plugins/titlebars-pkg/titlebars.so");
 }

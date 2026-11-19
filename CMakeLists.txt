@@ -622,8 +622,9 @@ function(protocolWayland)
 endfunction()
 
 # HypXRland builds of system plugins (<dir>/<package dir>/<name>.so) that the plugin loader uses
-# in place of stock-Hyprland plugin paths, see src/plugins/PluginPath.hpp. Set on the one source
-# file so the define set plugins compile with stays unchanged.
+# in place of stock-Hyprland plugin paths and of the hypxrland package's own plugin dir, see
+# src/plugins/PluginPath.hpp. A fishfood build points this at a user-owned dir (scripts/fishfood.sh).
+# Set on the one source file so the define set plugins compile with stays unchanged.
 set(HYPXR_PLUGIN_DIR "${CMAKE_INSTALL_FULL_LIBDIR}/hypxrland/plugins" CACHE STRING "Directory of HypXRland plugin builds")
 set_source_files_properties(src/plugins/PluginPath.cpp PROPERTIES COMPILE_DEFINITIONS "HYPXR_PLUGIN_DIR=\"${HYPXR_PLUGIN_DIR}\"")
 message(STATUS "HypXRland plugin builds: ${HYPXR_PLUGIN_DIR}")
