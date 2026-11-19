@@ -237,7 +237,7 @@ clientNew("pointer-constraints" PROTOS "pointer-constraints-unstable-v1" "xdg-sh
 clientNew("surface-scale-transform" PROTOS "fractional-scale-v1" "xdg-shell")
 clientNew("pointer-scroll" PROTOS "xdg-shell")
 clientNew("child-window" PROTOS "xdg-shell")
-clientNew("xdg-interactive" PROTOS "xdg-shell" "xdg-toplevel-tag-v1")
+clientNew("xdg-interactive" PROTOS "xdg-shell" "xdg-toplevel-tag-v1" "viewporter")
 clientNew("xdg-activation" PROTOS "xdg-shell" "xdg-activation-v1")
 clientNew("shortcut-inhibitor" PROTOS "xdg-shell" "keyboard-shortcuts-inhibit-unstable-v1")
 clientNew("keyboard-modifiers" PROTOS "xdg-shell")

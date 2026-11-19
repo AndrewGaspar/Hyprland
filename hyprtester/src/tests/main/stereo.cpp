@@ -982,6 +982,74 @@ TEST_CASE(stereoTaggedWindowSamplesOneHalfPerPane) {
     EXPECT(waitForPaneSignature(STEREO_MON, "abcd"), true);
 }
 
+// stereoContentSubsurfaceIsCropped — the picture is not always in the main surface.
+//
+// Wine's Wayland driver (winewayland.drv, GE-Proton's default under WAYLAND_DISPLAY) presents a
+// Vulkan/D3D game into a "client surface": a wl_subsurface of the toplevel whose wp_viewport
+// destination is the client rect, over a main surface that holds only GDI content (usually none).
+// A crop confined to the main surface halved an empty buffer and drew the game whole into both
+// eyes. xdg-interactive --subsurface reproduces that shape: an unpainted main surface, and a small
+// quadrant-painted buffer in a viewported subsurface.
+//
+//   1. a covering subsurface, tagged stereo:sbs   -> the left half, stretched   ("aacc")
+//   2. a subsurface over the middle 3/4, tagged   -> untouched: it is chrome    ("abcd")
+//   3. a covering subsurface, untagged            -> untouched: the control     ("abcd")
+//
+// (2) is the OSD contract of §8.6: a subsurface that does not cover the window is drawn whole into
+// both eyes. Its probes (at 1/4 and 3/4 of the window) land at 1/6 and 5/6 of the subsurface, so a
+// crop that leaked onto it would read "aacc".
+TEST_CASE(stereoContentSubsurfaceIsCropped) {
+    getFromSocket(std::format("/output remove {}", STEREO_MON));
+
+    OK(declareMonitor(STEREO_MON, STEREO_MODE, "sbs"));
+    OK(getFromSocket(std::format("/output create headless {}", STEREO_MON)));
+
+    CScopeGuard guard = {[&]() {
+        Tests::killAllWindows();
+        getFromSocket("/eval hl.window_rule({ name = 'stsub-stereo-auto', stereo = 'off' })");
+        getFromSocket(std::format("/output remove {}", STEREO_MON));
+    }};
+
+    ASSERT(waitForMonitorPresent(STEREO_MON, true), true);
+    ASSERT(waitForMonitorField(STEREO_MON, "width", "1920"), true);
+    Tests::sync();
+
+    OK(getFromSocket("/eval hl.window_rule({ name = 'stsub-stereo-auto', match = { xwayland = false }, stereo = 'auto' })"));
+
+    const auto probeCase = [&](const char* mode, const char* tag, const char* wantLayout, const char* wantSignature) {
+        OK(getFromSocket(std::format("/dispatch hl.dsp.focus({{ monitor = '{}' }})", STEREO_MON)));
+
+        std::vector<std::string> args{"--subsurface", mode};
+        if (tag) {
+            args.emplace_back("--tag");
+            args.emplace_back(tag);
+        }
+
+        const int     BEFORE = Tests::windowCount();
+        SWindowClient client(args);
+        ASSERT(client.waitForWindow(BEFORE), true);
+        Tests::sync();
+
+        EXPECT_CONTAINS(getFromSocket("/activewindow"), std::format("stereo: {}", wantLayout));
+        EXPECT(waitForPaneSignature(STEREO_MON, wantSignature), true);
+    };
+
+    NLog::log("{}1. a covering content subsurface, tagged stereo:sbs — the left half in the pane", Colors::YELLOW);
+    probeCase("full", "stereo:sbs", "sbs", "aacc");
+    // the witness: the crop reached a drawn surface
+    EXPECT(waitForMonitorField(STEREO_MON, "stereoContent", "true"), true);
+    Tests::killAllWindows();
+    Tests::waitUntilWindowsN(0);
+
+    NLog::log("{}2. a partial subsurface on a stereo:sbs window — left whole in both eyes", Colors::YELLOW);
+    probeCase("inset", "stereo:sbs", "sbs", "abcd");
+    Tests::killAllWindows();
+    Tests::waitUntilWindowsN(0);
+
+    NLog::log("{}3. a covering subsurface on an undeclared window — the control: nothing is cropped", Colors::YELLOW);
+    probeCase("full", nullptr, "off", "abcd");
+}
+
 // stereoRuleFoldAndProvenance — which instruction wins when several apply (research/24 §4.2, §4.5).
 //
 // The precedence itself is a pure function and is unit-tested as a full matrix
