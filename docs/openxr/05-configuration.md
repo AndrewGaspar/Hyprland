@@ -2040,7 +2040,8 @@ Two consequences worth knowing:
   an on-screen controller, a seek bar, a subtitle burned into the video's own pixels — is inside
   the packed frame as far as the crop is concerned, so each eye sees its own half of it. mpv's OSC
   is the usual offender; hide it (`--osc=no`, or just do not summon it) while a stereo file is up.
-  A *subsurface* OSD is safe: only the main surface is cropped (see "What it does not do").
+  A *subsurface* OSD is safe as long as it does not cover the window: only the main surface and a
+  subsurface that covers the whole window are cropped (see "Which surfaces are cropped" below).
 - **The compositor cannot warn you about this.** Everything it can see — the surface size, the
   buffer size, the window box — takes exactly the same values whether the player filled the surface
   or letterboxed inside it. There is no signal to test, which is why this is written down rather
@@ -2162,15 +2163,36 @@ windowrule = stereo off,  match:class ^(mpv|vlc)$, match:title .*[._ -]2d[._ -].
 (`windowrule` conditions are full-match regexes — unlike `xrrule`'s, which search — so they need
 the `.*` wrapping that `xrrule` lines do not.)
 
+### Which surfaces are cropped
+
+The window's **main surface** is always cropped. A **subsurface** is cropped too when it covers the
+window: its box — its position, and its size after its own `wp_viewport` destination — reaches the
+window's content box (the xdg window geometry, or the main surface if the client set none) on all
+four edges, give or take 2 logical px or 1% of the window, whichever is larger. The crop composes
+onto the subsurface's own viewport source exactly as it does for the main surface.
+
+This is what makes **Wine/Proton games** work. Wine's Wayland driver (`winewayland.drv`, the
+GE-Proton default when `WAYLAND_DISPLAY` is set) presents a Vulkan/D3D game into a *client
+surface* — a subsurface scaled by its viewport to the client rect — over a main surface that holds
+only GDI content, usually nothing. A borderless or fullscreen game's client surface covers the
+window, so its picture is cropped per eye. A *windowed* game with a Win32 title bar does not (the
+bar is far more than 1% of the window), so it is shown whole in both eyes; make it borderless or
+fullscreen.
+
+A subsurface that covers only part of the window — an OSD, a seek bar, a player's controls — is
+chrome, and is left alone. The flip side: a transparent overlay subsurface that spans the **whole**
+window is indistinguishable from content and is split per eye like in-surface chrome is.
+
 ### What it does not do
 
 - **On a monitor that is not `stereo:`, a stereo rule costs nothing and changes nothing** — the
   packed frame is shown as-is, doubled, exactly as it is today. There is only one pane to sample
   into, so there is nothing to un-pack; move the window to the stereo output. This is deliberate:
   a rule must never alter what an ordinary monitor shows.
-- **Only the window's main surface is cropped.** Subsurfaces and popups — a player's OSD, a
-  context menu — are drawn once and appear identically in both eyes at screen depth. So does the
-  cursor, which is composited into each pane at the same position.
+- **Only the surfaces that carry the window's picture are cropped** — see "Which surfaces are
+  cropped" below. A partial subsurface and every popup — a player's OSD, a context menu — are drawn
+  once and appear identically in both eyes at screen depth. So does the cursor, which is
+  composited into each pane at the same position.
 - **The panes cost a second composite, but only while a stereo window is on the output.** A stereo
   output with nothing declared renders one frame and blits it into both panes; the second composite
   starts when a declared window arrives and stops when it leaves — watch `stereoComposites` in
