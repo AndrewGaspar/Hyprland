@@ -3,6 +3,7 @@
 #include "../layout/LayoutManager.hpp"
 #include "../desktop/DepthTiers.hpp"
 #include "../desktop/view/Window.hpp"
+#include "../protocols/XDGShell.hpp"
 #include "render/pass/ClearPassElement.hpp"
 #include <hyprutils/memory/SharedPtr.hpp>
 #include <hyprutils/memory/UniquePtr.hpp>
@@ -51,14 +52,28 @@ static std::optional<Vector2D> getSurfaceExpectedSize(PHLWINDOW pWindow, SP<CWLS
     return std::nullopt;
 }
 
+// A subsurface of the window's own tree is content when it covers the window. X11 windows are one
+// surface, so they are never asked.
+static bool isStereoContentSubsurface(const PHLWINDOW& pWindow, const SP<CWLSurfaceResource>& pSurface, const Vector2D& localPos) {
+    if (!pSurface || pWindow->m_isX11 || !pWindow->m_xdgSurface || !pWindow->wlSurface() || !pWindow->wlSurface()->resource())
+        return false;
+
+    const auto CONTENT = Render::Stereo::windowContentBox(pWindow->m_xdgSurface->m_current.geometry, pWindow->wlSurface()->resource()->m_current.size);
+    return Render::Stereo::coversWindowContent(CBox{localPos, pSurface->m_current.size}, CONTENT);
+}
+
 // research/24 §5.3 + F7 (WP S1): the whole per-window stereo producer, at the one seam where UVs are
 // decided. While pane i of a stereo output is composited, a window whose content is declared packed
 // samples only its eye-i half of whatever UV range it had already resolved to — so it composes with
 // a wp_viewporter source box instead of fighting it, and the destination box is untouched, which is
 // what keeps input, layout and decorations completely unaware that any of this happened.
 //
-// It is deliberately confined to the window's MAIN surface: subsurfaces (a player's OSD) and popups
-// are chrome the client drew once, not packed content, and they belong at screen depth in both eyes.
+// It is confined to the surfaces that carry the window's CONTENT: the main surface, and a subsurface
+// that covers the window (Render::Stereo::coversWindowContent — Wine/Proton's client surface, where
+// a game's swapchain actually lands). A partial subsurface (a player's OSD) and popups are chrome
+// the client drew once, not packed content, and they belong at screen depth in both eyes. The crop
+// composes onto whatever UV range the surface resolved to, so a client surface's own viewport
+// source is honoured exactly as the main surface's is.
 //
 // The eye is m_renderData.stereoPane, the ONE index the pane loop in renderMonitor sets — the same
 // one depth signs its disparity from, which is what makes S-in-D compose without either producer
@@ -73,13 +88,23 @@ static std::optional<Vector2D> getSurfaceExpectedSize(PHLWINDOW pWindow, SP<CWLS
 // built, exactly as depth's is (IHyprRenderer::stereoContentActive). It is the witness: did the
 // crop actually reach a drawn surface, i.e. did the declaration survive the fullscreen gate,
 // occlusion and "not on this output". `hyprctl monitors` reports it as `stereoContent`.
-static void applyStereoContentCrop(PHLWINDOW pWindow, PHLMONITOR pMonitor, bool main) {
-    auto& renderData = g_pHyprRenderer->m_renderData;
+static void applyStereoContentCrop(const CSurfacePassElement::SRenderData& data) {
+    auto&       renderData = g_pHyprRenderer->m_renderData;
+    const auto& PWINDOW    = data.pWindow;
 
-    if (!main || !pWindow || !pMonitor || !pMonitor->isStereo())
+    if (!PWINDOW || !data.pMonitor || !data.pMonitor->isStereo())
         return;
 
-    const auto LAYOUT = pWindow->stereoLayout();
+    // popups share pWindow (their mainSurface is always false) but are never content
+    if (data.popup)
+        return;
+
+    // the geometric test is a handful of compares, so it runs BEFORE stereoLayout(): a partial
+    // subsurface never pays for the declaration lookup (which copies the xdg tag for `auto`)
+    if (!data.mainSurface && !isStereoContentSubsurface(PWINDOW, data.surface, data.localPos))
+        return;
+
+    const auto LAYOUT = PWINDOW->stereoLayout();
     if (Render::Stereo::viewCount(LAYOUT) < 2)
         return;
 
@@ -98,10 +123,6 @@ static void applyStereoContentCrop(PHLWINDOW pWindow, PHLMONITOR pMonitor, bool 
 void IElementRenderer::calculateUVForSurface(PHLWINDOW pWindow, SP<CWLSurfaceResource> pSurface, PHLMONITOR pMonitor, bool main, const Vector2D& projSize,
                                              const Vector2D& projSizeUnscaled, bool fixMisalignedFSV1) {
     auto& m_renderData = g_pHyprRenderer->m_renderData;
-
-    // the stereo crop runs on the way out of every branch below (the early return above it is the
-    // !main || !pWindow case, where the crop is a no-op by definition)
-    const Hyprutils::Utils::CScopeGuard STEREO_CROP{[pWindow, pMonitor, main] { applyStereoContentCrop(pWindow, pMonitor, main); }};
 
     if (!pWindow || !pWindow->m_isX11) {
         static auto PEXPANDEDGES = CConfigValue<Hyprlang::INT>("render:expand_undersized_textures");
@@ -334,6 +355,8 @@ void IElementRenderer::drawSurface(WP<CSurfacePassElement> element, const CRegio
         (!m_data.pLS || (!m_data.pLS->sizeAnimation()->isBeingAnimated())); /* not LS or not animated */
 
     calculateUVForSurface(m_data.pWindow, m_data.surface, m_data.pMonitor->m_self.lock(), m_data.mainSurface, windowBox.size(), PROJSIZEUNSCALED, MISALIGNEDFSV1);
+    // composes onto the UV range every branch of calculateUVForSurface resolved to
+    applyStereoContentCrop(m_data);
 
     auto cancelRender = false;
     auto clipRegion   = element->visibleRegion(cancelRender);

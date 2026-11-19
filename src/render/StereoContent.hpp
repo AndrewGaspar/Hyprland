@@ -297,6 +297,53 @@ namespace Render::Stereo {
         return out;
     }
 
+    // WHICH SURFACES CARRY THE PACKED FRAME. The window's main surface always does. A subsurface does
+    // too when it IS the window's content rather than chrome over it: Wine's Wayland driver
+    // (winewayland.drv, the GE-Proton default under WAYLAND_DISPLAY) presents a Vulkan/D3D game into
+    // a "client surface" — a wl_subsurface of the toplevel whose wp_viewport destination is the
+    // client rect — while the main surface holds only GDI content, usually nothing. Cropping the
+    // main surface alone would halve an empty buffer and draw the game whole into both eyes.
+    //
+    // The test is geometric and client-agnostic: the subsurface's logical box (offset from the main
+    // surface, size after its viewport destination) must cover the window's content box — the xdg
+    // window geometry, or the main surface's own box when the client set none — on all four edges.
+    // A partial subsurface (an OSD, a seek bar, a player's controls) fails it and stays at screen
+    // depth in both eyes; a surface that overhangs the content (a shadow margin) still passes.
+    //
+    // The slack, per axis, is max(COVER_SLACK_PX, COVER_SLACK_FRACTION of the content extent):
+    //   - 2 logical px absorbs integer rounding between the client's coordinate space and ours —
+    //     Wine converts its window-space client rect to surface coordinates per edge
+    //     (wayland_surface_coords_from_window), and at a non-1 scale each edge can land a pixel off.
+    //   - 1% absorbs a thin Win32 frame (WS_BORDER and friends are 1-8 px) around a client rect,
+    //     which is still the game's picture. It is far below any real overlay: an OSD that leaves
+    //     less than 1% of the window uncovered on every side is, for this purpose, the content.
+    //
+    // Pure, allocation-free and branch-cheap: the renderer calls it per window subsurface per frame,
+    // and only on a stereo output (nothing else is ever asked).
+    inline constexpr double COVER_SLACK_PX       = 2.0;
+    inline constexpr double COVER_SLACK_FRACTION = 0.01;
+
+    // The window's content box in main-surface-local logical coordinates: the xdg geometry if the
+    // client set a non-empty one, the main surface's box otherwise.
+    inline CBox windowContentBox(const CBox& xdgGeometry, const Vector2D& mainSurfaceSize) {
+        if (xdgGeometry.w > 0 && xdgGeometry.h > 0)
+            return xdgGeometry;
+        return CBox{0, 0, mainSurfaceSize.x, mainSurfaceSize.y};
+    }
+
+    // `surfaceBox` is the subsurface's logical box in the same coordinates as `contentBox`. An empty
+    // box on either side never covers (a surface with no buffer has zero size).
+    inline bool coversWindowContent(const CBox& surfaceBox, const CBox& contentBox) {
+        if (surfaceBox.w <= 0 || surfaceBox.h <= 0 || contentBox.w <= 0 || contentBox.h <= 0)
+            return false;
+
+        const double SLACKX = std::max(COVER_SLACK_PX, contentBox.w * COVER_SLACK_FRACTION);
+        const double SLACKY = std::max(COVER_SLACK_PX, contentBox.h * COVER_SLACK_FRACTION);
+
+        return surfaceBox.x <= contentBox.x + SLACKX && surfaceBox.y <= contentBox.y + SLACKY && surfaceBox.x + surfaceBox.w >= contentBox.x + contentBox.w - SLACKX &&
+            surfaceBox.y + surfaceBox.h >= contentBox.y + contentBox.h - SLACKY;
+    }
+
     // §5.6, both directions. A ray or pointer hit is computed against ONE PANE — the half of the
     // image an eye actually shows — while everything downstream of it (absolute pointer injection,
     // which is keyed by monitor name plus a 0..1 UV) wants a coordinate in the whole packed image.

@@ -594,3 +594,93 @@ TEST(StereoContent, aLetterboxOnTheUNSPLITAxisIsHarmless) {
         EXPECT_EQ(paneUVToContentUV({T, 0.5}, CONTENT_TAB, 0).x, paneUVToContentUV({T, 0.5}, CONTENT_TAB, 1).x);
     }
 }
+
+// --- which surfaces carry the packed frame: the content-surface cover test ---
+//
+// The renderer crops a stereo window's main surface, plus any subsurface for which
+// coversWindowContent(CBox{offset, m_current.size}, windowContentBox(xdgGeometry, mainSize)) holds.
+// m_current.size is the LOGICAL size — the viewport destination when there is one — which is the
+// box these cases build. The motivating client is Wine's Wayland driver: the game presents into a
+// subsurface whose wp_viewport destination is the client rect, over an empty GDI main surface.
+
+TEST(StereoContentSurface, aSubsurfaceExactlyOverTheWindowIsContent) {
+    const auto CONTENT = windowContentBox(CBox{0, 0, 1920, 1080}, {1920, 1080});
+    EXPECT_TRUE(coversWindowContent(CBox{0, 0, 1920, 1080}, CONTENT));
+}
+
+TEST(StereoContentSurface, aCoverWithinTheSlackIsStillContent) {
+    const auto CONTENT = windowContentBox(CBox{0, 0, 1920, 1080}, {1920, 1080});
+
+    // a pixel of rounding on every edge (Wine converts each client-rect edge separately)
+    EXPECT_TRUE(coversWindowContent(CBox{1, 1, 1918, 1078}, CONTENT));
+    // a thin Win32 frame: 8 px inside a 1920-wide window is under 1% on x, and 1% of 1080 is 10.8 on y
+    EXPECT_TRUE(coversWindowContent(CBox{8, 8, 1904, 1064}, CONTENT));
+    // on a small window the 2 px floor is what applies: 1% of 100 is 1 px
+    EXPECT_TRUE(coversWindowContent(CBox{2, 2, 96, 96}, windowContentBox(CBox{0, 0, 100, 100}, {100, 100})));
+    // and just past it, on either side, is not
+    EXPECT_FALSE(coversWindowContent(CBox{3, 0, 97, 100}, windowContentBox(CBox{0, 0, 100, 100}, {100, 100})));
+    EXPECT_FALSE(coversWindowContent(CBox{0, 0, 100, 97}, windowContentBox(CBox{0, 0, 100, 100}, {100, 100})));
+    // 1% of 1920 is 19.2: 20 px short on the right is past it
+    EXPECT_FALSE(coversWindowContent(CBox{0, 0, 1900, 1080}, CONTENT));
+}
+
+TEST(StereoContentSurface, theTestIsOnTheViewportDestinationNotTheBuffer) {
+    // Wine's swapchain at 1280x720, scaled by wp_viewport to the 1920x1080 client rect: the logical
+    // box is the destination, and it covers. The buffer's own size would not have.
+    const Vector2D BUFFER      = {1280, 720};
+    const Vector2D DESTINATION = {1920, 1080};
+    const auto     CONTENT     = windowContentBox(CBox{0, 0, 1920, 1080}, {1920, 1080});
+
+    EXPECT_TRUE(coversWindowContent(CBox{{0, 0}, DESTINATION}, CONTENT));
+    EXPECT_FALSE(coversWindowContent(CBox{{0, 0}, BUFFER}, CONTENT));
+
+    // ...and the other way round: a 4K buffer squeezed into a small destination is partial
+    EXPECT_FALSE(coversWindowContent(CBox{0, 0, 640, 360}, CONTENT));
+}
+
+TEST(StereoContentSurface, anOffsetOrPartialSubsurfaceIsChrome) {
+    const auto CONTENT = windowContentBox(CBox{0, 0, 1920, 1080}, {1920, 1080});
+
+    // a seek bar along the bottom: full width, a fraction of the height
+    EXPECT_FALSE(coversWindowContent(CBox{0, 1000, 1920, 80}, CONTENT));
+    // a centred overlay
+    EXPECT_FALSE(coversWindowContent(CBox{240, 135, 1440, 810}, CONTENT));
+    // a full-size surface shifted half off the window
+    EXPECT_FALSE(coversWindowContent(CBox{960, 0, 1920, 1080}, CONTENT));
+    EXPECT_FALSE(coversWindowContent(CBox{-960, 0, 1920, 1080}, CONTENT));
+    // a decorated Win32 window: a 30 px title bar above the client rect is far past the slack
+    EXPECT_FALSE(coversWindowContent(CBox{0, 30, 1920, 1050}, CONTENT));
+    // overhanging the window on every side is still a cover
+    EXPECT_TRUE(coversWindowContent(CBox{-10, -10, 1940, 1100}, CONTENT));
+}
+
+TEST(StereoContentSurface, theContentBoxIsTheXdgGeometryWithCsdMargins) {
+    // a CSD client: a 1000x800 main surface with 20 px shadow margins, geometry 960x760 at (20,20)
+    const auto CONTENT = windowContentBox(CBox{20, 20, 960, 760}, {1000, 800});
+    EXPECT_EQ(CONTENT, (CBox{20, 20, 960, 760}));
+
+    // a subsurface over exactly the geometry is content, and so is one over the shadow too
+    EXPECT_TRUE(coversWindowContent(CBox{20, 20, 960, 760}, CONTENT));
+    EXPECT_TRUE(coversWindowContent(CBox{0, 0, 1000, 800}, CONTENT));
+    // one at the main surface's origin but only geometry-sized misses the right and bottom margins
+    EXPECT_FALSE(coversWindowContent(CBox{0, 0, 960, 760}, CONTENT));
+
+    // no geometry set: the main surface's own box stands in
+    EXPECT_EQ(windowContentBox(CBox{}, {1000, 800}), (CBox{0, 0, 1000, 800}));
+    EXPECT_EQ(windowContentBox(CBox{20, 20, 0, 760}, {1000, 800}), (CBox{0, 0, 1000, 800}));
+    EXPECT_TRUE(coversWindowContent(CBox{0, 0, 1000, 800}, windowContentBox(CBox{}, {1000, 800})));
+}
+
+TEST(StereoContentSurface, anEmptySurfaceOrAnEmptyWindowNeverCovers) {
+    const auto CONTENT = windowContentBox(CBox{0, 0, 1920, 1080}, {1920, 1080});
+
+    // no buffer attached: m_current.size is {} (Compositor.cpp), at any offset
+    EXPECT_FALSE(coversWindowContent(CBox{0, 0, 0, 0}, CONTENT));
+    EXPECT_FALSE(coversWindowContent(CBox{0, 0, 1920, 0}, CONTENT));
+    EXPECT_FALSE(coversWindowContent(CBox{0, 0, -1920, -1080}, CONTENT));
+
+    // nothing to cover: an unmapped main surface with no geometry
+    const auto NOTHING = windowContentBox(CBox{}, {0, 0});
+    EXPECT_FALSE(coversWindowContent(CBox{0, 0, 1920, 1080}, NOTHING));
+    EXPECT_FALSE(coversWindowContent(CBox{0, 0, 0, 0}, NOTHING));
+}
